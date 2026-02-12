@@ -4,9 +4,13 @@
 using namespace thinger;
 
 int main() {
-    std::cout << "Simple Async Client Example\n" << std::endl;
+    std::cout << "=== Async Client Example ===\n" << std::endl;
 
-    // Create pool client - uses worker thread pool
+    // ============================================
+    // 1. Callback-based API
+    // ============================================
+    std::cout << "--- Callback API ---\n" << std::endl;
+
     http::async_client client;
 
     // Simple GET request with callback
@@ -21,38 +25,51 @@ int main() {
         std::cout << "Content-Length: " << res.content_length() << " bytes\n" << std::endl;
 
         if (res.is_json()) {
-            try {
-                auto json = res.json();
-                std::cout << "User info:" << std::endl;
-                std::cout << "  Login: " << json["login"].get<std::string>() << std::endl;
-                std::cout << "  Name: " << json["name"].get<std::string>() << std::endl;
-                std::cout << "  Public repos: " << json["public_repos"].get<int>() << std::endl;
-            } catch (const std::exception& e) {
-                std::cerr << "Failed to parse JSON: " << e.what() << std::endl;
-            }
+            auto json = res.json();
+            std::cout << "User info:" << std::endl;
+            std::cout << "  Login: " << json["login"].get<std::string>() << std::endl;
+            std::cout << "  Name: " << json["name"].get<std::string>() << std::endl;
+            std::cout << "  Public repos: " << json["public_repos"].get<int>() << std::endl;
         }
     });
 
-    // Wait for request to complete
     client.wait();
 
-    std::cout << "\n--- Multiple sequential callbacks ---\n" << std::endl;
+    // ============================================
+    // 2. Coroutine-based API (co_await)
+    // ============================================
+    std::cout << "\n--- Coroutine API (co_await) ---\n" << std::endl;
 
-    // Multiple requests with callbacks - each runs async but we wait between them
-    client.get("https://api.github.com/users/torvalds", [](http::client_response& res) {
-        if (res && res.is_json()) {
+    client.run([&client]() -> awaitable<void> {
+        // co_await makes async code look sequential
+        auto res = co_await client.get("https://api.github.com/users/torvalds");
+
+        if (!res) {
+            std::cerr << "Request failed: " << res.error() << std::endl;
+            co_return;
+        }
+
+        std::cout << "Status: " << res.status() << std::endl;
+
+        if (res.is_json()) {
             auto json = res.json();
-            std::cout << "Torvalds repos: " << json["public_repos"].get<int>() << std::endl;
+            std::cout << "User info:" << std::endl;
+            std::cout << "  Login: " << json["login"].get<std::string>() << std::endl;
+            std::cout << "  Name: " << json["name"].get<std::string>() << std::endl;
+            std::cout << "  Public repos: " << json["public_repos"].get<int>() << std::endl;
+        }
+
+        // Sequential requests within the same coroutine
+        std::cout << "\nFetching another user..." << std::endl;
+        auto res2 = co_await client.get("https://api.github.com/users/octocat");
+
+        if (res2 && res2.is_json()) {
+            auto json = res2.json();
+            std::cout << "  Login: " << json["login"].get<std::string>() << std::endl;
+            std::cout << "  Public repos: " << json["public_repos"].get<int>() << std::endl;
         }
     });
-    client.wait();
 
-    client.get("https://api.github.com/users/octocat", [](http::client_response& res) {
-        if (res && res.is_json()) {
-            auto json = res.json();
-            std::cout << "Octocat repos: " << json["public_repos"].get<int>() << std::endl;
-        }
-    });
     client.wait();
 
     std::cout << "\nAll requests completed!" << std::endl;

@@ -75,6 +75,34 @@ int main() {
     std::cout << "\nCompleted " << completed2.load() << " coroutine requests!" << std::endl;
 
     // ============================================
+    // Parallel coroutines with operator&&
+    // ============================================
+    std::cout << "\n--- Parallel Coroutines (operator&&) ---\n" << std::endl;
+
+    http::async_client client_parallel;
+
+    client_parallel.run([&client_parallel]() -> awaitable<void> {
+        // Launch 3 requests in parallel and wait for all of them
+        auto [res1, res2, res3] = co_await (
+            client_parallel.get("https://api.github.com/users/github") &&
+            client_parallel.get("https://api.github.com/users/torvalds") &&
+            client_parallel.get("https://api.github.com/users/octocat")
+        );
+
+        // All 3 responses are ready
+        for (auto* res : {&res1, &res2, &res3}) {
+            if (*res && res->is_json()) {
+                auto json = res->json();
+                std::cout << "[parallel] " << json["login"].get<std::string>()
+                          << " - " << json["public_repos"].get<int>() << " repos"
+                          << std::endl;
+            }
+        }
+    });
+
+    client_parallel.wait();
+
+    // ============================================
     // Check pending requests
     // ============================================
     std::cout << "\n--- Pending Requests ---\n" << std::endl;
