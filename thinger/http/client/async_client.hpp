@@ -115,6 +115,8 @@ public:
     using http_client_base::del;
     using http_client_base::head;
     using http_client_base::options;
+    using http_client_base::send;
+    using http_client_base::send_streaming;
 
     template<typename Callback>
     void get(const std::string& url, Callback&& callback, headers_map headers = {}) {
