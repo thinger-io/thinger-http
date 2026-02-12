@@ -2,7 +2,8 @@
 
 A modern C++20 HTTP/WebSocket library built on Boost.ASIO with coroutine support.
 
-> **Note:** This library is under active development and is not yet recommended for production use. APIs and interfaces may change without notice between versions. Feedback and contributions are welcome.
+> [!WARNING]
+> This library is under active development and is not yet recommended for production use. APIs and interfaces may change without notice between versions. Feedback and contributions are welcome.
 
 ## Features
 
