@@ -6,44 +6,17 @@ on:
   pull_request:
     branches: [ main ]
 
-env:
-  BOOST_VERSION: 1.90.0
-  BOOST_VERSION_UNDERSCORE: 1_90_0
-
 jobs:
   build-and-test:
     runs-on: self-hosted
+    container:
+      image: thinger/compiler:mold-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            cmake \
-            libssl-dev \
-            zlib1g-dev
-
-      - name: Cache Boost
-        id: cache-boost
-        uses: actions/cache@v4
-        with:
-          path: ~/boost-install
-          key: boost-${{ env.BOOST_VERSION }}-ubuntu-${{ runner.os }}
-
-      - name: Build Boost
-        if: steps.cache-boost.outputs.cache-hit != 'true'
-        run: |
-          wget -q https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${BOOST_VERSION_UNDERSCORE}.tar.gz
-          tar xzf boost_${BOOST_VERSION_UNDERSCORE}.tar.gz
-          cd boost_${BOOST_VERSION_UNDERSCORE}
-          ./bootstrap.sh --with-libraries=iostreams --prefix=$HOME/boost-install
-          ./b2 install -j$(nproc) link=static
-
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBOOST_ROOT=$HOME/boost-install
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build -j$(nproc)
