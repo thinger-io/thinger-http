@@ -5,6 +5,18 @@ A modern C++20 HTTP/WebSocket library built on Boost.ASIO with coroutine support
 > [!WARNING]
 > This library is under active development and is not yet recommended for production use. APIs and interfaces may change without notice between versions. Feedback and contributions are welcome.
 
+## Performance
+
+Benchmarked with [bombardier](https://github.com/codesenberg/bombardier) — 100 concurrent connections, 10s duration, "Hello World!" endpoint. All frameworks compiled with `-O3` (Release mode) on Apple M2 Max.
+
+| Framework | Req/s | Avg Latency | Throughput |
+|---|--:|--:|--:|
+| **thinger-http** | **~131,000** | **0.76ms** | 20.4 MB/s |
+| [Crow](https://github.com/CrowCpp/Crow) | ~122,000 | 0.82ms | 22.7 MB/s |
+| [cpp-httplib](https://github.com/yhirose/cpp-httplib) | ~34,000 | 3.89ms | 3.6 MB/s |
+
+> Both thinger-http and Crow run multi-threaded. See [`benchmark/`](benchmark/) for details and instructions to reproduce.
+
 ## Features
 
 - **HTTP Server & Client** - Full HTTP/1.1 support with connection pooling

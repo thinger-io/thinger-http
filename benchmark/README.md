@@ -4,9 +4,32 @@ This directory contains performance benchmarks comparing thinger-http with other
 
 ## Frameworks Tested
 
-- **thinger-http**: This library (port 9080)
-- **cpp-httplib**: A popular header-only HTTP library (port 9081)
-- **Crow**: A fast micro web framework (port 9082)
+Each framework runs an identical "Hello World!" endpoint:
+
+**thinger-http** (port 9080)
+```cpp
+http::pool_server srv;
+srv.get("/", [](http::request& req, http::response& res) {
+    res.send("Hello World!");
+});
+srv.start("0.0.0.0", 9080);
+```
+
+**cpp-httplib** (port 9081)
+```cpp
+httplib::Server svr;
+svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
+    res.set_content("Hello World!", "text/plain");
+});
+svr.listen("0.0.0.0", 9081);
+```
+
+**Crow** (port 9082)
+```cpp
+crow::SimpleApp app;
+CROW_ROUTE(app, "/")([]() { return "Hello World!"; });
+app.port(9082).multithreaded().run();
+```
 
 ## Prerequisites
 
@@ -120,12 +143,15 @@ rm -rf build
 
 ## Sample Results
 
-On Apple M1 Pro (macOS) with logging disabled:
-- **Crow**: ~84,634 req/s, 116.71μs avg latency
-- **thinger-http**: ~83,531 req/s, 118.23μs avg latency
-- **cpp-httplib**: ~37,321 req/s, 266.44μs avg latency  
+On Apple M2 Max (macOS), 100 concurrent connections, 10s duration, `-O3` Release mode:
 
-Both Crow and thinger-http show similar performance, approximately 2.2x faster than cpp-httplib in this simple benchmark.
+| Framework | Req/s | Avg Latency | Throughput |
+|---|--:|--:|--:|
+| **thinger-http** | **~131,000** | **0.76ms** | 20.4 MB/s |
+| Crow | ~122,000 | 0.82ms | 22.7 MB/s |
+| cpp-httplib | ~34,000 | 3.89ms | 3.6 MB/s |
+
+Both thinger-http and Crow run multi-threaded. thinger-http is approximately 3.9x faster than cpp-httplib.
 
 ## Notes
 
