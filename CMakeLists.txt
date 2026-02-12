@@ -18,6 +18,7 @@ option(THINGER_HTTP_BUILD_BENCHMARKS "Build benchmarks" OFF)
 option(THINGER_HTTP_ENABLE_SSL "Enable SSL support" ON)
 option(THINGER_HTTP_ENABLE_LOGGING "Enable spdlog logging" ON)
 option(THINGER_HTTP_ENABLE_COVERAGE "Enable code coverage" OFF)
+option(THINGER_HTTP_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
 # Coverage configuration
 if(THINGER_HTTP_ENABLE_COVERAGE)
@@ -28,6 +29,18 @@ if(THINGER_HTTP_ENABLE_COVERAGE)
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --coverage")
     else()
         message(WARNING "Code coverage requires GCC or Clang")
+    endif()
+endif()
+
+# Sanitizers configuration
+if(THINGER_HTTP_ENABLE_SANITIZERS)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        message(STATUS "Enabling AddressSanitizer and UndefinedBehaviorSanitizer")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address,undefined -fno-omit-frame-pointer")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address,undefined -fno-omit-frame-pointer")
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address,undefined")
+    else()
+        message(WARNING "Sanitizers require GCC or Clang")
     endif()
 endif()
 

@@ -1,0 +1,28 @@
+name: Sanitizers
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  sanitizers:
+    runs-on: self-hosted
+    container:
+      image: thinger/compiler:mold-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure with sanitizers
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DTHINGER_HTTP_ENABLE_SANITIZERS=ON
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Run tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure --timeout 120
