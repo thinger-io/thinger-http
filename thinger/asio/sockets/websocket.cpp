@@ -71,11 +71,28 @@ awaitable<void> websocket::send_close(uint8_t buffer[], size_t size) {
     LOG_DEBUG("close frame sent");
 
     if (!close_received_) {
-        // Wait for close acknowledgement with timeout
+        // Race: read the close ack vs timeout
         timer_.cancel();
         timer_.expires_after(std::chrono::seconds{5});
-        auto [timeout_ec] = co_await timer_.async_wait(use_nothrow_awaitable);
-        if (!timeout_ec && !close_received_) {
+
+        auto read_close_ack = [this]() -> awaitable<void> {
+            try {
+                uint8_t buf[125];
+                while (!close_received_ && socket_->is_open()) {
+                    co_await read_frame(buf, sizeof(buf));
+                }
+            } catch (...) {
+                // Expected: read_frame throws after processing close frame
+            }
+        };
+
+        auto wait_timeout = [this]() -> awaitable<void> {
+            auto [ec] = co_await timer_.async_wait(use_nothrow_awaitable);
+        };
+
+        co_await (read_close_ack() || wait_timeout());
+
+        if (!close_received_) {
             LOG_WARNING("timeout while waiting close acknowledgement");
         }
     }
