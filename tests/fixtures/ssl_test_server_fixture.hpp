@@ -7,7 +7,7 @@
 #include <thinger/asio/ssl/certificate_manager.hpp>
 #include <nlohmann/json.hpp>
 #include <catch2/catch_test_macros.hpp>
-#include <boost/asio/deadline_timer.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <chrono>
 #include <thread>
 
@@ -118,8 +118,8 @@ protected:
             }
 
             auto& io_context = socket->get_io_context();
-            auto timer = std::make_shared<boost::asio::deadline_timer>(io_context);
-            timer->expires_from_now(boost::posix_time::seconds(seconds));
+            auto timer = std::make_shared<boost::asio::steady_timer>(io_context);
+            timer->expires_after(std::chrono::seconds(seconds));
 
             timer->async_wait([res = std::move(res), seconds, timer](const boost::system::error_code& ec) mutable {
                 if (!ec) {

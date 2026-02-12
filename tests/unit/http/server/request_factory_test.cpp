@@ -27,7 +27,7 @@ TEST_CASE("Request factory headers_only mode returns true at end of headers with
     auto* it = begin;
     boost::tribool result = parser.parse(it, end);
 
-    REQUIRE(result == true);
+    REQUIRE(bool(result) == true);
 
     // The body should NOT have been consumed by the parser
     auto req = parser.consume_request();
@@ -57,7 +57,7 @@ TEST_CASE("Request factory headers_only mode with no Content-Length", "[request_
 
     boost::tribool result = parser.parse(it, end);
 
-    REQUIRE(result == true);
+    REQUIRE(bool(result) == true);
 
     auto req = parser.consume_request();
     REQUIRE(req != nullptr);
@@ -83,7 +83,7 @@ TEST_CASE("Request factory iterator tracks consumed bytes correctly", "[request_
     auto* it = begin;
 
     boost::tribool result = parser.parse(it, end);
-    REQUIRE(result == true);
+    REQUIRE(bool(result) == true);
 
     size_t remaining = static_cast<size_t>(end - it);
     REQUIRE(remaining == 4); // "NEXT"
@@ -111,7 +111,7 @@ TEST_CASE("Request factory returns indeterminate on partial headers", "[request_
     auto* it2 = begin2;
 
     result = parser.parse(it2, end2);
-    REQUIRE(result == true);
+    REQUIRE(bool(result) == true);
 
     auto req = parser.consume_request();
     REQUIRE(req != nullptr);
