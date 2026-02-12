@@ -26,6 +26,9 @@ protected:
 public:
     pool_server();
     ~pool_server() override;
+
+    // Expose http_server_base::start overloads (hidden by worker_client::start)
+    using http_server_base::start;
     
     // Implementation of worker_client interface
     bool start() override { return true; } // Already started in listen()
