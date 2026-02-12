@@ -232,6 +232,8 @@ void certificate_manager::generate_self_signed_certificate() {
 
 // SNI callback implementation
 int certificate_manager::sni_callback(SSL* ssl, int* al, void* arg) {
+    if (!ssl) return SSL_TLSEXT_ERR_OK;
+
     // Get SNI server name
     const char* hostname = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
     

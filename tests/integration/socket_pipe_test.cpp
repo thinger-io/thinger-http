@@ -6,7 +6,6 @@
 #include <boost/asio.hpp>
 #include <thread>
 #include <chrono>
-#include <random>
 #include <numeric>
 #include <atomic>
 
@@ -18,11 +17,15 @@ using net::ip::tcp;
 
 namespace {
 
-uint16_t get_test_port() {
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
-    static std::uniform_int_distribution<> dis(49152, 65535);
-    return static_cast<uint16_t>(dis(gen));
+// Create an acceptor on an OS-assigned port (port 0) to avoid conflicts
+tcp::acceptor make_acceptor(net::io_context& io) {
+    tcp::acceptor acc(io, {tcp::v4(), 0});
+    acc.set_option(net::socket_base::reuse_address(true));
+    return acc;
+}
+
+uint16_t get_port(const tcp::acceptor& acc) {
+    return acc.local_endpoint().port();
 }
 
 // Simple coroutine echo server: accepts one connection, echoes until EOF.
@@ -72,16 +75,14 @@ awaitable<void> proxy_session(
 TEST_CASE("Socket pipe bidirectional forwarding", "[socket-pipe]") {
     net::io_context io;
 
-    // Start echo server
-    uint16_t echo_port = get_test_port();
-    tcp::acceptor echo_acc(io, {tcp::v4(), echo_port});
-    echo_acc.set_option(net::socket_base::reuse_address(true));
+    // Start echo server (OS-assigned port)
+    tcp::acceptor echo_acc = make_acceptor(io);
+    uint16_t echo_port = get_port(echo_acc);
     co_spawn(io, echo_server(echo_acc), detached);
 
-    // Start proxy acceptor
-    uint16_t proxy_port = get_test_port();
-    tcp::acceptor proxy_acc(io, {tcp::v4(), proxy_port});
-    proxy_acc.set_option(net::socket_base::reuse_address(true));
+    // Start proxy acceptor (OS-assigned port)
+    tcp::acceptor proxy_acc = make_acceptor(io);
+    uint16_t proxy_port = get_port(proxy_acc);
 
     std::shared_ptr<socket_pipe> pipe;
     co_spawn(io, [&]() -> awaitable<void> {
@@ -161,14 +162,12 @@ TEST_CASE("Socket pipe bidirectional forwarding", "[socket-pipe]") {
 TEST_CASE("Socket pipe cancel stops both directions", "[socket-pipe]") {
     net::io_context io;
 
-    uint16_t echo_port = get_test_port();
-    tcp::acceptor echo_acc(io, {tcp::v4(), echo_port});
-    echo_acc.set_option(net::socket_base::reuse_address(true));
+    tcp::acceptor echo_acc = make_acceptor(io);
+    uint16_t echo_port = get_port(echo_acc);
     co_spawn(io, echo_server(echo_acc), detached);
 
-    uint16_t proxy_port = get_test_port();
-    tcp::acceptor proxy_acc(io, {tcp::v4(), proxy_port});
-    proxy_acc.set_option(net::socket_base::reuse_address(true));
+    tcp::acceptor proxy_acc = make_acceptor(io);
+    uint16_t proxy_port = get_port(proxy_acc);
 
     std::shared_ptr<socket_pipe> pipe;
     std::atomic<bool> pipe_finished{false};
@@ -243,12 +242,12 @@ TEST_CASE("Socket pipe on_end callback fires on destruction", "[socket-pipe]") {
 TEST_CASE("Socket pipe on_end callback fires after run completes", "[socket-pipe]") {
     net::io_context io;
 
-    uint16_t echo_port = get_test_port();
-    tcp::acceptor echo_acc(io, {tcp::v4(), echo_port});
+    tcp::acceptor echo_acc = make_acceptor(io);
+    uint16_t echo_port = get_port(echo_acc);
     co_spawn(io, echo_server(echo_acc), detached);
 
-    uint16_t proxy_port = get_test_port();
-    tcp::acceptor proxy_acc(io, {tcp::v4(), proxy_port});
+    tcp::acceptor proxy_acc = make_acceptor(io);
+    uint16_t proxy_port = get_port(proxy_acc);
 
     std::shared_ptr<socket_pipe> pipe;
     std::atomic<bool> on_end_called{false};
@@ -301,14 +300,12 @@ TEST_CASE("Socket pipe on_end callback fires after run completes", "[socket-pipe
 TEST_CASE("Socket pipe transfer stats are correct", "[socket-pipe]") {
     net::io_context io;
 
-    uint16_t echo_port = get_test_port();
-    tcp::acceptor echo_acc(io, {tcp::v4(), echo_port});
-    echo_acc.set_option(net::socket_base::reuse_address(true));
+    tcp::acceptor echo_acc = make_acceptor(io);
+    uint16_t echo_port = get_port(echo_acc);
     co_spawn(io, echo_server(echo_acc), detached);
 
-    uint16_t proxy_port = get_test_port();
-    tcp::acceptor proxy_acc(io, {tcp::v4(), proxy_port});
-    proxy_acc.set_option(net::socket_base::reuse_address(true));
+    tcp::acceptor proxy_acc = make_acceptor(io);
+    uint16_t proxy_port = get_port(proxy_acc);
 
     std::shared_ptr<socket_pipe> pipe;
 
