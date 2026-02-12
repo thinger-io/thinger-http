@@ -29,10 +29,30 @@ jobs:
           lcov --capture --directory build --output-file build/coverage.info --ignore-errors mismatch,negative
           lcov --extract build/coverage.info '*/thinger/*' --output-file build/coverage_filtered.info --ignore-errors unused
           genhtml build/coverage_filtered.info --output-directory build/coverage_html --ignore-errors negative
-          lcov --summary build/coverage_filtered.info
+          lcov --summary build/coverage_filtered.info 2>&1 | tee build/coverage_summary.txt
+
+      - name: Extract coverage percentage
+        id: coverage
+        run: |
+          COVERAGE=$(grep -Po 'lines\.*:\s*\K[0-9.]+' build/coverage_summary.txt | head -1)
+          echo "percentage=$COVERAGE" >> $GITHUB_OUTPUT
+          echo "Coverage: $COVERAGE%"
 
       - name: Upload coverage HTML report
         uses: actions/upload-artifact@v4
         with:
           name: coverage-html-report
           path: build/coverage_html/
+
+      - name: Update coverage badge
+        if: github.ref == 'refs/heads/main'
+        uses: schneegans/dynamic-badges-action@v1.7.0
+        with:
+          auth: ${{ secrets.GIST_SECRET }}
+          gistID: ${{ vars.COVERAGE_GIST_ID }}
+          filename: coverage.json
+          label: coverage
+          message: ${{ steps.coverage.outputs.percentage }}%
+          valColorRange: ${{ steps.coverage.outputs.percentage }}
+          minColorRange: 40
+          maxColorRange: 90
