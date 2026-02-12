@@ -4,15 +4,17 @@
 using namespace thinger;
 
 int main() {
-    std::cout << "Simple Async Client Example (Callbacks)\n" << std::endl;
+    std::cout << "Simple Async Client Example (Coroutines)\n" << std::endl;
 
     http::async_client client;
 
-    // Simple GET request with callback
-    client.get("https://api.github.com/users/github", [](http::client_response& res) {
+    // Sequential requests using co_await
+    client.run([&client]() -> awaitable<void> {
+        auto res = co_await client.get("https://api.github.com/users/github");
+
         if (!res) {
             std::cerr << "Request failed: " << res.error() << std::endl;
-            return;
+            co_return;
         }
 
         std::cout << "Status: " << res.status() << std::endl;
@@ -26,25 +28,15 @@ int main() {
             std::cout << "  Name: " << json["name"].get<std::string>() << std::endl;
             std::cout << "  Public repos: " << json["public_repos"].get<int>() << std::endl;
         }
-    });
 
-    // Wait for request to complete
-    client.wait();
+        // Sequential request within the same coroutine
+        std::cout << "\nFetching another user..." << std::endl;
+        auto res2 = co_await client.get("https://api.github.com/users/torvalds");
 
-    std::cout << "\n--- Multiple requests ---\n" << std::endl;
-
-    // Multiple requests with callbacks
-    client.get("https://api.github.com/users/torvalds", [](http::client_response& res) {
-        if (res && res.is_json()) {
-            auto json = res.json();
-            std::cout << "Torvalds repos: " << json["public_repos"].get<int>() << std::endl;
-        }
-    });
-
-    client.get("https://api.github.com/users/octocat", [](http::client_response& res) {
-        if (res && res.is_json()) {
-            auto json = res.json();
-            std::cout << "Octocat repos: " << json["public_repos"].get<int>() << std::endl;
+        if (res2 && res2.is_json()) {
+            auto json = res2.json();
+            std::cout << "  Login: " << json["login"].get<std::string>() << std::endl;
+            std::cout << "  Public repos: " << json["public_repos"].get<int>() << std::endl;
         }
     });
 
