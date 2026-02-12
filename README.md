@@ -1,5 +1,7 @@
 ![hola](/assets/thinger-http-banner.svg "thinger-http")
 
+[![CI](https://github.com/thinger-io/thinger-http/actions/workflows/ci.yml/badge.svg)](https://github.com/thinger-io/thinger-http/actions/workflows/ci.yml)
+
 A modern C++20 HTTP/WebSocket library built on Boost.ASIO with coroutine support.
 
 > [!WARNING]
