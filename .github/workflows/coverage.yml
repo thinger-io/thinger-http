@@ -1,0 +1,38 @@
+name: Coverage
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  coverage:
+    runs-on: self-hosted
+    container:
+      image: thinger/compiler:mold-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure with coverage
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DTHINGER_HTTP_ENABLE_COVERAGE=ON
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+      - name: Generate coverage report
+        run: |
+          lcov --capture --directory build --output-file build/coverage.info --ignore-errors mismatch
+          lcov --remove build/coverage.info '/usr/*' '*/build/*' '*/tests/*' '*/_deps/*' --output-file build/coverage_filtered.info --ignore-errors unused
+          genhtml build/coverage_filtered.info --output-directory build/coverage_html
+          lcov --summary build/coverage_filtered.info
+
+      - name: Upload coverage HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html-report
+          path: build/coverage_html/
