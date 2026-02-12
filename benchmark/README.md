@@ -151,7 +151,7 @@ On Apple M2 Max (macOS), 100 concurrent connections, 10s duration, `-O3` Release
 | Crow | ~122,000 | 0.82ms | 22.7 MB/s |
 | cpp-httplib | ~34,000 | 3.89ms | 3.6 MB/s |
 
-Both thinger-http and Crow run multi-threaded. thinger-http is approximately 3.9x faster than cpp-httplib.
+All three frameworks run multi-threaded by default. thinger-http is approximately 3.9x faster than cpp-httplib.
 
 ## Notes
 

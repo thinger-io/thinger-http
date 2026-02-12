@@ -1,6 +1,7 @@
 ![hola](/assets/thinger-http-banner.svg "thinger-http")
 
 [![CI](https://github.com/thinger-io/thinger-http/actions/workflows/ci.yml/badge.svg)](https://github.com/thinger-io/thinger-http/actions/workflows/ci.yml)
+[![Examples](https://github.com/thinger-io/thinger-http/actions/workflows/examples.yml/badge.svg)](https://github.com/thinger-io/thinger-http/actions/workflows/examples.yml)
 
 A modern C++20 HTTP/WebSocket library built on Boost.ASIO with coroutine support.
 
@@ -17,7 +18,7 @@ Benchmarked with [bombardier](https://github.com/codesenberg/bombardier) — 100
 | [Crow](https://github.com/CrowCpp/Crow) | ~122,000 | 0.82ms | 22.7 MB/s |
 | [cpp-httplib](https://github.com/yhirose/cpp-httplib) | ~34,000 | 3.89ms | 3.6 MB/s |
 
-> Both thinger-http and Crow run multi-threaded. See [`benchmark/`](benchmark/) for details and instructions to reproduce.
+> All three frameworks run multi-threaded by default. See [`benchmark/`](benchmark/) for details and instructions to reproduce.
 
 ## Features
 
