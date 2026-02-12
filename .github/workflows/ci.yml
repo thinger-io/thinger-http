@@ -7,8 +7,8 @@ on:
     branches: [ main ]
 
 env:
-  BOOST_VERSION: 1.87.0
-  BOOST_VERSION_UNDERSCORE: 1_87_0
+  BOOST_VERSION: 1.90.0
+  BOOST_VERSION_UNDERSCORE: 1_90_0
 
 jobs:
   build-and-test:

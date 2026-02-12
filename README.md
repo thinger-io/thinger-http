@@ -89,7 +89,7 @@ int main() {
 
 - C++20 compiler (GCC 11+, Clang 14+, MSVC 2022+)
 - CMake 3.14+
-- Boost 1.80+ (ASIO with coroutines, iostreams)
+- Boost 1.86+ (ASIO with coroutines, iostreams)
 - ZLIB (HTTP compression via Boost.Iostreams)
 - OpenSSL (for HTTPS/WSS)
 
