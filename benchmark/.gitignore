@@ -1,0 +1,11 @@
+# Compiled binaries
+thinger-http/server
+stress_test
+
+# Benchmark results
+*.log
+*.txt
+*.json
+
+# OS files
+.DS_Store

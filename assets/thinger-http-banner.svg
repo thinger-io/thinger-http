@@ -1,0 +1,184 @@
+<svg width="800" height="213" viewBox="0 0 800 213" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Main background gradient -->
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f0f23"/>
+      <stop offset="50%" style="stop-color:#1a1a3e"/>
+      <stop offset="100%" style="stop-color:#0d1b2a"/>
+    </linearGradient>
+    
+    <!-- Accent gradient for glows -->
+    <linearGradient id="accentGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#00d4aa"/>
+      <stop offset="50%" style="stop-color:#00b4d8"/>
+      <stop offset="100%" style="stop-color:#7c3aed"/>
+    </linearGradient>
+    
+    <!-- Text gradient -->
+    <linearGradient id="textGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#00d4aa"/>
+      <stop offset="100%" style="stop-color:#00b4d8"/>
+    </linearGradient>
+    
+    <!-- Glow filter -->
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    
+    <!-- Soft glow for background elements -->
+    <filter id="softGlow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="15" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    
+    <!-- Grid pattern -->
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="rgba(255,255,255,0.03)" stroke-width="1"/>
+    </pattern>
+  </defs>
+  
+  <!-- Background -->
+  <rect width="800" height="213" fill="url(#bgGradient)"/>
+  
+  <!-- Grid overlay -->
+  <rect width="800" height="213" fill="url(#grid)"/>
+  
+  <!-- Decorative gradient orbs -->
+  <ellipse cx="50" cy="180" rx="150" ry="100" fill="#00d4aa" opacity="0.08" filter="url(#softGlow)"/>
+  <ellipse cx="750" cy="30" rx="130" ry="80" fill="#7c3aed" opacity="0.08" filter="url(#softGlow)"/>
+  <ellipse cx="400" cy="106" rx="250" ry="120" fill="#00b4d8" opacity="0.04" filter="url(#softGlow)"/>
+  
+  <!-- Connection lines decoration -->
+  <g opacity="0.12" stroke="url(#accentGradient)" stroke-width="1">
+    <path d="M 0 40 Q 200 30, 400 40 T 800 30" fill="none"/>
+    <path d="M 0 173 Q 200 183, 400 173 T 800 183" fill="none"/>
+    
+    <!-- Data flow dots -->
+    <circle cx="100" cy="37" r="2" fill="#00d4aa"/>
+    <circle cx="350" cy="38" r="2" fill="#00b4d8"/>
+    <circle cx="550" cy="35" r="2" fill="#7c3aed"/>
+    <circle cx="720" cy="32" r="2" fill="#00d4aa"/>
+    
+    <circle cx="150" cy="178" r="2" fill="#7c3aed"/>
+    <circle cx="400" cy="174" r="2" fill="#00d4aa"/>
+    <circle cx="600" cy="180" r="2" fill="#00b4d8"/>
+    <circle cx="700" cy="177" r="2" fill="#00d4aa"/>
+  </g>
+  
+  <!-- Main content group - centered at 400 -->
+  <g transform="translate(400, 55)">
+    
+    <!-- Logo + Title group - centered together -->
+    <g transform="translate(0, 0)">
+      <!-- Code brackets </> icon -->
+      <g transform="translate(-195, 0)" filter="url(#glow)">
+        <text x="0" y="30" 
+              font-family="monospace" 
+              font-size="38" 
+              font-weight="700"
+              fill="url(#accentGradient)">&lt;/&gt;</text>
+      </g>
+      
+      <!-- Main title -->
+      <text x="35" y="28" 
+            font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" 
+            font-size="48" 
+            font-weight="700"
+            fill="url(#textGradient)"
+            filter="url(#glow)"
+            text-anchor="middle">thinger-http</text>
+    </g>
+    
+    <!-- Tagline -->
+    <text x="0" y="60" 
+          font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" 
+          font-size="15" 
+          font-weight="400"
+          fill="rgba(255,255,255,0.6)"
+          text-anchor="middle">Modern C++ HTTP Client &amp; Server Library</text>
+    
+    <!-- Feature badges -->
+    <g transform="translate(0, 100)">
+      <!-- C++20 badge -->
+      <g transform="translate(-175, 0)">
+        <rect x="-35" y="-12" width="70" height="24" rx="12" 
+              fill="rgba(255,255,255,0.08)" 
+              stroke="rgba(255,255,255,0.15)" 
+              stroke-width="1"/>
+        <text x="0" y="4" 
+              font-family="monospace" 
+              font-size="11" 
+              fill="#00d4aa"
+              text-anchor="middle"
+              font-weight="600">C++20</text>
+      </g>
+      
+      <!-- Async badge -->
+      <g transform="translate(-87, 0)">
+        <rect x="-30" y="-12" width="60" height="24" rx="12" 
+              fill="rgba(255,255,255,0.08)" 
+              stroke="rgba(255,255,255,0.15)" 
+              stroke-width="1"/>
+        <text x="0" y="4" 
+              font-family="monospace" 
+              font-size="11" 
+              fill="#00b4d8"
+              text-anchor="middle"
+              font-weight="600">Async</text>
+      </g>
+      
+      <!-- TLS 1.3 badge -->
+      <g transform="translate(0, 0)">
+        <rect x="-35" y="-12" width="70" height="24" rx="12" 
+              fill="rgba(255,255,255,0.08)" 
+              stroke="rgba(255,255,255,0.15)" 
+              stroke-width="1"/>
+        <text x="0" y="4" 
+              font-family="monospace" 
+              font-size="11" 
+              fill="#7c3aed"
+              text-anchor="middle"
+              font-weight="600">TLS 1.3</text>
+      </g>
+      
+      <!-- WebSockets badge -->
+      <g transform="translate(90, 0)">
+        <rect x="-42" y="-12" width="84" height="24" rx="12" 
+              fill="rgba(255,255,255,0.08)" 
+              stroke="rgba(255,255,255,0.15)" 
+              stroke-width="1"/>
+        <text x="0" y="4" 
+              font-family="monospace" 
+              font-size="11" 
+              fill="#00d4aa"
+              text-anchor="middle"
+              font-weight="600">WebSockets</text>
+      </g>
+      
+      <!-- SSE badge -->
+      <g transform="translate(175, 0)">
+        <rect x="-25" y="-12" width="50" height="24" rx="12" 
+              fill="rgba(255,255,255,0.08)" 
+              stroke="rgba(255,255,255,0.15)" 
+              stroke-width="1"/>
+        <text x="0" y="4" 
+              font-family="monospace" 
+              font-size="11" 
+              fill="#00b4d8"
+              text-anchor="middle"
+              font-weight="600">SSE</text>
+      </g>
+    </g>
+  </g>
+  
+  <!-- Corner accents -->
+  <path d="M 0 0 L 40 0 L 40 2 L 2 2 L 2 40 L 0 40 Z" fill="url(#accentGradient)" opacity="0.3"/>
+  <path d="M 800 213 L 760 213 L 760 211 L 798 211 L 798 173 L 800 173 Z" fill="url(#accentGradient)" opacity="0.3"/>
+</svg>
