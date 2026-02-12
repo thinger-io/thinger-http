@@ -1,0 +1,22 @@
+name: Examples
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-examples:
+    runs-on: self-hosted
+    container:
+      image: thinger/compiler:mold-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DTHINGER_HTTP_BUILD_TESTS=OFF -DTHINGER_HTTP_BUILD_EXAMPLES=ON
+
+      - name: Build examples
+        run: cmake --build build -j$(nproc)
