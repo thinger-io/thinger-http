@@ -8,13 +8,13 @@ namespace thinger::asio {
     socket::socket(const std::string& context, boost::asio::io_context& io_context)
         : context_(context), io_context_(io_context) {
         ++connections;
-        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        std::lock_guard<std::mutex> lock(mutex_);
         context_count[context_]++;
     }
 
     socket::~socket() {
         --connections;
-        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        std::lock_guard<std::mutex> lock(mutex_);
         if (--context_count[context_] == 0) {
             context_count.erase(context_);
         }
