@@ -33,6 +33,15 @@ namespace thinger::http{
     {
         co_spawn(ws_->get_io_context(),
             [this, self = shared_from_this()]() -> awaitable<void> {
+                // RAII guard: clears the on_message callback when the coroutine
+                // frame is destroyed (normal exit, exception, or io_context
+                // teardown). This breaks shared_ptr cycles that occur when the
+                // user captures shared_ptr<websocket_connection> in the callback.
+                struct cycle_guard {
+                    std::function<void(std::string, bool)>& ref;
+                    ~cycle_guard() { ref = nullptr; }
+                } guard{on_frame_callback_};
+
                 co_await read_loop();
             },
             detached);
