@@ -81,56 +81,42 @@ TEMPLATE_TEST_CASE("HTTP Server lifecycle management", "[http][server][unit]",
     SECTION("Listen and stop") {
         TestType server;
         REQUIRE(server.is_listening() == false);
-        
-        // Listen on a random high port to avoid conflicts
-        uint16_t port = 20000 + (std::rand() % 10000);
-        bool listen_result = server.listen("127.0.0.1", port);
-        
-        if (listen_result) {
+
+        // Listen on OS-assigned port
+        REQUIRE(server.listen("127.0.0.1", 0));
+        auto port = server.local_port();
+        REQUIRE(port != 0);
+        REQUIRE(server.is_listening() == true);
+
+        // Stop the server
+        server.stop();
+        REQUIRE(server.is_listening() == false);
+
+        // Should be safe to stop multiple times
+        server.stop();
+        REQUIRE(server.is_listening() == false);
+
+        // Should be able to restart on same port
+        bool restart_result = server.listen("127.0.0.1", port);
+        if (restart_result) {
             REQUIRE(server.is_listening() == true);
-            
-            // Stop the server
             server.stop();
             REQUIRE(server.is_listening() == false);
-            
-            // Should be safe to stop multiple times
-            server.stop();
-            REQUIRE(server.is_listening() == false);
-            
-            // Should be able to restart on same port
-            bool restart_result = server.listen("127.0.0.1", port);
-            if (restart_result) {
-                REQUIRE(server.is_listening() == true);
-                server.stop();
-                REQUIRE(server.is_listening() == false);
-            } else {
-                WARN("Could not restart server on same port");
-            }
         } else {
-            // Port might be in use, which is ok for unit tests
-            WARN("Could not bind to port " << port << ", skipping listen test");
+            WARN("Could not restart server on same port (OS may not have released it yet)");
         }
     }
     
     SECTION("Multiple start/stop cycles") {
         TestType server;
-        
-        // Try multiple ports to avoid conflicts
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            uint16_t port = 30000 + (std::rand() % 10000) + (attempt * 1000);
-            
-            REQUIRE(server.is_listening() == false);
-            
-            if (server.listen("127.0.0.1", port)) {
-                REQUIRE(server.is_listening() == true);
-                
-                server.stop();
-                REQUIRE(server.is_listening() == false);
-                
-                // Success on this attempt
-                break;
-            }
-        }
+
+        REQUIRE(server.is_listening() == false);
+
+        REQUIRE(server.listen("127.0.0.1", 0));
+        REQUIRE(server.is_listening() == true);
+
+        server.stop();
+        REQUIRE(server.is_listening() == false);
     }
 }
 
@@ -217,27 +203,24 @@ TEST_CASE("Pool Server specific features", "[http][server][pool][unit]") {
     SECTION("Listen starts workers") {
         bool initial_running = asio::get_workers().running();
         size_t initial_clients = asio::get_workers().client_count();
-        
+
         {
             http::pool_server server;
-            
-            // Try to listen
-            uint16_t port = 25000 + (std::rand() % 10000);
-            bool listen_result = server.listen("127.0.0.1", port);
-            
-            if (listen_result) {
-                // If auto-manage is enabled and this is the first client, workers should start
-                if (asio::get_workers().is_auto_managed() && initial_clients == 0) {
-                    REQUIRE(asio::get_workers().running() == true);
-                }
-                
-                server.stop();
+
+            // Listen on OS-assigned port
+            REQUIRE(server.listen("127.0.0.1", 0));
+
+            // If auto-manage is enabled and this is the first client, workers should start
+            if (asio::get_workers().is_auto_managed() && initial_clients == 0) {
+                REQUIRE(asio::get_workers().running() == true);
             }
+
+            server.stop();
         }
-        
+
         // Give time for async operations
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        
+
         // Workers should stop if this was the last client
         if (asio::get_workers().is_auto_managed() && initial_clients == 0) {
             REQUIRE(asio::get_workers().running() == false);

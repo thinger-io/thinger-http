@@ -28,6 +28,7 @@ public:
 
     // Override from base
     std::string get_service_name() const override;
+    uint16_t local_port() const override { return 0; }
 
 protected:
     bool create_acceptor() override;

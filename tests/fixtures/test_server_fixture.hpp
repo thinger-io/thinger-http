@@ -9,19 +9,18 @@
 #include <boost/asio/steady_timer.hpp>
 #include <chrono>
 #include <thread>
+#include <future>
 
 namespace thinger::http::test {
 
 // Test server fixture that starts a local HTTP server for testing
 struct TestServerFixture {
     http::server server;  // Single-threaded standalone server
-    uint16_t port = 9090;
+    uint16_t port = 0;
     std::string base_url;
     std::thread server_thread;  // Thread to run the server
     
-    TestServerFixture() : TestServerFixture(9090) {}
-    
-    explicit TestServerFixture(uint16_t custom_port) : port(custom_port) {
+    TestServerFixture() {
         setup_default_endpoints();
         start_server();
     }
@@ -242,33 +241,16 @@ protected:
     
 private:
     void start_server() {
-        // Try to start server, with fallback to find available port
-        bool started = false;
-        int attempts = 0;
-        const int max_attempts = 10;
-        
-        while (!started && attempts < max_attempts) {
-            if (server.listen("0.0.0.0", port)) {
-                started = true;
-                base_url = "http://localhost:" + std::to_string(port);
-            } else {
-                // Try next port
-                port++;
-                attempts++;
-            }
-        }
-        
-        if (!started) {
-            FAIL("Could not start test server after " + std::to_string(max_attempts) + " attempts");
-        }
-        
-        // Start server thread
-        server_thread = std::thread([this]() {
-            server.wait();  // This runs io_context.run() in the thread
+        REQUIRE(server.listen("0.0.0.0", 0));
+        port = server.local_port();
+        base_url = "http://localhost:" + std::to_string(port);
+
+        std::promise<void> ready;
+        server_thread = std::thread([this, &ready]() {
+            ready.set_value();
+            server.wait();
         });
-        
-        // Give server time to start
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        ready.get_future().wait();
     }
 };
 

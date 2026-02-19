@@ -83,6 +83,10 @@ std::string tcp_socket_server::get_service_name() const {
     return (ssl_enabled_ ? "ssl_server@" : "tcp_server@") + host_ + ":" + port_;
 }
 
+uint16_t tcp_socket_server::local_port() const {
+    return acceptor_ ? acceptor_->local_endpoint().port() : 0;
+}
+
 bool tcp_socket_server::create_acceptor() {
     int num_attempts = 0;
     
@@ -186,13 +190,13 @@ void tcp_socket_server::accept_connection() {
                 // Use co_spawn to run the coroutine-based handshake
                 co_spawn(sock->get_io_context(),
                     [this, sock]() -> awaitable<void> {
-                        try {
-                            co_await sock->handshake();
-                            if (handler_) handler_(sock);
-                        } catch (const boost::system::system_error& e) {
+                        auto ec = co_await sock->handshake();
+                        if (ec) {
                             LOG_ERROR("error while handling SSL handshake: {}, remote ip: {}",
-                                     e.code().message(), sock->get_remote_ip());
+                                     ec.message(), sock->get_remote_ip());
+                            co_return;
                         }
+                        if (handler_) handler_(sock);
                     },
                     detached);
             } else {

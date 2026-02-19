@@ -17,7 +17,7 @@ namespace {
 // WebSocket test server fixture for request builder tests
 struct WebSocketBuilderFixture {
     http::server server;
-    uint16_t port = 9200;
+    uint16_t port = 0;
     std::string ws_url;
     std::thread server_thread;
     std::string last_protocol;  // Store the negotiated protocol
@@ -57,29 +57,16 @@ private:
     }
 
     void start_server() {
-        bool started = false;
-        int attempts = 0;
-        const int max_attempts = 10;
+        REQUIRE(server.listen("127.0.0.1", 0));
+        port = server.local_port();
+        ws_url = "ws://127.0.0.1:" + std::to_string(port);
 
-        while (!started && attempts < max_attempts) {
-            if (server.listen("127.0.0.1", port)) {
-                started = true;
-                ws_url = "ws://127.0.0.1:" + std::to_string(port);
-            } else {
-                port++;
-                attempts++;
-            }
-        }
-
-        if (!started) {
-            throw std::runtime_error("Could not start WebSocket test server");
-        }
-
-        server_thread = std::thread([this]() {
+        std::promise<void> ready;
+        server_thread = std::thread([this, &ready]() {
+            ready.set_value();
             server.wait();
         });
-
-        std::this_thread::sleep_for(100ms);
+        ready.get_future().wait();
     }
 };
 

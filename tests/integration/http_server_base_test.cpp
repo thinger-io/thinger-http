@@ -8,6 +8,7 @@
 #include <boost/asio.hpp>
 #include <chrono>
 #include <thread>
+#include <future>
 #include <fstream>
 #include <filesystem>
 
@@ -18,40 +19,28 @@ using namespace std::chrono_literals;
 // Note: Routes and middleware must be added BEFORE calling start_server()
 struct ServerBaseTestFixture {
     http::server server;
-    uint16_t port = 9600;
+    uint16_t port = 0;
     std::string base_url;
     std::thread server_thread;
     bool server_started = false;
 
-    ServerBaseTestFixture() : port(9600) {}
-
-    explicit ServerBaseTestFixture(uint16_t custom_port) : port(custom_port) {}
+    ServerBaseTestFixture() = default;
 
     // Call this after setting up routes and middleware
     void start_server() {
         if (server_started) return;
 
-        bool started = false;
-        int attempts = 0;
-        const int max_attempts = 10;
+        REQUIRE(server.listen("0.0.0.0", 0));
+        port = server.local_port();
+        base_url = "http://localhost:" + std::to_string(port);
+        server_started = true;
 
-        while (!started && attempts < max_attempts) {
-            if (server.listen("0.0.0.0", port)) {
-                started = true;
-                base_url = "http://localhost:" + std::to_string(port);
-            } else {
-                port++;
-                attempts++;
-            }
-        }
-
-        if (started) {
-            server_started = true;
-            server_thread = std::thread([this]() {
-                server.wait();
-            });
-            std::this_thread::sleep_for(100ms);
-        }
+        std::promise<void> ready;
+        server_thread = std::thread([this, &ready]() {
+            ready.set_value();
+            server.wait();
+        });
+        ready.get_future().wait();
     }
 
     virtual ~ServerBaseTestFixture() {
@@ -393,32 +382,21 @@ TEST_CASE("Server is_listening", "[server][control][integration]") {
     }
 
     SECTION("Server is listening after start") {
-        uint16_t port = 9700;
-        bool started = false;
-        int attempts = 0;
+        REQUIRE(server.listen("0.0.0.0", 0));
 
-        while (!started && attempts < 10) {
-            if (server.listen("0.0.0.0", port)) {
-                started = true;
-            } else {
-                port++;
-                attempts++;
-            }
-        }
+        std::promise<void> ready;
+        std::thread t([&server, &ready]() {
+            ready.set_value();
+            server.wait();
+        });
+        ready.get_future().wait();
 
-        if (started) {
-            std::thread t([&server]() {
-                server.wait();
-            });
-            std::this_thread::sleep_for(100ms);
+        REQUIRE(server.is_listening());
 
-            REQUIRE(server.is_listening());
+        server.stop();
+        t.join();
 
-            server.stop();
-            t.join();
-
-            REQUIRE_FALSE(server.is_listening());
-        }
+        REQUIRE_FALSE(server.is_listening());
     }
 }
 
@@ -430,28 +408,17 @@ TEST_CASE("Server Stop", "[server][control][integration]") {
     }
 
     SECTION("Stop on running server returns true") {
-        uint16_t port = 9710;
-        bool started = false;
-        int attempts = 0;
+        REQUIRE(server.listen("0.0.0.0", 0));
 
-        while (!started && attempts < 10) {
-            if (server.listen("0.0.0.0", port)) {
-                started = true;
-            } else {
-                port++;
-                attempts++;
-            }
-        }
+        std::promise<void> ready;
+        std::thread t([&server, &ready]() {
+            ready.set_value();
+            server.wait();
+        });
+        ready.get_future().wait();
 
-        if (started) {
-            std::thread t([&server]() {
-                server.wait();
-            });
-            std::this_thread::sleep_for(100ms);
-
-            REQUIRE(server.stop());
-            t.join();
-        }
+        REQUIRE(server.stop());
+        t.join();
     }
 }
 
@@ -478,7 +445,7 @@ TEST_CASE("Server Static File Serving", "[server][static][integration]") {
         file << "<html><body>Index</body></html>";
     }
 
-    ServerBaseTestFixture fixture(9720);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
     auto& base_url = fixture.base_url;
 
@@ -643,7 +610,7 @@ TEST_CASE("Server Multiple Methods Same Path", "[server][routes][integration]") 
 // ============================================================================
 
 TEST_CASE("Server Basic Auth", "[server][auth][integration]") {
-    ServerBaseTestFixture fixture(9730);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
     auto& base_url = fixture.base_url;
 
@@ -699,7 +666,7 @@ TEST_CASE("Server Basic Auth", "[server][auth][integration]") {
 // ============================================================================
 
 TEST_CASE("Server Chunked Response", "[server][chunked][integration]") {
-    ServerBaseTestFixture fixture(9740);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
     auto& base_url = fixture.base_url;
 
@@ -769,7 +736,7 @@ TEST_CASE("Server Chunked Response", "[server][chunked][integration]") {
 // ============================================================================
 
 TEST_CASE("Server POST with JSON body - backward compat", "[server][body][integration]") {
-    ServerBaseTestFixture fixture(9750);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
     auto& base_url = fixture.base_url;
 
@@ -793,7 +760,7 @@ TEST_CASE("Server POST with JSON body - backward compat", "[server][body][integr
 }
 
 TEST_CASE("Server POST body exceeding max_body_size returns 413", "[server][body][413][integration]") {
-    ServerBaseTestFixture fixture(9760);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
     auto& base_url = fixture.base_url;
 
@@ -826,7 +793,7 @@ TEST_CASE("Server POST body exceeding max_body_size returns 413", "[server][body
 }
 
 TEST_CASE("Server large body (1MB) arrives correctly", "[server][body][large][integration]") {
-    ServerBaseTestFixture fixture(9770);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
     auto& base_url = fixture.base_url;
 
@@ -865,7 +832,7 @@ TEST_CASE("Server large body (1MB) arrives correctly", "[server][body][large][in
 // ============================================================================
 
 TEST_CASE("Server HTTP pipelining - two GET requests in one TCP send", "[server][pipelining][integration]") {
-    ServerBaseTestFixture fixture(9780);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
 
     std::atomic<int> call_count{0};
@@ -923,7 +890,7 @@ TEST_CASE("Server HTTP pipelining - two GET requests in one TCP send", "[server]
 // ============================================================================
 
 TEST_CASE("Deferred body route - streaming upload 1MB with correct checksum", "[server][deferred][integration]") {
-    ServerBaseTestFixture fixture(9800);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
     auto& base_url = fixture.base_url;
 
@@ -969,7 +936,7 @@ TEST_CASE("Deferred body route - streaming upload 1MB with correct checksum", "[
 }
 
 TEST_CASE("Deferred body route - read_some with small chunks", "[server][deferred][integration]") {
-    ServerBaseTestFixture fixture(9810);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
     auto& base_url = fixture.base_url;
 
@@ -1006,7 +973,7 @@ TEST_CASE("Deferred body route - read_some with small chunks", "[server][deferre
 }
 
 TEST_CASE("Deferred body + non-deferred on same server", "[server][deferred][integration]") {
-    ServerBaseTestFixture fixture(9820);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
     auto& base_url = fixture.base_url;
 
@@ -1060,7 +1027,7 @@ TEST_CASE("Deferred body + non-deferred on same server", "[server][deferred][int
 }
 
 TEST_CASE("413 still works for non-deferred routes", "[server][deferred][413][integration]") {
-    ServerBaseTestFixture fixture(9830);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
     auto& base_url = fixture.base_url;
 
@@ -1093,7 +1060,7 @@ TEST_CASE("413 still works for non-deferred routes", "[server][deferred][413][in
 }
 
 TEST_CASE("HTTP pipelining - deferred body request followed by GET", "[server][deferred][pipelining][integration]") {
-    ServerBaseTestFixture fixture(9840);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
 
     // Deferred body route
@@ -1180,7 +1147,7 @@ static std::string raw_http_exchange(uint16_t port, const std::string& raw_reque
 }
 
 TEST_CASE("Chunked request - non-deferred route receives decoded body", "[server][chunked-request][integration]") {
-    ServerBaseTestFixture fixture(9850);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
 
     // Non-deferred route: body is auto-read before handler
@@ -1214,7 +1181,7 @@ TEST_CASE("Chunked request - non-deferred route receives decoded body", "[server
 }
 
 TEST_CASE("Chunked request - deferred route reads chunks manually", "[server][chunked-request][deferred][integration]") {
-    ServerBaseTestFixture fixture(9860);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
 
     // Deferred body route: reads chunked body manually
@@ -1273,7 +1240,7 @@ TEST_CASE("Chunked request - deferred route reads chunks manually", "[server][ch
 }
 
 TEST_CASE("Chunked request - exceeding max_body_size returns 413", "[server][chunked-request][413][integration]") {
-    ServerBaseTestFixture fixture(9870);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
 
     // Set very small max body size
@@ -1320,7 +1287,7 @@ TEST_CASE("Chunked request - exceeding max_body_size returns 413", "[server][chu
 }
 
 TEST_CASE("Chunked request - pipelining with chunked then GET", "[server][chunked-request][pipelining][integration]") {
-    ServerBaseTestFixture fixture(9880);
+    ServerBaseTestFixture fixture;
     auto& server = fixture.server;
 
     server.post("/chunked-echo", [](http::request& req, http::response& res) {
@@ -1363,5 +1330,231 @@ TEST_CASE("Chunked request - pipelining with chunked then GET", "[server][chunke
         // Both bodies present
         REQUIRE(response.find("\"body\":\"hello\"") != std::string::npos);
         REQUIRE(response.find("\"status\":\"ok\"") != std::string::npos);
+    }
+}
+
+// ============================================================================
+// Keep-Alive and Connection Timeout Tests
+// ============================================================================
+
+// Helper: connect a raw TCP socket to the test server
+static boost::asio::ip::tcp::socket raw_connect(boost::asio::io_context& ioc, uint16_t port) {
+    boost::asio::ip::tcp::socket sock(ioc);
+    boost::asio::ip::tcp::resolver resolver(ioc);
+    auto results = resolver.resolve("127.0.0.1", std::to_string(port));
+    boost::asio::connect(sock, results);
+    return sock;
+}
+
+// Helper: read one HTTP response from a keep-alive connection.
+// Parses headers to find Content-Length, then reads exactly that many body bytes.
+static std::string read_one_response(boost::asio::ip::tcp::socket& sock,
+                                      boost::asio::streambuf& buf) {
+    boost::system::error_code ec;
+
+    // Read until end of headers
+    boost::asio::read_until(sock, buf, "\r\n\r\n", ec);
+    if (ec) return "";
+
+    // Snapshot current buffer as string
+    std::string data(boost::asio::buffers_begin(buf.data()),
+                     boost::asio::buffers_end(buf.data()));
+
+    // Parse Content-Length
+    size_t content_length = 0;
+    auto cl_pos = data.find("Content-Length: ");
+    if (cl_pos != std::string::npos) {
+        auto cl_end = data.find("\r\n", cl_pos);
+        content_length = std::stoul(data.substr(cl_pos + 16, cl_end - cl_pos - 16));
+    }
+
+    // Determine how much body we still need
+    auto header_end = data.find("\r\n\r\n");
+    size_t total_needed = header_end + 4 + content_length;
+
+    if (buf.size() < total_needed) {
+        boost::asio::read(sock, buf,
+            boost::asio::transfer_exactly(total_needed - buf.size()), ec);
+    }
+
+    // Extract this response and consume from buffer
+    std::string all(boost::asio::buffers_begin(buf.data()),
+                    boost::asio::buffers_end(buf.data()));
+    std::string response = all.substr(0, total_needed);
+    buf.consume(total_needed);
+    return response;
+}
+
+TEST_CASE("Server Keep-Alive behavior", "[server][keepalive][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    server.get("/ping", [](http::response& res) {
+        res.json({{"pong", true}});
+    });
+
+    fixture.start_server();
+
+    SECTION("HTTP/1.1 defaults to keep-alive — multiple requests on same connection") {
+        boost::asio::io_context ioc;
+        auto sock = raw_connect(ioc, fixture.port);
+        boost::asio::streambuf buf;
+
+        // First request (no explicit Connection header — HTTP/1.1 defaults to keep-alive)
+        std::string req1 = "GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        boost::asio::write(sock, boost::asio::buffer(req1));
+        auto resp1 = read_one_response(sock, buf);
+        REQUIRE(resp1.find("HTTP/1.1 200") != std::string::npos);
+        REQUIRE(resp1.find("\"pong\":true") != std::string::npos);
+
+        // Second request on same connection
+        std::string req2 = "GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        boost::asio::write(sock, boost::asio::buffer(req2));
+        auto resp2 = read_one_response(sock, buf);
+        REQUIRE(resp2.find("HTTP/1.1 200") != std::string::npos);
+        REQUIRE(resp2.find("\"pong\":true") != std::string::npos);
+
+        // Third request — still alive
+        std::string req3 = "GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        boost::asio::write(sock, boost::asio::buffer(req3));
+        auto resp3 = read_one_response(sock, buf);
+        REQUIRE(resp3.find("HTTP/1.1 200") != std::string::npos);
+
+        sock.close();
+    }
+
+    SECTION("Connection: close causes server to close connection after response") {
+        boost::asio::io_context ioc;
+        auto sock = raw_connect(ioc, fixture.port);
+
+        // Send request with Connection: close
+        std::string req =
+            "GET /ping HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        boost::asio::write(sock, boost::asio::buffer(req));
+
+        // Read until server closes the connection
+        boost::system::error_code ec;
+        boost::asio::streambuf response_buf;
+        boost::asio::read(sock, response_buf, ec);
+
+        // Server should close — we get EOF
+        REQUIRE(ec == boost::asio::error::eof);
+
+        std::string response(boost::asio::buffers_begin(response_buf.data()),
+                             boost::asio::buffers_end(response_buf.data()));
+        REQUIRE(response.find("HTTP/1.1 200") != std::string::npos);
+        REQUIRE(response.find("\"pong\":true") != std::string::npos);
+    }
+
+    SECTION("Keep-alive then close on last request") {
+        boost::asio::io_context ioc;
+        auto sock = raw_connect(ioc, fixture.port);
+        boost::asio::streambuf buf;
+
+        // First request with keep-alive
+        std::string req1 =
+            "GET /ping HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n";
+        boost::asio::write(sock, boost::asio::buffer(req1));
+        auto resp1 = read_one_response(sock, buf);
+        REQUIRE(resp1.find("HTTP/1.1 200") != std::string::npos);
+
+        // Second request with close
+        std::string req2 =
+            "GET /ping HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        boost::asio::write(sock, boost::asio::buffer(req2));
+
+        // Read remaining data — server will close after this response
+        boost::system::error_code ec;
+        boost::asio::streambuf tail;
+        boost::asio::read(sock, tail, ec);
+        REQUIRE(ec == boost::asio::error::eof);
+
+        std::string resp2(boost::asio::buffers_begin(tail.data()),
+                          boost::asio::buffers_end(tail.data()));
+        REQUIRE(resp2.find("HTTP/1.1 200") != std::string::npos);
+    }
+}
+
+TEST_CASE("Server Connection Timeout", "[server][timeout][keepalive][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    // Short timeout for testing
+    server.set_connection_timeout(std::chrono::seconds(2));
+
+    server.get("/ping", [](http::response& res) {
+        res.json({{"pong", true}});
+    });
+
+    fixture.start_server();
+
+    SECTION("Idle connection is closed after timeout") {
+        boost::asio::io_context ioc;
+        auto sock = raw_connect(ioc, fixture.port);
+        boost::asio::streambuf buf;
+
+        // Send a request to establish the connection
+        std::string req = "GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        boost::asio::write(sock, boost::asio::buffer(req));
+        auto resp = read_one_response(sock, buf);
+        REQUIRE(resp.find("HTTP/1.1 200") != std::string::npos);
+
+        // Wait longer than the 2s timeout
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+
+        // Try to read — server should have closed the connection
+        char tmp[64];
+        boost::system::error_code ec;
+        sock.read_some(boost::asio::buffer(tmp), ec);
+        REQUIRE(ec); // EOF or connection_reset
+    }
+
+    SECTION("Timeout resets with each request — connection survives beyond initial timeout") {
+        boost::asio::io_context ioc;
+        auto sock = raw_connect(ioc, fixture.port);
+        boost::asio::streambuf buf;
+
+        // Send 3 requests with 1.5s gaps (total ~3s, exceeds 2s timeout)
+        // If the timeout resets on each request, all should succeed
+        for (int i = 0; i < 3; i++) {
+            if (i > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+            }
+
+            std::string req = "GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            boost::system::error_code write_ec;
+            boost::asio::write(sock, boost::asio::buffer(req), write_ec);
+            REQUIRE_FALSE(write_ec);
+
+            auto resp = read_one_response(sock, buf);
+            REQUIRE(resp.find("HTTP/1.1 200") != std::string::npos);
+        }
+        // Total elapsed ~3s > 2s timeout, but connection is still alive
+        // because each request reset the timer
+
+        sock.close();
+    }
+
+    SECTION("Fresh connection with no request is closed after timeout") {
+        boost::asio::io_context ioc;
+        auto sock = raw_connect(ioc, fixture.port);
+
+        // Don't send anything — just wait
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+
+        // Server should have closed the idle connection
+        char tmp[64];
+        boost::system::error_code ec;
+        sock.read_some(boost::asio::buffer(tmp), ec);
+        REQUIRE(ec);
     }
 }

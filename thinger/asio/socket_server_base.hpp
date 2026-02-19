@@ -37,6 +37,7 @@ public:
     virtual bool stop();
     bool is_running() const { return running_; }
     virtual std::string get_service_name() const = 0;
+    virtual uint16_t local_port() const = 0;
 
 protected:
     // Pure virtual methods that derived classes must implement

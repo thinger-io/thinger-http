@@ -10,20 +10,18 @@
 #include <boost/asio/steady_timer.hpp>
 #include <chrono>
 #include <thread>
+#include <future>
 
 namespace thinger::http::test {
 
 // HTTPS test server fixture with SSL support and self-signed certificate
 struct SSLTestServerFixture {
     http::server server;
-    uint16_t port = 9443;
+    uint16_t port = 0;
     std::string base_url;
     std::thread server_thread;
 
-    SSLTestServerFixture() : SSLTestServerFixture(9443) {}
-
-    explicit SSLTestServerFixture(uint16_t custom_port) : port(custom_port) {
-        // Enable SSL - certificate_manager will auto-generate self-signed cert
+    SSLTestServerFixture() {
         server.enable_ssl(true);
         setup_default_endpoints();
         start_server();
@@ -229,29 +227,16 @@ protected:
 
 private:
     void start_server() {
-        bool started = false;
-        int attempts = 0;
-        const int max_attempts = 10;
+        REQUIRE(server.listen("0.0.0.0", 0));
+        port = server.local_port();
+        base_url = "https://localhost:" + std::to_string(port);
 
-        while (!started && attempts < max_attempts) {
-            if (server.listen("0.0.0.0", port)) {
-                started = true;
-                base_url = "https://localhost:" + std::to_string(port);
-            } else {
-                port++;
-                attempts++;
-            }
-        }
-
-        if (!started) {
-            FAIL("Could not start SSL test server after " + std::to_string(max_attempts) + " attempts");
-        }
-
-        server_thread = std::thread([this]() {
+        std::promise<void> ready;
+        server_thread = std::thread([this, &ready]() {
+            ready.set_value();
             server.wait();
         });
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        ready.get_future().wait();
     }
 };
 

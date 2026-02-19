@@ -7,6 +7,7 @@
 #include <boost/asio/deadline_timer.hpp>
 #include <chrono>
 #include <thread>
+#include <future>
 #include <fstream>
 #include <filesystem>
 
@@ -16,7 +17,7 @@ using namespace std::chrono_literals;
 // Test fixture for server request/response tests
 struct RequestResponseTestFixture {
     http::server server;
-    uint16_t port = 9500;
+    uint16_t port = 0;
     std::string base_url;
     std::thread server_thread;
 
@@ -66,12 +67,11 @@ private:
         server.post("/json-body", [](http::request& req, http::response& res) {
             nlohmann::json response;
             response["raw_body"] = req.body();
-            try {
-                response["parsed_json"] = req.json();
-                response["parse_success"] = true;
-            } catch (...) {
-                response["parse_success"] = false;
-            }
+            auto parsed = req.json();
+            // json() returns null for empty body or parse failure
+            bool success = req.body().empty() || !parsed.is_null();
+            response["parsed_json"] = parsed;
+            response["parse_success"] = success;
             res.json(response);
         });
 
@@ -284,29 +284,16 @@ private:
     }
 
     void start_server() {
-        bool started = false;
-        int attempts = 0;
-        const int max_attempts = 10;
+        REQUIRE(server.listen("0.0.0.0", 0));
+        port = server.local_port();
+        base_url = "http://localhost:" + std::to_string(port);
 
-        while (!started && attempts < max_attempts) {
-            if (server.listen("0.0.0.0", port)) {
-                started = true;
-                base_url = "http://localhost:" + std::to_string(port);
-            } else {
-                port++;
-                attempts++;
-            }
-        }
-
-        if (!started) {
-            FAIL("Could not start test server");
-        }
-
-        server_thread = std::thread([this]() {
+        std::promise<void> ready;
+        server_thread = std::thread([this, &ready]() {
+            ready.set_value();
             server.wait();
         });
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        ready.get_future().wait();
     }
 };
 

@@ -380,6 +380,10 @@ bool http_server_base::is_listening() const {
     return socket_server_ != nullptr && socket_server_->is_running();
 }
 
+uint16_t http_server_base::local_port() const {
+    return socket_server_ ? socket_server_->local_port() : 0;
+}
+
 
 // Private methods
 void http_server_base::setup_connection_handler() {

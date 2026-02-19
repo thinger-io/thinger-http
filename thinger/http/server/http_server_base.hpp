@@ -177,6 +177,9 @@ public:
     
     // Check if server is listening
     bool is_listening() const;
+
+    // Get the port assigned by the OS after listen()
+    uint16_t local_port() const;
     
     // Access to router for advanced use cases
     route_handler& router() { return router_; }

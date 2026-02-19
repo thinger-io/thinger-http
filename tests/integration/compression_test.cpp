@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 #include <chrono>
 #include <thread>
+#include <future>
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -22,7 +23,7 @@ static nlohmann::json make_large_json() {
 
 struct CompressionTestFixture {
     http::server server;
-    uint16_t port = 9600;
+    uint16_t port = 0;
     std::string base_url;
     std::thread server_thread;
 
@@ -55,29 +56,16 @@ struct CompressionTestFixture {
 
 private:
     void start_server() {
-        bool started = false;
-        int attempts = 0;
-        const int max_attempts = 10;
+        REQUIRE(server.listen("0.0.0.0", 0));
+        port = server.local_port();
+        base_url = "http://localhost:" + std::to_string(port);
 
-        while (!started && attempts < max_attempts) {
-            if (server.listen("0.0.0.0", port)) {
-                started = true;
-                base_url = "http://localhost:" + std::to_string(port);
-            } else {
-                port++;
-                attempts++;
-            }
-        }
-
-        if (!started) {
-            FAIL("Could not start test server for compression tests");
-        }
-
-        server_thread = std::thread([this]() {
+        std::promise<void> ready;
+        server_thread = std::thread([this, &ready]() {
+            ready.set_value();
             server.wait();
         });
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        ready.get_future().wait();
     }
 };
 
@@ -105,7 +93,7 @@ TEST_CASE("Server decompresses gzip request body", "[compression][integration]")
     std::string json_str = payload.dump();
 
     // Compress the body with gzip
-    std::string compressed = util::gzip::compress(json_str);
+    std::string compressed = util::gzip::compress(json_str).value();
 
     // Send compressed body with Content-Encoding: gzip
     auto response = client.request(fixture.base_url + "/echo")
@@ -129,7 +117,7 @@ TEST_CASE("Full round-trip: gzip compressed request + compressed response", "[co
     std::string json_str = payload.dump();
 
     // Compress request body with gzip
-    std::string compressed = util::gzip::compress(json_str);
+    std::string compressed = util::gzip::compress(json_str).value();
 
     // Client auto-sends Accept-Encoding and auto-decompresses response
     auto response = client.request(fixture.base_url + "/echo")
@@ -151,7 +139,7 @@ TEST_CASE("Full round-trip with deflate", "[compression][integration]") {
     std::string json_str = payload.dump();
 
     // Compress request body with deflate
-    std::string compressed = util::deflate::compress(json_str);
+    std::string compressed = util::deflate::compress(json_str).value();
 
     auto response = client.request(fixture.base_url + "/echo")
         .header("Content-Encoding", "deflate")

@@ -171,7 +171,7 @@ TEST_CASE_METHOD(thinger::http::test::TestServerFixture, "HTTP Client connection
     
     SECTION("Different ports use different connections") {
         // Start a second test server on a different port
-        thinger::http::test::TestServerFixture test_server2(9091);
+        thinger::http::test::TestServerFixture test_server2;
         
         http::async_client client;
         int server1_requests = 0;
