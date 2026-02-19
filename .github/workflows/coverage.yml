@@ -6,6 +6,15 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
 jobs:
   coverage:
     runs-on: self-hosted
@@ -56,3 +65,28 @@ jobs:
           valColorRange: ${{ steps.coverage.outputs.percentage }}
           minColorRange: 40
           maxColorRange: 90
+
+  deploy-pages:
+    if: github.ref == 'refs/heads/main'
+    needs: coverage
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-html-report
+          path: coverage
+
+      - name: Upload to GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: coverage
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
