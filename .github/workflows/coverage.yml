@@ -35,9 +35,9 @@ jobs:
 
       - name: Generate coverage report
         run: |
-          lcov --capture --directory build --output-file build/coverage.info --ignore-errors source,mismatch,negative
+          lcov --capture --directory build --output-file build/coverage.info --ignore-errors source,mismatch,negative,gcov
           lcov --extract build/coverage.info '*/thinger/*' --output-file build/coverage_filtered.info --ignore-errors unused
-          genhtml build/coverage_filtered.info --output-directory build/coverage_html --ignore-errors negative
+          genhtml build/coverage_filtered.info --output-directory build/coverage_html --ignore-errors negative,mismatch
           lcov --summary build/coverage_filtered.info 2>&1 | tee build/coverage_summary.txt
 
       - name: Extract coverage percentage
