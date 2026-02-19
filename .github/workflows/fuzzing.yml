@@ -1,0 +1,65 @@
+name: Fuzzing
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  fuzz:
+    runs-on: self-hosted
+    container:
+      image: thinger/compiler:mold-latest
+
+    env:
+      CC: clang
+      CXX: clang++
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore fuzz corpus cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            build-fuzz/corpus
+          key: fuzz-corpus-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-
+
+      - name: Configure
+        run: cmake -B build-fuzz -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTHINGER_HTTP_ENABLE_FUZZING=ON -DTHINGER_HTTP_BUILD_TESTS=OFF -DTHINGER_HTTP_ENABLE_LOGGING=OFF
+
+      - name: Build
+        run: cmake --build build-fuzz -j$(nproc)
+
+      - name: Prepare corpus directories
+        run: |
+          mkdir -p build-fuzz/corpus/http_request_parser
+          mkdir -p build-fuzz/corpus/url_decode
+          cp -rn tests/fuzz/corpus/http_request_parser/* build-fuzz/corpus/http_request_parser/ 2>/dev/null || true
+          cp -rn tests/fuzz/corpus/url_decode/* build-fuzz/corpus/url_decode/ 2>/dev/null || true
+
+      - name: Fuzz HTTP request parser
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: build-fuzz/tests/fuzz/fuzz_http_request_parser build-fuzz/corpus/http_request_parser -max_total_time=300 -max_len=4096
+
+      - name: Fuzz URL decode
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: build-fuzz/tests/fuzz/fuzz_url_decode build-fuzz/corpus/url_decode -max_total_time=300 -max_len=4096
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+          retention-days: 30

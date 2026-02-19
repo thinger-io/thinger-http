@@ -19,6 +19,7 @@ option(THINGER_HTTP_ENABLE_SSL "Enable SSL support" ON)
 option(THINGER_HTTP_ENABLE_LOGGING "Enable spdlog logging" ON)
 option(THINGER_HTTP_ENABLE_COVERAGE "Enable code coverage" OFF)
 option(THINGER_HTTP_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(THINGER_HTTP_ENABLE_FUZZING "Enable fuzz testing with libFuzzer (requires Clang)" OFF)
 option(THINGER_HTTP_NO_EXCEPTIONS "Compile without exception support" OFF)
 
 # No-exceptions configuration
@@ -52,6 +53,18 @@ if(THINGER_HTTP_ENABLE_SANITIZERS)
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address,undefined")
     else()
         message(WARNING "Sanitizers require GCC or Clang")
+    endif()
+endif()
+
+# Fuzzing configuration (requires Clang)
+if(THINGER_HTTP_ENABLE_FUZZING)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(STATUS "Enabling fuzz testing with libFuzzer")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer")
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address,undefined")
+    else()
+        message(FATAL_ERROR "Fuzz testing requires Clang (libFuzzer)")
     endif()
 endif()
 
@@ -190,6 +203,11 @@ endif()
 # Benchmarks
 if(THINGER_HTTP_BUILD_BENCHMARKS)
     add_subdirectory(benchmark)
+endif()
+
+# Fuzzing
+if(THINGER_HTTP_ENABLE_FUZZING)
+    add_subdirectory(tests/fuzz)
 endif()
 
 # Installation (commented out for now)

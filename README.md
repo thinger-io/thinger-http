@@ -4,6 +4,7 @@
 [![Examples](https://img.shields.io/github/actions/workflow/status/thinger-io/thinger-http/examples.yml?branch=main&label=Examples&logo=bookstack&logoColor=white)](https://github.com/thinger-io/thinger-http/actions/workflows/examples.yml)
 [![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/alvarolb/8811c934f647f86b48040792983d5abe/raw/coverage.json&logo=codecov&logoColor=white)](https://thinger-io.github.io/thinger-http/)
 [![Sanitizers](https://img.shields.io/github/actions/workflow/status/thinger-io/thinger-http/sanitizers.yml?branch=main&label=Sanitizers&logo=adguard&logoColor=white)](https://github.com/thinger-io/thinger-http/actions/workflows/sanitizers.yml)
+[![Fuzzing](https://img.shields.io/github/actions/workflow/status/thinger-io/thinger-http/fuzzing.yml?branch=main&label=Fuzzing&logo=hackthebox&logoColor=white)](https://github.com/thinger-io/thinger-http/actions/workflows/fuzzing.yml)
 
 A modern C++20 HTTP/WebSocket library built on Boost.ASIO with coroutine support.
 
