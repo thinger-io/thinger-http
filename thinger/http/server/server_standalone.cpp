@@ -93,6 +93,30 @@ bool server::listen(const std::string& host, uint16_t port) {
     return true;
 }
 
+bool server::listen_unix(const std::string& unix_path) {
+    if (running_) {
+        LOG_WARNING("Server already running");
+        return false;
+    }
+
+    // Restart io_context if it was previously stopped
+    io_context_.restart();
+
+    // Call base implementation to setup unix socket server
+    if (!http_server_base::listen_unix(unix_path)) {
+        return false;
+    }
+
+    // Create work guard to keep io_context running
+    work_guard_ = std::make_unique<work_guard_type>(io_context_.get_executor());
+
+    // Mark as running
+    running_ = true;
+    LOG_INFO("Standalone server listening on unix:{} (single-threaded)", unix_path);
+
+    return true;
+}
+
 void server::wait() {
     if (!running_) {
         return;

@@ -122,6 +122,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/compression_test.cpp)
     add_thinger_test(test_integration_compression integration/compression_test.cpp)
 endif()
 
+# Integration tests - Unix Socket Server
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/unix_socket_server_test.cpp)
+    add_thinger_test(test_integration_unix_socket_server integration/unix_socket_server_test.cpp)
+endif()
+
 # ==================== ALL TESTS RUNNER ====================
 
 # Collect all test files

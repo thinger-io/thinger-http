@@ -39,6 +39,7 @@ public:
     
     // Override listen to setup server
     bool listen(const std::string& host, uint16_t port) override;
+    bool listen_unix(const std::string& unix_path) override;
     
     // Wait for server to stop
     void wait() override;
