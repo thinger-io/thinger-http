@@ -39,19 +39,22 @@ std::shared_ptr<boost::asio::ssl::context> certificate_manager::create_ssl_conte
     const std::string& private_key) {
     
     auto context = create_base_ssl_context();
-    
-    try {
-        context->use_certificate_chain(boost::asio::buffer(cert_chain.data(), cert_chain.size()));
-        context->use_private_key(boost::asio::buffer(private_key.data(), private_key.size()), 
-                               boost::asio::ssl::context::pem);
-        return context;
-    } catch (const std::exception& e) {
-        LOG_ERROR("Cannot set certificates: {}", e.what());
-    } catch (...) {
-        LOG_ERROR("Cannot set certificates: unknown error");
+
+    boost::system::error_code ec;
+    context->use_certificate_chain(boost::asio::buffer(cert_chain.data(), cert_chain.size()), ec);
+    if (ec) {
+        LOG_ERROR("Cannot set certificate chain: {}", ec.message());
+        return nullptr;
     }
-    
-    return nullptr;
+
+    context->use_private_key(boost::asio::buffer(private_key.data(), private_key.size()),
+                           boost::asio::ssl::context::pem, ec);
+    if (ec) {
+        LOG_ERROR("Cannot set private key: {}", ec.message());
+        return nullptr;
+    }
+
+    return context;
 }
 
 bool certificate_manager::set_certificate(const std::string& hostname, 
@@ -208,21 +211,14 @@ void certificate_manager::generate_self_signed_certificate() {
     // Create SSL context
     auto context = create_base_ssl_context();
     
-    try {
-        // Set certificate and key
-        if (SSL_CTX_use_certificate(context->native_handle(), x509) != 1) {
-            throw std::runtime_error("Failed to use certificate");
-        }
-        
-        if (SSL_CTX_use_PrivateKey(context->native_handle(), pkey) != 1) {
-            throw std::runtime_error("Failed to use private key");
-        }
-        
+    // Set certificate and key
+    if (SSL_CTX_use_certificate(context->native_handle(), x509) != 1) {
+        LOG_ERROR("Failed to use certificate for self-signed cert");
+    } else if (SSL_CTX_use_PrivateKey(context->native_handle(), pkey) != 1) {
+        LOG_ERROR("Failed to use private key for self-signed cert");
+    } else {
         default_context_ = context;
         LOG_INFO("Generated self-signed certificate for development use (CN=localhost)");
-        
-    } catch (const std::exception& e) {
-        LOG_ERROR("Failed to set self-signed certificate: {}", e.what());
     }
     
     // Cleanup

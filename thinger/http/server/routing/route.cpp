@@ -122,11 +122,11 @@ void route::handle_request(request& req, response& res) const {
     else if (std::holds_alternative<route_callback_json_response>(callback_)) {
         auto http_req = req.get_http_request();
         if (!http_req->get_body().empty()) {
-            try {
-                auto json = nlohmann::json::parse(http_req->get_body());
-                std::get<route_callback_json_response>(callback_)(json, res);
-            } catch (const nlohmann::json::exception& e) {
+            auto json = nlohmann::json::parse(http_req->get_body(), nullptr, false);
+            if (json.is_discarded()) {
                 res.error(http_response::status::bad_request, "Invalid JSON");
+            } else {
+                std::get<route_callback_json_response>(callback_)(json, res);
             }
         } else {
             nlohmann::json empty_json;
@@ -141,11 +141,11 @@ void route::handle_request(request& req, response& res) const {
     else if (std::holds_alternative<route_callback_request_json_response>(callback_)) {
         auto http_req = req.get_http_request();
         if (!http_req->get_body().empty()) {
-            try {
-                auto json = nlohmann::json::parse(http_req->get_body());
-                std::get<route_callback_request_json_response>(callback_)(req, json, res);
-            } catch (const nlohmann::json::exception& e) {
+            auto json = nlohmann::json::parse(http_req->get_body(), nullptr, false);
+            if (json.is_discarded()) {
                 res.error(http_response::status::bad_request, "Invalid JSON");
+            } else {
+                std::get<route_callback_request_json_response>(callback_)(req, json, res);
             }
         } else {
             nlohmann::json empty_json;

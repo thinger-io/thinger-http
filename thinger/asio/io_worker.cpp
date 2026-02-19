@@ -11,21 +11,7 @@ namespace thinger::asio{
     io_worker::~io_worker() = default;
 
     void io_worker::start() {
-        // a thread that is running forever with a try catch over the io service run so it can recover from errors
-        for (;;) {
-            try {
-                io_.run();
-                break; // run() exited normally
-            } catch (const std::exception &ex) {
-                LOG_ERROR("thread crashed: {}", ex.what());
-            } catch (const std::string &ex) {
-                LOG_ERROR("thread crashed: {}", ex);
-            } catch (...) {
-                LOG_ERROR("unknown thread crash");
-            }
-            LOG_WARNING("restarting thread");
-            io_.restart();
-        }
+        io_.run();
     }
 
     void io_worker::stop(){

@@ -3,6 +3,7 @@
 
 #include "../common/http_response.hpp"
 #include <boost/system/error_code.hpp>
+#include <cassert>
 #include <memory>
 #include <nlohmann/json.hpp>
 
@@ -51,11 +52,11 @@ public:
         if (!response_ || response_->get_content().empty()) {
             return nlohmann::json();
         }
-        try {
-            return nlohmann::json::parse(response_->get_content());
-        } catch (...) {
+        auto j = nlohmann::json::parse(response_->get_content(), nullptr, false);
+        if (j.is_discarded()) {
             return nlohmann::json();
         }
+        return j;
     }
     
     // Status info
@@ -106,9 +107,9 @@ public:
     // Advanced access
     const http_response* operator->() const { return response_.get(); }
     
-    const http_response& operator*() const { 
-        if (!response_) throw std::runtime_error("No response available");
-        return *response_; 
+    const http_response& operator*() const {
+        assert(response_ && "Dereferencing empty client_response");
+        return *response_;
     }
     
     std::shared_ptr<http_response> get() const { return response_; }

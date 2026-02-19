@@ -20,12 +20,9 @@ unix_socket::~unix_socket() {
 }
 
 void unix_socket::close() {
-    try {
-        if (socket_.is_open()) {
-            boost::system::error_code ec;
-            socket_.close(ec);
-        }
-    } catch (...) {
+    if (socket_.is_open()) {
+        boost::system::error_code ec;
+        socket_.close(ec);
     }
 }
 
@@ -33,7 +30,7 @@ void unix_socket::cancel() {
     socket_.cancel();
 }
 
-awaitable<void> unix_socket::connect(const std::string &path, std::chrono::seconds timeout) {
+awaitable<boost::system::error_code> unix_socket::connect(const std::string &path, std::chrono::seconds timeout) {
     close();
 
     // Setup timeout timer
@@ -41,6 +38,7 @@ awaitable<void> unix_socket::connect(const std::string &path, std::chrono::secon
     timer.expires_after(timeout);
 
     bool timed_out = false;
+    boost::system::error_code connect_ec;
 
     // Start timeout
     auto timeout_coro = [&]() -> awaitable<void> {
@@ -58,24 +56,23 @@ awaitable<void> unix_socket::connect(const std::string &path, std::chrono::secon
             use_nothrow_awaitable);
         timer.cancel();
         if (ec) {
-            if (timed_out) {
-                throw boost::system::system_error(boost::asio::error::timed_out);
-            }
-            throw boost::system::system_error(ec);
+            connect_ec = timed_out ? boost::asio::error::timed_out : ec;
         }
     };
 
     co_spawn(io_context_, timeout_coro(), detached);
     co_await connect_coro();
+
+    co_return connect_ec;
 }
 
-awaitable<void> unix_socket::connect(
+awaitable<boost::system::error_code> unix_socket::connect(
     const std::string &host,
     const std::string &port,
     std::chrono::seconds timeout)
 {
     LOG_WARNING("calling connect to a unix socket over host/port");
-    co_await connect(host, timeout);
+    co_return co_await connect(host, timeout);
 }
 
 std::string unix_socket::get_remote_ip() const {
@@ -96,58 +93,73 @@ std::string unix_socket::get_remote_port() const {
 }
 
 awaitable<size_t> unix_socket::read_some(uint8_t buffer[], size_t max_size) {
-    co_return co_await socket_.async_read_some(
+    auto [ec, bytes] = co_await socket_.async_read_some(
         boost::asio::buffer(buffer, max_size),
-        use_awaitable);
+        use_nothrow_awaitable);
+    if (ec) co_return 0;
+    co_return bytes;
 }
 
 awaitable<size_t> unix_socket::read(uint8_t buffer[], size_t size) {
-    co_return co_await boost::asio::async_read(
+    auto [ec, bytes] = co_await boost::asio::async_read(
         socket_,
         boost::asio::buffer(buffer, size),
         boost::asio::transfer_exactly(size),
-        use_awaitable);
+        use_nothrow_awaitable);
+    if (ec) co_return 0;
+    co_return bytes;
 }
 
 awaitable<size_t> unix_socket::read(boost::asio::streambuf& buffer, size_t size) {
-    co_return co_await boost::asio::async_read(
+    auto [ec, bytes] = co_await boost::asio::async_read(
         socket_,
         buffer,
         boost::asio::transfer_exactly(size),
-        use_awaitable);
+        use_nothrow_awaitable);
+    if (ec) co_return 0;
+    co_return bytes;
 }
 
 awaitable<size_t> unix_socket::read_until(boost::asio::streambuf& buffer, std::string_view delim) {
-    co_return co_await boost::asio::async_read_until(
+    auto [ec, bytes] = co_await boost::asio::async_read_until(
         socket_,
         buffer,
         std::string(delim),
-        use_awaitable);
+        use_nothrow_awaitable);
+    if (ec) co_return 0;
+    co_return bytes;
 }
 
 awaitable<size_t> unix_socket::write(const uint8_t buffer[], size_t size) {
-    co_return co_await boost::asio::async_write(
+    auto [ec, bytes] = co_await boost::asio::async_write(
         socket_,
         boost::asio::buffer(buffer, size),
-        use_awaitable);
+        use_nothrow_awaitable);
+    if (ec) co_return 0;
+    co_return bytes;
 }
 
 awaitable<size_t> unix_socket::write(std::string_view str) {
-    co_return co_await boost::asio::async_write(
+    auto [ec, bytes] = co_await boost::asio::async_write(
         socket_,
         boost::asio::buffer(str.data(), str.size()),
-        use_awaitable);
+        use_nothrow_awaitable);
+    if (ec) co_return 0;
+    co_return bytes;
 }
 
 awaitable<size_t> unix_socket::write(const std::vector<boost::asio::const_buffer>& buffers) {
-    co_return co_await boost::asio::async_write(
+    auto [ec, bytes] = co_await boost::asio::async_write(
         socket_,
         buffers,
-        use_awaitable);
+        use_nothrow_awaitable);
+    if (ec) co_return 0;
+    co_return bytes;
 }
 
-awaitable<void> unix_socket::wait(boost::asio::socket_base::wait_type type) {
-    co_await socket_.async_wait(type, use_awaitable);
+awaitable<boost::system::error_code> unix_socket::wait(boost::asio::socket_base::wait_type type) {
+    auto [ec] = co_await socket_.async_wait(type, use_nothrow_awaitable);
+    co_return ec;
 }
 
 bool unix_socket::is_open() const {

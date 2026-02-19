@@ -33,7 +33,7 @@ void tcp_socket::cancel() {
     socket_.cancel();
 }
 
-awaitable<void> tcp_socket::connect(
+awaitable<boost::system::error_code> tcp_socket::connect(
     const std::string& host,
     const std::string& port,
     std::chrono::seconds timeout)
@@ -46,7 +46,7 @@ awaitable<void> tcp_socket::connect(
         host, port, use_nothrow_awaitable);
 
     if (ec_resolve) {
-        throw boost::system::system_error(ec_resolve);
+        co_return ec_resolve;
     }
 
     // Setup timeout timer
@@ -55,6 +55,7 @@ awaitable<void> tcp_socket::connect(
 
     // Race between connect and timeout
     bool timed_out = false;
+    boost::system::error_code connect_ec;
 
     // Start timeout
     auto timeout_coro = [&]() -> awaitable<void> {
@@ -71,10 +72,7 @@ awaitable<void> tcp_socket::connect(
             socket_, endpoints, use_nothrow_awaitable);
         timer.cancel();
         if (ec) {
-            if (timed_out) {
-                throw boost::system::system_error(boost::asio::error::timed_out);
-            }
-            throw boost::system::system_error(ec);
+            connect_ec = timed_out ? boost::asio::error::timed_out : ec;
         }
     };
 
@@ -82,10 +80,20 @@ awaitable<void> tcp_socket::connect(
     co_spawn(io_context_, timeout_coro(), detached);
     co_await connect_coro();
 
+    if (connect_ec) {
+        co_return connect_ec;
+    }
+
     // Run handshake if required (for SSL sockets)
     if (requires_handshake()) {
-        co_await handshake(host);
+        auto hs_ec = co_await handshake(host);
+        if (hs_ec) {
+            close();
+            co_return hs_ec;
+        }
     }
+
+    co_return boost::system::error_code{};
 }
 
 boost::asio::ip::tcp::socket& tcp_socket::get_socket() {
@@ -120,58 +128,73 @@ std::string tcp_socket::get_remote_port() const {
 }
 
 awaitable<size_t> tcp_socket::read_some(uint8_t* buffer, size_t max_size) {
-    co_return co_await socket_.async_read_some(
+    auto [ec, bytes] = co_await socket_.async_read_some(
         boost::asio::buffer(buffer, max_size),
-        use_awaitable);
+        use_nothrow_awaitable);
+    if (ec) co_return 0;
+    co_return bytes;
 }
 
 awaitable<size_t> tcp_socket::read(uint8_t* buffer, size_t size) {
-    co_return co_await boost::asio::async_read(
+    auto [ec, bytes] = co_await boost::asio::async_read(
         socket_,
         boost::asio::buffer(buffer, size),
         boost::asio::transfer_exactly(size),
-        use_awaitable);
+        use_nothrow_awaitable);
+    if (ec) co_return 0;
+    co_return bytes;
 }
 
 awaitable<size_t> tcp_socket::read(boost::asio::streambuf& buffer, size_t size) {
-    co_return co_await boost::asio::async_read(
+    auto [ec, bytes] = co_await boost::asio::async_read(
         socket_,
         buffer,
         boost::asio::transfer_exactly(size),
-        use_awaitable);
+        use_nothrow_awaitable);
+    if (ec) co_return 0;
+    co_return bytes;
 }
 
 awaitable<size_t> tcp_socket::read_until(boost::asio::streambuf& buffer, std::string_view delim) {
-    co_return co_await boost::asio::async_read_until(
+    auto [ec, bytes] = co_await boost::asio::async_read_until(
         socket_,
         buffer,
         std::string(delim),
-        use_awaitable);
+        use_nothrow_awaitable);
+    if (ec) co_return 0;
+    co_return bytes;
 }
 
 awaitable<size_t> tcp_socket::write(const uint8_t* buffer, size_t size) {
-    co_return co_await boost::asio::async_write(
+    auto [ec, bytes] = co_await boost::asio::async_write(
         socket_,
         boost::asio::buffer(buffer, size),
-        use_awaitable);
+        use_nothrow_awaitable);
+    if (ec) co_return 0;
+    co_return bytes;
 }
 
 awaitable<size_t> tcp_socket::write(std::string_view str) {
-    co_return co_await boost::asio::async_write(
+    auto [ec, bytes] = co_await boost::asio::async_write(
         socket_,
         boost::asio::buffer(str.data(), str.size()),
-        use_awaitable);
+        use_nothrow_awaitable);
+    if (ec) co_return 0;
+    co_return bytes;
 }
 
 awaitable<size_t> tcp_socket::write(const std::vector<boost::asio::const_buffer>& buffers) {
-    co_return co_await boost::asio::async_write(
+    auto [ec, bytes] = co_await boost::asio::async_write(
         socket_,
         buffers,
-        use_awaitable);
+        use_nothrow_awaitable);
+    if (ec) co_return 0;
+    co_return bytes;
 }
 
-awaitable<void> tcp_socket::wait(boost::asio::socket_base::wait_type type) {
-    co_await socket_.async_wait(type, use_awaitable);
+awaitable<boost::system::error_code> tcp_socket::wait(boost::asio::socket_base::wait_type type) {
+    auto [ec] = co_await socket_.async_wait(type, use_nothrow_awaitable);
+    co_return ec;
 }
 
 void tcp_socket::enable_tcp_no_delay() {

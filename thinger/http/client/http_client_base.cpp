@@ -228,76 +228,70 @@ awaitable<client_response> http_client_base::send_with_redirects(
     std::shared_ptr<client_connection> connection,
     unsigned int redirect_count) {
 
-    try {
-        // Send request
-        auto response = co_await connection->send_request(request);
+    // Send request
+    auto response = co_await connection->send_request(request);
 
-        if (!response) {
-            co_return client_response(boost::asio::error::invalid_argument, nullptr);
-        }
-
-        // Handle redirects
-        if (follow_redirects_ && response->is_redirect_response() &&
-            redirect_count < max_redirects_ && response->has_header("Location")) {
-
-            std::string location = response->get_header("Location");
-            LOG_DEBUG("Following redirect #{} to: {}", redirect_count + 1, location);
-
-            // Determine redirect method based on status code
-            method redirect_method = request->get_method();
-            int status = response->get_status_code();
-
-            // 303 See Other always changes to GET
-            if (status == 303) {
-                redirect_method = method::GET;
-            }
-            // 301/302 traditionally change POST/PUT/DELETE to GET (browser behavior)
-            else if ((status == 301 || status == 302) &&
-                     (request->get_method() == method::POST ||
-                      request->get_method() == method::PUT ||
-                      request->get_method() == method::DELETE)) {
-                redirect_method = method::GET;
-            }
-            // 307 and 308 preserve the original method
-
-            // Create redirect request
-            auto redirect_request = create_request(redirect_method, location);
-
-            // Preserve body for 307/308
-            if ((status == 307 || status == 308) && !request->get_body().empty()) {
-                redirect_request->set_content(request->get_body());
-                if (request->has_header("Content-Type")) {
-                    redirect_request->add_header("Content-Type", request->get_header("Content-Type"));
-                }
-                if (request->has_header("Content-Length")) {
-                    redirect_request->add_header("Content-Length", request->get_header("Content-Length"));
-                }
-            }
-
-            // Copy Authorization only for same origin
-            std::string original_url = request->get_url();
-            if (request->has_header("Authorization") && is_same_origin(original_url, location)) {
-                redirect_request->add_header("Authorization", request->get_header("Authorization"));
-                LOG_DEBUG("Preserving Authorization header for same-origin redirect");
-            }
-
-            // Handle cookies
-            if (request->get_cookie_store().update_from_headers(*response)) {
-                redirect_request->set_header(header::cookie, request->get_cookie_store().get_cookie_string());
-            }
-
-            // Get connection for redirect (may be different host)
-            auto redirect_connection = get_or_create_connection(redirect_request);
-
-            co_return co_await send_with_redirects(redirect_request, redirect_connection, redirect_count + 1);
-        }
-
-        co_return client_response(boost::system::error_code{}, response);
-
-    } catch (const boost::system::system_error& e) {
-        LOG_ERROR("Error sending request to {}: {}", request->get_url(), e.what());
-        co_return client_response(e.code(), nullptr);
+    if (!response) {
+        co_return client_response(boost::asio::error::invalid_argument, nullptr);
     }
+
+    // Handle redirects
+    if (follow_redirects_ && response->is_redirect_response() &&
+        redirect_count < max_redirects_ && response->has_header("Location")) {
+
+        std::string location = response->get_header("Location");
+        LOG_DEBUG("Following redirect #{} to: {}", redirect_count + 1, location);
+
+        // Determine redirect method based on status code
+        method redirect_method = request->get_method();
+        int status = response->get_status_code();
+
+        // 303 See Other always changes to GET
+        if (status == 303) {
+            redirect_method = method::GET;
+        }
+        // 301/302 traditionally change POST/PUT/DELETE to GET (browser behavior)
+        else if ((status == 301 || status == 302) &&
+                 (request->get_method() == method::POST ||
+                  request->get_method() == method::PUT ||
+                  request->get_method() == method::DELETE)) {
+            redirect_method = method::GET;
+        }
+        // 307 and 308 preserve the original method
+
+        // Create redirect request
+        auto redirect_request = create_request(redirect_method, location);
+
+        // Preserve body for 307/308
+        if ((status == 307 || status == 308) && !request->get_body().empty()) {
+            redirect_request->set_content(request->get_body());
+            if (request->has_header("Content-Type")) {
+                redirect_request->add_header("Content-Type", request->get_header("Content-Type"));
+            }
+            if (request->has_header("Content-Length")) {
+                redirect_request->add_header("Content-Length", request->get_header("Content-Length"));
+            }
+        }
+
+        // Copy Authorization only for same origin
+        std::string original_url = request->get_url();
+        if (request->has_header("Authorization") && is_same_origin(original_url, location)) {
+            redirect_request->add_header("Authorization", request->get_header("Authorization"));
+            LOG_DEBUG("Preserving Authorization header for same-origin redirect");
+        }
+
+        // Handle cookies
+        if (request->get_cookie_store().update_from_headers(*response)) {
+            redirect_request->set_header(header::cookie, request->get_cookie_store().get_cookie_string());
+        }
+
+        // Get connection for redirect (may be different host)
+        auto redirect_connection = get_or_create_connection(redirect_request);
+
+        co_return co_await send_with_redirects(redirect_request, redirect_connection, redirect_count + 1);
+    }
+
+    co_return client_response(boost::system::error_code{}, response);
 }
 
 // Simple URL version delegates to the request version
@@ -332,82 +326,75 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
         }
     }
 
-    try {
-        auto& io_context = get_io_context();
+    auto& io_context = get_io_context();
 
-        // Create socket based on scheme
-        std::shared_ptr<asio::socket> socket;
-        if (components->secure) {
-            auto ssl_context = std::make_shared<boost::asio::ssl::context>(
-                boost::asio::ssl::context::sslv23_client);
-            ssl_context->set_default_verify_paths();
-            if (!verify_ssl_) {
-                ssl_context->set_verify_mode(boost::asio::ssl::verify_none);
-            }
-            socket = std::make_shared<asio::ssl_socket>("wss_client", io_context, ssl_context);
-        } else {
-            socket = std::make_shared<asio::tcp_socket>("ws_client", io_context);
+    // Create socket based on scheme
+    std::shared_ptr<asio::socket> socket;
+    if (components->secure) {
+        auto ssl_context = std::make_shared<boost::asio::ssl::context>(
+            boost::asio::ssl::context::sslv23_client);
+        ssl_context->set_default_verify_paths();
+        if (!verify_ssl_) {
+            ssl_context->set_verify_mode(boost::asio::ssl::verify_none);
         }
+        socket = std::make_shared<asio::ssl_socket>("wss_client", io_context, ssl_context);
+    } else {
+        socket = std::make_shared<asio::tcp_socket>("ws_client", io_context);
+    }
 
-        // Connect
-        co_await socket->connect(components->host, components->port, timeout_);
-
-        // SSL handshake if needed
-        if (socket->requires_handshake()) {
-            co_await socket->handshake(components->host);
-        }
-
-        // Create connection for HTTP upgrade
-        auto connection = std::make_shared<client_connection>(socket, timeout_);
-
-        // Set correct URL in request
-        std::string http_url = (components->secure ? "https://" : "http://")
-                              + components->host + ":" + components->port + components->path;
-        request->set_url(http_url);
-        request->set_method(method::GET);
-
-        // Add WebSocket-specific headers (use set_header to avoid duplicates if request already has these)
-        request->set_header("Upgrade", "websocket");
-        request->set_header("Connection", "Upgrade");
-
-        std::string ws_key = websocket_util::generate_websocket_key();
-        request->add_header("Sec-WebSocket-Key", ws_key);
-        request->add_header("Sec-WebSocket-Version", "13");
-
-        if (!subprotocol.empty()) {
-            request->add_header("Sec-WebSocket-Protocol", subprotocol);
-        }
-
-        apply_default_headers(request);
-
-        // Send upgrade request
-        auto response = co_await connection->send_request(request);
-
-        if (!response || response->get_status_code() != 101) {
-            LOG_ERROR("WebSocket upgrade failed: {}",
-                     response ? std::to_string(response->get_status_code()) : "no response");
-            co_return std::nullopt;
-        }
-
-        // Validate accept key
-        auto accept_key = response->get_header("Sec-WebSocket-Accept");
-        if (!websocket_util::validate_accept_key(accept_key, ws_key)) {
-            LOG_ERROR("Invalid Sec-WebSocket-Accept key");
-            co_return std::nullopt;
-        }
-
-        // Upgrade to WebSocket
-        auto raw_socket = connection->release_socket();
-        auto ws = std::make_shared<asio::websocket>(raw_socket, false, false);
-
-        LOG_INFO("WebSocket connected to {}", url);
-
-        co_return websocket_client(std::move(ws));
-
-    } catch (const std::exception& e) {
-        LOG_ERROR("WebSocket connect error: {}", e.what());
+    // Connect
+    auto ec = co_await socket->connect(components->host, components->port, timeout_);
+    if (ec) {
+        LOG_ERROR("WebSocket connect error: {}", ec.message());
         co_return std::nullopt;
     }
+
+    // Create connection for HTTP upgrade
+    auto connection = std::make_shared<client_connection>(socket, timeout_);
+
+    // Set correct URL in request
+    std::string http_url = (components->secure ? "https://" : "http://")
+                          + components->host + ":" + components->port + components->path;
+    request->set_url(http_url);
+    request->set_method(method::GET);
+
+    // Add WebSocket-specific headers (use set_header to avoid duplicates if request already has these)
+    request->set_header("Upgrade", "websocket");
+    request->set_header("Connection", "Upgrade");
+
+    std::string ws_key = websocket_util::generate_websocket_key();
+    request->add_header("Sec-WebSocket-Key", ws_key);
+    request->add_header("Sec-WebSocket-Version", "13");
+
+    if (!subprotocol.empty()) {
+        request->add_header("Sec-WebSocket-Protocol", subprotocol);
+    }
+
+    apply_default_headers(request);
+
+    // Send upgrade request
+    auto response = co_await connection->send_request(request);
+
+    if (!response || response->get_status_code() != 101) {
+        LOG_ERROR("WebSocket upgrade failed: {}",
+                 response ? std::to_string(response->get_status_code()) : "no response");
+        co_return std::nullopt;
+    }
+
+    // Validate accept key
+    auto accept_key = response->get_header("Sec-WebSocket-Accept");
+    if (!websocket_util::validate_accept_key(accept_key, ws_key)) {
+        LOG_ERROR("Invalid Sec-WebSocket-Accept key");
+        co_return std::nullopt;
+    }
+
+    // Upgrade to WebSocket
+    auto raw_socket = connection->release_socket();
+    auto ws = std::make_shared<asio::websocket>(raw_socket, false, false);
+
+    LOG_INFO("WebSocket connected to {}", url);
+
+    co_return websocket_client(std::move(ws));
 }
 
 } // namespace thinger::http

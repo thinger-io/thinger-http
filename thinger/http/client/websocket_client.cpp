@@ -58,18 +58,12 @@ bool websocket_client::send_text(std::string_view message) {
     boost::asio::co_spawn(
         io_context,
         [this, msg = std::string(message), &promise]() -> awaitable<void> {
-            try {
-                bool result = co_await send_text_async(std::move(msg));
-                promise.set_value(result);
-            } catch (...) {
-                promise.set_exception(std::current_exception());
-            }
+            bool result = co_await send_text_async(std::move(msg));
+            promise.set_value(result);
         },
         boost::asio::detached
     );
 
-    // If we're already running on the io_context's thread (e.g., from async_client callback),
-    // we need to poll to let our coroutine run. Otherwise, drive the io_context ourselves.
     if (io_context.get_executor().running_in_this_thread()) {
         while (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
             io_context.poll_one();
@@ -98,12 +92,8 @@ bool websocket_client::send_binary(std::string_view data) {
     boost::asio::co_spawn(
         io_context,
         [this, data_vec = std::move(data_vec), &promise]() mutable -> awaitable<void> {
-            try {
-                bool result = co_await send_binary_async(std::move(data_vec));
-                promise.set_value(result);
-            } catch (...) {
-                promise.set_exception(std::current_exception());
-            }
+            bool result = co_await send_binary_async(std::move(data_vec));
+            promise.set_value(result);
         },
         boost::asio::detached
     );
@@ -131,12 +121,8 @@ std::pair<std::string, bool> websocket_client::receive() {
     boost::asio::co_spawn(
         io_context,
         [this, &promise]() -> awaitable<void> {
-            try {
-                auto result = co_await receive_async();
-                promise.set_value(std::move(result));
-            } catch (...) {
-                promise.set_exception(std::current_exception());
-            }
+            auto result = co_await receive_async();
+            promise.set_value(std::move(result));
         },
         boost::asio::detached
     );
@@ -164,12 +150,8 @@ void websocket_client::close() {
     boost::asio::co_spawn(
         io_context,
         [this, &promise]() -> awaitable<void> {
-            try {
-                co_await close_async();
-                promise.set_value();
-            } catch (...) {
-                promise.set_exception(std::current_exception());
-            }
+            co_await close_async();
+            promise.set_value();
         },
         boost::asio::detached
     );
@@ -183,11 +165,7 @@ void websocket_client::close() {
         io_context.restart();
     }
 
-    try {
-        future.get();
-    } catch (...) {
-        // Ignore close errors
-    }
+    future.get();
 }
 
 // ============================================
@@ -217,23 +195,19 @@ void websocket_client::stop() {
 
 awaitable<void> websocket_client::message_loop() {
     while (running_ && is_open()) {
-        try {
-            auto [message, is_binary] = co_await receive_async();
+        auto [message, is_binary] = co_await receive_async();
 
-            if (message.empty() && !is_open()) {
-                break;
-            }
-
-            if (on_message_) {
-                on_message_(message, is_binary);
-            }
-
-        } catch (const std::exception& e) {
-            LOG_DEBUG("WebSocket message loop ended: {}", e.what());
-            if (on_error_) {
-                on_error_(e.what());
-            }
+        if (message.empty() && !is_open()) {
             break;
+        }
+
+        if (message.empty()) {
+            // Error or connection closed
+            break;
+        }
+
+        if (on_message_) {
+            on_message_(message, is_binary);
         }
     }
 
@@ -251,27 +225,17 @@ awaitable<void> websocket_client::message_loop() {
 awaitable<bool> websocket_client::send_text_async(std::string message) {
     if (!is_open()) co_return false;
 
-    try {
-        websocket_->set_binary(false);
-        co_await websocket_->write(message);
-        co_return true;
-    } catch (const std::exception& e) {
-        LOG_ERROR("WebSocket send error: {}", e.what());
-        co_return false;
-    }
+    websocket_->set_binary(false);
+    co_await websocket_->write(message);
+    co_return websocket_->is_open();
 }
 
 awaitable<bool> websocket_client::send_binary_async(std::vector<uint8_t> data) {
     if (!is_open()) co_return false;
 
-    try {
-        websocket_->set_binary(true);
-        co_await websocket_->write(data.data(), data.size());
-        co_return true;
-    } catch (const std::exception& e) {
-        LOG_ERROR("WebSocket send error: {}", e.what());
-        co_return false;
-    }
+    websocket_->set_binary(true);
+    co_await websocket_->write(data.data(), data.size());
+    co_return websocket_->is_open();
 }
 
 awaitable<std::pair<std::string, bool>> websocket_client::receive_async() {
@@ -279,28 +243,22 @@ awaitable<std::pair<std::string, bool>> websocket_client::receive_async() {
         co_return std::make_pair(std::string{}, false);
     }
 
-    try {
-        std::array<uint8_t, 65536> buffer;
-        size_t bytes_read = co_await websocket_->read_some(buffer.data(), buffer.size());
+    std::array<uint8_t, 65536> buffer;
+    size_t bytes_read = co_await websocket_->read_some(buffer.data(), buffer.size());
 
-        std::string message(reinterpret_cast<char*>(buffer.data()), bytes_read);
-        bool is_binary = websocket_->is_binary();
-
-        co_return std::make_pair(std::move(message), is_binary);
-
-    } catch (const std::exception& e) {
-        LOG_DEBUG("WebSocket receive ended: {}", e.what());
+    if (bytes_read == 0) {
         co_return std::make_pair(std::string{}, false);
     }
+
+    std::string message(reinterpret_cast<char*>(buffer.data()), bytes_read);
+    bool is_binary = websocket_->is_binary();
+
+    co_return std::make_pair(std::move(message), is_binary);
 }
 
 awaitable<void> websocket_client::close_async() {
     if (websocket_) {
-        try {
-            co_await websocket_->close_graceful();
-        } catch (...) {
-            // Ignore close errors
-        }
+        co_await websocket_->close_graceful();
     }
     running_ = false;
 }

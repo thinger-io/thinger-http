@@ -69,11 +69,7 @@ public:
         track_request_start();
         co_spawn(get_io_context(),
             [this, coro = std::move(coro)]() mutable -> awaitable<void> {
-                try {
-                    co_await std::move(coro);
-                } catch (...) {
-                    // Log or handle error
-                }
+                co_await std::move(coro);
                 track_request_end();
             },
             detached);
@@ -85,11 +81,7 @@ public:
         track_request_start();
         co_spawn(get_io_context(),
             [this, factory = std::forward<F>(coro_factory)]() mutable -> awaitable<void> {
-                try {
-                    co_await factory();
-                } catch (...) {
-                    // Log or handle error
-                }
+                co_await factory();
                 track_request_end();
             },
             detached);

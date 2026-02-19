@@ -40,13 +40,13 @@ std::unique_ptr<asio::socket_server> server::create_socket_server(
         
         if (!default_ctx) {
             LOG_ERROR("No default SSL certificate configured");
-            throw std::runtime_error("No default SSL certificate configured");
+            return nullptr;
         }
-        
+
         server->set_ssl_context(default_ctx);
         server->set_sni_callback(asio::certificate_manager::sni_callback);
     }
-    
+
     return server;
 }
 

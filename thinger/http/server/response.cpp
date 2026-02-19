@@ -23,7 +23,7 @@ void response::redirect(const std::string& url, http::http_response::status redi
 
 // File sending implementation
 void response::send_file(const std::filesystem::path& path, bool force_download) {
-    ensure_not_responded();
+    if (!ensure_not_responded()) return;
     
     // For now, we'll implement basic file sending here
     // TODO: Integrate with simple_file_handler when it's updated to work with response
@@ -73,7 +73,7 @@ void response::send_file(const std::filesystem::path& path, bool force_download)
 // WebSocket upgrade implementation
 void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_connection>)> handler,
                                 const std::set<std::string>& supported_protocols) {
-    ensure_not_responded();
+    if (!ensure_not_responded()) return;
     
     auto conn = connection_.lock();
     auto str = stream_.lock();
@@ -152,7 +152,7 @@ void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_co
 
 // Server-Sent Events implementation
 void response::start_sse(std::function<void(std::shared_ptr<sse_connection>)> handler) {
-    ensure_not_responded();
+    if (!ensure_not_responded()) return;
     
     auto conn = connection_.lock();
     auto str = stream_.lock();
@@ -195,13 +195,14 @@ void response::start_sse(std::function<void(std::shared_ptr<sse_connection>)> ha
 }
 
 // Chunked response support
-void response::start_chunked(const std::string& content_type, http::http_response::status status) {
-    ensure_not_responded();
+bool response::start_chunked(const std::string& content_type, http::http_response::status status) {
+    if (!ensure_not_responded()) return false;
 
     auto conn = connection_.lock();
     auto str = stream_.lock();
     if (!conn || !str) {
-        throw std::runtime_error("Connection lost");
+        LOG_ERROR("Connection lost while starting chunked response");
+        return false;
     }
 
     // Create chunked response headers
@@ -216,39 +217,45 @@ void response::start_chunked(const std::string& content_type, http::http_respons
     conn->handle_stream(str, response_);
 
     responded_ = true;
+    return true;
 }
 
-void response::write_chunk(const std::string& data) {
+bool response::write_chunk(const std::string& data) {
     if (!responded_) {
-        throw std::runtime_error("Must call start_chunked() before writing chunks");
+        LOG_ERROR("Must call start_chunked() before writing chunks");
+        return false;
     }
 
     auto conn = connection_.lock();
     auto str = stream_.lock();
     if (!conn || !str) {
-        throw std::runtime_error("Connection lost");
+        LOG_ERROR("Connection lost while writing chunk");
+        return false;
     }
 
     auto chunk = std::make_shared<http_data>(std::make_shared<data::out_chunk>(data));
     chunk->set_last_frame(false);
     conn->handle_stream(str, chunk);
+    return true;
 }
 
-void response::end_chunked() {
+bool response::end_chunked() {
     if (!responded_) {
-        throw std::runtime_error("Must call start_chunked() before ending chunks");
+        LOG_ERROR("Must call start_chunked() before ending chunks");
+        return false;
     }
 
     auto conn = connection_.lock();
     auto str = stream_.lock();
     if (!conn || !str) {
-        return;
+        return false;
     }
 
     // Send final zero-length chunk to terminate the response
     auto chunk = std::make_shared<http_data>(std::make_shared<data::out_chunk>());
     chunk->set_last_frame(true);
     conn->handle_stream(str, chunk);
+    return true;
 }
 
 } // namespace thinger::http

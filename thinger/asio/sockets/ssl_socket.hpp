@@ -19,7 +19,7 @@ public:
     // socket control
     void close() override;
     bool requires_handshake() const override;
-    awaitable<void> handshake(const std::string& host = "") override;
+    awaitable<boost::system::error_code> handshake(const std::string& host = "") override;
 
     // read operations
     awaitable<size_t> read_some(uint8_t buffer[], size_t max_size) override;

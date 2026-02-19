@@ -8,6 +8,7 @@
 
 #include <boost/asio.hpp>
 #include <boost/asio/buffer.hpp>
+#include <boost/system/error_code.hpp>
 
 #include "../../util/types.hpp"
 
@@ -21,14 +22,14 @@ public:
     virtual ~socket();
 
     // socket control
-    virtual awaitable<void> connect(
+    virtual awaitable<boost::system::error_code> connect(
         const std::string &host,
         const std::string &port,
         std::chrono::seconds timeout) = 0;
     virtual void close() = 0;
     virtual void cancel() = 0;
     virtual bool requires_handshake() const;
-    virtual awaitable<void> handshake(const std::string &host = "");
+    virtual awaitable<boost::system::error_code> handshake(const std::string &host = "");
 
     // read operations
     virtual awaitable<size_t> read_some(uint8_t buffer[], size_t max_size) = 0;
@@ -42,7 +43,7 @@ public:
     virtual awaitable<size_t> write(const std::vector<boost::asio::const_buffer> &buffers) = 0;
 
     // wait
-    virtual awaitable<void> wait(boost::asio::socket_base::wait_type type) = 0;
+    virtual awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type) = 0;
 
     // some getters to check the state
     virtual bool is_open() const = 0;

@@ -40,68 +40,66 @@ namespace thinger::http{
 
     awaitable<void> websocket_connection::read_loop()
     {
-        try {
-            while (ws_->is_open()) {
-                LOG_LEVEL(2, "waiting websocket data");
+        while (ws_->is_open()) {
+            LOG_LEVEL(2, "waiting websocket data");
 
-                auto bytes_transferred = co_await ws_->read_some(buffer_.write_position(), buffer_.write_capacity());
+            auto bytes_transferred = co_await ws_->read_some(buffer_.write_position(), buffer_.write_capacity());
 
-                LOG_LEVEL(2, "socket read: {} bytes", bytes_transferred);
+            // read_some returns 0 on error or close
+            if (bytes_transferred == 0) {
+                break;
+            }
 
-                // commit_write the read data
-                buffer_.commit_write(bytes_transferred);
+            LOG_LEVEL(2, "socket read: {} bytes", bytes_transferred);
 
-                // get remaining data in the frame
-                auto remaining = ws_->remaining_in_frame();
+            // commit_write the read data
+            buffer_.commit_write(bytes_transferred);
 
-                // no pending data to read from the frame
-                if(remaining==0){
+            // get remaining data in the frame
+            auto remaining = ws_->remaining_in_frame();
 
-                    // is the message complete ? FIN flag is set
-                    if(ws_->is_message_complete()){
+            // no pending data to read from the frame
+            if(remaining==0){
 
-                        // check if the message is a valid UTF8 message
-                        if(!ws_->is_binary()){
-                            if(utf8_naive(buffer_.data(), buffer_.size()) > 0){
-                                LOG_ERROR("invalid UTF8 message received!");
-                                co_return;
-                            }
+                // is the message complete ? FIN flag is set
+                if(ws_->is_message_complete()){
+
+                    // check if the message is a valid UTF8 message
+                    if(!ws_->is_binary()){
+                        if(utf8_naive(buffer_.data(), buffer_.size()) > 0){
+                            LOG_ERROR("invalid UTF8 message received!");
+                            co_return;
                         }
-
-                        if (on_frame_callback_) {
-                            std::string data(reinterpret_cast<const char *>(buffer_.data()), buffer_.size());
-                            LOG_DEBUG("decoded payload: '{}'", util::lowercase_hex_encode(data));
-                            on_frame_callback_(std::move(data), ws_->is_binary());
-                        }
-
-                        // clear processed buffer
-                        buffer_.commit_read(buffer_.size());
                     }
 
-                }else{
-                    // if the remaining data is larger than the buffer, then reserve more space
-                    if(buffer_.write_capacity() < remaining){
+                    if (on_frame_callback_) {
+                        std::string data(reinterpret_cast<const char *>(buffer_.data()), buffer_.size());
+                        LOG_DEBUG("decoded payload: '{}'", util::lowercase_hex_encode(data));
+                        on_frame_callback_(std::move(data), ws_->is_binary());
+                    }
 
-                        // check if the buffer is not going to overflow
-                        if(buffer_.size() + remaining > MAX_BUFFER_SIZE){
-                            LOG_ERROR("websocket buffer overflow. closing connection");
-                            co_return;
-                        }
+                    // clear processed buffer
+                    buffer_.commit_read(buffer_.size());
+                }
 
-                        // reserve more space
-                        if(buffer_.reserve_write_capacity(remaining, BUFFER_GROWING_SIZE)){
-                            LOG_DEBUG("buffer resized to {} bytes", buffer_.capacity());
-                        }else{
-                            LOG_ERROR("error resizing buffer to accommodate {} bytes", remaining);
-                            co_return;
-                        }
+            }else{
+                // if the remaining data is larger than the buffer, then reserve more space
+                if(buffer_.write_capacity() < remaining){
+
+                    // check if the buffer is not going to overflow
+                    if(buffer_.size() + remaining > MAX_BUFFER_SIZE){
+                        LOG_ERROR("websocket buffer overflow. closing connection");
+                        co_return;
+                    }
+
+                    // reserve more space
+                    if(buffer_.reserve_write_capacity(remaining, BUFFER_GROWING_SIZE)){
+                        LOG_DEBUG("buffer resized to {} bytes", buffer_.capacity());
+                    }else{
+                        LOG_ERROR("error resizing buffer to accommodate {} bytes", remaining);
+                        co_return;
                     }
                 }
-            }
-        } catch (const boost::system::system_error& e) {
-            if (e.code() != boost::asio::error::operation_aborted &&
-                e.code() != boost::asio::error::eof) {
-                LOG_ERROR("websocket read error: {}", e.what());
             }
         }
     }
@@ -113,24 +111,19 @@ namespace thinger::http{
 
         co_spawn(ws_->get_io_context(),
             [this, self = shared_from_this()]() -> awaitable<void> {
-                try {
-                    while(!out_queue_.empty()) {
-                        LOG_LEVEL(2, "handling websocket write, remaining in queue: {}", out_queue_.size());
-                        auto& data = out_queue_.front();
-                        ws_->set_binary(data.second);
+                while(!out_queue_.empty() && ws_->is_open()) {
+                    LOG_LEVEL(2, "handling websocket write, remaining in queue: {}", out_queue_.size());
+                    auto& data = out_queue_.front();
+                    ws_->set_binary(data.second);
 
-                        co_await ws_->write(std::string_view(data.first));
+                    co_await ws_->write(std::string_view(data.first));
 
-                        LOG_DEBUG("message sent, remaining in queue: {}", out_queue_.size());
-                        out_queue_.pop();
-                    }
-                    writing_ = false;
-                } catch (const boost::system::system_error& e) {
-                    if(e.code() != boost::asio::error::operation_aborted){
-                        LOG_ERROR("error while writing to websocket: {}", e.what());
-                    }
-                    writing_ = false;
+                    if (!ws_->is_open()) break;
+
+                    LOG_DEBUG("message sent, remaining in queue: {}", out_queue_.size());
+                    out_queue_.pop();
                 }
+                writing_ = false;
             },
             detached);
     }
@@ -162,12 +155,8 @@ namespace thinger::http{
             LOG_LEVEL(1, "closing websocket");
             co_spawn(ws_->get_io_context(),
                 [this, self]() -> awaitable<void> {
-                    try {
-                        co_await ws_->close_graceful();
-                        LOG_LEVEL(1, "websocket closed gracefully");
-                    } catch (const boost::system::system_error& e) {
-                        LOG_LEVEL(1, "websocket close result: {}", e.what());
-                    }
+                    co_await ws_->close_graceful();
+                    LOG_LEVEL(1, "websocket closed");
                 },
                 detached);
         });

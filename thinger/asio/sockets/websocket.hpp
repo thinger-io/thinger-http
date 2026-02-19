@@ -20,7 +20,7 @@ public:
     virtual ~websocket();
 
     // Socket control
-    awaitable<void> connect(
+    awaitable<boost::system::error_code> connect(
         const std::string &host,
         const std::string &port,
         std::chrono::seconds timeout) override;
@@ -28,7 +28,7 @@ public:
     awaitable<void> close_graceful();
     void cancel() override;
     bool requires_handshake() const override;
-    awaitable<void> handshake(const std::string& host = "") override;
+    awaitable<boost::system::error_code> handshake(const std::string& host = "") override;
 
     // Read operations
     awaitable<size_t> read_some(uint8_t buffer[], size_t max_size) override;
@@ -42,7 +42,7 @@ public:
     awaitable<size_t> write(const std::vector<boost::asio::const_buffer> &buffers) override;
 
     // Wait
-    awaitable<void> wait(boost::asio::socket_base::wait_type type) override;
+    awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type) override;
 
     // WebSocket-specific operations
     awaitable<void> send_ping(uint8_t buffer[] = nullptr, size_t size = 0);
@@ -66,7 +66,7 @@ public:
 private:
     // Internal helpers
     void unmask(uint8_t buffer[], size_t size);
-    awaitable<size_t> read_frame(uint8_t buffer[], size_t max_size);
+    awaitable<size_t> read_frame(uint8_t buffer[], size_t max_size, boost::system::error_code& ec);
     awaitable<size_t> send_message(uint8_t opcode, const uint8_t buffer[], size_t size);
     awaitable<void> send_close(uint8_t buffer[] = nullptr, size_t size = 0);
 

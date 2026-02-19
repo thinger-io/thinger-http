@@ -108,13 +108,14 @@ namespace thinger::http {
 			    
 			    // Compress using gzip
 			    auto data = std::make_shared<data::out_string>();
-			    try {
-				    data->get_string() = util::gzip::compress(buffer);
+			    auto compressed = util::gzip::compress(buffer);
+			    if (compressed) {
+				    data->get_string() = std::move(*compressed);
 				    auto fsCompressed = data->get_size();
 				    response->add_header("Content-Encoding", "gzip");
 				    response->set_content_length(fsCompressed);
 				    response->set_next_data(data);
-			    } catch (const std::exception& e) {
+			    } else {
 				    // If compression fails, fall back to uncompressed
 				    gzip = false;
 			    }

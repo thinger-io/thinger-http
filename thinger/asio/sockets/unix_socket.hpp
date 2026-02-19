@@ -17,11 +17,11 @@ public:
     ~unix_socket() override;
 
     // socket control
-    awaitable<void> connect(
+    awaitable<boost::system::error_code> connect(
         const std::string &host,
         const std::string &port,
         std::chrono::seconds timeout) override;
-    awaitable<void> connect(const std::string &path, std::chrono::seconds timeout);
+    awaitable<boost::system::error_code> connect(const std::string &path, std::chrono::seconds timeout);
     void close() override;
     void cancel() override;
 
@@ -37,7 +37,7 @@ public:
     awaitable<size_t> write(const std::vector<boost::asio::const_buffer> &buffers) override;
 
     // wait
-    awaitable<void> wait(boost::asio::socket_base::wait_type type) override;
+    awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type) override;
 
     // some getters to check the state
     bool is_open() const override;

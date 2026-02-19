@@ -205,7 +205,11 @@ namespace thinger::http{
         if (content.empty()) {
             return nlohmann::json{};
         }
-        return nlohmann::json::parse(content);
+        auto j = nlohmann::json::parse(content, nullptr, false);
+        if (j.is_discarded()) {
+            return nlohmann::json{};
+        }
+        return j;
     }
 
     std::string request::header(const std::string& key) const {
@@ -469,17 +473,24 @@ namespace thinger::http{
             // Decompress chunked body if Content-Encoding is set
             if (http_request_->has_header("Content-Encoding")) {
                 std::string encoding = http_request_->get_header("Content-Encoding");
-                try {
-                    if (encoding == "gzip") {
-                        body = ::thinger::util::gzip::decompress(body);
+                if (encoding == "gzip") {
+                    auto decompressed = ::thinger::util::gzip::decompress(body);
+                    if (decompressed) {
+                        body = std::move(*decompressed);
                         http_request_->remove_header("Content-Encoding");
-                    } else if (encoding == "deflate") {
-                        body = ::thinger::util::deflate::decompress(body);
-                        http_request_->remove_header("Content-Encoding");
+                    } else {
+                        LOG_ERROR("Failed to decompress gzip request body");
+                        co_return false;
                     }
-                } catch (const std::exception& e) {
-                    LOG_ERROR("Failed to decompress request body: {}", e.what());
-                    co_return false;
+                } else if (encoding == "deflate") {
+                    auto decompressed = ::thinger::util::deflate::decompress(body);
+                    if (decompressed) {
+                        body = std::move(*decompressed);
+                        http_request_->remove_header("Content-Encoding");
+                    } else {
+                        LOG_ERROR("Failed to decompress deflate request body");
+                        co_return false;
+                    }
                 }
             }
 
@@ -499,17 +510,24 @@ namespace thinger::http{
         // Decompress body if Content-Encoding is set
         if (http_request_->has_header("Content-Encoding")) {
             std::string encoding = http_request_->get_header("Content-Encoding");
-            try {
-                if (encoding == "gzip") {
-                    body = ::thinger::util::gzip::decompress(body);
+            if (encoding == "gzip") {
+                auto decompressed = ::thinger::util::gzip::decompress(body);
+                if (decompressed) {
+                    body = std::move(*decompressed);
                     http_request_->remove_header("Content-Encoding");
-                } else if (encoding == "deflate") {
-                    body = ::thinger::util::deflate::decompress(body);
-                    http_request_->remove_header("Content-Encoding");
+                } else {
+                    LOG_ERROR("Failed to decompress gzip request body");
+                    co_return false;
                 }
-            } catch (const std::exception& e) {
-                LOG_ERROR("Failed to decompress request body: {}", e.what());
-                co_return false;
+            } else if (encoding == "deflate") {
+                auto decompressed = ::thinger::util::deflate::decompress(body);
+                if (decompressed) {
+                    body = std::move(*decompressed);
+                    http_request_->remove_header("Content-Encoding");
+                } else {
+                    LOG_ERROR("Failed to decompress deflate request body");
+                    co_return false;
+                }
             }
         }
 

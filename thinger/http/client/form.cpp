@@ -38,7 +38,7 @@ form& form::file(std::string name, const std::filesystem::path& path,
     // Read file content
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs) {
-        throw std::runtime_error("Cannot open file: " + path.string());
+        return *this;
     }
 
     std::ostringstream oss;

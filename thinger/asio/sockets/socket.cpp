@@ -26,8 +26,8 @@ namespace thinger::asio {
         return false;
     }
 
-    awaitable<void> socket::handshake(const std::string& host) {
-        co_return;
+    awaitable<boost::system::error_code> socket::handshake(const std::string& host) {
+        co_return boost::system::error_code{};
     }
 
     std::map<std::string, unsigned long> socket::context_count;
