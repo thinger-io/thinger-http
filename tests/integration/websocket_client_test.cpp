@@ -153,6 +153,27 @@ TEST_CASE("HTTP Client WebSocket Integration", "[websocket][client][integration]
         ws->close();
     }
 
+    SECTION("Server closes connection on buffer overflow") {
+        http::client client;
+
+        auto ws = client.websocket(fixture.ws_url + "/ws/echo");
+        REQUIRE(ws.has_value());
+        REQUIRE(ws->is_open());
+
+        // Create message larger than websocket_connection::MAX_BUFFER_SIZE (16MB)
+        std::string large_message(17 * 1024 * 1024, 'X');
+
+        // Send oversized message - may fail mid-write when server detects overflow
+        ws->send_text(large_message);
+
+        // Server should have closed the connection after detecting buffer overflow
+        // receive() returns empty when the server-side connection is gone
+        auto [message, is_binary] = ws->receive();
+        REQUIRE(message.empty());
+
+        ws->close();
+    }
+
     SECTION("Same client can do HTTP and WebSocket") {
         http::client client;
 

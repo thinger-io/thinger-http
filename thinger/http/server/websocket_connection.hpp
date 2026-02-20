@@ -3,7 +3,7 @@
 
 #include <memory>
 #include <queue>
-#include "../util/data_buffer.hpp"
+#include <boost/asio/streambuf.hpp>
 #include "../../asio/sockets/websocket.hpp"
 #include "../../asio/sockets/socket.hpp"
 #include "../data/out_data.hpp"
@@ -19,9 +19,8 @@ public:
     * Parameter for controlling the maximum number of bytes used in the incoming
     * buffer
     */
-    static constexpr int DEFAULT_BUFFER_SIZE = 1024;        // 1KB
-    static constexpr int BUFFER_GROWING_SIZE = 1024;        // 1KB
-    static constexpr int MAX_BUFFER_SIZE = 16*1024*1024;    // 16MB
+    static constexpr size_t DEFAULT_BUFFER_SIZE = 1024;        // 1KB
+    static constexpr size_t MAX_BUFFER_SIZE = 16*1024*1024;   // 16MB
 
     /**
     * Parameter for controlling the maximum number of pending messages stored
@@ -131,7 +130,7 @@ private:
     std::queue<std::pair<std::string, bool>> out_queue_;
 
     /// Buffer for incoming data.
-    thinger::data_buffer buffer_;
+    boost::asio::streambuf buffer_{MAX_BUFFER_SIZE};
 
     /// Message listener
     //std::shared_ptr<messages::stream_handler> stream_handler_;

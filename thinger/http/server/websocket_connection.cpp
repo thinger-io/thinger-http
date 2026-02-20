@@ -2,8 +2,6 @@
 #include "../../util/hex.hpp"
 #include "../../util/types.hpp"
 #include "websocket_connection.hpp"
-#include <boost/iostreams/device/file.hpp>
-#include <boost/iostreams/stream.hpp>
 #include <utility>
 #include "../util/utf8.hpp"
 
@@ -49,10 +47,14 @@ namespace thinger::http{
 
     awaitable<void> websocket_connection::read_loop()
     {
+        size_t next_read_size = DEFAULT_BUFFER_SIZE;
+
         while (ws_->is_open()) {
             LOG_LEVEL(2, "waiting websocket data");
 
-            auto bytes_transferred = co_await ws_->read_some(buffer_.write_position(), buffer_.write_capacity());
+            auto buf = buffer_.prepare(next_read_size);
+            auto bytes_transferred = co_await ws_->read_some(
+                static_cast<uint8_t*>(buf.data()), buf.size());
 
             // read_some returns 0 on error or close
             if (bytes_transferred == 0) {
@@ -61,54 +63,50 @@ namespace thinger::http{
 
             LOG_LEVEL(2, "socket read: {} bytes", bytes_transferred);
 
-            // commit_write the read data
-            buffer_.commit_write(bytes_transferred);
+            buffer_.commit(bytes_transferred);
 
             // get remaining data in the frame
             auto remaining = ws_->remaining_in_frame();
 
             // no pending data to read from the frame
-            if(remaining==0){
+            if(remaining == 0){
 
                 // is the message complete ? FIN flag is set
                 if(ws_->is_message_complete()){
 
+                    auto readable = buffer_.data();
+                    auto* data_ptr = static_cast<const uint8_t*>(readable.data());
+                    auto data_size = readable.size();
+
                     // check if the message is a valid UTF8 message
                     if(!ws_->is_binary()){
-                        if(utf8_naive(buffer_.data(), buffer_.size()) > 0){
+                        if(utf8_naive(data_ptr, data_size) > 0){
                             LOG_ERROR("invalid UTF8 message received!");
                             co_return;
                         }
                     }
 
                     if (on_frame_callback_) {
-                        std::string data(reinterpret_cast<const char *>(buffer_.data()), buffer_.size());
+                        std::string data(reinterpret_cast<const char*>(data_ptr), data_size);
                         LOG_DEBUG("decoded payload: '{}'", util::lowercase_hex_encode(data));
                         on_frame_callback_(std::move(data), ws_->is_binary());
                     }
 
                     // clear processed buffer
-                    buffer_.commit_read(buffer_.size());
+                    buffer_.consume(buffer_.size());
                 }
+
+                next_read_size = DEFAULT_BUFFER_SIZE;
 
             }else{
-                // if the remaining data is larger than the buffer, then reserve more space
-                if(buffer_.write_capacity() < remaining){
-
-                    // check if the buffer is not going to overflow
-                    if(buffer_.size() + remaining > MAX_BUFFER_SIZE){
-                        LOG_ERROR("websocket buffer overflow. closing connection");
-                        co_return;
-                    }
-
-                    // reserve more space
-                    if(buffer_.reserve_write_capacity(remaining, BUFFER_GROWING_SIZE)){
-                        LOG_DEBUG("buffer resized to {} bytes", buffer_.capacity());
-                    }else{
-                        LOG_ERROR("error resizing buffer to accommodate {} bytes", remaining);
-                        co_return;
-                    }
+                // check if the buffer is not going to overflow
+                if(buffer_.size() + remaining > buffer_.max_size()){
+                    LOG_ERROR("websocket buffer overflow. closing connection");
+                    co_return;
                 }
+
+                // next iteration will prepare enough space for remaining frame data
+                next_read_size = remaining;
             }
         }
     }
@@ -146,12 +144,6 @@ namespace thinger::http{
     }
 
     void websocket_connection::start(){
-        // reserve default buffer size
-        if(!buffer_.reserve(DEFAULT_BUFFER_SIZE)){
-            LOG_ERROR("cannot allocate default websocket buffer: {}", DEFAULT_BUFFER_SIZE);
-            return;
-        }
-
         // handle timeout on websocket
         ws_->start_timeout();
 
