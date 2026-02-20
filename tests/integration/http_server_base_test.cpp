@@ -266,21 +266,98 @@ TEST_CASE("Server OPTIONS Method", "[server][options][integration]") {
 // The current fixture starts the server in the constructor before middleware can be added
 // TODO: Create a separate fixture that allows pre-listen configuration
 
-TEST_CASE("Server Middleware API", "[server][middleware][unit]") {
-    http::server server;
+TEST_CASE("Server Middleware Execution - modifies request", "[server][middleware][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    auto& base_url = fixture.base_url;
 
-    SECTION("Can add middleware with use()") {
-        server.use([](http::request& req, http::response& res, std::function<void()> next) {
-            next();
-        });
-        REQUIRE(true);  // API acceptance test
+    // Middleware that sets auth user on the request
+    server.use([](http::request& req, http::response& res, std::function<void()> next) {
+        req.set_auth_user("middleware-user");
+        next();
+    });
+
+    server.get("/middleware-test", [](http::request& req, http::response& res) {
+        res.json({{"user", req.get_auth_user()}});
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    SECTION("Middleware modifies request before route handler") {
+        auto response = client.get(base_url + "/middleware-test");
+        REQUIRE(response.ok());
+        REQUIRE(response.json()["user"] == "middleware-user");
+    }
+}
+
+TEST_CASE("Server Middleware Blocks Request", "[server][middleware][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    auto& base_url = fixture.base_url;
+
+    // Middleware that blocks requests without X-Api-Key header
+    server.use([](http::request& req, http::response& res, std::function<void()> next) {
+        auto http_request = req.get_http_request();
+        if (http_request && http_request->get_header("X-Api-Key").empty()) {
+            res.error(http::http_response::status::forbidden, "API key required");
+            return;
+        }
+        next();
+    });
+
+    server.get("/protected", [](http::response& res) {
+        res.json({{"secret", "data"}});
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    SECTION("Request without API key is blocked by middleware") {
+        auto response = client.get(base_url + "/protected");
+        REQUIRE(response.status() == 403);
+        REQUIRE(response.body().find("API key required") != std::string::npos);
     }
 
-    SECTION("Can add multiple middlewares") {
-        server.use([](http::request& req, http::response& res, std::function<void()> next) { next(); });
-        server.use([](http::request& req, http::response& res, std::function<void()> next) { next(); });
-        server.use([](http::request& req, http::response& res, std::function<void()> next) { next(); });
-        REQUIRE(true);  // API acceptance test
+    SECTION("Request with API key passes middleware") {
+        http::headers_map headers = {{"X-Api-Key", "my-key"}};
+        auto response = client.get(base_url + "/protected", headers);
+        REQUIRE(response.ok());
+        REQUIRE(response.json()["secret"] == "data");
+    }
+}
+
+TEST_CASE("Server Multiple Middlewares Execute In Order", "[server][middleware][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    auto& base_url = fixture.base_url;
+
+    // First middleware sets auth user
+    server.use([](http::request& req, http::response& res, std::function<void()> next) {
+        req.set_auth_user("first");
+        next();
+    });
+
+    // Second middleware appends to auth user
+    server.use([](http::request& req, http::response& res, std::function<void()> next) {
+        req.set_auth_user(req.get_auth_user() + "+second");
+        next();
+    });
+
+    server.get("/order-test", [](http::request& req, http::response& res) {
+        res.json({{"order", req.get_auth_user()}});
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    SECTION("Both middlewares execute in order") {
+        auto response = client.get(base_url + "/order-test");
+        REQUIRE(response.ok());
+        REQUIRE(response.json()["order"] == "first+second");
     }
 }
 
@@ -292,22 +369,39 @@ TEST_CASE("Server Middleware API", "[server][middleware][unit]") {
 // The current fixture starts the server in the constructor before routes can be set
 // TODO: Create a separate fixture that allows pre-listen configuration
 
-TEST_CASE("Server set_not_found_handler API", "[server][notfound][unit]") {
-    http::server server;
+TEST_CASE("Server Not Found Handler Integration", "[server][notfound][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    auto& base_url = fixture.base_url;
 
-    SECTION("Can set response-only not found handler") {
-        server.set_not_found_handler([](http::response& res) {
-            res.status(http::http_response::status::not_found);
-            res.json({{"error", "not_found"}});
-        });
-        REQUIRE(true);  // API acceptance test
+    // Set custom not-found handler with JSON response
+    server.set_not_found_handler([](http::request& req, http::response& res) {
+        auto http_request = req.get_http_request();
+        std::string uri = http_request ? http_request->get_uri() : "unknown";
+        res.json({{"error", "not_found"}, {"path", uri}}, http::http_response::status::not_found);
+    });
+
+    // One registered route for comparison
+    server.get("/exists", [](http::response& res) {
+        res.json({{"found", true}});
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    SECTION("Registered route works normally") {
+        auto response = client.get(base_url + "/exists");
+        REQUIRE(response.ok());
+        REQUIRE(response.json()["found"] == true);
     }
 
-    SECTION("Can set request-response not found handler") {
-        server.set_not_found_handler([](http::request& req, http::response& res) {
-            res.status(http::http_response::status::not_found);
-        });
-        REQUIRE(true);  // API acceptance test
+    SECTION("Unregistered route triggers custom not-found handler") {
+        auto response = client.get(base_url + "/does-not-exist");
+        REQUIRE(response.status() == 404);
+        auto json = response.json();
+        REQUIRE(json["error"] == "not_found");
+        REQUIRE(json["path"] == "/does-not-exist");
     }
 }
 
@@ -346,11 +440,22 @@ TEST_CASE("Server Configuration - CORS", "[server][config][cors][integration]") 
     http::client client;
     client.timeout(10s);
 
-    SECTION("CORS is enabled") {
+    SECTION("CORS headers are present on response") {
         auto response = client.get(base_url + "/cors-test");
         REQUIRE(response.ok());
-        // Note: CORS headers are typically added in response constructor
-        // We're mainly testing that enable_cors doesn't break anything
+        REQUIRE(response.header("Access-Control-Allow-Origin") == "*");
+        REQUIRE(response.header("Access-Control-Allow-Methods").find("GET") != std::string::npos);
+        REQUIRE(response.header("Access-Control-Allow-Methods").find("POST") != std::string::npos);
+        REQUIRE(response.header("Access-Control-Allow-Methods").find("DELETE") != std::string::npos);
+        REQUIRE(response.header("Access-Control-Allow-Headers").find("Content-Type") != std::string::npos);
+        REQUIRE(response.header("Access-Control-Allow-Headers").find("Authorization") != std::string::npos);
+        REQUIRE(response.header("Access-Control-Allow-Credentials") == "true");
+    }
+
+    SECTION("CORS preflight OPTIONS request") {
+        auto response = client.options(base_url + "/cors-test");
+        // OPTIONS on unregistered route — CORS headers should still be on matched routes
+        // Test that the server doesn't crash on OPTIONS
     }
 }
 
@@ -658,6 +763,99 @@ TEST_CASE("Server Basic Auth", "[server][auth][integration]") {
         REQUIRE(response.ok());
         auto json = response.json();
         REQUIRE(json["public"] == true);
+    }
+
+    SECTION("Non-Basic auth scheme returns 401") {
+        http::headers_map headers = {{"Authorization", "Bearer some-token"}};
+        auto response = client.get(base_url + "/protected/data", headers);
+        REQUIRE(response.status() == 401);
+    }
+
+    SECTION("WWW-Authenticate header includes realm") {
+        auto response = client.get(base_url + "/protected/data");
+        REQUIRE(response.status() == 401);
+        std::string www_auth = response.header("WWW-Authenticate");
+        REQUIRE(www_auth.find("Basic") != std::string::npos);
+        REQUIRE(www_auth.find("Test Realm") != std::string::npos);
+    }
+}
+
+TEST_CASE("Server Basic Auth with Multiple Users", "[server][auth][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    auto& base_url = fixture.base_url;
+
+    // Set up basic auth with multiple users
+    std::map<std::string, std::string> users = {
+        {"alice", "password1"},
+        {"bob", "password2"}
+    };
+    server.set_basic_auth("/api", "API Realm", users);
+
+    server.get("/api/data", [](http::request& req, http::response& res) {
+        res.json({{"user", req.get_auth_user()}});
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    SECTION("Alice can authenticate") {
+        // "alice:password1" -> base64 -> "YWxpY2U6cGFzc3dvcmQx"
+        http::headers_map headers = {{"Authorization", "Basic YWxpY2U6cGFzc3dvcmQx"}};
+        auto response = client.get(base_url + "/api/data", headers);
+        REQUIRE(response.ok());
+        REQUIRE(response.json()["user"] == "alice");
+    }
+
+    SECTION("Bob can authenticate") {
+        // "bob:password2" -> base64 -> "Ym9iOnBhc3N3b3JkMg=="
+        http::headers_map headers = {{"Authorization", "Basic Ym9iOnBhc3N3b3JkMg=="}};
+        auto response = client.get(base_url + "/api/data", headers);
+        REQUIRE(response.ok());
+        REQUIRE(response.json()["user"] == "bob");
+    }
+
+    SECTION("Unknown user is rejected") {
+        // "charlie:pass" -> base64 -> "Y2hhcmxpZTpwYXNz"
+        http::headers_map headers = {{"Authorization", "Basic Y2hhcmxpZTpwYXNz"}};
+        auto response = client.get(base_url + "/api/data", headers);
+        REQUIRE(response.status() == 401);
+    }
+}
+
+TEST_CASE("Server Basic Auth with Verify Function", "[server][auth][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    auto& base_url = fixture.base_url;
+
+    // Custom verify function that accepts any user with password "master"
+    server.set_basic_auth("/secure", "Secure Realm",
+        [](const std::string& user, const std::string& pass) {
+            return pass == "master";
+        });
+
+    server.get("/secure/info", [](http::request& req, http::response& res) {
+        res.json({{"user", req.get_auth_user()}});
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    SECTION("Any user with correct password passes") {
+        // "anyone:master" -> base64 -> "YW55b25lOm1hc3Rlcg=="
+        http::headers_map headers = {{"Authorization", "Basic YW55b25lOm1hc3Rlcg=="}};
+        auto response = client.get(base_url + "/secure/info", headers);
+        REQUIRE(response.ok());
+        REQUIRE(response.json()["user"] == "anyone");
+    }
+
+    SECTION("Wrong password is rejected") {
+        // "anyone:wrong" -> base64 -> "YW55b25lOndyb25n"
+        http::headers_map headers = {{"Authorization", "Basic YW55b25lOndyb25n"}};
+        auto response = client.get(base_url + "/secure/info", headers);
+        REQUIRE(response.status() == 401);
     }
 }
 

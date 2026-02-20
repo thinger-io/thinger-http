@@ -150,6 +150,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/routing_test.cpp)
     add_thinger_test(test_integration_routing integration/routing_test.cpp)
 endif()
 
+# Integration tests - SSE
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/sse_test.cpp)
+    add_thinger_test(test_integration_sse integration/sse_test.cpp)
+endif()
+
 # ==================== ALL TESTS RUNNER ====================
 
 # Collect all test files

@@ -648,3 +648,252 @@ TEST_CASE("Server Response Connection Info", "[server][response][integration]") 
     }
 }
 
+// ============================================================================
+// Response Compression Tests
+// ============================================================================
+
+// Compression fixture — same pattern as ServerBaseTestFixture
+struct ResponseCompressionFixture {
+    http::server server;
+    uint16_t port = 0;
+    std::thread server_thread;
+    bool server_started = false;
+
+    ResponseCompressionFixture() = default;
+
+    void start_server() {
+        if (server_started) return;
+        REQUIRE(server.listen("0.0.0.0", 0));
+        port = server.local_port();
+        server_started = true;
+
+        std::promise<void> ready;
+        server_thread = std::thread([this, &ready]() {
+            ready.set_value();
+            server.wait();
+        });
+        ready.get_future().wait();
+    }
+
+    ~ResponseCompressionFixture() {
+        if (server_started) {
+            server.stop();
+            if (server_thread.joinable()) {
+                server_thread.join();
+            }
+        }
+    }
+};
+
+// Helper: raw HTTP exchange with custom headers
+static std::string raw_exchange(uint16_t port, const std::string& raw_request) {
+    boost::asio::io_context ioc;
+    boost::asio::ip::tcp::socket sock(ioc);
+    boost::asio::ip::tcp::resolver resolver(ioc);
+    auto results = resolver.resolve("127.0.0.1", std::to_string(port));
+    boost::asio::connect(sock, results);
+
+    boost::asio::write(sock, boost::asio::buffer(raw_request));
+
+    boost::system::error_code ec;
+    boost::asio::streambuf response_buf;
+    boost::asio::read(sock, response_buf, ec);
+
+    return std::string(
+        boost::asio::buffers_begin(response_buf.data()),
+        boost::asio::buffers_end(response_buf.data()));
+}
+
+TEST_CASE("Server Response Compression - gzip", "[server][response][compression][integration]") {
+    ResponseCompressionFixture fixture;
+
+    // Large JSON (>200 bytes to trigger compression)
+    fixture.server.get("/large-json", [](http::response& res) {
+        nlohmann::json data;
+        data["message"] = "This is a large response body that should be compressed by the server "
+                          "when the client sends Accept-Encoding header with gzip or deflate. "
+                          "We need at least 200 bytes to trigger compression threshold.";
+        data["padding"] = std::string(200, 'x');
+        res.json(data);
+    });
+
+    fixture.server.get("/large-text", [](http::response& res) {
+        res.send(std::string(500, 'A'), "text/plain");
+    });
+
+    fixture.server.get("/large-xml", [](http::response& res) {
+        res.send("<root>" + std::string(300, 'x') + "</root>", "application/xml");
+    });
+
+    fixture.server.get("/large-html", [](http::response& res) {
+        res.html("<html><body>" + std::string(300, 'x') + "</body></html>");
+    });
+
+    fixture.start_server();
+
+    SECTION("Large JSON is gzip-compressed when client accepts gzip") {
+        std::string raw =
+            "GET /large-json HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Accept-Encoding: gzip\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+
+        std::string response = raw_exchange(fixture.port, raw);
+
+        REQUIRE(response.find("HTTP/1.1 200") != std::string::npos);
+        REQUIRE(response.find("Content-Encoding: gzip") != std::string::npos);
+    }
+
+    SECTION("Large text/plain is gzip-compressed") {
+        std::string raw =
+            "GET /large-text HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Accept-Encoding: gzip\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+
+        std::string response = raw_exchange(fixture.port, raw);
+
+        REQUIRE(response.find("HTTP/1.1 200") != std::string::npos);
+        REQUIRE(response.find("Content-Encoding: gzip") != std::string::npos);
+    }
+
+    SECTION("Large application/xml is gzip-compressed") {
+        std::string raw =
+            "GET /large-xml HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Accept-Encoding: gzip\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+
+        std::string response = raw_exchange(fixture.port, raw);
+
+        REQUIRE(response.find("HTTP/1.1 200") != std::string::npos);
+        REQUIRE(response.find("Content-Encoding: gzip") != std::string::npos);
+    }
+
+    SECTION("Large text/html is gzip-compressed") {
+        std::string raw =
+            "GET /large-html HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Accept-Encoding: gzip\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+
+        std::string response = raw_exchange(fixture.port, raw);
+
+        REQUIRE(response.find("HTTP/1.1 200") != std::string::npos);
+        REQUIRE(response.find("Content-Encoding: gzip") != std::string::npos);
+    }
+}
+
+TEST_CASE("Server Response Compression - deflate", "[server][response][compression][integration]") {
+    ResponseCompressionFixture fixture;
+
+    fixture.server.get("/large-json", [](http::response& res) {
+        nlohmann::json data;
+        data["message"] = "This is a large response body that should be compressed by the server "
+                          "when the client sends Accept-Encoding header with gzip or deflate. "
+                          "We need at least 200 bytes to trigger compression threshold.";
+        data["padding"] = std::string(200, 'x');
+        res.json(data);
+    });
+
+    fixture.start_server();
+
+    SECTION("Large JSON is deflate-compressed when client accepts deflate") {
+        std::string raw =
+            "GET /large-json HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Accept-Encoding: deflate\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+
+        std::string response = raw_exchange(fixture.port, raw);
+
+        REQUIRE(response.find("HTTP/1.1 200") != std::string::npos);
+        REQUIRE(response.find("Content-Encoding: deflate") != std::string::npos);
+    }
+}
+
+TEST_CASE("Server Response Compression - skipped cases", "[server][response][compression][integration]") {
+    ResponseCompressionFixture fixture;
+
+    fixture.server.get("/large-json", [](http::response& res) {
+        nlohmann::json data;
+        data["message"] = "This is a large response body that should be compressed by the server "
+                          "when the client sends Accept-Encoding header with gzip or deflate. "
+                          "We need at least 200 bytes to trigger compression threshold.";
+        data["padding"] = std::string(200, 'x');
+        res.json(data);
+    });
+
+    fixture.server.get("/small-json", [](http::response& res) {
+        res.json({{"small", true}});
+    });
+
+    fixture.server.get("/binary", [](http::response& res) {
+        std::string binary(500, '\0');
+        for (size_t i = 0; i < binary.size(); ++i) binary[i] = static_cast<char>(i % 256);
+        res.send(binary, "application/octet-stream");
+    });
+
+    fixture.start_server();
+
+    SECTION("Small response body is NOT compressed") {
+        std::string raw =
+            "GET /small-json HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Accept-Encoding: gzip\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+
+        std::string response = raw_exchange(fixture.port, raw);
+
+        REQUIRE(response.find("HTTP/1.1 200") != std::string::npos);
+        REQUIRE(response.find("Content-Encoding") == std::string::npos);
+    }
+
+    SECTION("Binary content type is NOT compressed") {
+        std::string raw =
+            "GET /binary HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Accept-Encoding: gzip\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+
+        std::string response = raw_exchange(fixture.port, raw);
+
+        REQUIRE(response.find("HTTP/1.1 200") != std::string::npos);
+        REQUIRE(response.find("Content-Encoding") == std::string::npos);
+    }
+
+    SECTION("No Accept-Encoding header means no compression") {
+        std::string raw =
+            "GET /large-json HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+
+        std::string response = raw_exchange(fixture.port, raw);
+
+        REQUIRE(response.find("HTTP/1.1 200") != std::string::npos);
+        REQUIRE(response.find("Content-Encoding") == std::string::npos);
+    }
+
+    SECTION("gzip preferred over deflate when both accepted") {
+        std::string raw =
+            "GET /large-json HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Accept-Encoding: gzip, deflate\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+
+        std::string response = raw_exchange(fixture.port, raw);
+
+        REQUIRE(response.find("HTTP/1.1 200") != std::string::npos);
+        REQUIRE(response.find("Content-Encoding: gzip") != std::string::npos);
+    }
+}
+
