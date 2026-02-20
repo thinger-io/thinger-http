@@ -39,14 +39,16 @@ bool unix_socket_server::stop() {
     // First call base class to set running_ = false
     socket_server_base::stop();
     
-    // Now close the acceptor safely
-    if (acceptor_) {
+    // Close the acceptor to cancel pending async operations, but do NOT
+    // destroy it (reset) here. The async_accept handler may still be in
+    // flight on the io_context thread and needs the acceptor alive until
+    // the handler completes. The unique_ptr will clean up on destruction.
+    if (acceptor_ && acceptor_->is_open()) {
         boost::system::error_code ec;
         acceptor_->close(ec);
         if (ec) {
             LOG_WARNING("Error closing Unix acceptor: {}", ec.message());
         }
-        acceptor_.reset();
     }
     
     // Remove the socket file when server is stopped

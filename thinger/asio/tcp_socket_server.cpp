@@ -50,13 +50,16 @@ bool tcp_socket_server::stop() {
 }
 
 void tcp_socket_server::close_acceptor() {
-    if (acceptor_) {
+    // Close the acceptor to cancel pending async operations, but do NOT
+    // destroy it (reset) here. The async_accept handler may still be in
+    // flight on the io_context thread and needs the acceptor alive until
+    // the handler completes. The unique_ptr will clean up on destruction.
+    if (acceptor_ && acceptor_->is_open()) {
         boost::system::error_code ec;
         acceptor_->close(ec);
         if (ec) {
             LOG_WARNING("Error closing TCP acceptor: {}", ec.message());
         }
-        acceptor_.reset();
     }
 }
 
