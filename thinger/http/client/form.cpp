@@ -1,11 +1,10 @@
 #include "form.hpp"
 #include "../server/mime_types.hpp"
+#include "../util/url.hpp"
 #include <fstream>
 #include <sstream>
 #include <random>
-#include <iomanip>
 #include <algorithm>
-#include <cctype>
 
 namespace thinger::http {
 
@@ -159,49 +158,30 @@ std::string form::generate_boundary() {
 }
 
 // ============================================
-// URL encoding/decoding
+// URL encoding/decoding (delegates to util::url)
 // ============================================
 
 std::string form::url_encode(const std::string& str) {
-    std::ostringstream oss;
-    oss << std::hex << std::uppercase;
-
+    // application/x-www-form-urlencoded uses '+' for space instead of '%20'
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string result;
+    result.reserve(str.size());
     for (unsigned char c : str) {
-        // Unreserved characters (RFC 3986)
         if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-            oss << c;
+            result += static_cast<char>(c);
         } else if (c == ' ') {
-            oss << '+';  // application/x-www-form-urlencoded uses + for space
+            result += '+';
         } else {
-            oss << '%' << std::setw(2) << std::setfill('0') << static_cast<int>(c);
+            result += '%';
+            result += hex[c >> 4];
+            result += hex[c & 0x0F];
         }
     }
-
-    return oss.str();
+    return result;
 }
 
 std::string form::url_decode(const std::string& str) {
-    std::string result;
-    result.reserve(str.size());
-
-    for (size_t i = 0; i < str.size(); ++i) {
-        if (str[i] == '%' && i + 2 < str.size()) {
-            int value;
-            std::istringstream iss(str.substr(i + 1, 2));
-            if (iss >> std::hex >> value) {
-                result += static_cast<char>(value);
-                i += 2;
-            } else {
-                result += str[i];
-            }
-        } else if (str[i] == '+') {
-            result += ' ';
-        } else {
-            result += str[i];
-        }
-    }
-
-    return result;
+    return util::url::url_decode(str);
 }
 
 // ============================================

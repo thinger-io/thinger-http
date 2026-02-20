@@ -7,3 +7,4 @@ endfunction()
 
 add_fuzz_target(fuzz_http_request_parser fuzz_http_request_parser.cpp)
 add_fuzz_target(fuzz_url_decode fuzz_url_decode.cpp)
+add_fuzz_target(fuzz_utf8_validate fuzz_utf8_validate.cpp)
