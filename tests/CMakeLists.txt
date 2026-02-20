@@ -49,6 +49,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/server_test.cpp)
     add_thinger_test(test_server unit/http/server/server_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/route_test.cpp)
+    add_thinger_test(test_route unit/http/server/route_test.cpp)
+endif()
+
 # Unit tests - HTTP Common
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/common/headers_test.cpp)
     add_thinger_test(test_headers unit/http/common/headers_test.cpp)
@@ -60,6 +64,10 @@ endif()
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/common/http_response_test.cpp)
     add_thinger_test(test_http_response unit/http/common/http_response_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/common/http_data_test.cpp)
+    add_thinger_test(test_http_data unit/http/common/http_data_test.cpp)
 endif()
 
 # Unit tests - ASIO
@@ -125,6 +133,16 @@ endif()
 # Integration tests - Unix Socket Server
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/unix_socket_server_test.cpp)
     add_thinger_test(test_integration_unix_socket_server integration/unix_socket_server_test.cpp)
+endif()
+
+# Integration tests - Socket I/O
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/socket_io_test.cpp)
+    add_thinger_test(test_integration_socket_io integration/socket_io_test.cpp)
+endif()
+
+# Integration tests - Routing
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/routing_test.cpp)
+    add_thinger_test(test_integration_routing integration/routing_test.cpp)
 endif()
 
 # ==================== ALL TESTS RUNNER ====================

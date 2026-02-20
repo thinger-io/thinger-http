@@ -286,17 +286,100 @@ TEST_CASE("HTTP Response edge cases", "[http][response][unit]") {
         res.set_status(http_response::status::switching_protocols);
         res.set_header("Upgrade", "websocket");
         res.set_header("Connection", "Upgrade");
-        
+
         REQUIRE(res.get_status() == http_response::status::switching_protocols);
         REQUIRE(res.get_header("Upgrade") == "websocket");
     }
-    
+
     SECTION("Large content") {
         http_response res;
         std::string large_content(1024 * 1024, 'x'); // 1MB of 'x'
         res.set_content(large_content);
-        
+
         REQUIRE(res.get_content_size() == 1024 * 1024);
         REQUIRE(res.get_header("Content-Length") == "1048576");
+    }
+}
+
+TEST_CASE("HTTP Response additional methods", "[http][response][unit]") {
+
+    SECTION("get_status_code returns integer") {
+        http_response res;
+        res.set_status(http_response::status::not_found);
+        REQUIRE(res.get_status_code() == 404);
+
+        res.set_status(http_response::status::ok);
+        REQUIRE(res.get_status_code() == 200);
+
+        res.set_status(http_response::status::internal_server_error);
+        REQUIRE(res.get_status_code() == 500);
+    }
+
+    SECTION("set_reason_phrase does not affect status") {
+        http_response res;
+        res.set_reason_phrase("Custom Reason");
+        REQUIRE(res.get_status() == http_response::status::ok);
+    }
+
+    SECTION("Mutable get_content allows modification") {
+        http_response res;
+        res.set_content("original");
+        res.get_content() = "modified";
+        REQUIRE(res.get_content() == "modified");
+    }
+
+    SECTION("Stock replies for various status codes") {
+        std::vector<http_response::status> codes = {
+            http_response::status::ok,
+            http_response::status::created,
+            http_response::status::accepted,
+            http_response::status::no_content,
+            http_response::status::moved_permanently,
+            http_response::status::moved_temporarily,
+            http_response::status::temporary_redirect,
+            http_response::status::permanent_redirect,
+            http_response::status::not_modified,
+            http_response::status::bad_request,
+            http_response::status::unauthorized,
+            http_response::status::forbidden,
+            http_response::status::internal_server_error,
+            http_response::status::service_unavailable,
+            http_response::status::too_many_requests,
+            http_response::status::timed_out,
+            http_response::status::payload_too_large
+        };
+        for (auto code : codes) {
+            auto reply = http_response::stock_http_reply(code);
+            REQUIRE(reply != nullptr);
+            REQUIRE(reply->get_status() == code);
+            REQUIRE(reply->has_header("Content-Type"));
+        }
+    }
+}
+
+TEST_CASE("HTTP Response log", "[http][response][unit]") {
+
+    SECTION("log with content does not crash") {
+        http_response res;
+        res.set_status(http_response::status::ok);
+        res.set_content("test body", "text/plain");
+        REQUIRE_NOTHROW(res.log("test", 0));
+    }
+
+    SECTION("log with large body does not crash") {
+        http_response res;
+        res.set_content(std::string(1000, 'x'), "text/plain");
+        REQUIRE_NOTHROW(res.log("test", 0));
+    }
+
+    SECTION("log with empty body does not crash") {
+        http_response res;
+        REQUIRE_NOTHROW(res.log("test", 0));
+    }
+
+    SECTION("log with proxy headers does not crash") {
+        http_response res;
+        res.add_proxy("X-Forwarded-For", "10.0.0.1");
+        REQUIRE_NOTHROW(res.log("test", 0));
     }
 }
