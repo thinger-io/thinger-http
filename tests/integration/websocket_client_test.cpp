@@ -174,6 +174,62 @@ TEST_CASE("HTTP Client WebSocket Integration", "[websocket][client][integration]
         ws->close();
     }
 
+    SECTION("Valid UTF-8 text is echoed back") {
+        http::client client;
+
+        auto ws = client.websocket(fixture.ws_url + "/ws/echo");
+        REQUIRE(ws.has_value());
+
+        // ASCII
+        REQUIRE(ws->send_text("Hello World"));
+        auto [msg1, _1] = ws->receive();
+        REQUIRE(msg1 == "Hello World");
+
+        // Multi-byte: 2-byte (Latin), 3-byte (CJK), 4-byte (emoji)
+        std::string utf8_multi = "caf\xC3\xA9 \xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E \xF0\x9F\x98\x80";
+        REQUIRE(ws->send_text(utf8_multi));
+        auto [msg2, _2] = ws->receive();
+        REQUIRE(msg2 == utf8_multi);
+
+        ws->close();
+    }
+
+    SECTION("Invalid UTF-8 text causes server to close connection") {
+        http::client client;
+
+        auto ws = client.websocket(fixture.ws_url + "/ws/echo");
+        REQUIRE(ws.has_value());
+        REQUIRE(ws->is_open());
+
+        // Send invalid UTF-8: 0xC0 is never valid as a leading byte
+        std::string invalid_utf8 = "hello\xC0\x80world";
+        ws->send_text(invalid_utf8);
+
+        // Server should reject the invalid UTF-8 and close the connection
+        auto [message, is_binary] = ws->receive();
+        REQUIRE(message.empty());
+
+        ws->close();
+    }
+
+    SECTION("Binary frames skip UTF-8 validation") {
+        http::client client;
+
+        auto ws = client.websocket(fixture.ws_url + "/ws/echo");
+        REQUIRE(ws.has_value());
+
+        // Send bytes that would be invalid UTF-8, but as binary frame
+        std::vector<uint8_t> data = {0xC0, 0x80, 0xFF, 0xFE};
+        REQUIRE(ws->send_binary(data.data(), data.size()));
+
+        // Should be echoed back without validation
+        auto [message, is_binary] = ws->receive();
+        REQUIRE(message.size() == data.size());
+        REQUIRE(is_binary);
+
+        ws->close();
+    }
+
     SECTION("Same client can do HTTP and WebSocket") {
         http::client client;
 
