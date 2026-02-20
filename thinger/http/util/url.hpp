@@ -1,9 +1,8 @@
 #ifndef THINGER_HTTP_UTIL_URL_HPP
 #define THINGER_HTTP_UTIL_URL_HPP
 
+#include <algorithm>
 #include <cctype>
-#include <iomanip>
-#include <sstream>
 #include <string>
 #include <map>
 

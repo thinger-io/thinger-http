@@ -70,6 +70,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/common/http_data_test.cpp)
     add_thinger_test(test_http_data unit/http/common/http_data_test.cpp)
 endif()
 
+# Unit tests - URL utilities
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/util/url_test.cpp)
+    add_thinger_test(test_url unit/http/util/url_test.cpp)
+endif()
+
 # Unit tests - ASIO
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/asio/workers_test.cpp)
     add_thinger_test(test_workers unit/asio/workers_test.cpp)
