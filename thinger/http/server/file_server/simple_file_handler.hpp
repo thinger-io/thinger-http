@@ -18,7 +18,7 @@
 #include <fstream>
 #include <chrono>
 
-#include "thinger/http/util/utf8.hpp"
+#include "../../util/utf8.hpp"
 
 
 namespace thinger::http {
@@ -80,7 +80,7 @@ namespace thinger::http {
             if(!extension.empty()){
                 response->set_content_type(mime_types::extension_to_type(extension));
             }else{
-                if(file_is_utf8(full_path.string())){
+                if(utf8::file_is_valid(full_path.string())){
                     response->set_content_type(mime_types::text_plain);
                 }else{
                     response->set_content_type(mime_types::application_octect_stream);

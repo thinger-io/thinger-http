@@ -80,7 +80,7 @@ namespace thinger::http{
 
                     // check if the message is a valid UTF8 message
                     if(!ws_->is_binary()){
-                        if(utf8_naive(data_ptr, data_size) > 0){
+                        if(!utf8::is_valid(data_ptr, data_size)){
                             LOG_ERROR("invalid UTF8 message received!");
                             co_return;
                         }
