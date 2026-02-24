@@ -35,15 +35,15 @@ public:
     void cancel() override;
 
     // read operations
-    awaitable<size_t> read_some(uint8_t buffer[], size_t max_size) override;
-    awaitable<size_t> read(uint8_t buffer[], size_t size) override;
-    awaitable<size_t> read(boost::asio::streambuf &buffer, size_t size) override;
-    awaitable<size_t> read_until(boost::asio::streambuf &buffer, std::string_view delim) override;
+    awaitable<io_result> read_some(uint8_t buffer[], size_t max_size) override;
+    awaitable<io_result> read(uint8_t buffer[], size_t size) override;
+    awaitable<io_result> read(boost::asio::streambuf &buffer, size_t size) override;
+    awaitable<io_result> read_until(boost::asio::streambuf &buffer, std::string_view delim) override;
 
     // write operations
-    awaitable<size_t> write(const uint8_t buffer[], size_t size) override;
-    awaitable<size_t> write(std::string_view str) override;
-    awaitable<size_t> write(const std::vector<boost::asio::const_buffer> &buffers) override;
+    awaitable<io_result> write(const uint8_t buffer[], size_t size) override;
+    awaitable<io_result> write(std::string_view str) override;
+    awaitable<io_result> write(const std::vector<boost::asio::const_buffer> &buffers) override;
 
     // wait
     awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type) override;

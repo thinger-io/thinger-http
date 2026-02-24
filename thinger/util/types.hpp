@@ -25,6 +25,9 @@ namespace thinger {
     constexpr auto use_nothrow_awaitable =
         boost::asio::as_tuple(boost::asio::use_awaitable);
 
+    // Result type for socket read/write operations (error_code + bytes transferred)
+    using io_result = std::tuple<boost::system::error_code, size_t>;
+
     // Awaitable operators for combining coroutines (||, &&)
     using namespace boost::asio::experimental::awaitable_operators;
 

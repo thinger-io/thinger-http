@@ -111,10 +111,10 @@ awaitable<size_t> websocket::read_frame(uint8_t buffer[], size_t max_size, boost
     // If there's remaining data in current frame, read it
     if (frame_remaining_ > 0) {
         auto read_size = std::min(frame_remaining_, max_size);
-        auto bytes = co_await socket_->read(buffer, read_size);
+        auto [read_ec, bytes] = co_await socket_->read(buffer, read_size);
 
-        if (bytes == 0) {
-            ec = boost::asio::error::connection_reset;
+        if (read_ec) {
+            ec = read_ec;
             co_return 0;
         }
 
@@ -125,9 +125,12 @@ awaitable<size_t> websocket::read_frame(uint8_t buffer[], size_t max_size, boost
     }
 
     // Read frame header (2 bytes minimum)
-    if (co_await socket_->read(buffer_, 2) != 2) {
-        ec = boost::asio::error::connection_reset;
-        co_return 0;
+    {
+        auto [read_ec, bytes] = co_await socket_->read(buffer_, 2);
+        if (read_ec) {
+            ec = read_ec;
+            co_return 0;
+        }
     }
     data_received_ = true;
 
@@ -194,14 +197,16 @@ awaitable<size_t> websocket::read_frame(uint8_t buffer[], size_t max_size, boost
     // Determine payload length
     uint64_t payload_size = data_size;
     if (data_size == 126) {
-        if (co_await socket_->read(buffer_, 2) != 2) {
-            ec = boost::asio::error::connection_reset;
+        auto [read_ec, bytes] = co_await socket_->read(buffer_, 2);
+        if (read_ec) {
+            ec = read_ec;
             co_return 0;
         }
         payload_size = (buffer_[0] << 8) | buffer_[1];
     } else if (data_size == 127) {
-        if (co_await socket_->read(buffer_, 8) != 8) {
-            ec = boost::asio::error::connection_reset;
+        auto [read_ec, bytes] = co_await socket_->read(buffer_, 8);
+        if (read_ec) {
+            ec = read_ec;
             co_return 0;
         }
         payload_size = 0;
@@ -214,8 +219,9 @@ awaitable<size_t> websocket::read_frame(uint8_t buffer[], size_t max_size, boost
 
     // Read mask if present
     if (masked_) {
-        if (co_await socket_->read(mask_, MASK_SIZE_BYTES) != MASK_SIZE_BYTES) {
-            ec = boost::asio::error::connection_reset;
+        auto [read_ec, bytes] = co_await socket_->read(mask_, MASK_SIZE_BYTES);
+        if (read_ec) {
+            ec = read_ec;
             co_return 0;
         }
     }
@@ -226,8 +232,9 @@ awaitable<size_t> websocket::read_frame(uint8_t buffer[], size_t max_size, boost
         uint8_t control_buffer[125];
         size_t control_size = std::min(static_cast<size_t>(payload_size), size_t(125));
         if (control_size > 0) {
-            if (co_await socket_->read(control_buffer, control_size) != control_size) {
-                ec = boost::asio::error::connection_reset;
+            auto [read_ec, bytes] = co_await socket_->read(control_buffer, control_size);
+            if (read_ec) {
+                ec = read_ec;
                 co_return 0;
             }
             if (masked_) unmask(control_buffer, control_size);
@@ -262,10 +269,10 @@ awaitable<size_t> websocket::read_frame(uint8_t buffer[], size_t max_size, boost
     }
 
     auto read_size = std::min(frame_remaining_, max_size);
-    auto bytes = co_await socket_->read(buffer, read_size);
+    auto [read_ec, bytes] = co_await socket_->read(buffer, read_size);
 
-    if (bytes == 0) {
-        ec = boost::asio::error::connection_reset;
+    if (read_ec) {
+        ec = read_ec;
         co_return 0;
     }
 
@@ -281,7 +288,7 @@ awaitable<size_t> websocket::read_frame(uint8_t buffer[], size_t max_size, boost
     co_return bytes;
 }
 
-awaitable<size_t> websocket::send_message(uint8_t opcode, const uint8_t buffer[], size_t size) {
+awaitable<io_result> websocket::send_message(uint8_t opcode, const uint8_t buffer[], size_t size) {
     std::lock_guard<std::mutex> lock(write_mutex_);
 
     uint8_t header_size = 2;
@@ -334,59 +341,59 @@ awaitable<size_t> websocket::send_message(uint8_t opcode, const uint8_t buffer[]
 
     LOG_DEBUG("sending websocket data. header: {}, payload: {}", header_size, size);
 
-    auto bytes = co_await socket_->write(output_buffers);
-    if (bytes == 0) {
-        co_return 0;
+    auto [ec, bytes] = co_await socket_->write(output_buffers);
+    if (ec) {
+        co_return io_result{ec, 0};
     }
-    co_return bytes - header_size;
+    co_return io_result{ec, bytes - header_size};
 }
 
-awaitable<size_t> websocket::read_some(uint8_t buffer[], size_t max_size) {
+awaitable<io_result> websocket::read_some(uint8_t buffer[], size_t max_size) {
     boost::system::error_code ec;
     auto bytes = co_await read_frame(buffer, max_size, ec);
     if (ec) {
         if (ec != boost::asio::error::connection_aborted) {
             LOG_ERROR("websocket read_some error: {}", ec.message());
         }
-        co_return 0;
+        co_return io_result{ec, 0};
     }
-    co_return bytes;
+    co_return io_result{{}, bytes};
 }
 
-awaitable<size_t> websocket::read(uint8_t buffer[], size_t size) {
+awaitable<io_result> websocket::read(uint8_t buffer[], size_t size) {
     boost::system::error_code ec;
     auto bytes = co_await read_frame(buffer, size, ec);
     if (ec) {
         if (ec != boost::asio::error::connection_aborted) {
             LOG_ERROR("websocket read error: {}", ec.message());
         }
-        co_return 0;
+        co_return io_result{ec, 0};
     }
-    co_return bytes;
+    co_return io_result{{}, bytes};
 }
 
-awaitable<size_t> websocket::read(boost::asio::streambuf& buffer, size_t size) {
+awaitable<io_result> websocket::read(boost::asio::streambuf& buffer, size_t size) {
     // Not supported for websocket
-    co_return 0;
+    co_return io_result{boost::asio::error::operation_not_supported, 0};
 }
 
-awaitable<size_t> websocket::read_until(boost::asio::streambuf& buffer, std::string_view delim) {
+awaitable<io_result> websocket::read_until(boost::asio::streambuf& buffer, std::string_view delim) {
     // Not supported for websocket
-    co_return 0;
+    co_return io_result{boost::asio::error::operation_not_supported, 0};
 }
 
-awaitable<size_t> websocket::write(const uint8_t buffer[], size_t size) {
+awaitable<io_result> websocket::write(const uint8_t buffer[], size_t size) {
     co_return co_await send_message(binary_ ? 0x02 : 0x01, buffer, size);
 }
 
-awaitable<size_t> websocket::write(std::string_view str) {
+awaitable<io_result> websocket::write(std::string_view str) {
     co_return co_await send_message(binary_ ? 0x02 : 0x01,
         reinterpret_cast<const uint8_t*>(str.data()), str.size());
 }
 
-awaitable<size_t> websocket::write(const std::vector<boost::asio::const_buffer>& buffers) {
+awaitable<io_result> websocket::write(const std::vector<boost::asio::const_buffer>& buffers) {
     // Not supported for websocket
-    co_return 0;
+    co_return io_result{boost::asio::error::operation_not_supported, 0};
 }
 
 awaitable<boost::system::error_code> websocket::wait(boost::asio::socket_base::wait_type type) {

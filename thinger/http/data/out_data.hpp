@@ -15,7 +15,7 @@ public:
     out_data() = default;
     virtual ~out_data() = default;
 
-    virtual awaitable<size_t> to_socket(std::shared_ptr<thinger::asio::socket> socket) {
+    virtual awaitable<io_result> to_socket(std::shared_ptr<thinger::asio::socket> socket) {
         std::vector<boost::asio::const_buffer> buffer;
         fill_buffer(buffer);
         co_return co_await socket->write(buffer);

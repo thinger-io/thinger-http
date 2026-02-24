@@ -56,8 +56,8 @@ struct TcpEchoFixture {
             co_spawn(io_ctx, [sock]() -> awaitable<void> {
                 uint8_t buf[4096];
                 while (sock->is_open()) {
-                    auto n = co_await sock->read_some(buf, sizeof(buf));
-                    if (n == 0) break;
+                    auto [ec, n] = co_await sock->read_some(buf, sizeof(buf));
+                    if (ec) break;
                     co_await sock->write(buf, n);
                 }
             }, detached);
@@ -104,8 +104,8 @@ struct UnixEchoFixture {
             co_spawn(io_ctx, [sock]() -> awaitable<void> {
                 uint8_t buf[4096];
                 while (sock->is_open()) {
-                    auto n = co_await sock->read_some(buf, sizeof(buf));
-                    if (n == 0) break;
+                    auto [ec, n] = co_await sock->read_some(buf, sizeof(buf));
+                    if (ec) break;
                     co_await sock->write(buf, n);
                 }
             }, detached);
@@ -153,11 +153,13 @@ TEST_CASE_METHOD(TcpEchoFixture, "TCP: write string_view and read_some echo",
         auto ec = co_await client.connect("127.0.0.1", port_str(), 5s);
         REQUIRE_FALSE(ec);
 
-        auto written = co_await client.write("hello echo"sv);
+        auto [w_ec, written] = co_await client.write("hello echo"sv);
+        REQUIRE_FALSE(w_ec);
         REQUIRE(written == 10);
 
         uint8_t buf[64];
-        auto n = co_await client.read_some(buf, sizeof(buf));
+        auto [r_ec, n] = co_await client.read_some(buf, sizeof(buf));
+        REQUIRE_FALSE(r_ec);
         REQUIRE(n == 10);
         REQUIRE(std::string_view(reinterpret_cast<char*>(buf), n) == "hello echo");
     });
@@ -172,11 +174,13 @@ TEST_CASE_METHOD(TcpEchoFixture, "TCP: write and read exact bytes",
         REQUIRE_FALSE(ec);
 
         const uint8_t data[] = {0x01, 0x02, 0x03, 0x04, 0x05};
-        auto written = co_await client.write(data, 5);
+        auto [w_ec, written] = co_await client.write(data, 5);
+        REQUIRE_FALSE(w_ec);
         REQUIRE(written == 5);
 
         uint8_t buf[5];
-        auto n = co_await client.read(buf, 5);
+        auto [r_ec, n] = co_await client.read(buf, 5);
+        REQUIRE_FALSE(r_ec);
         REQUIRE(n == 5);
         REQUIRE(std::memcmp(buf, data, 5) == 0);
     });
@@ -196,11 +200,13 @@ TEST_CASE_METHOD(TcpEchoFixture, "TCP: write scatter buffers and read into strea
             boost::asio::buffer(part1),
             boost::asio::buffer(part2)
         };
-        auto written = co_await client.write(buffers);
+        auto [w_ec, written] = co_await client.write(buffers);
+        REQUIRE_FALSE(w_ec);
         REQUIRE(written == 11);
 
         boost::asio::streambuf sb;
-        auto n = co_await client.read(sb, 11);
+        auto [r_ec, n] = co_await client.read(sb, 11);
+        REQUIRE_FALSE(r_ec);
         REQUIRE(n == 11);
 
         auto begin = boost::asio::buffers_begin(sb.data());
@@ -220,7 +226,8 @@ TEST_CASE_METHOD(TcpEchoFixture, "TCP: read_until delimiter",
         co_await client.write("hello\nworld\n"sv);
 
         boost::asio::streambuf sb;
-        auto n = co_await client.read_until(sb, "\n");
+        auto [r_ec, n] = co_await client.read_until(sb, "\n");
+        REQUIRE_FALSE(r_ec);
         REQUIRE(n > 0);
 
         auto begin = boost::asio::buffers_begin(sb.data());
@@ -270,8 +277,8 @@ TEST_CASE_METHOD(TcpEchoFixture, "TCP: cancel pending read",
 
         // read_some blocks because no data is sent; cancel will abort it
         uint8_t buf[64];
-        auto n = co_await client.read_some(buf, sizeof(buf));
-        REQUIRE(n == 0);
+        auto [cancel_ec, n] = co_await client.read_some(buf, sizeof(buf));
+        REQUIRE(cancel_ec);
     });
 }
 
@@ -344,11 +351,13 @@ TEST_CASE_METHOD(UnixEchoFixture, "Unix: write string_view and read_some echo",
         auto ec = co_await client.connect(socket_path, 5s);
         REQUIRE_FALSE(ec);
 
-        auto written = co_await client.write("unix echo"sv);
+        auto [w_ec, written] = co_await client.write("unix echo"sv);
+        REQUIRE_FALSE(w_ec);
         REQUIRE(written == 9);
 
         uint8_t buf[64];
-        auto n = co_await client.read_some(buf, sizeof(buf));
+        auto [r_ec, n] = co_await client.read_some(buf, sizeof(buf));
+        REQUIRE_FALSE(r_ec);
         REQUIRE(n == 9);
         REQUIRE(std::string_view(reinterpret_cast<char*>(buf), n) == "unix echo");
     });
@@ -363,11 +372,13 @@ TEST_CASE_METHOD(UnixEchoFixture, "Unix: write and read exact bytes",
         REQUIRE_FALSE(ec);
 
         const uint8_t data[] = {0xAA, 0xBB, 0xCC, 0xDD};
-        auto written = co_await client.write(data, 4);
+        auto [w_ec, written] = co_await client.write(data, 4);
+        REQUIRE_FALSE(w_ec);
         REQUIRE(written == 4);
 
         uint8_t buf[4];
-        auto n = co_await client.read(buf, 4);
+        auto [r_ec, n] = co_await client.read(buf, 4);
+        REQUIRE_FALSE(r_ec);
         REQUIRE(n == 4);
         REQUIRE(std::memcmp(buf, data, 4) == 0);
     });
@@ -384,7 +395,8 @@ TEST_CASE_METHOD(UnixEchoFixture, "Unix: read_until delimiter",
         co_await client.write("line1\nline2\n"sv);
 
         boost::asio::streambuf sb;
-        auto n = co_await client.read_until(sb, "\n");
+        auto [r_ec, n] = co_await client.read_until(sb, "\n");
+        REQUIRE_FALSE(r_ec);
         REQUIRE(n > 0);
 
         auto begin = boost::asio::buffers_begin(sb.data());
@@ -411,8 +423,8 @@ TEST_CASE_METHOD(UnixEchoFixture, "Unix: cancel pending read",
 
         // read_some blocks; cancel will abort it
         uint8_t buf[64];
-        auto n = co_await client.read_some(buf, sizeof(buf));
-        REQUIRE(n == 0);
+        auto [cancel_ec, n] = co_await client.read_some(buf, sizeof(buf));
+        REQUIRE(cancel_ec);
     });
 }
 
@@ -435,6 +447,7 @@ TEST_CASE_METHOD(UnixEchoFixture, "Unix: available bytes after echo",
 
         // Consume echoed data
         uint8_t buf[64];
-        co_await client.read_some(buf, sizeof(buf));
+        auto [r_ec, r_n] = co_await client.read_some(buf, sizeof(buf));
+        REQUIRE_FALSE(r_ec);
     });
 }

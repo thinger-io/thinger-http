@@ -31,15 +31,15 @@ public:
     awaitable<boost::system::error_code> handshake(const std::string& host = "") override;
 
     // Read operations
-    awaitable<size_t> read_some(uint8_t buffer[], size_t max_size) override;
-    awaitable<size_t> read(uint8_t buffer[], size_t size) override;
-    awaitable<size_t> read(boost::asio::streambuf &buffer, size_t size) override;
-    awaitable<size_t> read_until(boost::asio::streambuf &buffer, std::string_view delim) override;
+    awaitable<io_result> read_some(uint8_t buffer[], size_t max_size) override;
+    awaitable<io_result> read(uint8_t buffer[], size_t size) override;
+    awaitable<io_result> read(boost::asio::streambuf &buffer, size_t size) override;
+    awaitable<io_result> read_until(boost::asio::streambuf &buffer, std::string_view delim) override;
 
     // Write operations
-    awaitable<size_t> write(const uint8_t buffer[], size_t size) override;
-    awaitable<size_t> write(std::string_view str) override;
-    awaitable<size_t> write(const std::vector<boost::asio::const_buffer> &buffers) override;
+    awaitable<io_result> write(const uint8_t buffer[], size_t size) override;
+    awaitable<io_result> write(std::string_view str) override;
+    awaitable<io_result> write(const std::vector<boost::asio::const_buffer> &buffers) override;
 
     // Wait
     awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type) override;
@@ -67,7 +67,7 @@ private:
     // Internal helpers
     void unmask(uint8_t buffer[], size_t size);
     awaitable<size_t> read_frame(uint8_t buffer[], size_t max_size, boost::system::error_code& ec);
-    awaitable<size_t> send_message(uint8_t opcode, const uint8_t buffer[], size_t size);
+    awaitable<io_result> send_message(uint8_t opcode, const uint8_t buffer[], size_t size);
     awaitable<void> send_close(uint8_t buffer[] = nullptr, size_t size = 0);
 
     std::shared_ptr<socket> socket_;

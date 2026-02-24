@@ -127,69 +127,55 @@ std::string tcp_socket::get_remote_port() const {
     return "0";
 }
 
-awaitable<size_t> tcp_socket::read_some(uint8_t* buffer, size_t max_size) {
-    auto [ec, bytes] = co_await socket_.async_read_some(
+awaitable<io_result> tcp_socket::read_some(uint8_t* buffer, size_t max_size) {
+    co_return co_await socket_.async_read_some(
         boost::asio::buffer(buffer, max_size),
         use_nothrow_awaitable);
-    if (ec) co_return 0;
-    co_return bytes;
 }
 
-awaitable<size_t> tcp_socket::read(uint8_t* buffer, size_t size) {
-    auto [ec, bytes] = co_await boost::asio::async_read(
+awaitable<io_result> tcp_socket::read(uint8_t* buffer, size_t size) {
+    co_return co_await boost::asio::async_read(
         socket_,
         boost::asio::buffer(buffer, size),
         boost::asio::transfer_exactly(size),
         use_nothrow_awaitable);
-    if (ec) co_return 0;
-    co_return bytes;
 }
 
-awaitable<size_t> tcp_socket::read(boost::asio::streambuf& buffer, size_t size) {
-    auto [ec, bytes] = co_await boost::asio::async_read(
+awaitable<io_result> tcp_socket::read(boost::asio::streambuf& buffer, size_t size) {
+    co_return co_await boost::asio::async_read(
         socket_,
         buffer,
         boost::asio::transfer_exactly(size),
         use_nothrow_awaitable);
-    if (ec) co_return 0;
-    co_return bytes;
 }
 
-awaitable<size_t> tcp_socket::read_until(boost::asio::streambuf& buffer, std::string_view delim) {
-    auto [ec, bytes] = co_await boost::asio::async_read_until(
+awaitable<io_result> tcp_socket::read_until(boost::asio::streambuf& buffer, std::string_view delim) {
+    co_return co_await boost::asio::async_read_until(
         socket_,
         buffer,
         std::string(delim),
         use_nothrow_awaitable);
-    if (ec) co_return 0;
-    co_return bytes;
 }
 
-awaitable<size_t> tcp_socket::write(const uint8_t* buffer, size_t size) {
-    auto [ec, bytes] = co_await boost::asio::async_write(
+awaitable<io_result> tcp_socket::write(const uint8_t* buffer, size_t size) {
+    co_return co_await boost::asio::async_write(
         socket_,
         boost::asio::buffer(buffer, size),
         use_nothrow_awaitable);
-    if (ec) co_return 0;
-    co_return bytes;
 }
 
-awaitable<size_t> tcp_socket::write(std::string_view str) {
-    auto [ec, bytes] = co_await boost::asio::async_write(
+awaitable<io_result> tcp_socket::write(std::string_view str) {
+    co_return co_await boost::asio::async_write(
         socket_,
         boost::asio::buffer(str.data(), str.size()),
         use_nothrow_awaitable);
-    if (ec) co_return 0;
-    co_return bytes;
 }
 
-awaitable<size_t> tcp_socket::write(const std::vector<boost::asio::const_buffer>& buffers) {
-    auto [ec, bytes] = co_await boost::asio::async_write(
+awaitable<io_result> tcp_socket::write(const std::vector<boost::asio::const_buffer>& buffers) {
+    co_return co_await boost::asio::async_write(
         socket_,
         buffers,
         use_nothrow_awaitable);
-    if (ec) co_return 0;
-    co_return bytes;
 }
 
 awaitable<boost::system::error_code> tcp_socket::wait(boost::asio::socket_base::wait_type type) {

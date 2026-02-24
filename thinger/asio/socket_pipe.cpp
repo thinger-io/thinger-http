@@ -65,9 +65,10 @@ awaitable<void> socket_pipe::forward(
     try {
         std::vector<uint8_t> buffer(BUFFER_SIZE);
         while (!cancelled_) {
-            size_t n = co_await from->read_some(buffer.data(), BUFFER_SIZE);
-            if (n == 0) break;
-            co_await to->write(buffer.data(), n);
+            auto [read_ec, n] = co_await from->read_some(buffer.data(), BUFFER_SIZE);
+            if (read_ec) break;
+            auto [write_ec, written] = co_await to->write(buffer.data(), n);
+            if (write_ec) break;
             bytes_transferred.fetch_add(n, std::memory_order_relaxed);
         }
     } catch (const boost::system::system_error& e) {

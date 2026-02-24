@@ -84,7 +84,8 @@ private:
                             buffers.push_back(boost::asio::buffer(misc_strings::lf));
                         }
 
-                        co_await socket_->write(buffers);
+                        auto [write_ec, write_bytes] = co_await socket_->write(buffers);
+                        if (write_ec) break;
                         idle_ = false;
                         out_queue_.pop();
                     }

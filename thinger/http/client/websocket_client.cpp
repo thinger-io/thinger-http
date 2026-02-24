@@ -226,16 +226,16 @@ awaitable<bool> websocket_client::send_text_async(std::string message) {
     if (!is_open()) co_return false;
 
     websocket_->set_binary(false);
-    co_await websocket_->write(message);
-    co_return websocket_->is_open();
+    auto [ec, bytes] = co_await websocket_->write(message);
+    co_return !ec;
 }
 
 awaitable<bool> websocket_client::send_binary_async(std::vector<uint8_t> data) {
     if (!is_open()) co_return false;
 
     websocket_->set_binary(true);
-    co_await websocket_->write(data.data(), data.size());
-    co_return websocket_->is_open();
+    auto [ec, bytes] = co_await websocket_->write(data.data(), data.size());
+    co_return !ec;
 }
 
 awaitable<std::pair<std::string, bool>> websocket_client::receive_async() {
@@ -244,9 +244,9 @@ awaitable<std::pair<std::string, bool>> websocket_client::receive_async() {
     }
 
     std::array<uint8_t, 65536> buffer;
-    size_t bytes_read = co_await websocket_->read_some(buffer.data(), buffer.size());
+    auto [ec, bytes_read] = co_await websocket_->read_some(buffer.data(), buffer.size());
 
-    if (bytes_read == 0) {
+    if (ec) {
         co_return std::make_pair(std::string{}, false);
     }
 

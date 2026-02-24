@@ -54,69 +54,55 @@ awaitable<boost::system::error_code> ssl_socket::handshake(const std::string& ho
     }
 }
 
-awaitable<size_t> ssl_socket::read_some(uint8_t buffer[], size_t max_size) {
-    auto [ec, bytes] = co_await ssl_stream_.async_read_some(
+awaitable<io_result> ssl_socket::read_some(uint8_t buffer[], size_t max_size) {
+    co_return co_await ssl_stream_.async_read_some(
         boost::asio::buffer(buffer, max_size),
         use_nothrow_awaitable);
-    if (ec) co_return 0;
-    co_return bytes;
 }
 
-awaitable<size_t> ssl_socket::read(uint8_t buffer[], size_t size) {
-    auto [ec, bytes] = co_await boost::asio::async_read(
+awaitable<io_result> ssl_socket::read(uint8_t buffer[], size_t size) {
+    co_return co_await boost::asio::async_read(
         ssl_stream_,
         boost::asio::buffer(buffer, size),
         boost::asio::transfer_exactly(size),
         use_nothrow_awaitable);
-    if (ec) co_return 0;
-    co_return bytes;
 }
 
-awaitable<size_t> ssl_socket::read(boost::asio::streambuf& buffer, size_t size) {
-    auto [ec, bytes] = co_await boost::asio::async_read(
+awaitable<io_result> ssl_socket::read(boost::asio::streambuf& buffer, size_t size) {
+    co_return co_await boost::asio::async_read(
         ssl_stream_,
         buffer,
         boost::asio::transfer_exactly(size),
         use_nothrow_awaitable);
-    if (ec) co_return 0;
-    co_return bytes;
 }
 
-awaitable<size_t> ssl_socket::read_until(boost::asio::streambuf& buffer, std::string_view delim) {
-    auto [ec, bytes] = co_await boost::asio::async_read_until(
+awaitable<io_result> ssl_socket::read_until(boost::asio::streambuf& buffer, std::string_view delim) {
+    co_return co_await boost::asio::async_read_until(
         ssl_stream_,
         buffer,
         std::string(delim),
         use_nothrow_awaitable);
-    if (ec) co_return 0;
-    co_return bytes;
 }
 
-awaitable<size_t> ssl_socket::write(const uint8_t buffer[], size_t size) {
-    auto [ec, bytes] = co_await boost::asio::async_write(
+awaitable<io_result> ssl_socket::write(const uint8_t buffer[], size_t size) {
+    co_return co_await boost::asio::async_write(
         ssl_stream_,
         boost::asio::buffer(buffer, size),
         use_nothrow_awaitable);
-    if (ec) co_return 0;
-    co_return bytes;
 }
 
-awaitable<size_t> ssl_socket::write(std::string_view str) {
-    auto [ec, bytes] = co_await boost::asio::async_write(
+awaitable<io_result> ssl_socket::write(std::string_view str) {
+    co_return co_await boost::asio::async_write(
         ssl_stream_,
         boost::asio::buffer(str.data(), str.size()),
         use_nothrow_awaitable);
-    if (ec) co_return 0;
-    co_return bytes;
 }
 
-awaitable<size_t> ssl_socket::write(const std::vector<boost::asio::const_buffer>& buffers) {
-    auto [ec, bytes] = co_await boost::asio::async_write(
+awaitable<io_result> ssl_socket::write(const std::vector<boost::asio::const_buffer>& buffers) {
+    co_return co_await boost::asio::async_write(
         ssl_stream_,
         buffers,
         use_nothrow_awaitable);
-    if (ec) co_return 0;
-    co_return bytes;
 }
 
 bool ssl_socket::is_secure() const {

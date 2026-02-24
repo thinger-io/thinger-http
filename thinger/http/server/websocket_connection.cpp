@@ -53,11 +53,10 @@ namespace thinger::http{
             LOG_LEVEL(2, "waiting websocket data");
 
             auto buf = buffer_.prepare(next_read_size);
-            auto bytes_transferred = co_await ws_->read_some(
+            auto [ec, bytes_transferred] = co_await ws_->read_some(
                 static_cast<uint8_t*>(buf.data()), buf.size());
 
-            // read_some returns 0 on error or close
-            if (bytes_transferred == 0) {
+            if (ec) {
                 break;
             }
 
@@ -123,9 +122,9 @@ namespace thinger::http{
                     auto& data = out_queue_.front();
                     ws_->set_binary(data.second);
 
-                    co_await ws_->write(std::string_view(data.first));
+                    auto [write_ec, write_bytes] = co_await ws_->write(std::string_view(data.first));
 
-                    if (!ws_->is_open()) break;
+                    if (write_ec) break;
 
                     LOG_DEBUG("message sent, remaining in queue: {}", out_queue_.size());
                     out_queue_.pop();

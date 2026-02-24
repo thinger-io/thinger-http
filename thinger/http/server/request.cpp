@@ -261,7 +261,8 @@ namespace thinger::http{
         // Read from socket
         auto sock = get_socket();
         if (sock) {
-            co_return co_await sock->read_some(buffer, max_size);
+            auto [ec, bytes] = co_await sock->read_some(buffer, max_size);
+            co_return bytes;
         }
 
         co_return 0;
@@ -441,7 +442,7 @@ namespace thinger::http{
             auto sock = get_socket();
             if (sock) {
                 size_t remaining = size - total;
-                size_t bytes = co_await sock->read(buffer + total, remaining);
+                auto [ec, bytes] = co_await sock->read(buffer + total, remaining);
                 total += bytes;
             }
         }

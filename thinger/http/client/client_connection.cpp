@@ -74,9 +74,9 @@ awaitable<std::shared_ptr<http_response>> client_connection::read_response(bool 
     response_parser_.reset();
 
     while (true) {
-        auto bytes = co_await socket_->read_some(buffer_, MAX_BUFFER_SIZE);
+        auto [ec, bytes] = co_await socket_->read_some(buffer_, MAX_BUFFER_SIZE);
 
-        if (bytes == 0) {
+        if (ec) {
             co_return nullptr;
         }
 
@@ -194,10 +194,10 @@ awaitable<stream_result> client_connection::send_request_streaming(
 
         // Read response with streaming
         while (true) {
-            auto bytes = co_await socket_->read_some(buffer_, MAX_BUFFER_SIZE);
+            auto [ec, bytes] = co_await socket_->read_some(buffer_, MAX_BUFFER_SIZE);
 
-            if (bytes == 0) {
-                result.error = "Connection closed";
+            if (ec) {
+                result.error = "Connection closed: " + ec.message();
                 co_return;
             }
 

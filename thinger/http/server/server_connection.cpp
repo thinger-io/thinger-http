@@ -62,7 +62,8 @@ awaitable<void> server_connection::read_loop() {
         while (running_ && socket_->is_open()) {
             // If no buffered data, read from socket
             if (buffered == 0) {
-                auto bytes = co_await socket_->read_some(buffer_, MAX_BUFFER_SIZE);
+                auto [ec, bytes] = co_await socket_->read_some(buffer_, MAX_BUFFER_SIZE);
+                if (ec) break;
                 reset_timeout();
                 buffered = bytes;
             }

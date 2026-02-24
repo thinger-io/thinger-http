@@ -32,15 +32,15 @@ public:
     virtual awaitable<boost::system::error_code> handshake(const std::string &host = "");
 
     // read operations
-    virtual awaitable<size_t> read_some(uint8_t buffer[], size_t max_size) = 0;
-    virtual awaitable<size_t> read(uint8_t buffer[], size_t size) = 0;
-    virtual awaitable<size_t> read(boost::asio::streambuf &buffer, size_t size) = 0;
-    virtual awaitable<size_t> read_until(boost::asio::streambuf &buffer, std::string_view delim) = 0;
+    virtual awaitable<io_result> read_some(uint8_t buffer[], size_t max_size) = 0;
+    virtual awaitable<io_result> read(uint8_t buffer[], size_t size) = 0;
+    virtual awaitable<io_result> read(boost::asio::streambuf &buffer, size_t size) = 0;
+    virtual awaitable<io_result> read_until(boost::asio::streambuf &buffer, std::string_view delim) = 0;
 
     // write operations
-    virtual awaitable<size_t> write(const uint8_t buffer[], size_t size) = 0;
-    virtual awaitable<size_t> write(std::string_view str) = 0;
-    virtual awaitable<size_t> write(const std::vector<boost::asio::const_buffer> &buffers) = 0;
+    virtual awaitable<io_result> write(const uint8_t buffer[], size_t size) = 0;
+    virtual awaitable<io_result> write(std::string_view str) = 0;
+    virtual awaitable<io_result> write(const std::vector<boost::asio::const_buffer> &buffers) = 0;
 
     // wait
     virtual awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type) = 0;
