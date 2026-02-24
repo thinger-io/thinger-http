@@ -357,7 +357,7 @@ awaitable<io_result> websocket::read_some(uint8_t buffer[], size_t max_size) {
         }
         co_return io_result{ec, 0};
     }
-    co_return io_result{{}, bytes};
+    co_return io_result{boost::system::error_code{}, bytes};
 }
 
 awaitable<io_result> websocket::read(uint8_t buffer[], size_t size) {
@@ -369,7 +369,7 @@ awaitable<io_result> websocket::read(uint8_t buffer[], size_t size) {
         }
         co_return io_result{ec, 0};
     }
-    co_return io_result{{}, bytes};
+    co_return io_result{boost::system::error_code{}, bytes};
 }
 
 awaitable<io_result> websocket::read(boost::asio::streambuf& buffer, size_t size) {
