@@ -84,6 +84,15 @@ public:
     awaitable<client_response> post(const std::string& url, const std::string& unix_socket,
                                     std::string body = {}, std::string content_type = "application/json",
                                     headers_map headers = {});
+    awaitable<client_response> put(const std::string& url, const std::string& unix_socket,
+                                   std::string body = {}, std::string content_type = "application/json",
+                                   headers_map headers = {});
+    awaitable<client_response> patch(const std::string& url, const std::string& unix_socket,
+                                     std::string body = {}, std::string content_type = "application/json",
+                                     headers_map headers = {});
+    awaitable<client_response> del(const std::string& url, const std::string& unix_socket, headers_map headers = {});
+    awaitable<client_response> head(const std::string& url, const std::string& unix_socket, headers_map headers = {});
+    awaitable<client_response> options(const std::string& url, const std::string& unix_socket, headers_map headers = {});
 
     // Generic send with custom request
     awaitable<client_response> send(std::shared_ptr<http_request> request);

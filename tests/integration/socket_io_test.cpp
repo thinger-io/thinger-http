@@ -309,7 +309,29 @@ TEST_CASE_METHOD(TcpEchoFixture, "TCP: close active connection",
     });
 }
 
-// #10: enable/disable tcp_no_delay
+// #10: write after close returns error
+TEST_CASE_METHOD(TcpEchoFixture, "TCP: write after close returns error",
+                 "[tcp][socket][io][integration]") {
+    run_client([this](boost::asio::io_context& ctx) -> awaitable<void> {
+        tcp_socket client("test", ctx);
+        auto ec = co_await client.connect("127.0.0.1", port_str(), 5s);
+        REQUIRE_FALSE(ec);
+
+        client.close();
+        REQUIRE_FALSE(client.is_open());
+
+        auto [w_ec, written] = co_await client.write("hello"sv);
+        REQUIRE(w_ec);
+        REQUIRE(written == 0);
+
+        uint8_t buf[64];
+        auto [r_ec, n] = co_await client.read_some(buf, sizeof(buf));
+        REQUIRE(r_ec);
+        REQUIRE(n == 0);
+    });
+}
+
+// #11: enable/disable tcp_no_delay
 TEST_CASE_METHOD(TcpEchoFixture, "TCP: enable and disable tcp_no_delay",
                  "[tcp][socket][io][integration]") {
     run_client([this](boost::asio::io_context& ctx) -> awaitable<void> {
@@ -428,7 +450,29 @@ TEST_CASE_METHOD(UnixEchoFixture, "Unix: cancel pending read",
     });
 }
 
-// #16: available()
+// #16: write after close returns error
+TEST_CASE_METHOD(UnixEchoFixture, "Unix: write after close returns error",
+                 "[unix][socket][io][integration]") {
+    run_client([this](boost::asio::io_context& ctx) -> awaitable<void> {
+        unix_socket client("test", ctx);
+        auto ec = co_await client.connect(socket_path, 5s);
+        REQUIRE_FALSE(ec);
+
+        client.close();
+        REQUIRE_FALSE(client.is_open());
+
+        auto [w_ec, written] = co_await client.write("hello"sv);
+        REQUIRE(w_ec);
+        REQUIRE(written == 0);
+
+        uint8_t buf[64];
+        auto [r_ec, n] = co_await client.read_some(buf, sizeof(buf));
+        REQUIRE(r_ec);
+        REQUIRE(n == 0);
+    });
+}
+
+// #17: available()
 TEST_CASE_METHOD(UnixEchoFixture, "Unix: available bytes after echo",
                  "[unix][socket][io][integration]") {
     run_client([this](boost::asio::io_context& ctx) -> awaitable<void> {
