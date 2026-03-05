@@ -29,6 +29,7 @@ protected:
     std::string user_agent_{"ThingerHTTP/2.0"};
     bool auto_decompress_{true};
     bool verify_ssl_{true};
+    std::string unix_socket_;
 
     // Connection pool for keep-alive
     connection_pool pool_;
@@ -53,6 +54,7 @@ public:
     http_client_base& user_agent(const std::string& agent) { user_agent_ = agent; return *this; }
     http_client_base& auto_decompress(bool decompress) { auto_decompress_ = decompress; return *this; }
     http_client_base& verify_ssl(bool verify) { verify_ssl_ = verify; return *this; }
+    http_client_base& unix_socket(const std::string& path) { unix_socket_ = path; return *this; }
 
     // Configuration getters
     std::chrono::seconds get_timeout() const { return timeout_; }
@@ -64,7 +66,6 @@ public:
 
     // Request creation
     std::shared_ptr<http_request> create_request(method m, const std::string& url);
-    std::shared_ptr<http_request> create_request(method m, const std::string& url, const std::string& unix_socket);
 
     // Main HTTP methods - all return awaitable
     awaitable<client_response> get(const std::string& url, headers_map headers = {});
@@ -78,21 +79,6 @@ public:
     awaitable<client_response> del(const std::string& url, headers_map headers = {});
     awaitable<client_response> head(const std::string& url, headers_map headers = {});
     awaitable<client_response> options(const std::string& url, headers_map headers = {});
-
-    // Unix socket variants
-    awaitable<client_response> get(const std::string& url, const std::string& unix_socket, headers_map headers = {});
-    awaitable<client_response> post(const std::string& url, const std::string& unix_socket,
-                                    std::string body, std::string content_type,
-                                    headers_map headers = {});
-    awaitable<client_response> put(const std::string& url, const std::string& unix_socket,
-                                   std::string body, std::string content_type,
-                                   headers_map headers = {});
-    awaitable<client_response> patch(const std::string& url, const std::string& unix_socket,
-                                     std::string body, std::string content_type,
-                                     headers_map headers = {});
-    awaitable<client_response> del(const std::string& url, const std::string& unix_socket, headers_map headers = {});
-    awaitable<client_response> head(const std::string& url, const std::string& unix_socket, headers_map headers = {});
-    awaitable<client_response> options(const std::string& url, const std::string& unix_socket, headers_map headers = {});
 
     // Generic send with custom request
     awaitable<client_response> send(std::shared_ptr<http_request> request);

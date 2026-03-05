@@ -68,6 +68,17 @@ private:
             }}
         });
 
+        // PATCH with schema
+        server.patch("/api/users/:id", [](nlohmann::json& json, http::response& res) {
+            res.json({{"patched", true}});
+        }).schema({
+            {"type", "object"},
+            {"properties", {
+                {"name", {{"type", "string"}}},
+                {"email", {{"type", "string"}}}
+            }}
+        });
+
         // Schema with enum validation
         server.post("/api/status", [](nlohmann::json& json, http::response& res) {
             res.json({{"status", json["status"]}});
@@ -254,6 +265,24 @@ TEST_CASE("Schema validation - PUT with schema", "[server][schema]") {
     SECTION("wrong type") {
         auto res = client.put(fixture.base_url + "/api/users/123",
             R"({"name":456})", "application/json");
+        REQUIRE(res.status_code() == 400);
+    }
+}
+
+TEST_CASE("Schema validation - PATCH with schema", "[server][schema]") {
+    SchemaTestFixture fixture;
+    http::client client;
+
+    SECTION("valid") {
+        auto res = client.patch(fixture.base_url + "/api/users/123",
+            R"({"name":"Patched"})", "application/json");
+        REQUIRE(res.ok());
+        REQUIRE(res.json()["patched"] == true);
+    }
+
+    SECTION("wrong type") {
+        auto res = client.patch(fixture.base_url + "/api/users/123",
+            R"({"name":789})", "application/json");
         REQUIRE(res.status_code() == 400);
     }
 }

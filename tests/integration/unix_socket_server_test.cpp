@@ -113,17 +113,17 @@ TEST_CASE("Unix Socket GET request/response", "[unix][server][get][integration]"
 
     fixture.start_server();
     http::client client;
-    client.timeout(10s);
+    client.timeout(10s).unix_socket(fixture.socket_path);
 
     SECTION("Simple GET returns 200 with JSON body") {
-        auto response = client.get(fixture.url("/hello"), fixture.socket_path);
+        auto response = client.get(fixture.url("/hello"));
         REQUIRE(response.ok());
         auto json = response.json();
         REQUIRE(json["message"] == "hello from unix socket");
     }
 
     SECTION("GET with path parameter") {
-        auto response = client.get(fixture.url("/greet/world"), fixture.socket_path);
+        auto response = client.get(fixture.url("/greet/world"));
         REQUIRE(response.ok());
         auto json = response.json();
         REQUIRE(json["greeting"] == "hello world");
@@ -145,11 +145,11 @@ TEST_CASE("Unix Socket POST with JSON body", "[unix][server][post][integration]"
 
     fixture.start_server();
     http::client client;
-    client.timeout(10s);
+    client.timeout(10s).unix_socket(fixture.socket_path);
 
     SECTION("POST JSON body is echoed back") {
         std::string body = R"({"name": "unix_test", "value": 42})";
-        auto response = client.post(fixture.url("/echo-json"), fixture.socket_path,
+        auto response = client.post(fixture.url("/echo-json"),
                                     body, "application/json");
         REQUIRE(response.ok());
         auto json = response.json();
@@ -183,44 +183,72 @@ TEST_CASE("Unix Socket multiple HTTP methods", "[unix][server][methods][integrat
         res.json({{"method", "DELETE"}});
     });
 
+    server.patch("/resource", [](http::request& req, http::response& res) {
+        res.json({{"method", "PATCH"}, {"body", req.body()}});
+    });
+
+    server.head("/resource", [](http::response& res) {
+        res.status(http::http_response::status::ok);
+        res.header("X-Method", "HEAD");
+        res.send("");
+    });
+
+    server.options("/resource", [](http::response& res) {
+        res.header("Allow", "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS");
+        res.send("");
+    });
+
     fixture.start_server();
     http::client client;
-    client.timeout(10s);
+    client.timeout(10s).unix_socket(fixture.socket_path);
 
     SECTION("GET on /resource") {
-        auto response = client.get(fixture.url("/resource"), fixture.socket_path);
+        auto response = client.get(fixture.url("/resource"));
         REQUIRE(response.ok());
         REQUIRE(response.json()["method"] == "GET");
     }
 
     SECTION("POST on /resource") {
-        auto response = client.post(fixture.url("/resource"), fixture.socket_path,
+        auto response = client.post(fixture.url("/resource"),
                                     "", "text/plain");
         REQUIRE(response.ok());
         REQUIRE(response.json()["method"] == "POST");
     }
 
-    SECTION("PUT on /resource via generic send") {
-        auto request = std::make_shared<http::http_request>();
-        request->set_method(http::method::PUT);
-        request->set_url(fixture.url("/resource"));
-        request->set_unix_socket(fixture.socket_path);
-        request->set_content("test body", "text/plain");
-        auto response = client.send(request);
+    SECTION("PUT on /resource") {
+        auto response = client.put(fixture.url("/resource"),
+                                   "test body", "text/plain");
         REQUIRE(response.ok());
         auto json = response.json();
         REQUIRE(json["method"] == "PUT");
         REQUIRE(json["body"] == "test body");
     }
 
-    SECTION("DELETE on /resource via generic send") {
-        auto request = std::make_shared<http::http_request>();
-        request->set_method(http::method::DELETE);
-        request->set_url(fixture.url("/resource"));
-        request->set_unix_socket(fixture.socket_path);
-        auto response = client.send(request);
+    SECTION("DELETE on /resource") {
+        auto response = client.del(fixture.url("/resource"));
         REQUIRE(response.ok());
         REQUIRE(response.json()["method"] == "DELETE");
+    }
+
+    SECTION("PATCH on /resource") {
+        auto response = client.patch(fixture.url("/resource"),
+                                     "patch body", "text/plain");
+        REQUIRE(response.ok());
+        auto json = response.json();
+        REQUIRE(json["method"] == "PATCH");
+        REQUIRE(json["body"] == "patch body");
+    }
+
+    SECTION("HEAD on /resource") {
+        auto response = client.head(fixture.url("/resource"));
+        REQUIRE(response.ok());
+        REQUIRE(response.header("X-Method") == "HEAD");
+    }
+
+    SECTION("OPTIONS on /resource") {
+        auto response = client.options(fixture.url("/resource"));
+        REQUIRE(response.ok());
+        REQUIRE(response.header("Allow").find("GET") != std::string::npos);
     }
 }
 
@@ -240,11 +268,11 @@ TEST_CASE("Unix Socket multiple sequential requests", "[unix][server][sequential
 
     fixture.start_server();
     http::client client;
-    client.timeout(10s);
+    client.timeout(10s).unix_socket(fixture.socket_path);
 
     SECTION("Multiple sequential requests succeed") {
         for (int i = 1; i <= 5; ++i) {
-            auto response = client.get(fixture.url("/count"), fixture.socket_path);
+            auto response = client.get(fixture.url("/count"));
             REQUIRE(response.ok());
             REQUIRE(response.json()["count"] == i);
         }
@@ -268,11 +296,11 @@ TEST_CASE("Unix Socket custom headers", "[unix][server][headers][integration]") 
 
     fixture.start_server();
     http::client client;
-    client.timeout(10s);
+    client.timeout(10s).unix_socket(fixture.socket_path);
 
     SECTION("Send and receive custom headers") {
         http::headers_map headers = {{"X-Custom-Input", "ping"}};
-        auto response = client.get(fixture.url("/headers"), fixture.socket_path, headers);
+        auto response = client.get(fixture.url("/headers"), headers);
         REQUIRE(response.ok());
         REQUIRE(response.json()["received_header"] == "ping");
         REQUIRE(response.header("X-Custom-Output") == "pong");
@@ -293,16 +321,16 @@ TEST_CASE("Unix Socket not found handler", "[unix][server][notfound][integration
 
     fixture.start_server();
     http::client client;
-    client.timeout(10s);
+    client.timeout(10s).unix_socket(fixture.socket_path);
 
     SECTION("Request to existing route returns 200") {
-        auto response = client.get(fixture.url("/exists"), fixture.socket_path);
+        auto response = client.get(fixture.url("/exists"));
         REQUIRE(response.ok());
         REQUIRE(response.json()["found"] == true);
     }
 
     SECTION("Request to non-existent route returns 404") {
-        auto response = client.get(fixture.url("/does-not-exist"), fixture.socket_path);
+        auto response = client.get(fixture.url("/does-not-exist"));
         REQUIRE(response.status() == 404);
     }
 }
@@ -325,10 +353,10 @@ TEST_CASE("Unix Socket large response body", "[unix][server][large][integration]
 
     fixture.start_server();
     http::client client;
-    client.timeout(30s);
+    client.timeout(30s).unix_socket(fixture.socket_path);
 
     SECTION("Large response body arrives intact") {
-        auto response = client.get(fixture.url("/large"), fixture.socket_path);
+        auto response = client.get(fixture.url("/large"));
         REQUIRE(response.ok());
         REQUIRE(response.body().size() == large_size);
         REQUIRE(response.body() == large_body);

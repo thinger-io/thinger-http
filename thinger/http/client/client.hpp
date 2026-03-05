@@ -93,41 +93,6 @@ public:
         return exec(http_client_base::options(url, std::move(headers)));
     }
 
-    // Unix socket variants
-    client_response get(const std::string& url, const std::string& unix_socket, headers_map headers = {}) {
-        return exec(http_client_base::get(url, unix_socket, std::move(headers)));
-    }
-
-    client_response post(const std::string& url, const std::string& unix_socket,
-                         std::string body, std::string content_type,
-                         headers_map headers = {}) {
-        return exec(http_client_base::post(url, unix_socket, std::move(body), std::move(content_type), std::move(headers)));
-    }
-
-    client_response put(const std::string& url, const std::string& unix_socket,
-                        std::string body, std::string content_type,
-                        headers_map headers = {}) {
-        return exec(http_client_base::put(url, unix_socket, std::move(body), std::move(content_type), std::move(headers)));
-    }
-
-    client_response patch(const std::string& url, const std::string& unix_socket,
-                          std::string body, std::string content_type,
-                          headers_map headers = {}) {
-        return exec(http_client_base::patch(url, unix_socket, std::move(body), std::move(content_type), std::move(headers)));
-    }
-
-    client_response del(const std::string& url, const std::string& unix_socket, headers_map headers = {}) {
-        return exec(http_client_base::del(url, unix_socket, std::move(headers)));
-    }
-
-    client_response head(const std::string& url, const std::string& unix_socket, headers_map headers = {}) {
-        return exec(http_client_base::head(url, unix_socket, std::move(headers)));
-    }
-
-    client_response options(const std::string& url, const std::string& unix_socket, headers_map headers = {}) {
-        return exec(http_client_base::options(url, unix_socket, std::move(headers)));
-    }
-
     // Generic send with custom request
     client_response send(std::shared_ptr<http_request> request) {
         return exec(http_client_base::send(std::move(request)));

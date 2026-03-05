@@ -24,16 +24,9 @@ std::shared_ptr<http_request> http_client_base::create_request(method m, const s
     auto request = std::make_shared<http_request>();
     request->set_method(m);
     request->set_url(url);
-    apply_default_headers(request);
-    return request;
-}
-
-std::shared_ptr<http_request> http_client_base::create_request(method m, const std::string& url,
-                                                                const std::string& unix_socket) {
-    auto request = std::make_shared<http_request>();
-    request->set_method(m);
-    request->set_url(url);
-    request->set_unix_socket(unix_socket);
+    if (!unix_socket_.empty()) {
+        request->set_unix_socket(unix_socket_);
+    }
     apply_default_headers(request);
     return request;
 }
@@ -170,82 +163,6 @@ awaitable<client_response> http_client_base::head(const std::string& url, header
 
 awaitable<client_response> http_client_base::options(const std::string& url, headers_map headers) {
     auto request = create_request(method::OPTIONS, url);
-    for (const auto& [key, value] : headers) {
-        request->add_header(key, value);
-    }
-    co_return co_await send(request);
-}
-
-// Unix socket variants
-awaitable<client_response> http_client_base::get(const std::string& url, const std::string& unix_socket,
-                                                  headers_map headers) {
-    auto request = create_request(method::GET, url, unix_socket);
-    for (const auto& [key, value] : headers) {
-        request->add_header(key, value);
-    }
-    co_return co_await send(request);
-}
-
-awaitable<client_response> http_client_base::post(const std::string& url, const std::string& unix_socket,
-                                                   std::string body, std::string content_type,
-                                                   headers_map headers) {
-    auto request = create_request(method::POST, url, unix_socket);
-    if (!body.empty()) {
-        request->set_content(std::move(body), std::move(content_type));
-    }
-    for (const auto& [key, value] : headers) {
-        request->add_header(key, value);
-    }
-    co_return co_await send(request);
-}
-
-awaitable<client_response> http_client_base::put(const std::string& url, const std::string& unix_socket,
-                                                  std::string body, std::string content_type,
-                                                  headers_map headers) {
-    auto request = create_request(method::PUT, url, unix_socket);
-    if (!body.empty()) {
-        request->set_content(std::move(body), std::move(content_type));
-    }
-    for (const auto& [key, value] : headers) {
-        request->add_header(key, value);
-    }
-    co_return co_await send(request);
-}
-
-awaitable<client_response> http_client_base::patch(const std::string& url, const std::string& unix_socket,
-                                                    std::string body, std::string content_type,
-                                                    headers_map headers) {
-    auto request = create_request(method::PATCH, url, unix_socket);
-    if (!body.empty()) {
-        request->set_content(std::move(body), std::move(content_type));
-    }
-    for (const auto& [key, value] : headers) {
-        request->add_header(key, value);
-    }
-    co_return co_await send(request);
-}
-
-awaitable<client_response> http_client_base::del(const std::string& url, const std::string& unix_socket,
-                                                  headers_map headers) {
-    auto request = create_request(method::DELETE, url, unix_socket);
-    for (const auto& [key, value] : headers) {
-        request->add_header(key, value);
-    }
-    co_return co_await send(request);
-}
-
-awaitable<client_response> http_client_base::head(const std::string& url, const std::string& unix_socket,
-                                                   headers_map headers) {
-    auto request = create_request(method::HEAD, url, unix_socket);
-    for (const auto& [key, value] : headers) {
-        request->add_header(key, value);
-    }
-    co_return co_await send(request);
-}
-
-awaitable<client_response> http_client_base::options(const std::string& url, const std::string& unix_socket,
-                                                      headers_map headers) {
-    auto request = create_request(method::OPTIONS, url, unix_socket);
     for (const auto& [key, value] : headers) {
         request->add_header(key, value);
     }
