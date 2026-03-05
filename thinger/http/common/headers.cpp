@@ -1,4 +1,5 @@
 #include "headers.hpp"
+#include <charconv>
 #include <regex>
 #include "../../util/logger.hpp"
 
@@ -29,10 +30,8 @@ namespace thinger::http{
         if(is_header(key, header::accept)){
             stream_ = boost::iequals(value, accept::event_stream);
         }else if(is_header(key, header::content_length)){
-            try{
-                content_length_ = boost::lexical_cast<unsigned long>(value);
-            }catch(const boost::bad_lexical_cast &)
-            {
+            auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), content_length_);
+            if (ec != std::errc{}) {
                 content_length_ = 0;
             }
         }

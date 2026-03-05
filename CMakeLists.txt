@@ -20,18 +20,6 @@ option(THINGER_HTTP_ENABLE_LOGGING "Enable spdlog logging" ON)
 option(THINGER_HTTP_ENABLE_COVERAGE "Enable code coverage" OFF)
 option(THINGER_HTTP_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(THINGER_HTTP_ENABLE_FUZZING "Enable fuzz testing with libFuzzer (requires Clang)" OFF)
-option(THINGER_HTTP_NO_EXCEPTIONS "Compile without exception support" OFF)
-
-# No-exceptions configuration
-if(THINGER_HTTP_NO_EXCEPTIONS)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        message(STATUS "Disabling C++ exceptions")
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions")
-    else()
-        message(WARNING "No-exceptions mode requires GCC or Clang")
-    endif()
-endif()
-
 # Coverage configuration
 if(THINGER_HTTP_ENABLE_COVERAGE)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -147,10 +135,6 @@ endif()
 
 if(THINGER_HTTP_ENABLE_LOGGING)
     target_compile_definitions(thinger_http PUBLIC THINGER_LOG_SPDLOG)
-endif()
-
-if(THINGER_HTTP_NO_EXCEPTIONS)
-    target_compile_definitions(thinger_http PUBLIC THINGER_HTTP_NO_EXCEPTIONS)
 endif()
 
 # Disable logging when building benchmarks

@@ -71,7 +71,6 @@ private:
         // Spawn a coroutine to handle the write
         co_spawn(socket_->get_io_context(),
             [this, self = shared_from_this()]() -> awaitable<void> {
-                try {
                     while(!out_queue_.empty()) {
                         const auto& data = out_queue_.front();
                         std::vector<boost::asio::const_buffer> buffers;
@@ -90,10 +89,6 @@ private:
                         out_queue_.pop();
                     }
                     writing_ = false;
-                } catch (const boost::system::system_error& e) {
-                    timer_.cancel();
-                    writing_ = false;
-                }
             },
             detached);
     }

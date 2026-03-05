@@ -62,22 +62,13 @@ awaitable<void> socket_pipe::forward(
     std::shared_ptr<socket> to,
     std::atomic<size_t>& bytes_transferred)
 {
-    try {
-        std::vector<uint8_t> buffer(BUFFER_SIZE);
-        while (!cancelled_) {
-            auto [read_ec, n] = co_await from->read_some(buffer.data(), BUFFER_SIZE);
-            if (read_ec) break;
-            auto [write_ec, written] = co_await to->write(buffer.data(), n);
-            if (write_ec) break;
-            bytes_transferred.fetch_add(n, std::memory_order_relaxed);
-        }
-    } catch (const boost::system::system_error& e) {
-        if (e.code() != boost::asio::error::eof &&
-            e.code() != boost::asio::error::operation_aborted) {
-            LOG_WARNING("socket_pipe forward error: {}", e.what());
-        }
-    } catch (const std::exception& e) {
-        LOG_WARNING("socket_pipe forward error: {}", e.what());
+    std::vector<uint8_t> buffer(BUFFER_SIZE);
+    while (!cancelled_) {
+        auto [read_ec, n] = co_await from->read_some(buffer.data(), BUFFER_SIZE);
+        if (read_ec) break;
+        auto [write_ec, written] = co_await to->write(buffer.data(), n);
+        if (write_ec) break;
+        bytes_transferred.fetch_add(n, std::memory_order_relaxed);
     }
     // Close both sockets to interrupt the other direction
     cancel();

@@ -2,104 +2,81 @@
 #define THINGER_UTIL_BASE64_HPP
 
 #include <string>
-#include <vector>
-#include <stdexcept>
+#include <cstdint>
+#include <array>
 
 namespace thinger::util {
 
 class base64 {
 private:
-    static constexpr const char* base64_chars = 
+    static constexpr const char encode_table[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         "abcdefghijklmnopqrstuvwxyz"
         "0123456789+/";
 
-    static inline bool is_base64(unsigned char c) {
-        return (isalnum(c) || (c == '+') || (c == '/'));
+    static const std::array<uint8_t, 256>& get_decode_table() {
+        static const auto table = [] {
+            std::array<uint8_t, 256> t{};
+            t.fill(0xFF);
+            for (uint8_t i = 0; i < 64; ++i) {
+                t[static_cast<uint8_t>(encode_table[i])] = i;
+            }
+            return t;
+        }();
+        return table;
+    }
+
+    static bool is_base64(uint8_t c) {
+        return get_decode_table()[c] != 0xFF;
     }
 
 public:
     static std::string encode(const std::string& input) {
-        return encode(reinterpret_cast<const unsigned char*>(input.c_str()), input.length());
+        return encode(reinterpret_cast<const unsigned char*>(input.data()), input.size());
     }
 
-    static std::string encode(const unsigned char* bytes_to_encode, size_t in_len) {
-        std::string ret;
-        int i = 0;
-        int j = 0;
-        unsigned char char_array_3[3];
-        unsigned char char_array_4[4];
+    static std::string encode(const unsigned char* data, size_t len) {
+        std::string result;
+        result.reserve(((len + 2) / 3) * 4);
 
-        while (in_len--) {
-            char_array_3[i++] = *(bytes_to_encode++);
-            if (i == 3) {
-                char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
-                char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
-                char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
-                char_array_4[3] = char_array_3[2] & 0x3f;
+        for (size_t i = 0; i < len; i += 3) {
+            uint32_t n = static_cast<uint32_t>(data[i]) << 16;
+            if (i + 1 < len) n |= static_cast<uint32_t>(data[i + 1]) << 8;
+            if (i + 2 < len) n |= static_cast<uint32_t>(data[i + 2]);
 
-                for(i = 0; i < 4; i++)
-                    ret += base64_chars[char_array_4[i]];
-                i = 0;
-            }
+            result += encode_table[(n >> 18) & 0x3F];
+            result += encode_table[(n >> 12) & 0x3F];
+            result += (i + 1 < len) ? encode_table[(n >> 6) & 0x3F] : '=';
+            result += (i + 2 < len) ? encode_table[n & 0x3F] : '=';
         }
 
-        if (i) {
-            for(j = i; j < 3; j++)
-                char_array_3[j] = '\0';
-
-            char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
-            char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
-            char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
-
-            for (j = 0; j < i + 1; j++)
-                ret += base64_chars[char_array_4[j]];
-
-            while((i++ < 3))
-                ret += '=';
-        }
-
-        return ret;
+        return result;
     }
 
-    static std::string decode(const std::string& encoded_string) {
-        size_t in_len = encoded_string.size();
-        int i = 0;
-        int j = 0;
-        int in_ = 0;
-        unsigned char char_array_4[4], char_array_3[3];
-        std::string ret;
+    static std::string decode(const std::string& input) {
+        const auto& table = get_decode_table();
+        std::string result;
+        result.reserve(input.size() * 3 / 4);
 
-        while (in_len-- && (encoded_string[in_] != '=') && is_base64(encoded_string[in_])) {
-            char_array_4[i++] = encoded_string[in_]; in_++;
-            if (i == 4) {
-                for (i = 0; i < 4; i++) {
-                    char_array_4[i] = static_cast<unsigned char>(std::string(base64_chars).find(char_array_4[i]));
-                }
+        uint32_t buf = 0;
+        int bits = 0;
 
-                char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
-                char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
-                char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
+        for (char c : input) {
+            if (c == '=' || c == '\0') break;
 
-                for (i = 0; i < 3; i++)
-                    ret += char_array_3[i];
-                i = 0;
+            uint8_t val = table[static_cast<uint8_t>(c)];
+            if (val == 0xFF) continue;
+
+            buf = (buf << 6) | val;
+            bits += 6;
+
+            if (bits >= 8) {
+                bits -= 8;
+                result += static_cast<char>((buf >> bits) & 0xFF);
             }
         }
 
-        if (i) {
-            for (j = 0; j < i; j++) {
-                char_array_4[j] = static_cast<unsigned char>(std::string(base64_chars).find(char_array_4[j]));
-            }
-
-            char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
-            char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
-
-            for (j = 0; j < i - 1; j++) 
-                ret += char_array_3[j];
-        }
-
-        return ret;
+        return result;
     }
 };
 
