@@ -48,6 +48,10 @@ target_link_libraries(server_upload_example PRIVATE thinger::http)
 add_executable(server_streaming_upload_example server_streaming_upload_example.cpp)
 target_link_libraries(server_streaming_upload_example PRIVATE thinger::http)
 
+# Server Schema Validation example (JSON Schema with Valijson)
+add_executable(server_schema_example server_schema_example.cpp)
+target_link_libraries(server_schema_example PRIVATE thinger::http)
+
 # Install examples
 install(TARGETS simple_http_server simple_https_server advanced_http_server
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/examples

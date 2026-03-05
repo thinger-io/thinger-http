@@ -236,6 +236,52 @@ server.serve_static("/app", "/var/www/app", "app.html");
 server.serve_static("/assets", "/var/www/assets", "");
 ```
 
+### JSON Schema Validation
+
+Validate request bodies against [JSON Schema](https://json-schema.org/) using [Valijson](https://github.com/tristanpenman/valijson). Chain `.schema()` on any route to enforce validation before the handler is called. Invalid requests get a `400 Bad Request` with error details.
+
+```cpp
+server.post("/api/users", [](nlohmann::json& json, auto& res) {
+    // json is already validated against the schema
+    res.json({{"created", true}, {"name", json["name"]}});
+}).schema({
+    {"type", "object"},
+    {"required", {"name", "email"}},
+    {"properties", {
+        {"name", {{"type", "string"}}},
+        {"email", {{"type", "string"}}},
+        {"age", {{"type", "integer"}, {"minimum", 0}}}
+    }}
+});
+```
+
+Works with all JSON handler signatures and HTTP methods:
+
+```cpp
+// With request access
+server.put("/api/users/:id", [](auto& req, nlohmann::json& json, auto& res) {
+    res.json({{"updated", true}, {"id", req["id"]}});
+}).schema({
+    {"type", "object"},
+    {"properties", {
+        {"name", {{"type", "string"}}}
+    }}
+});
+
+// Enum validation
+server.post("/api/status", [](nlohmann::json& json, auto& res) {
+    res.json({{"status", json["status"]}});
+}).schema({
+    {"type", "object"},
+    {"required", {"status"}},
+    {"properties", {
+        {"status", {{"type", "string"}, {"enum", {"active", "inactive", "pending"}}}}
+    }}
+});
+```
+
+Valijson is enabled by default. Disable with `-DTHINGER_HTTP_ENABLE_VALIJSON=OFF`.
+
 ### CORS
 
 ```cpp
@@ -294,6 +340,28 @@ auto res = client.put(url, body, content_type);
 auto res = client.del(url);
 ```
 
+### Unix Socket
+
+Connect to services via Unix domain sockets (e.g., Docker, systemd). Configure once on the client — all methods work transparently:
+
+```cpp
+thinger::http::client client;
+client.unix_socket("/var/run/docker.sock");
+
+// Same API as TCP — the socket is used automatically
+auto containers = client.get("http://localhost/containers/json");
+auto result = client.post("http://localhost/containers/create",
+    R"({"Image": "nginx"})", "application/json");
+```
+
+Also available via the request builder for per-request control:
+
+```cpp
+auto res = client.request("http://localhost/containers/json")
+    .unix_socket("/var/run/docker.sock")
+    .get();
+```
+
 ### Configuration
 
 ```cpp
@@ -301,6 +369,7 @@ client.timeout(std::chrono::seconds(30));
 client.follow_redirects(true);
 client.max_redirects(10);
 client.verify_ssl(false);  // Disable SSL verification
+client.unix_socket("/path/to/socket");  // Unix domain socket
 ```
 
 ### Request Builder (Fluent API)
@@ -663,6 +732,8 @@ thinger::logging::set_logger(logger);
 | CMake Option | Default | Description |
 |--------------|---------|-------------|
 | `THINGER_HTTP_ENABLE_LOGGING` | `ON` | Enable spdlog integration |
+| `THINGER_HTTP_ENABLE_VALIJSON` | `ON` | Enable JSON Schema validation |
+| `THINGER_HTTP_ENABLE_SSL` | `ON` | Enable SSL/TLS support |
 | `THINGER_HTTP_BUILD_TESTS` | `ON` | Build test suite |
 | `THINGER_HTTP_BUILD_EXAMPLES` | `OFF` | Build examples |
 
