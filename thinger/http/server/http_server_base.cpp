@@ -239,49 +239,73 @@ void http_server_base::set_max_listening_attempts(int attempts) {
 }
 
 // Static file serving
-void http_server_base::serve_static(const std::string& url_prefix, 
+void http_server_base::serve_static(const std::string& url_prefix,
                                const std::string& directory,
-                               bool fallback_to_index) {
+                               const std::string& fallback) {
     namespace fs = std::filesystem;
-    
-    get(url_prefix + "/:path*", [directory, fallback_to_index](request& req, response& res) {
-        // Get the requested path
+
+    // Normalize route: avoid double slash when prefix is "/"
+    std::string route = url_prefix;
+    if (!route.empty() && route.back() == '/') route.pop_back();
+    route += "/:path(.*)";
+
+    get(route, [directory, fallback](request& req, response& res) {
         std::string path = req["path"];
-        
+
+        auto canonical_dir = fs::canonical(directory);
+        bool has_fallback = !fallback.empty();
+
+        // Empty path means root request — try fallback file directly
+        if (path.empty()) {
+            if (has_fallback) {
+                auto fallback_file = canonical_dir / fallback;
+                if (fs::exists(fallback_file) && fs::is_regular_file(fallback_file)) {
+                    res.send_file(fallback_file);
+                    return;
+                }
+            }
+            res.status(http_response::status::not_found);
+            res.send("Not found");
+            return;
+        }
+
         // Construct full file path
         fs::path file_path = fs::path(directory) / path;
-        
-        // Security: ensure the resolved path is within the directory
-        auto canonical_dir = fs::canonical(directory);
         auto canonical_file = fs::weakly_canonical(file_path);
-        
+
+        // Security: ensure the resolved path is within the directory
         if (!canonical_file.string().starts_with(canonical_dir.string())) {
             res.status(http_response::status::forbidden);
             res.send("Access denied");
             return;
         }
-        
-        // Check if file exists
+
+        // Serve file if it exists
         if (fs::exists(canonical_file)) {
             if (fs::is_regular_file(canonical_file)) {
                 res.send_file(canonical_file);
-            } else if (fs::is_directory(canonical_file) && fallback_to_index) {
-                // Try index.html in the directory
-                auto index_file = canonical_file / "index.html";
-                if (fs::exists(index_file) && fs::is_regular_file(index_file)) {
-                    res.send_file(index_file);
-                } else {
-                    res.status(http_response::status::not_found);
-                    res.send("Not found");
-                }
-            } else {
-                res.status(http_response::status::not_found);
-                res.send("Not found");
+                return;
             }
-        } else {
-            res.status(http_response::status::not_found);
-            res.send("Not found");
+            if (fs::is_directory(canonical_file) && has_fallback) {
+                auto fallback_file = canonical_file / fallback;
+                if (fs::exists(fallback_file) && fs::is_regular_file(fallback_file)) {
+                    res.send_file(fallback_file);
+                    return;
+                }
+            }
         }
+
+        // SPA fallback: serve root fallback file for non-existent paths
+        if (has_fallback) {
+            auto fallback_file = canonical_dir / fallback;
+            if (fs::exists(fallback_file) && fs::is_regular_file(fallback_file)) {
+                res.send_file(fallback_file);
+                return;
+            }
+        }
+
+        res.status(http_response::status::not_found);
+        res.send("Not found");
     });
 }
 

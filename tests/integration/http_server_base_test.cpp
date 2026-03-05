@@ -554,16 +554,11 @@ TEST_CASE("Server Static File Serving", "[server][static][integration]") {
     auto& server = fixture.server;
     auto& base_url = fixture.base_url;
 
-    server.serve_static("/static", temp_dir.string(), true);
+    server.serve_static("/static", temp_dir.string());
 
     fixture.start_server();
     http::client client;
     client.timeout(10s);
-
-    SECTION("Request non-existent static file returns 404") {
-        auto response = client.get(base_url + "/static/nonexistent.txt");
-        REQUIRE(response.status() == 404);
-    }
 
     SECTION("Serve existing text file with correct MIME type") {
         auto response = client.get(base_url + "/static/test.txt");
@@ -572,8 +567,7 @@ TEST_CASE("Server Static File Serving", "[server][static][integration]") {
         REQUIRE(response.content_type().find("text/plain") != std::string::npos);
     }
 
-    SECTION("Serve index.html for subdirectory with correct MIME type") {
-        // Create a subdirectory with an index.html
+    SECTION("Serve index.html for subdirectory") {
         auto subdir = temp_dir / "subdir";
         fs::create_directories(subdir);
         {
@@ -586,7 +580,58 @@ TEST_CASE("Server Static File Serving", "[server][static][integration]") {
         REQUIRE(response.content_type().find("text/html") != std::string::npos);
     }
 
+    SECTION("SPA fallback serves index.html for non-existent paths") {
+        auto response = client.get(base_url + "/static/app/dashboard");
+        REQUIRE(response.ok());
+        REQUIRE(response.body() == "<html><body>Index</body></html>");
+    }
+
+    SECTION("Root path serves index.html") {
+        auto response = client.get(base_url + "/static/");
+        REQUIRE(response.ok());
+        REQUIRE(response.body() == "<html><body>Index</body></html>");
+    }
+
     // Cleanup
+    fs::remove_all(temp_dir);
+}
+
+TEST_CASE("Server Static File Serving Without Fallback", "[server][static][integration]") {
+    namespace fs = std::filesystem;
+
+    auto temp_dir = fs::temp_directory_path() / "thinger_static_nofallback_test";
+    fs::create_directories(temp_dir);
+    {
+        std::ofstream file(temp_dir / "test.txt");
+        file << "Hello";
+    }
+
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    auto& base_url = fixture.base_url;
+
+    server.serve_static("/static", temp_dir.string(), "");
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    SECTION("Non-existent file returns 404 without fallback") {
+        auto response = client.get(base_url + "/static/nonexistent.txt");
+        REQUIRE(response.status() == 404);
+    }
+
+    SECTION("Existing file still served") {
+        auto response = client.get(base_url + "/static/test.txt");
+        REQUIRE(response.ok());
+        REQUIRE(response.body() == "Hello");
+    }
+
+    SECTION("Root path returns 404 without fallback") {
+        auto response = client.get(base_url + "/static/");
+        REQUIRE(response.status() == 404);
+    }
+
     fs::remove_all(temp_dir);
 }
 

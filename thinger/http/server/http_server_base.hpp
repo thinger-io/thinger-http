@@ -155,9 +155,9 @@ public:
     void set_max_listening_attempts(int attempts);
     
     // Static file serving
-    void serve_static(const std::string& url_prefix, 
+    void serve_static(const std::string& url_prefix,
                      const std::string& directory,
-                     bool fallback_to_index = true);
+                     const std::string& fallback = "index.html");
     
     // Server control
     virtual bool listen(const std::string& host, uint16_t port);

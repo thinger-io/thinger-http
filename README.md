@@ -226,11 +226,14 @@ res.error(http::http_response::status::not_found, "Not found");
 ### Static Files
 
 ```cpp
-// Serve directory with fallback to index.html
+// Serve directory with fallback to index.html (default)
 server.serve_static("/static", "/var/www/static");
 
-// Without fallback to index
-server.serve_static("/assets", "/var/www/assets", false);
+// Custom fallback file
+server.serve_static("/app", "/var/www/app", "app.html");
+
+// Without fallback (returns 404 for non-existent files)
+server.serve_static("/assets", "/var/www/assets", "");
 ```
 
 ### CORS
