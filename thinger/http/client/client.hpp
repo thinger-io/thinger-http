@@ -99,19 +99,19 @@ public:
     }
 
     client_response post(const std::string& url, const std::string& unix_socket,
-                         std::string body = {}, std::string content_type = "application/json",
+                         std::string body, std::string content_type,
                          headers_map headers = {}) {
         return exec(http_client_base::post(url, unix_socket, std::move(body), std::move(content_type), std::move(headers)));
     }
 
     client_response put(const std::string& url, const std::string& unix_socket,
-                        std::string body = {}, std::string content_type = "application/json",
+                        std::string body, std::string content_type,
                         headers_map headers = {}) {
         return exec(http_client_base::put(url, unix_socket, std::move(body), std::move(content_type), std::move(headers)));
     }
 
     client_response patch(const std::string& url, const std::string& unix_socket,
-                          std::string body = {}, std::string content_type = "application/json",
+                          std::string body, std::string content_type,
                           headers_map headers = {}) {
         return exec(http_client_base::patch(url, unix_socket, std::move(body), std::move(content_type), std::move(headers)));
     }

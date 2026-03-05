@@ -20,6 +20,7 @@ option(THINGER_HTTP_ENABLE_LOGGING "Enable spdlog logging" ON)
 option(THINGER_HTTP_ENABLE_COVERAGE "Enable code coverage" OFF)
 option(THINGER_HTTP_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(THINGER_HTTP_ENABLE_FUZZING "Enable fuzz testing with libFuzzer (requires Clang)" OFF)
+option(THINGER_HTTP_ENABLE_VALIJSON "Enable JSON Schema validation with Valijson" ON)
 # Coverage configuration
 if(THINGER_HTTP_ENABLE_COVERAGE)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -87,6 +88,18 @@ if(THINGER_HTTP_ENABLE_LOGGING)
     endif()
 endif()
 
+if(THINGER_HTTP_ENABLE_VALIJSON)
+    FetchContent_Declare(
+        valijson
+        GIT_REPOSITORY https://github.com/tristanpenman/valijson.git
+        GIT_TAG v1.0.3
+        GIT_SHALLOW TRUE
+    )
+    set(valijson_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(valijson_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(valijson)
+endif()
+
 # Collect source files
 file(GLOB_RECURSE THINGER_SOURCES 
     ${CMAKE_CURRENT_SOURCE_DIR}/thinger/*.cpp
@@ -128,6 +141,10 @@ target_link_libraries(thinger_http
         $<$<BOOL:${THINGER_HTTP_ENABLE_LOGGING}>:spdlog::spdlog>
 )
 
+if(THINGER_HTTP_ENABLE_VALIJSON)
+    target_link_libraries(thinger_http PUBLIC ValiJSON::valijson)
+endif()
+
 # Compile definitions
 if(THINGER_HTTP_ENABLE_SSL)
     target_compile_definitions(thinger_http PUBLIC THINGER_HTTP_SSL_ENABLED)
@@ -135,6 +152,10 @@ endif()
 
 if(THINGER_HTTP_ENABLE_LOGGING)
     target_compile_definitions(thinger_http PUBLIC THINGER_LOG_SPDLOG)
+endif()
+
+if(THINGER_HTTP_ENABLE_VALIJSON)
+    target_compile_definitions(thinger_http PUBLIC THINGER_HTTP_VALIJSON_ENABLED)
 endif()
 
 # Disable logging when building benchmarks

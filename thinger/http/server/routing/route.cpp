@@ -1,6 +1,7 @@
 #include "route.hpp"
 #include "../response.hpp"
 #include <regex>
+#include "../../../util/logger.hpp"
 
 namespace thinger::http {
 
@@ -126,10 +127,16 @@ void route::handle_request(request& req, response& res) const {
             if (json.is_discarded()) {
                 res.error(http_response::status::bad_request, "Invalid JSON");
             } else {
+#ifdef THINGER_HTTP_VALIJSON_ENABLED
+                if (!validate_json(json, res)) return;
+#endif
                 std::get<route_callback_json_response>(callback_)(json, res);
             }
         } else {
             nlohmann::json empty_json;
+#ifdef THINGER_HTTP_VALIJSON_ENABLED
+            if (!validate_json(empty_json, res)) return;
+#endif
             std::get<route_callback_json_response>(callback_)(empty_json, res);
         }
     }
@@ -145,10 +152,16 @@ void route::handle_request(request& req, response& res) const {
             if (json.is_discarded()) {
                 res.error(http_response::status::bad_request, "Invalid JSON");
             } else {
+#ifdef THINGER_HTTP_VALIJSON_ENABLED
+                if (!validate_json(json, res)) return;
+#endif
                 std::get<route_callback_request_json_response>(callback_)(req, json, res);
             }
         } else {
             nlohmann::json empty_json;
+#ifdef THINGER_HTTP_VALIJSON_ENABLED
+            if (!validate_json(empty_json, res)) return;
+#endif
             std::get<route_callback_request_json_response>(callback_)(req, empty_json, res);
         }
     }
@@ -170,5 +183,54 @@ thinger::awaitable<void> route::handle_request_coro(request& req, response& res)
 void route::parse_parameters() {
     // Parameters are now parsed in the constructor
 }
+
+route& route::schema(const nlohmann::json& json_schema) {
+#ifdef THINGER_HTTP_VALIJSON_ENABLED
+    json_schema_ = json_schema;
+    schema_ = std::make_shared<valijson::Schema>();
+    valijson::SchemaParser parser;
+    valijson::adapters::NlohmannJsonAdapter adapter(json_schema_);
+    try {
+        parser.populateSchema(adapter, *schema_);
+    } catch (const std::exception& e) {
+        LOG_ERROR("Failed to parse JSON Schema: {}", e.what());
+        schema_.reset();
+    }
+#else
+    LOG_WARNING("JSON Schema validation requested but Valijson is not enabled");
+#endif
+    return *this;
+}
+
+#ifdef THINGER_HTTP_VALIJSON_ENABLED
+bool route::validate_json(const nlohmann::json& json, response& res) const {
+    if (!schema_) return true;
+
+    valijson::Validator validator;
+    valijson::adapters::NlohmannJsonAdapter adapter(json);
+    valijson::ValidationResults results;
+
+    if (validator.validate(*schema_, adapter, &results)) {
+        return true;
+    }
+
+    // Build error response with first validation error
+    valijson::ValidationResults::Error error;
+    nlohmann::json error_response = {{"error", {{"message", "Schema validation failed"}}}};
+    if (results.popError(error)) {
+        error_response["error"]["message"] = error.description;
+        nlohmann::json context = nlohmann::json::array();
+        for (const auto& c : error.context) {
+            context.push_back(c);
+        }
+        if (!context.empty()) {
+            error_response["error"]["context"] = std::move(context);
+        }
+    }
+
+    res.json(error_response, http_response::status::bad_request);
+    return false;
+}
+#endif
 
 } // namespace thinger::http

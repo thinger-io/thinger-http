@@ -72,6 +72,11 @@ public:
         return *this;
     }
 
+    request_builder& unix_socket(const std::string& path) {
+        request_->set_unix_socket(path);
+        return *this;
+    }
+
     request_builder& protocol(std::string proto) {
         protocol_ = std::move(proto);
         return *this;

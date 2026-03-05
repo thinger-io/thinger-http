@@ -82,13 +82,13 @@ public:
     // Unix socket variants
     awaitable<client_response> get(const std::string& url, const std::string& unix_socket, headers_map headers = {});
     awaitable<client_response> post(const std::string& url, const std::string& unix_socket,
-                                    std::string body = {}, std::string content_type = "application/json",
+                                    std::string body, std::string content_type,
                                     headers_map headers = {});
     awaitable<client_response> put(const std::string& url, const std::string& unix_socket,
-                                   std::string body = {}, std::string content_type = "application/json",
+                                   std::string body, std::string content_type,
                                    headers_map headers = {});
     awaitable<client_response> patch(const std::string& url, const std::string& unix_socket,
-                                     std::string body = {}, std::string content_type = "application/json",
+                                     std::string body, std::string content_type,
                                      headers_map headers = {});
     awaitable<client_response> del(const std::string& url, const std::string& unix_socket, headers_map headers = {});
     awaitable<client_response> head(const std::string& url, const std::string& unix_socket, headers_map headers = {});

@@ -9,6 +9,14 @@
 #include "../request.hpp"
 #include "../../../util/types.hpp"
 
+#ifdef THINGER_HTTP_VALIJSON_ENABLED
+#include <valijson/schema.hpp>
+#include <valijson/schema_parser.hpp>
+#include <valijson/validator.hpp>
+#include <valijson/validation_results.hpp>
+#include <valijson/adapters/nlohmann_json_adapter.hpp>
+#endif
+
 namespace thinger::http {
 
 // Route parameters syntax:
@@ -65,9 +73,12 @@ public:
     route& deferred_body(bool enabled = true);
     bool is_deferred_body() const { return deferred_body_; }
 
+    // Set JSON Schema for request body validation
+    route& schema(const nlohmann::json& json_schema);
+
     // Set authorization level
     route& auth(auth_level level);
-    
+
     // Set description for API documentation
     route& description(const std::string& desc);
     
@@ -103,7 +114,14 @@ private:
         route_callback_request_json_response,
         route_callback_awaitable
     > callback_;
-    
+
+#ifdef THINGER_HTTP_VALIJSON_ENABLED
+    nlohmann::json json_schema_;
+    std::shared_ptr<valijson::Schema> schema_;
+
+    bool validate_json(const nlohmann::json& json, response& res) const;
+#endif
+
     void parse_parameters();
 };
 
