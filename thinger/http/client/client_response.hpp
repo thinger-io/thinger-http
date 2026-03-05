@@ -126,7 +126,8 @@ public:
     
     bool is_json() const {
         auto ct = content_type();
-        return ct.find("application/json") != std::string::npos;
+        return ct.find("application/json") != std::string::npos
+            || ct.find("+json") != std::string::npos;
     }
     
     bool is_html() const {
