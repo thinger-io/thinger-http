@@ -281,6 +281,25 @@ private:
             res.json(response);
         });
 
+        // Test content-type detection with structured suffix +json (RFC 6839)
+        server.get("/response/vendor-json", [](http::request& req, http::response& res) {
+            nlohmann::json data = {{"manifest", "v2"}};
+            res.send(data.dump(), "application/vnd.docker.distribution.manifest.v2+json");
+        });
+
+        server.get("/response/oci-json", [](http::request& req, http::response& res) {
+            nlohmann::json data = {{"index", true}};
+            res.send(data.dump(), "application/vnd.oci.image.index.v1+json");
+        });
+
+        server.get("/response/plain-json", [](http::request& req, http::response& res) {
+            res.json({{"standard", true}});
+        });
+
+        server.get("/response/not-json", [](http::request& req, http::response& res) {
+            res.send("<html></html>", "text/html");
+        });
+
     }
 
     void start_server() {
@@ -894,6 +913,39 @@ TEST_CASE("Server Response Compression - skipped cases", "[server][response][com
 
         REQUIRE(response.find("HTTP/1.1 200") != std::string::npos);
         REQUIRE(response.find("Content-Encoding: gzip") != std::string::npos);
+    }
+}
+
+TEST_CASE("Client response is_json with structured suffix +json (RFC 6839)", "[server][response][json][integration]") {
+    RequestResponseTestFixture fixture;
+    http::client client;
+    client.timeout(10s);
+
+    SECTION("application/json is recognized") {
+        auto response = client.get(fixture.base_url + "/response/plain-json");
+        REQUIRE(response.ok());
+        REQUIRE(response.is_json());
+        REQUIRE(response.json()["standard"] == true);
+    }
+
+    SECTION("vendor +json suffix is recognized") {
+        auto response = client.get(fixture.base_url + "/response/vendor-json");
+        REQUIRE(response.ok());
+        REQUIRE(response.is_json());
+        REQUIRE(response.json()["manifest"] == "v2");
+    }
+
+    SECTION("OCI +json suffix is recognized") {
+        auto response = client.get(fixture.base_url + "/response/oci-json");
+        REQUIRE(response.ok());
+        REQUIRE(response.is_json());
+        REQUIRE(response.json()["index"] == true);
+    }
+
+    SECTION("text/html is not JSON") {
+        auto response = client.get(fixture.base_url + "/response/not-json");
+        REQUIRE(response.ok());
+        REQUIRE_FALSE(response.is_json());
     }
 }
 
