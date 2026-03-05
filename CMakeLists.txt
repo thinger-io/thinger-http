@@ -137,7 +137,6 @@ target_link_libraries(thinger_http
         nlohmann_json::nlohmann_json
         $<$<BOOL:${THINGER_HTTP_ENABLE_SSL}>:OpenSSL::SSL>
         $<$<BOOL:${THINGER_HTTP_ENABLE_SSL}>:OpenSSL::Crypto>
-    PRIVATE
         $<$<BOOL:${THINGER_HTTP_ENABLE_LOGGING}>:spdlog::spdlog>
 )
 
