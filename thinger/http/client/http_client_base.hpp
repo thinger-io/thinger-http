@@ -30,6 +30,7 @@ protected:
     bool auto_decompress_{true};
     bool verify_ssl_{true};
     std::string unix_socket_;
+    size_t max_content_size_{8 * 1048576};  // 8 MB default; buffered-mode responses above this are rejected
 
     // Connection pool for keep-alive
     connection_pool pool_;
@@ -55,6 +56,7 @@ public:
     http_client_base& auto_decompress(bool decompress) { auto_decompress_ = decompress; return *this; }
     http_client_base& verify_ssl(bool verify) { verify_ssl_ = verify; return *this; }
     http_client_base& unix_socket(const std::string& path) { unix_socket_ = path; return *this; }
+    http_client_base& max_content_size(size_t size) { max_content_size_ = size; return *this; }
 
     // Configuration getters
     std::chrono::seconds get_timeout() const { return timeout_; }
@@ -63,6 +65,7 @@ public:
     const std::string& get_user_agent() const { return user_agent_; }
     bool get_auto_decompress() const { return auto_decompress_; }
     bool get_verify_ssl() const { return verify_ssl_; }
+    size_t get_max_content_size() const { return max_content_size_; }
 
     // Request creation
     std::shared_ptr<http_request> create_request(method m, const std::string& url);

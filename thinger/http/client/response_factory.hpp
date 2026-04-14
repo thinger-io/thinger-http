@@ -16,7 +16,7 @@ namespace thinger::http {
     class response_factory {
     public:
         /// Specify the maximum response size to be read
-        const size_t MAX_CONTENT_SIZE = 8*1048576;  // 1MB
+        static constexpr size_t DEFAULT_MAX_CONTENT_SIZE = 8*1048576;  // 8 MB (buffered mode only; streaming bypasses)
         const size_t MAX_HEADERS_SIZE = 8*1024;     // 8KB
 
         /// Construct ready to parse the http_request method.
@@ -117,6 +117,13 @@ namespace thinger::http {
          */
         bool is_streaming() const { return on_streaming_ != nullptr; }
 
+        /**
+         * Set the maximum response size when buffering the body. Responses
+         * larger than this are rejected. In streaming mode the limit does
+         * not apply because the body is handed off chunk-by-chunk.
+         */
+        void set_max_content_size(size_t size) { max_content_size_ = size; }
+
     private:
         /// Handle the next character of input.
         boost::tribool consume(char input, bool head_request=false);
@@ -149,6 +156,7 @@ namespace thinger::http {
         std::function<bool(const std::string_view&, size_t, size_t)> on_streaming_;
         size_t streaming_downloaded_ = 0;
         bool streaming_aborted_ = false;
+        size_t max_content_size_ = DEFAULT_MAX_CONTENT_SIZE;
 
         enum content_type{
             none,

@@ -49,6 +49,9 @@ public:
     std::shared_ptr<thinger::asio::socket> get_socket() const { return socket_; }
     bool is_open() const { return socket_ && socket_->is_open(); }
 
+    // Forward max response size to the underlying parser.
+    void set_max_content_size(size_t size) { response_parser_.set_max_content_size(size); }
+
 private:
     // Internal helpers
     awaitable<void> ensure_connected(const http_request& request);

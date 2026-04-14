@@ -378,10 +378,12 @@ namespace thinger::http{
 
     bool response_factory::on_chunk_read(size_t size){
         if(size==0) return true;
-        // check that the size meets MAX_CONTENT_SIZE
+        // In streaming mode the content is handed off chunk-by-chunk and never
+        // accumulated, so the max_content_size_ buffer limit does not apply.
+        if(on_streaming_) return true;
         size_t expected_size = get_content_read() +  size;
-        if(expected_size>MAX_CONTENT_SIZE){
-            LOG_ERROR("the response size exceeds the maximum allowed file size: %zu (%zu max)", size, MAX_CONTENT_SIZE);
+        if(expected_size>max_content_size_){
+            LOG_ERROR("the response size exceeds the maximum allowed file size: %zu (%zu max)", size, max_content_size_);
             return false;
         }
         // upgrade buffer size
@@ -390,8 +392,11 @@ namespace thinger::http{
     }
 
     bool response_factory::on_length_delimited_content(size_t size){
-        if(size>MAX_CONTENT_SIZE){
-            LOG_ERROR("the response size exceeds the maximum allowed file size: %zu (%zu max)", size, MAX_CONTENT_SIZE);
+        // In streaming mode the content is handed off chunk-by-chunk and never
+        // accumulated, so the max_content_size_ buffer limit does not apply.
+        if(on_streaming_) return true;
+        if(size>max_content_size_){
+            LOG_ERROR("the response size exceeds the maximum allowed file size: %zu (%zu max)", size, max_content_size_);
             return false;
         }
         resp->get_content().reserve(size);
