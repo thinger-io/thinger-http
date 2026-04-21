@@ -27,7 +27,7 @@ jobs:
         uses: github/codeql-action/init@v4
         with:
           languages: c-cpp
-          queries: security-extended
+          config-file: ./.github/codeql/codeql-config.yml
 
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release

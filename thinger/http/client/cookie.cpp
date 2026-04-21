@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <format>
 #include <sstream>
 #include <iomanip>
 #include <ctime>
@@ -260,11 +261,9 @@ namespace thinger::http {
         if (max_age_.has_value()) {
             oss << "; Max-Age=" << max_age_.value();
         } else if (expires_ > 0) {
-            std::time_t t = static_cast<std::time_t>(expires_);
-            std::tm* tm = std::gmtime(&t);
-            char buf[64];
-            std::strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", tm);
-            oss << "; Expires=" << buf;
+            const auto tp = std::chrono::system_clock::from_time_t(
+                static_cast<std::time_t>(expires_));
+            oss << "; Expires=" << std::format("{:%a, %d %b %Y %H:%M:%S} GMT", tp);
         }
         if (secure_) {
             oss << "; Secure";

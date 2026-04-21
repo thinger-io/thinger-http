@@ -1,0 +1,11 @@
+name: "thinger-http CodeQL config"
+
+queries:
+  - uses: security-extended
+
+paths-ignore:
+  - build/**
+  - build-*/**
+  - tests/**
+  - benchmark/**
+  - examples/**
