@@ -3,6 +3,8 @@
 #include <array>
 #include <cstring>
 
+#include <boost/asio/ssl/host_name_verification.hpp>
+
 namespace thinger::asio {
 
 ssl_socket::ssl_socket(const std::string& context, boost::asio::io_context& io_context,
@@ -43,6 +45,13 @@ awaitable<boost::system::error_code> ssl_socket::handshake(const std::string& ho
         // add support for SNI
         if (!SSL_set_tlsext_host_name(ssl_stream_.native_handle(), host.c_str())) {
             LOG_ERROR("SSL_set_tlsext_host_name failed. SNI will fail");
+        }
+        // verify the server certificate hostname when verification is enabled on the
+        // context (verify_peer); the callback is not consulted when verify_mode is verify_none
+        boost::system::error_code verify_ec;
+        ssl_stream_.set_verify_callback(boost::asio::ssl::host_name_verification(host), verify_ec);
+        if (verify_ec) {
+            LOG_ERROR("failed to enable host name verification: {}", verify_ec.message());
         }
         // client handshake
         auto [ec] = co_await ssl_stream_.async_handshake(

@@ -78,7 +78,9 @@ std::shared_ptr<client_connection> http_client_base::get_or_create_connection(
             auto ssl_context = std::make_shared<boost::asio::ssl::context>(
                 boost::asio::ssl::context::sslv23_client);
             ssl_context->set_default_verify_paths();
-            if (!verify_ssl_) {
+            if (verify_ssl_) {
+                ssl_context->set_verify_mode(boost::asio::ssl::verify_peer);
+            } else {
                 ssl_context->set_verify_mode(boost::asio::ssl::verify_none);
             }
             sock = std::make_shared<thinger::asio::ssl_socket>("http_client", io_context, ssl_context);
@@ -313,7 +315,9 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
         auto ssl_context = std::make_shared<boost::asio::ssl::context>(
             boost::asio::ssl::context::sslv23_client);
         ssl_context->set_default_verify_paths();
-        if (!verify_ssl_) {
+        if (verify_ssl_) {
+            ssl_context->set_verify_mode(boost::asio::ssl::verify_peer);
+        } else {
             ssl_context->set_verify_mode(boost::asio::ssl::verify_none);
         }
         socket = std::make_shared<asio::ssl_socket>("wss_client", io_context, ssl_context);
