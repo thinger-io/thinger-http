@@ -14,6 +14,8 @@
 #include <filesystem>
 #include <sstream>
 #include <atomic>
+#include <map>
+#include <set>
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -2528,4 +2530,55 @@ TEST_CASE("Middleware stops a coroutine JSON route before its body is read", "[s
     REQUIRE(response.starts_with("HTTP/1.1 401"));
     REQUIRE(response.find("check-ok") != std::string::npos);
     REQUIRE(handler_calls == 0);
+}
+
+// ============================================================================
+// Route metadata read by middlewares
+// ============================================================================
+
+TEST_CASE("Authorization middleware reads the permission from route metadata", "[server][meta][middleware][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    // Permissions granted to each token (stand-in for a real token store)
+    std::map<std::string, std::set<std::string>> grants = {
+        {"reader", {"Device:Read"}},
+        {"admin", {"Device:Read", "Device:Delete"}},
+    };
+
+    server.use([&grants](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+        auto* route = req.get_matched_route();
+        if (!route || !route->has_meta("permission")) co_return true;
+
+        auto permission = route->get_meta("permission").get<std::string>();
+        auto it = grants.find(req.header("Authorization"));
+        if (it == grants.end() || !it->second.contains(permission)) {
+            res.error(http::http_response::status::forbidden, "missing permission " + permission);
+            co_return false;
+        }
+        co_return true;
+    });
+
+    auto devices = server.group("/devices").tag("Devices");
+    devices.get("/:id", [](http::request& req, http::response& res) {
+        res.json({{"id", req["id"]}});
+    }).meta("permission", "Device:Read");
+    devices.del("/:id", [](http::response& res) {
+        res.json({{"deleted", true}});
+    }).meta("permission", "Device:Delete");
+    server.get("/public", [](http::response& res) { res.send("public"); });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+    const auto& base_url = fixture.base_url;
+
+    REQUIRE(client.get(base_url + "/public").ok());
+    REQUIRE(client.get(base_url + "/devices/1").status() == 403);
+    REQUIRE(client.get(base_url + "/devices/1", {{"Authorization", "reader"}}).ok());
+
+    auto denied = client.del(base_url + "/devices/1", {{"Authorization", "reader"}});
+    REQUIRE(denied.status() == 403);
+    REQUIRE(denied.body() == "missing permission Device:Delete");
+    REQUIRE(client.del(base_url + "/devices/1", {{"Authorization", "admin"}}).ok());
 }

@@ -336,3 +336,56 @@ TEST_CASE("Coroutine handler signatures", "[route][coroutine][unit]") {
         REQUIRE(r.is_deferred_body());
     }
 }
+
+TEST_CASE("Route documentation fields", "[route][docs][unit]") {
+    route r("/v1/users/:user/devices/:device([a-z0-9_-]{1,32})");
+    r.summary("Get device")
+     .description("Returns a device of the user")
+     .tag("Devices").tags({"Devices", "Users"})
+     .operation_id("getDevice")
+     .deprecated()
+     .path_param("user", "User id")
+     .path_param("device", "Device id")
+     .query_param("fields", "Fields to return", {{"type", "string"}}, false)
+     .returns(200, "The device", {{"type", "object"}}, {{"device", "d1"}})
+     .returns(404, "Device not found")
+     .example({{"name", "sensor"}})
+     .schema({{"type", "object"}});
+
+    REQUIRE(r.get_summary() == "Get device");
+    REQUIRE(r.get_description() == "Returns a device of the user");
+    REQUIRE(r.get_tags() == std::vector<std::string>{"Devices", "Users"});
+    REQUIRE(r.get_operation_id() == "getDevice");
+    REQUIRE(r.is_deprecated());
+
+    REQUIRE(r.get_param_docs().size() == 3);
+    REQUIRE(r.get_param_docs()[0].in == "path");
+    REQUIRE(r.get_param_docs()[0].required);
+    REQUIRE(r.get_param_docs()[2].in == "query");
+    REQUIRE_FALSE(r.get_param_docs()[2].required);
+
+    REQUIRE(r.get_parameter_pattern("device") == "[a-z0-9_-]{1,32}");
+    REQUIRE(r.get_parameter_pattern("user").empty());
+
+    REQUIRE(r.get_responses().size() == 2);
+    REQUIRE(r.get_responses().at(200).example["device"] == "d1");
+    REQUIRE(r.get_responses().at(404).schema.is_null());
+    REQUIRE(r.get_examples().size() == 1);
+    REQUIRE(r.get_schema()["type"] == "object");
+}
+
+TEST_CASE("Route free metadata", "[route][meta][unit]") {
+    route r("/test");
+    REQUIRE(r.get_metadata().empty());
+    REQUIRE_FALSE(r.has_meta("permission"));
+    REQUIRE(r.get_meta("permission").is_null());
+
+    auto& ref = r.meta("permission", "Device:ReadDeviceConfig").meta("resource", {{"type", "device"}});
+    REQUIRE(&ref == &r);
+    REQUIRE(r.has_meta("permission"));
+    REQUIRE(r.get_meta("permission") == "Device:ReadDeviceConfig");
+    REQUIRE(r.get_meta("resource")["type"] == "device");
+
+    r.meta("permission", "Device:Write");
+    REQUIRE(r.get_meta("permission") == "Device:Write");
+}

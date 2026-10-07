@@ -1,6 +1,7 @@
 #include "route.hpp"
 #include "../response.hpp"
 #include <regex>
+#include <algorithm>
 #include "../../../util/logger.hpp"
 
 namespace thinger::http {
@@ -23,6 +24,7 @@ route::route(const std::string& pattern)
     // Find all :param(regex) patterns
     while (std::regex_search(temp, match, custom_param_regex)) {
         parameters_.push_back(match[1]);
+        parameter_patterns_[match[1]] = match[2];
         temp = match.suffix();
     }
     
@@ -110,9 +112,80 @@ route& route::deferred_body(bool enabled) {
     return *this;
 }
 
+route& route::summary(const std::string& text) {
+    summary_ = text;
+    return *this;
+}
+
 route& route::description(const std::string& desc) {
     description_ = desc;
     return *this;
+}
+
+route& route::tag(const std::string& name) {
+    if (std::find(tags_.begin(), tags_.end(), name) == tags_.end()) {
+        tags_.push_back(name);
+    }
+    return *this;
+}
+
+route& route::tags(const std::vector<std::string>& names) {
+    for (const auto& name : names) tag(name);
+    return *this;
+}
+
+route& route::operation_id(const std::string& id) {
+    operation_id_ = id;
+    return *this;
+}
+
+route& route::deprecated(bool value) {
+    deprecated_ = value;
+    return *this;
+}
+
+route& route::path_param(const std::string& name, const std::string& description, nlohmann::json schema) {
+    if (std::find(parameters_.begin(), parameters_.end(), name) == parameters_.end()) {
+        LOG_WARNING("Route {} documents unknown path parameter '{}'", pattern_, name);
+    }
+    param_docs_.push_back({name, "path", description, std::move(schema), true});
+    return *this;
+}
+
+route& route::query_param(const std::string& name, const std::string& description,
+                          nlohmann::json schema, bool required) {
+    param_docs_.push_back({name, "query", description, std::move(schema), required});
+    return *this;
+}
+
+route& route::returns(int status, const std::string& description, nlohmann::json schema, nlohmann::json example) {
+    responses_[status] = {description, std::move(schema), std::move(example)};
+    return *this;
+}
+
+route& route::example(nlohmann::json body) {
+    examples_.push_back(std::move(body));
+    return *this;
+}
+
+std::string route::get_parameter_pattern(const std::string& name) const {
+    auto it = parameter_patterns_.find(name);
+    return it != parameter_patterns_.end() ? it->second : std::string{};
+}
+
+route& route::meta(const std::string& key, nlohmann::json value) {
+    metadata_[key] = std::move(value);
+    return *this;
+}
+
+bool route::has_meta(const std::string& key) const {
+    return metadata_.contains(key);
+}
+
+const nlohmann::json& route::get_meta(const std::string& key) const {
+    static const nlohmann::json null_value;
+    auto it = metadata_.find(key);
+    return it != metadata_.end() ? *it : null_value;
 }
 
 bool route::matches(const std::string& path, std::smatch& matches) const {
@@ -185,8 +258,8 @@ void route::parse_parameters() {
 }
 
 route& route::schema(const nlohmann::json& json_schema) {
-#ifdef THINGER_HTTP_VALIJSON_ENABLED
     json_schema_ = json_schema;
+#ifdef THINGER_HTTP_VALIJSON_ENABLED
     schema_ = std::make_shared<valijson::Schema>();
     valijson::SchemaParser parser;
     valijson::adapters::NlohmannJsonAdapter adapter(json_schema_);

@@ -3,6 +3,7 @@
 
 #include <concepts>
 #include <variant>
+#include <map>
 #include <functional>
 #include <regex>
 #include <string>
@@ -77,6 +78,22 @@ concept coroutine_handler = awaitable_handler<F> || awaitable_json_handler<F> ||
 using route_callback = route_callback_request_response;
 using route_callback_json = route_callback_request_json_response;
 
+// Documented request parameter (path or query), for API documentation
+struct route_parameter {
+    std::string name;
+    std::string in;             // "path" or "query"
+    std::string description;
+    nlohmann::json schema;      // JSON Schema of the value
+    bool required = false;
+};
+
+// Documented response for a status code, for API documentation
+struct route_response {
+    std::string description;
+    nlohmann::json schema;      // JSON Schema of the body (null if none)
+    nlohmann::json example;     // example body (null if none)
+};
+
 class route {
 public:
     route(const std::string& pattern);
@@ -111,8 +128,40 @@ public:
     // Set JSON Schema for request body validation
     route& schema(const nlohmann::json& json_schema);
 
-    // Set description for API documentation
+    // --- API documentation (read by tools such as OpenAPI generators) ---
+    route& summary(const std::string& text);
     route& description(const std::string& desc);
+    route& tag(const std::string& name);
+    route& tags(const std::vector<std::string>& names);
+    route& operation_id(const std::string& id);
+    route& deprecated(bool value = true);
+    route& path_param(const std::string& name, const std::string& description,
+                      nlohmann::json schema = {{"type", "string"}});
+    route& query_param(const std::string& name, const std::string& description,
+                       nlohmann::json schema = {{"type", "string"}}, bool required = false);
+    route& returns(int status, const std::string& description,
+                   nlohmann::json schema = nullptr, nlohmann::json example = nullptr);
+    route& example(nlohmann::json body);
+
+    const std::string& get_summary() const { return summary_; }
+    const std::string& get_description() const { return description_; }
+    const std::vector<std::string>& get_tags() const { return tags_; }
+    const std::string& get_operation_id() const { return operation_id_; }
+    bool is_deprecated() const { return deprecated_; }
+    const std::vector<route_parameter>& get_param_docs() const { return param_docs_; }
+    const std::map<int, route_response>& get_responses() const { return responses_; }
+    const std::vector<nlohmann::json>& get_examples() const { return examples_; }
+    const nlohmann::json& get_schema() const { return json_schema_; }
+
+    // Custom regex of a path parameter declared as :name(regex), empty if it has none
+    std::string get_parameter_pattern(const std::string& name) const;
+
+    // --- Free metadata for the application (e.g. the permission a route requires). ---
+    // The library does not interpret it; middlewares can read it via request::get_matched_route().
+    route& meta(const std::string& key, nlohmann::json value);
+    bool has_meta(const std::string& key) const;
+    const nlohmann::json& get_meta(const std::string& key) const;  // null if missing
+    const nlohmann::json& get_metadata() const { return metadata_; }
     
     // Check if route matches the given path
     bool matches(const std::string& path, std::smatch& matches) const;
@@ -133,7 +182,19 @@ private:
     std::string pattern_;
     std::regex regex_;
     std::vector<std::string> parameters_;
+    std::map<std::string, std::string> parameter_patterns_;
+    nlohmann::json json_schema_;
+
+    // Documentation and metadata
+    std::string summary_;
     std::string description_;
+    std::vector<std::string> tags_;
+    std::string operation_id_;
+    bool deprecated_ = false;
+    std::vector<route_parameter> param_docs_;
+    std::map<int, route_response> responses_;
+    std::vector<nlohmann::json> examples_;
+    nlohmann::json metadata_ = nlohmann::json::object();
     bool deferred_body_ = false;
     std::variant<
         route_callback_response_only,
@@ -153,7 +214,6 @@ private:
     bool parse_json_body(request& req, response& res, nlohmann::json& json) const;
 
 #ifdef THINGER_HTTP_VALIJSON_ENABLED
-    nlohmann::json json_schema_;
     std::shared_ptr<valijson::Schema> schema_;
 
     bool validate_json(const nlohmann::json& json, response& res) const;

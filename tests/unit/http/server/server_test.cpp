@@ -171,6 +171,37 @@ TEMPLATE_TEST_CASE("HTTP Server route management", "[http][server][unit]",
         REQUIRE(true);
     }
 
+    SECTION("Route groups add prefix, tags and metadata") {
+        auto devices = server.group("/v1/users/:user/devices").tag("Devices").meta("resource", "device");
+        devices.get("/:device", [](http::response& res) { res.send("ok"); })
+            .meta("permission", "ReadDevice");
+        devices.post("/", [](http::request& req, nlohmann::json& body, http::response& res) -> thinger::awaitable<void> {
+            co_return;
+        }).meta("resource", "device-collection");
+        devices.group("/:device/resources").tag("Resources")
+            .get("/:resource", [](http::response& res) { res.send("ok"); });
+
+        const auto& get_routes = server.router().get_routes().at(http::method::GET);
+        auto find = [](const std::vector<http::route>& routes, const std::string& pattern) -> const http::route* {
+            for (const auto& r : routes) if (r.get_pattern() == pattern) return &r;
+            return nullptr;
+        };
+
+        auto* device = find(get_routes, "/v1/users/:user/devices/:device");
+        REQUIRE(device);
+        REQUIRE(device->get_tags() == std::vector<std::string>{"Devices"});
+        REQUIRE(device->get_meta("resource") == "device");
+        REQUIRE(device->get_meta("permission") == "ReadDevice");
+
+        auto* resource = find(get_routes, "/v1/users/:user/devices/:device/resources/:resource");
+        REQUIRE(resource);
+        REQUIRE(resource->get_tags() == std::vector<std::string>{"Devices", "Resources"});
+
+        auto* create = find(server.router().get_routes().at(http::method::POST), "/v1/users/:user/devices/");
+        REQUIRE(create);
+        REQUIRE(create->get_meta("resource") == "device-collection");
+    }
+
     SECTION("Add async middleware") {
         server.use([](http::request& req, http::response& res) -> thinger::awaitable<bool> {
             co_return true;

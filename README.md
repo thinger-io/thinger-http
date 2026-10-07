@@ -380,6 +380,43 @@ Notes:
 
 `set_basic_auth()` is a ready-made middleware for HTTP Basic authentication on a path prefix (see `examples/http_server/server_auth_example.cpp`).
 
+### Route Metadata and Documentation
+
+Routes can carry documentation fields (for API documentation tools) and free metadata for your application. The library does not interpret the metadata: middlewares read it from the matched route, e.g. to check the permission a route requires.
+
+```cpp
+server.get("/devices/:device([a-z0-9_-]{1,32})", handler)
+    .summary("Get a device")
+    .description("Returns the device configuration")
+    .tag("Devices")
+    .operation_id("getDevice")
+    .path_param("device", "Device identifier")
+    .query_param("fields", "Fields to return")
+    .returns(200, "The device", device_schema)
+    .returns(404, "Device not found")
+    .meta("permission", "Device:Read");
+
+server.use([](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+    auto* route = req.get_matched_route();
+    if (route && route->has_meta("permission") &&
+        !allowed(req, route->get_meta("permission").get<std::string>())) {
+        res.error(http::http_response::status::forbidden);
+        co_return false;
+    }
+    co_return true;
+});
+```
+
+Groups share a path prefix and pass their tags and metadata on to their routes (a route can override a metadata key):
+
+```cpp
+auto devices = server.group("/v1/users/:user/devices").tag("Devices").meta("resource", "device");
+devices.get("/:device", get_device).meta("permission", "Device:Read");
+devices.group("/:device/resources").tag("Resources").get("/:resource", get_resource);
+```
+
+All routes, with their documentation and metadata, are available from `server.router().get_routes()`. See `examples/http_server/route_metadata_example.cpp`.
+
 ### CORS
 
 ```cpp

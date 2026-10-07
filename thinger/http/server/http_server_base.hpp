@@ -18,6 +18,7 @@ namespace thinger::http {
 // Forward declarations
 class request;
 class response;
+class route_group;
 
 // Middlewares run after route matching (request::get_matched_route() is set, or null
 // if no route matched) and before the request body is read, so they cannot see it.
@@ -117,6 +118,9 @@ public:
         return router_[method::PATCH][path] = std::forward<F>(handler);
     }
 
+    // Group of routes sharing a path prefix, tags and metadata (see route_group)
+    route_group group(const std::string& prefix);
+
     // Middleware (register before listen(), executed in registration order)
     void use(async_middleware_function middleware);
     void use(middleware_function middleware);
@@ -199,6 +203,73 @@ private:
     awaitable<bool> run_middlewares(request& req, response& res);
     awaitable<void> discard_unread_body(request& req);
 };
+
+// Routes registered through a group get its path prefix, and inherit its tags and
+// metadata (a route can still override a metadata key with its own meta()).
+class route_group {
+public:
+    route_group(http_server_base& server, std::string prefix)
+        : server_(server), prefix_(std::move(prefix)) {}
+
+    route_group& tag(const std::string& name) {
+        tags_.push_back(name);
+        return *this;
+    }
+
+    route_group& meta(const std::string& key, nlohmann::json value) {
+        metadata_[key] = std::move(value);
+        return *this;
+    }
+
+    // Nested group: prefix appended, tags and metadata inherited
+    route_group group(const std::string& prefix) const {
+        route_group nested(*this);
+        nested.prefix_ += prefix;
+        return nested;
+    }
+
+    const std::string& prefix() const { return prefix_; }
+
+    template<typename F> route& get(const std::string& path, F&& handler) {
+        return apply(server_.get(prefix_ + path, std::forward<F>(handler)));
+    }
+    template<typename F> route& post(const std::string& path, F&& handler) {
+        return apply(server_.post(prefix_ + path, std::forward<F>(handler)));
+    }
+    template<typename F> route& put(const std::string& path, F&& handler) {
+        return apply(server_.put(prefix_ + path, std::forward<F>(handler)));
+    }
+    template<typename F> route& del(const std::string& path, F&& handler) {
+        return apply(server_.del(prefix_ + path, std::forward<F>(handler)));
+    }
+    template<typename F> route& patch(const std::string& path, F&& handler) {
+        return apply(server_.patch(prefix_ + path, std::forward<F>(handler)));
+    }
+    template<typename F> route& head(const std::string& path, F&& handler) {
+        return apply(server_.head(prefix_ + path, std::forward<F>(handler)));
+    }
+    template<typename F> route& options(const std::string& path, F&& handler) {
+        return apply(server_.options(prefix_ + path, std::forward<F>(handler)));
+    }
+
+private:
+    route& apply(route& r) const {
+        r.tags(tags_);
+        for (const auto& [key, value] : metadata_.items()) {
+            r.meta(key, value);
+        }
+        return r;
+    }
+
+    http_server_base& server_;
+    std::string prefix_;
+    std::vector<std::string> tags_;
+    nlohmann::json metadata_ = nlohmann::json::object();
+};
+
+inline route_group http_server_base::group(const std::string& prefix) {
+    return route_group(*this, prefix);
+}
 
 } // namespace thinger::http
 

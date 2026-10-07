@@ -56,3 +56,6 @@ target_link_libraries(server_schema_example PRIVATE thinger::http)
 install(TARGETS simple_http_server simple_https_server advanced_http_server
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/examples
 )
+# Route metadata example (authorization middleware reading route metadata)
+add_executable(route_metadata_example route_metadata_example.cpp)
+target_link_libraries(route_metadata_example PRIVATE thinger::http)
