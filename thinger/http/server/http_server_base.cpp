@@ -210,6 +210,17 @@ void http_server_base::set_basic_auth(const std::string& path_prefix,
         });
 }
 
+// OpenAPI
+void http_server_base::schema_component(const std::string& name, nlohmann::json schema) {
+    router_.add_schema_component(name, std::move(schema));
+}
+
+route& http_server_base::serve_openapi(const std::string& path) {
+    return get(path, [this](response& res) {
+        res.json(openapi_.generate());
+    }).hidden();
+}
+
 // Fallback handlers
 void http_server_base::set_not_found_handler(route_callback_response_only handler) {
     router_.set_fallback_handler([handler](request& req, response& res) {
@@ -253,7 +264,7 @@ void http_server_base::serve_static(const std::string& url_prefix,
     if (!route.empty() && route.back() == '/') route.pop_back();
     route += "/:path(.*)";
 
-    get(route, [directory, fallback](request& req, response& res) {
+    auto& static_route = get(route, [directory, fallback](request& req, response& res) {
         std::string path = req["path"];
 
         auto canonical_dir = fs::canonical(directory);
@@ -311,6 +322,7 @@ void http_server_base::serve_static(const std::string& url_prefix,
         res.status(http_response::status::not_found);
         res.send("Not found");
     });
+    static_route.hidden();
 }
 
 // Server control

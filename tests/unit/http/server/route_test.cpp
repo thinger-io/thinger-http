@@ -389,3 +389,32 @@ TEST_CASE("Route free metadata", "[route][meta][unit]") {
     r.meta("permission", "Device:Write");
     REQUIRE(r.get_meta("permission") == "Device:Write");
 }
+
+TEST_CASE("Route patterns with special characters and mixed parameters", "[route][unit]") {
+    SECTION("Literal dots match only a dot") {
+        route r("/openapi.json");
+        std::smatch m;
+        std::string ok = "/openapi.json", other = "/openapiXjson";
+        REQUIRE(r.matches(ok, m));
+        REQUIRE_FALSE(r.matches(other, m));
+    }
+
+    SECTION("Catch-all parameter matches any path") {
+        route r(":path(.*)");
+        std::smatch m;
+        std::string a = "/any/path", b = "*";
+        REQUIRE(r.matches(a, m));
+        REQUIRE(r.matches(b, m));
+    }
+
+    SECTION("Parameters keep their order when regex and simple ones are mixed") {
+        route r("/u/:user/d/:device([a-z]+)/r/:resource");
+        REQUIRE(r.get_parameters() == std::vector<std::string>{"user", "device", "resource"});
+        std::smatch m;
+        std::string path = "/u/alice/d/xyz/r/temp";
+        REQUIRE(r.matches(path, m));
+        REQUIRE(m[1] == "alice");
+        REQUIRE(m[2] == "xyz");
+        REQUIRE(m[3] == "temp");
+    }
+}

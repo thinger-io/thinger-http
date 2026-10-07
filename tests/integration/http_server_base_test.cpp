@@ -2582,3 +2582,44 @@ TEST_CASE("Authorization middleware reads the permission from route metadata", "
     REQUIRE(denied.body() == "missing permission Device:Delete");
     REQUIRE(client.del(base_url + "/devices/1", {{"Authorization", "admin"}}).ok());
 }
+
+// ============================================================================
+// OpenAPI
+// ============================================================================
+
+TEST_CASE("OpenAPI document served and shared schemas used for validation", "[server][openapi][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    server.schema_component("Device", {
+        {"type", "object"},
+        {"required", {"name"}},
+        {"properties", {{"name", {{"type", "string"}}}}}
+    });
+
+    server.post("/devices", [](nlohmann::json& body, http::response& res) -> thinger::awaitable<void> {
+        res.json({{"created", body["name"]}});
+        co_return;
+    }).schema({{"$ref", "#/components/schemas/Device"}}).summary("Create device");
+
+    server.openapi().title("Devices API");
+    server.serve_openapi();
+    fixture.start_server();
+
+    http::client client;
+    client.timeout(10s);
+
+    SECTION("Document is served") {
+        auto response = client.get(fixture.base_url + "/openapi.json");
+        REQUIRE(response.ok());
+        auto doc = response.json();
+        REQUIRE(doc["info"]["title"] == "Devices API");
+        REQUIRE(doc["paths"]["/devices"]["post"]["summary"] == "Create device");
+        REQUIRE(doc["components"]["schemas"].contains("Device"));
+    }
+
+    SECTION("Schema referencing a component validates the body") {
+        REQUIRE(client.post(fixture.base_url + "/devices", R"({"name":"sensor"})", "application/json").ok());
+        REQUIRE(client.post(fixture.base_url + "/devices", R"({"other":1})", "application/json").status() == 400);
+    }
+}

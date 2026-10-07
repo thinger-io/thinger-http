@@ -8,7 +8,7 @@ namespace thinger::http {
 route_handler::route_handler() = default;
 
 route_builder route_handler::operator[](method http_method) {
-    return route_builder(http_method, routes_[http_method]);
+    return route_builder(http_method, routes_[http_method], &schema_components_);
 }
 
 void route_handler::enable_cors(bool enabled) {
@@ -16,7 +16,7 @@ void route_handler::enable_cors(bool enabled) {
     
     if (enabled) {
         // Add OPTIONS handler for all routes
-        (*this)[method::OPTIONS][".*"] = [](request& req, response& res) {
+        (*this)[method::OPTIONS][":path(.*)"] = [](request& req, response& res) {
             auto response = std::make_shared<http_response>();
             response->set_status(http_response::status::no_content);
             
@@ -28,6 +28,7 @@ void route_handler::enable_cors(bool enabled) {
             
             res.send_response(response);
         };
+        routes_[method::OPTIONS].back().hidden();
     }
 }
 

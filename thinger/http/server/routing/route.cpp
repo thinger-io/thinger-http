@@ -16,30 +16,24 @@ route::route(const std::string& pattern)
     
     std::string regex_pattern = pattern;
     
-    // First, handle parameters with custom regex: :param(regex)
+    // Collect parameters in order of appearance, as they map to the regex capture groups:
+    // :name or :name(regex)
     std::regex custom_param_regex(":([a-zA-Z_][a-zA-Z0-9_]*)\\(([^)]+)\\)");
-    std::smatch match;
-    std::string temp = pattern;
-    
-    // Find all :param(regex) patterns
-    while (std::regex_search(temp, match, custom_param_regex)) {
-        parameters_.push_back(match[1]);
-        parameter_patterns_[match[1]] = match[2];
-        temp = match.suffix();
-    }
-    
-    // Then, handle simple parameters: :param
     std::regex simple_param_regex(":([a-zA-Z_][a-zA-Z0-9_]*)(?![\\(])");
-    temp = pattern;
-    while (std::regex_search(temp, match, simple_param_regex)) {
-        // Only add if not already added (avoid duplicates with custom regex params)
-        std::string param_name = match[1];
+    std::regex any_param_regex(":([a-zA-Z_][a-zA-Z0-9_]*)(?:\\(([^)]+)\\))?");
+    std::smatch match;
+    std::string temp;
+
+    for (std::sregex_iterator it(pattern.begin(), pattern.end(), any_param_regex), end; it != end; ++it) {
+        std::string param_name = (*it)[1];
+        if ((*it)[2].matched) {
+            parameter_patterns_[param_name] = (*it)[2];
+        }
         if (std::find(parameters_.begin(), parameters_.end(), param_name) == parameters_.end()) {
             parameters_.push_back(param_name);
         }
-        temp = match.suffix();
     }
-    
+
     // Escape special regex characters in the pattern (but not in our parameter patterns)
     std::string escaped = pattern;
     
@@ -48,7 +42,8 @@ route::route(const std::string& pattern)
     escaped = std::regex_replace(escaped, simple_param_regex, "__SIMPLE_PARAM_$1__");
     
     // Escape special characters
-    escaped = std::regex_replace(escaped, std::regex("([.^$*+?{}\\[\\]\\\\|])"), "\\\\$1");
+    // (the replacement format only treats $ specially: a single backslash is literal)
+    escaped = std::regex_replace(escaped, std::regex("([.^$*+?{}\\[\\]\\\\|])"), "\\$1");
     
     // Now replace parameters with their regex groups
     // Custom parameters: restore the custom regex
@@ -168,6 +163,11 @@ route& route::example(nlohmann::json body) {
     return *this;
 }
 
+route& route::hidden(bool value) {
+    hidden_ = value;
+    return *this;
+}
+
 std::string route::get_parameter_pattern(const std::string& name) const {
     auto it = parameter_patterns_.find(name);
     return it != parameter_patterns_.end() ? it->second : std::string{};
@@ -260,9 +260,14 @@ void route::parse_parameters() {
 route& route::schema(const nlohmann::json& json_schema) {
     json_schema_ = json_schema;
 #ifdef THINGER_HTTP_VALIJSON_ENABLED
+    // Make shared components resolvable as #/components/schemas/<name> within the schema
+    nlohmann::json root = json_schema_;
+    if (schema_components_ && !schema_components_->empty() && root.is_object()) {
+        root["components"]["schemas"] = *schema_components_;
+    }
     schema_ = std::make_shared<valijson::Schema>();
     valijson::SchemaParser parser;
-    valijson::adapters::NlohmannJsonAdapter adapter(json_schema_);
+    valijson::adapters::NlohmannJsonAdapter adapter(root);
     try {
         parser.populateSchema(adapter, *schema_);
     } catch (const std::exception& e) {

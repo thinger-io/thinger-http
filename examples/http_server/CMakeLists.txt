@@ -59,3 +59,7 @@ install(TARGETS simple_http_server simple_https_server advanced_http_server
 # Route metadata example (authorization middleware reading route metadata)
 add_executable(route_metadata_example route_metadata_example.cpp)
 target_link_libraries(route_metadata_example PRIVATE thinger::http)
+
+# OpenAPI example (document generated from the routes, Swagger UI)
+add_executable(openapi_example openapi_example.cpp)
+target_link_libraries(openapi_example PRIVATE thinger::http)

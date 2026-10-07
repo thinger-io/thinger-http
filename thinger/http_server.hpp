@@ -11,6 +11,7 @@
 // Routing
 #include <thinger/http/server/routing/route_handler.hpp>
 #include <thinger/http/server/routing/route_builder.hpp>
+#include <thinger/http/server/openapi.hpp>
 
 // File server
 #include <thinger/http/server/file_server/file_server_handler.hpp>

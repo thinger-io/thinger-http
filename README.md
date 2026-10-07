@@ -417,6 +417,41 @@ devices.group("/:device/resources").tag("Resources").get("/:resource", get_resou
 
 All routes, with their documentation and metadata, are available from `server.router().get_routes()`. See `examples/http_server/route_metadata_example.cpp`.
 
+### OpenAPI
+
+The server builds an OpenAPI 3.1 document from its routes: paths and path parameters from the route patterns (including the regex of `:param(regex)`), request bodies from the validation schemas, and summaries, tags, parameters, responses and examples from the route documentation. Hidden routes (`.hidden()`), static files and the document itself are left out.
+
+```cpp
+// Shared schemas: referenced from routes, published as components and validated at runtime
+server.schema_component("Device", {
+    {"type", "object"},
+    {"required", {"name"}},
+    {"properties", {{"name", {{"type", "string"}}}}}
+});
+
+server.post("/devices", create_device)
+    .schema({{"$ref", "#/components/schemas/Device"}})
+    .summary("Create a device")
+    .returns(201, "Device created", {{"$ref", "#/components/schemas/Device"}})
+    .meta("permission", "Device:Create");
+
+server.openapi()
+    .title("Devices API")
+    .version("1.0.0")
+    // The library does not interpret route metadata: hooks turn it into what you need
+    .on_operation([](const http::route& route, const std::string& method, nlohmann::json& operation) {
+        if (route.has_meta("permission")) operation["x-permission"] = route.get_meta("permission");
+    })
+    .on_document([](nlohmann::json& document) {
+        document["components"]["securitySchemes"]["bearerAuth"] = {{"type", "http"}, {"scheme", "bearer"}};
+    });
+
+server.serve_openapi("/openapi.json");       // optional: not served unless called
+auto document = server.openapi().generate(); // or build it directly
+```
+
+Register shared schemas before the routes that reference them. See `examples/http_server/openapi_example.cpp`, which also serves Swagger UI.
+
 ### CORS
 
 ```cpp

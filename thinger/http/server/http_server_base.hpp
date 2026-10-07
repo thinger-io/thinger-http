@@ -3,6 +3,7 @@
 
 #include "routing/route_handler.hpp"
 #include "routing/route.hpp"
+#include "openapi.hpp"
 #include "http_stream.hpp"
 #include "../../asio/socket_server.hpp"
 #include "../../asio/socket_server_base.hpp"
@@ -35,6 +36,7 @@ using middleware_function = std::function<void(request&, response&, std::functio
 class http_server_base {
 protected:
     route_handler router_;
+    openapi_generator openapi_{router_};
     std::unique_ptr<asio::socket_server_base> socket_server_;
     std::vector<async_middleware_function> middlewares_;
     std::string host_ = "0.0.0.0";
@@ -120,6 +122,16 @@ public:
 
     // Group of routes sharing a path prefix, tags and metadata (see route_group)
     route_group group(const std::string& prefix);
+
+    // Shared JSON schema (OpenAPI component) that route schemas can reference with
+    // {"$ref": "#/components/schemas/<name>"}. Register it before the routes using it.
+    void schema_component(const std::string& name, nlohmann::json schema);
+
+    // OpenAPI document generated from the routes (configure title, hooks... here)
+    openapi_generator& openapi() { return openapi_; }
+
+    // Serve the OpenAPI document as JSON at `path` (not served unless called)
+    route& serve_openapi(const std::string& path = "/openapi.json");
 
     // Middleware (register before listen(), executed in registration order)
     void use(async_middleware_function middleware);

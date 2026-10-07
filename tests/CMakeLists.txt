@@ -53,6 +53,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/route_test.cpp)
     add_thinger_test(test_route unit/http/server/route_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/openapi_test.cpp)
+    add_thinger_test(test_openapi unit/http/server/openapi_test.cpp)
+endif()
+
 # Unit tests - HTTP Common
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/common/headers_test.cpp)
     add_thinger_test(test_headers unit/http/common/headers_test.cpp)

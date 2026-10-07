@@ -142,6 +142,7 @@ public:
     route& returns(int status, const std::string& description,
                    nlohmann::json schema = nullptr, nlohmann::json example = nullptr);
     route& example(nlohmann::json body);
+    route& hidden(bool value = true);   // leave the route out of the API documentation
 
     const std::string& get_summary() const { return summary_; }
     const std::string& get_description() const { return description_; }
@@ -152,6 +153,14 @@ public:
     const std::map<int, route_response>& get_responses() const { return responses_; }
     const std::vector<nlohmann::json>& get_examples() const { return examples_; }
     const nlohmann::json& get_schema() const { return json_schema_; }
+    bool is_hidden() const { return hidden_; }
+
+    // Whether the callback receives the request body parsed as JSON
+    bool takes_json_body() const;
+
+    // Shared schemas (OpenAPI components) that route schemas can reference with
+    // {"$ref": "#/components/schemas/<name>"}; set by the router that owns the route
+    void set_schema_components(const nlohmann::json* components) { schema_components_ = components; }
 
     // Custom regex of a path parameter declared as :name(regex), empty if it has none
     std::string get_parameter_pattern(const std::string& name) const;
@@ -194,7 +203,9 @@ private:
     std::vector<route_parameter> param_docs_;
     std::map<int, route_response> responses_;
     std::vector<nlohmann::json> examples_;
+    bool hidden_ = false;
     nlohmann::json metadata_ = nlohmann::json::object();
+    const nlohmann::json* schema_components_ = nullptr;
     bool deferred_body_ = false;
     std::variant<
         route_callback_response_only,
@@ -205,9 +216,6 @@ private:
         route_callback_awaitable_json,
         route_callback_awaitable_request_json
     > callback_;
-
-    // Whether the callback receives the request body parsed as JSON
-    bool takes_json_body() const;
 
     // Parse the request body as JSON and validate it against the schema; responds with
     // an error and returns false if it is not valid

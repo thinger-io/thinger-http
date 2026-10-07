@@ -38,9 +38,17 @@ public:
     
     // Get all registered routes (useful for API documentation)
     const std::map<method, std::vector<route>>& get_routes() const { return routes_; }
+
+    // Shared JSON schemas (OpenAPI components), referenced from route schemas with
+    // {"$ref": "#/components/schemas/<name>"}. Register them before the routes using them.
+    void add_schema_component(const std::string& name, nlohmann::json schema) {
+        schema_components_[name] = std::move(schema);
+    }
+    const nlohmann::json& get_schema_components() const { return schema_components_; }
     
 private:
     std::map<method, std::vector<route>> routes_;
+    nlohmann::json schema_components_ = nlohmann::json::object();
     bool cors_enabled_ = false;
     std::function<void(request&, response&)> fallback_handler_;
     
