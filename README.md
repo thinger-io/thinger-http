@@ -213,6 +213,9 @@ server.post("/upload", [](http::request& req, http::response& res) -> thinger::a
 
 Reads never go past the end of the body. Whatever the handler leaves unread is discarded after it returns, so it is never parsed as the next request on a keep-alive connection; if it exceeds `set_max_body_size()`, the connection is closed instead.
 
+- Handlers that read the body straight from the socket (`req.get_socket()`, e.g. to forward it) must first take the bytes already buffered with `req.read()` (`req.read_ahead_available()` tells how many), and call `req.mark_body_consumed()` when done, so the server does not try to discard it again.
+- `co_await req.read_body()` loads the remaining body into `req.body()`. Do not mix it with `read()`/`read_some()` on the same request: the stored body would miss the part already read (and fail to decompress if the request is compressed).
+
 ### Response Types
 
 ```cpp

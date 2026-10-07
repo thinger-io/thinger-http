@@ -2243,3 +2243,52 @@ TEST_CASE("Middleware headers are kept on unmatched requests", "[server][middlew
     REQUIRE(response.status() == 404);
     REQUIRE(response.header("X-Request-Id") == "abc123");
 }
+
+TEST_CASE("Body read straight from the socket can be marked as consumed", "[server][deferred][body][pipelining][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    std::atomic<int> check_count{0};
+
+    // Reads the body bypassing read()/read_some(), as a forwarding proxy would
+    server.post("/forward", [](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        std::string body(req.content_length(), '\0');
+        auto* data = reinterpret_cast<uint8_t*>(body.data());
+        size_t total = co_await req.read(data, req.read_ahead_available());
+        auto [ec, bytes] = co_await req.get_socket()->read(data + total, body.size() - total);
+        total += bytes;
+        req.mark_body_consumed();
+        res.json({{"forwarded", body.substr(0, total)}, {"pending", req.has_pending_body()}});
+    });
+
+    server.get("/check", [&check_count](http::response& res) {
+        check_count++;
+        res.send("check-ok");
+    });
+
+    fixture.start_server();
+
+    boost::asio::io_context ioc;
+    boost::asio::ip::tcp::socket sock(ioc);
+    boost::asio::ip::tcp::resolver resolver(ioc);
+    boost::asio::connect(sock, resolver.resolve("127.0.0.1", std::to_string(fixture.port)));
+
+    // Headers first, then the body together with the next request, so the body arrives
+    // on the socket after the handler has started
+    const std::string body = "0123456789abcdef";
+    boost::asio::write(sock, boost::asio::buffer(
+        "POST /forward HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n"));
+    std::this_thread::sleep_for(200ms);
+    boost::asio::write(sock, boost::asio::buffer(
+        body + "GET /check HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"));
+
+    boost::system::error_code ec;
+    boost::asio::streambuf response_buf;
+    boost::asio::read(sock, response_buf, ec);
+    std::string response(boost::asio::buffers_begin(response_buf.data()),
+                         boost::asio::buffers_end(response_buf.data()));
+
+    REQUIRE(response.find("\"forwarded\":\"0123456789abcdef\"") != std::string::npos);
+    REQUIRE(response.find("\"pending\":false") != std::string::npos);
+    REQUIRE(response.find("check-ok") != std::string::npos);
+    REQUIRE(check_count == 1);
+}

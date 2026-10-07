@@ -105,6 +105,9 @@ namespace thinger::http{
         thinger::awaitable<size_t> read_some(uint8_t* buffer, size_t max_size);
 
         /// Read full body into http_request content (for non-deferred dispatch).
+        /// Only reads what is still pending: do not mix it with read()/read_some() on
+        /// the same request, or the stored body will be incomplete (and fail to
+        /// decompress if Content-Encoding is set).
         thinger::awaitable<bool> read_body();
 
         /// Read and drop an unread body so the connection can be reused.
@@ -114,6 +117,10 @@ namespace thinger::http{
         /// Whether part of the body is still unread. Tracks read(), read_some() and
         /// read_body(); reading the socket directly through get_socket() is not tracked.
         bool has_pending_body() const;
+
+        /// Declare the body fully consumed after reading it outside read()/read_some()
+        /// (e.g. straight from get_socket()), so the server does not try to discard it.
+        void mark_body_consumed();
 
         /// Content-Length convenience (0 for chunked requests)
         size_t content_length() const;
@@ -125,7 +132,8 @@ namespace thinger::http{
         size_t read_ahead_available() const;
 
         /// Direct socket access (for pipe-style forwarding). Body bytes read this way are
-        /// not tracked: the server will still discard what it considers unread.
+        /// not tracked: consume read_ahead_available() bytes with read() first, and call
+        /// mark_body_consumed() once the body has been read from the socket.
         std::shared_ptr<asio::socket> get_socket() const;
 
         //exec_result get_request_data() const;

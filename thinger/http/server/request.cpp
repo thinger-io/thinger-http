@@ -552,6 +552,11 @@ namespace thinger::http{
         return body_remaining_ > 0;
     }
 
+    void request::mark_body_consumed() {
+        body_remaining_ = 0;
+        chunk_state_ = chunk_state::done;
+    }
+
     thinger::awaitable<bool> request::discard_body(size_t max_size) {
         if (!has_pending_body()) co_return true;
 
