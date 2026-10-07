@@ -196,6 +196,29 @@ server.post("/api/data", [](auto& req, auto& res) {
 });
 ```
 
+### Coroutine Handlers
+
+Handlers can be coroutines that `co_await` other work (database queries, HTTP calls, timers). Declaring the JSON body in the signature makes the server read it, parse it and validate it against the route schema before the handler runs; invalid JSON or a body that does not match the schema is answered with `400` and the handler is not called:
+
+```cpp
+server.post("/api/users", [&db](http::request& req, nlohmann::json& body, http::response& res) -> thinger::awaitable<void> {
+    auto id = co_await db.insert_user(body["name"]);
+    res.json({{"id", id}});
+}).schema({
+    {"type", "object"},
+    {"required", {"name"}},
+    {"properties", {{"name", {{"type", "string"}}}}}
+});
+
+// Without the request
+server.put("/api/config", [](nlohmann::json& body, http::response& res) -> thinger::awaitable<void> {
+    res.json(body);
+    co_return;
+});
+```
+
+A coroutine taking only `(request&, response&)` reads the body itself (see below). Add `.deferred_body(false)` to have the server read it into `req.body()` first.
+
 ### Streaming Request Body
 
 Coroutine handlers read the body themselves, as it arrives (both `Content-Length` and chunked bodies):

@@ -88,46 +88,33 @@ public:
     route& options(const std::string& path, route_callback_response_only handler);
     route& options(const std::string& path, route_callback_request_response handler);
 
-    // Awaitable (deferred body) route registration — auto-enables deferred_body
-    // Uses template + requires to avoid ambiguity with std::function<void(...)> overloads
-    template<typename F>
-        requires requires(F f, request& req, response& res) {
-            { f(req, res) } -> std::same_as<thinger::awaitable<void>>;
-        }
+    // Coroutine route registration. See coroutine_handler (route.hpp) for the signatures:
+    // handlers taking a JSON body get it read, parsed and validated first; (request&, response&)
+    // handlers read the body themselves unless deferred_body(false) is set on the route.
+    // Templates avoid ambiguity with the std::function<void(...)> overloads above.
+    template<coroutine_handler F>
     route& get(const std::string& path, F&& handler) {
-        return router_[method::GET][path] = route_callback_awaitable(std::forward<F>(handler));
+        return router_[method::GET][path] = std::forward<F>(handler);
     }
 
-    template<typename F>
-        requires requires(F f, request& req, response& res) {
-            { f(req, res) } -> std::same_as<thinger::awaitable<void>>;
-        }
+    template<coroutine_handler F>
     route& post(const std::string& path, F&& handler) {
-        return router_[method::POST][path] = route_callback_awaitable(std::forward<F>(handler));
+        return router_[method::POST][path] = std::forward<F>(handler);
     }
 
-    template<typename F>
-        requires requires(F f, request& req, response& res) {
-            { f(req, res) } -> std::same_as<thinger::awaitable<void>>;
-        }
+    template<coroutine_handler F>
     route& put(const std::string& path, F&& handler) {
-        return router_[method::PUT][path] = route_callback_awaitable(std::forward<F>(handler));
+        return router_[method::PUT][path] = std::forward<F>(handler);
     }
 
-    template<typename F>
-        requires requires(F f, request& req, response& res) {
-            { f(req, res) } -> std::same_as<thinger::awaitable<void>>;
-        }
+    template<coroutine_handler F>
     route& del(const std::string& path, F&& handler) {
-        return router_[method::DELETE][path] = route_callback_awaitable(std::forward<F>(handler));
+        return router_[method::DELETE][path] = std::forward<F>(handler);
     }
 
-    template<typename F>
-        requires requires(F f, request& req, response& res) {
-            { f(req, res) } -> std::same_as<thinger::awaitable<void>>;
-        }
+    template<coroutine_handler F>
     route& patch(const std::string& path, F&& handler) {
-        return router_[method::PATCH][path] = route_callback_awaitable(std::forward<F>(handler));
+        return router_[method::PATCH][path] = std::forward<F>(handler);
     }
 
     // Middleware (register before listen(), executed in registration order)

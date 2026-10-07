@@ -4,6 +4,7 @@
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/client/client.hpp>
 #include <thinger/util/types.hpp>
+#include <thinger/util/compression.hpp>
 #include <nlohmann/json.hpp>
 #include <boost/asio.hpp>
 #include <chrono>
@@ -2389,4 +2390,142 @@ TEST_CASE("Pipelined request after a chunked body spanning several reads", "[ser
 
     REQUIRE(response.find("\"body\":\"hello world\"") != std::string::npos);
     REQUIRE(response.find("check-ok") != std::string::npos);
+}
+
+// ============================================================================
+// Coroutine routes with a JSON body
+// ============================================================================
+
+TEST_CASE("Coroutine routes receive the JSON body read, parsed and validated", "[server][coroutine][json][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    server.set_max_body_size(1024);
+    std::atomic<int> handler_calls{0};
+
+    server.post("/users", [&handler_calls](http::request& req, nlohmann::json& body, http::response& res) -> thinger::awaitable<void> {
+        handler_calls++;
+        boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 20ms);
+        co_await timer.async_wait(thinger::use_awaitable);
+        res.json({{"name", body["name"]}, {"ip_known", !req.get_request_ip().empty()}});
+    }).schema({
+        {"type", "object"},
+        {"required", {"name"}},
+        {"properties", {{"name", {{"type", "string"}}}, {"age", {{"type", "integer"}, {"minimum", 0}}}}}
+    });
+
+    // JSON-only signature
+    server.put("/echo", [](nlohmann::json& body, http::response& res) -> thinger::awaitable<void> {
+        res.json(body);
+        co_return;
+    });
+
+    // Plain coroutine that asks the server to read the body
+    server.post("/raw", [](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        res.json({{"body", req.body()}});
+        co_return;
+    }).deferred_body(false);
+
+    server.get("/check", [](http::response& res) {
+        res.send("check-ok");
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+    const auto& base_url = fixture.base_url;
+
+    SECTION("Valid body") {
+        auto response = client.post(base_url + "/users", R"({"name":"alice","age":30})", "application/json");
+        REQUIRE(response.ok());
+        REQUIRE(response.json()["name"] == "alice");
+        REQUIRE(response.json()["ip_known"] == true);
+        REQUIRE(handler_calls == 1);
+    }
+
+    SECTION("Invalid JSON returns 400 without calling the handler") {
+        auto response = client.post(base_url + "/users", "{not json", "application/json");
+        REQUIRE(response.status() == 400);
+        REQUIRE(handler_calls == 0);
+    }
+
+    SECTION("Body not matching the schema returns 400 without calling the handler") {
+        auto response = client.post(base_url + "/users", R"({"age":-1})", "application/json");
+        REQUIRE(response.status() == 400);
+        REQUIRE(response.json()["error"]["message"].is_string());
+        REQUIRE(handler_calls == 0);
+    }
+
+    SECTION("Body above max_body_size returns 413") {
+        std::string big = R"({"name":")" + std::string(2000, 'x') + R"("})";
+        auto response = client.post(base_url + "/users", big, "application/json");
+        REQUIRE(response.status() == 413);
+        REQUIRE(handler_calls == 0);
+    }
+
+    SECTION("JSON-only signature") {
+        auto response = client.put(base_url + "/echo", R"({"a":1})", "application/json");
+        REQUIRE(response.ok());
+        REQUIRE(response.json()["a"] == 1);
+    }
+
+    SECTION("Plain coroutine with deferred_body(false) gets the body") {
+        auto response = client.post(base_url + "/raw", "plain text", "text/plain");
+        REQUIRE(response.ok());
+        REQUIRE(response.json()["body"] == "plain text");
+    }
+
+    SECTION("Gzip-compressed body") {
+        auto compressed = thinger::util::gzip::compress(R"({"name":"zipped"})");
+        REQUIRE(compressed);
+        auto response = raw_http_exchange(fixture.port,
+            "POST /users HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+            "Content-Encoding: gzip\r\nConnection: close\r\nContent-Length: " + std::to_string(compressed->size()) +
+            "\r\n\r\n" + *compressed);
+        REQUIRE(response.starts_with("HTTP/1.1 200"));
+        REQUIRE(response.find("\"name\":\"zipped\"") != std::string::npos);
+    }
+
+    SECTION("Chunked body followed by a pipelined request") {
+        auto response = raw_http_exchange(fixture.port,
+            "POST /users HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+            "9\r\n{\"name\":\"\r\n6\r\nchunk\"\r\n1\r\n}\r\n0\r\n\r\n"
+            "GET /check HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        REQUIRE(response.find("\"name\":\"chunk\"") != std::string::npos);
+        REQUIRE(response.find("check-ok") != std::string::npos);
+    }
+}
+
+TEST_CASE("Middleware stops a coroutine JSON route before its body is read", "[server][coroutine][json][middleware][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    std::atomic<int> handler_calls{0};
+
+    server.use([](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+        if (req.header("Authorization").empty()) {
+            res.error(http::http_response::status::unauthorized, "denied");
+            co_return false;
+        }
+        co_return true;
+    });
+
+    server.post("/items", [&handler_calls](nlohmann::json& body, http::response& res) -> thinger::awaitable<void> {
+        handler_calls++;
+        res.json(body);
+        co_return;
+    });
+
+    server.get("/check", [](http::response& res) {
+        res.send("check-ok");
+    });
+
+    fixture.start_server();
+
+    std::string body = R"({"id":1})";
+    auto response = raw_http_exchange(fixture.port,
+        "POST /items HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body +
+        "GET /check HTTP/1.1\r\nHost: localhost\r\nAuthorization: x\r\nConnection: close\r\n\r\n");
+
+    REQUIRE(response.starts_with("HTTP/1.1 401"));
+    REQUIRE(response.find("check-ok") != std::string::npos);
+    REQUIRE(handler_calls == 0);
 }

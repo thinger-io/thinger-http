@@ -306,3 +306,33 @@ TEST_CASE("Route handle_request dispatch", "[route][unit]") {
         REQUIRE_NOTHROW(r.handle_request(*req, res));
     }
 }
+
+TEST_CASE("Coroutine handler signatures", "[route][coroutine][unit]") {
+    SECTION("JSON body handlers are never deferred") {
+        route r("/test");
+        r = [](nlohmann::json&, response&) -> thinger::awaitable<void> { co_return; };
+        r.deferred_body(true);
+        REQUIRE_FALSE(r.is_deferred_body());
+
+        route r2("/test");
+        r2 = [](request&, nlohmann::json&, response&) -> thinger::awaitable<void> { co_return; };
+        REQUIRE_FALSE(r2.is_deferred_body());
+    }
+
+    SECTION("Plain coroutines are deferred unless disabled") {
+        route r("/test");
+        r = [](request&, response&) -> thinger::awaitable<void> { co_return; };
+        REQUIRE(r.is_deferred_body());
+        r.deferred_body(false);
+        REQUIRE_FALSE(r.is_deferred_body());
+    }
+
+    SECTION("Generic two-argument lambdas are (request&, response&) handlers") {
+        auto generic = [](auto&, auto&) -> thinger::awaitable<void> { co_return; };
+        STATIC_REQUIRE(awaitable_handler<decltype(generic)>);
+        STATIC_REQUIRE_FALSE(awaitable_json_handler<decltype(generic)>);
+        route r("/test");
+        r = generic;
+        REQUIRE(r.is_deferred_body());
+    }
+}

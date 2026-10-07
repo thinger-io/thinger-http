@@ -95,6 +95,16 @@ route& route::operator=(route_callback_awaitable callback) {
     return *this;
 }
 
+route& route::operator=(route_callback_awaitable_json callback) {
+    callback_ = std::move(callback);
+    return *this;
+}
+
+route& route::operator=(route_callback_awaitable_request_json callback) {
+    callback_ = std::move(callback);
+    return *this;
+}
+
 route& route::deferred_body(bool enabled) {
     deferred_body_ = enabled;
     return *this;
@@ -109,67 +119,62 @@ bool route::matches(const std::string& path, std::smatch& matches) const {
     return std::regex_match(path, matches, regex_);
 }
 
+bool route::takes_json_body() const {
+    return std::holds_alternative<route_callback_json_response>(callback_)
+        || std::holds_alternative<route_callback_request_json_response>(callback_)
+        || std::holds_alternative<route_callback_awaitable_json>(callback_)
+        || std::holds_alternative<route_callback_awaitable_request_json>(callback_);
+}
+
+bool route::parse_json_body(request& req, response& res, nlohmann::json& json) const {
+    const auto& body = req.get_http_request()->get_body();
+    if (!body.empty()) {
+        json = nlohmann::json::parse(body, nullptr, false);
+        if (json.is_discarded()) {
+            res.error(http_response::status::bad_request, "Invalid JSON");
+            return false;
+        }
+    }
+#ifdef THINGER_HTTP_VALIJSON_ENABLED
+    if (!validate_json(json, res)) return false;
+#endif
+    return true;
+}
+
 void route::handle_request(request& req, response& res) const {
-    // Handle response-only callback
-    if (std::holds_alternative<route_callback_response_only>(callback_)) {
-        std::get<route_callback_response_only>(callback_)(res);
-    }
-    // Handle JSON + response callback (json is parsed from request body)
-    else if (std::holds_alternative<route_callback_json_response>(callback_)) {
-        auto http_req = req.get_http_request();
-        if (!http_req->get_body().empty()) {
-            auto json = nlohmann::json::parse(http_req->get_body(), nullptr, false);
-            if (json.is_discarded()) {
-                res.error(http_response::status::bad_request, "Invalid JSON");
-            } else {
-#ifdef THINGER_HTTP_VALIJSON_ENABLED
-                if (!validate_json(json, res)) return;
-#endif
-                std::get<route_callback_json_response>(callback_)(json, res);
-            }
+    std::visit([&](const auto& callback) {
+        using callback_type = std::decay_t<decltype(callback)>;
+        if constexpr (std::is_same_v<callback_type, route_callback_response_only>) {
+            callback(res);
+        } else if constexpr (std::is_same_v<callback_type, route_callback_request_response>) {
+            callback(req, res);
+        } else if constexpr (std::is_same_v<callback_type, route_callback_json_response>) {
+            nlohmann::json json;
+            if (parse_json_body(req, res, json)) callback(json, res);
+        } else if constexpr (std::is_same_v<callback_type, route_callback_request_json_response>) {
+            nlohmann::json json;
+            if (parse_json_body(req, res, json)) callback(req, json, res);
         } else {
-            nlohmann::json empty_json;
-#ifdef THINGER_HTTP_VALIJSON_ENABLED
-            if (!validate_json(empty_json, res)) return;
-#endif
-            std::get<route_callback_json_response>(callback_)(empty_json, res);
+            // Coroutine callbacks cannot be called synchronously
+            res.error(http_response::status::internal_server_error,
+                      "Awaitable route handler invoked synchronously; use handle_request_coro() instead");
         }
-    }
-    // Handle request + response callback
-    else if (std::holds_alternative<route_callback_request_response>(callback_)) {
-        std::get<route_callback_request_response>(callback_)(req, res);
-    }
-    // Handle request + JSON + response callback (json is parsed from request body)
-    else if (std::holds_alternative<route_callback_request_json_response>(callback_)) {
-        auto http_req = req.get_http_request();
-        if (!http_req->get_body().empty()) {
-            auto json = nlohmann::json::parse(http_req->get_body(), nullptr, false);
-            if (json.is_discarded()) {
-                res.error(http_response::status::bad_request, "Invalid JSON");
-            } else {
-#ifdef THINGER_HTTP_VALIJSON_ENABLED
-                if (!validate_json(json, res)) return;
-#endif
-                std::get<route_callback_request_json_response>(callback_)(req, json, res);
-            }
-        } else {
-            nlohmann::json empty_json;
-#ifdef THINGER_HTTP_VALIJSON_ENABLED
-            if (!validate_json(empty_json, res)) return;
-#endif
-            std::get<route_callback_request_json_response>(callback_)(req, empty_json, res);
-        }
-    }
-    // Awaitable callback — cannot be called synchronously
-    else if (std::holds_alternative<route_callback_awaitable>(callback_)) {
-        res.error(http_response::status::internal_server_error,
-                  "Awaitable route handler invoked synchronously; use handle_request_coro() instead");
-    }
+    }, callback_);
 }
 
 thinger::awaitable<void> route::handle_request_coro(request& req, response& res) const {
     if (std::holds_alternative<route_callback_awaitable>(callback_)) {
         co_await std::get<route_callback_awaitable>(callback_)(req, res);
+    } else if (std::holds_alternative<route_callback_awaitable_json>(callback_)) {
+        nlohmann::json json;
+        if (parse_json_body(req, res, json)) {
+            co_await std::get<route_callback_awaitable_json>(callback_)(json, res);
+        }
+    } else if (std::holds_alternative<route_callback_awaitable_request_json>(callback_)) {
+        nlohmann::json json;
+        if (parse_json_body(req, res, json)) {
+            co_await std::get<route_callback_awaitable_request_json>(callback_)(req, json, res);
+        }
     } else {
         handle_request(req, res);
     }

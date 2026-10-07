@@ -1,6 +1,8 @@
 #ifndef THINGER_HTTP_ROUTE_DESCRIPTOR_HPP
 #define THINGER_HTTP_ROUTE_DESCRIPTOR_HPP
 
+#include <concepts>
+#include <variant>
 #include <functional>
 #include <regex>
 #include <string>
@@ -46,6 +48,30 @@ using route_callback_json_response = std::function<void(nlohmann::json&, respons
 using route_callback_request_response = std::function<void(request&, response&)>;
 using route_callback_request_json_response = std::function<void(request&, nlohmann::json&, response&)>;
 using route_callback_awaitable = std::function<thinger::awaitable<void>(request&, response&)>;
+using route_callback_awaitable_json = std::function<thinger::awaitable<void>(nlohmann::json&, response&)>;
+using route_callback_awaitable_request_json = std::function<thinger::awaitable<void>(request&, nlohmann::json&, response&)>;
+
+// Coroutine handler signatures. Those taking a JSON body get it read, parsed and validated
+// against the route schema before they run; (request&, response&) reads the body itself
+// (deferred body) unless deferred_body(false) is set.
+template<typename F>
+concept awaitable_handler = requires(F f, request& req, response& res) {
+    { f(req, res) } -> std::same_as<thinger::awaitable<void>>;
+};
+
+template<typename F>
+concept awaitable_request_json_handler = requires(F f, request& req, nlohmann::json& json, response& res) {
+    { f(req, json, res) } -> std::same_as<thinger::awaitable<void>>;
+};
+
+// Generic lambdas taking two arguments are treated as (request&, response&)
+template<typename F>
+concept awaitable_json_handler = !awaitable_handler<F> && requires(F f, nlohmann::json& json, response& res) {
+    { f(json, res) } -> std::same_as<thinger::awaitable<void>>;
+};
+
+template<typename F>
+concept coroutine_handler = awaitable_handler<F> || awaitable_json_handler<F> || awaitable_request_json_handler<F>;
 
 // Legacy callback types (for backward compatibility if needed)
 using route_callback = route_callback_request_response;
@@ -61,10 +87,26 @@ public:
     route& operator=(route_callback_request_response callback);
     route& operator=(route_callback_request_json_response callback);
     route& operator=(route_callback_awaitable callback);
-    
-    // Deferred body mode - handler reads body at its discretion
+    route& operator=(route_callback_awaitable_json callback);
+    route& operator=(route_callback_awaitable_request_json callback);
+
+    // Coroutine lambdas: picked before the std::function<void(...)> overloads above,
+    // which would otherwise also accept them (discarding the awaitable)
+    template<coroutine_handler F>
+    route& operator=(F&& callback) {
+        if constexpr (awaitable_handler<F>) {
+            return *this = route_callback_awaitable(std::forward<F>(callback));
+        } else if constexpr (awaitable_request_json_handler<F>) {
+            return *this = route_callback_awaitable_request_json(std::forward<F>(callback));
+        } else {
+            return *this = route_callback_awaitable_json(std::forward<F>(callback));
+        }
+    }
+
+    // Deferred body mode - handler reads body at its discretion. Ignored by handlers
+    // that take the JSON body, which always need it read first.
     route& deferred_body(bool enabled = true);
-    bool is_deferred_body() const { return deferred_body_; }
+    bool is_deferred_body() const { return deferred_body_ && !takes_json_body(); }
 
     // Set JSON Schema for request body validation
     route& schema(const nlohmann::json& json_schema);
@@ -98,8 +140,17 @@ private:
         route_callback_json_response,
         route_callback_request_response,
         route_callback_request_json_response,
-        route_callback_awaitable
+        route_callback_awaitable,
+        route_callback_awaitable_json,
+        route_callback_awaitable_request_json
     > callback_;
+
+    // Whether the callback receives the request body parsed as JSON
+    bool takes_json_body() const;
+
+    // Parse the request body as JSON and validate it against the schema; responds with
+    // an error and returns false if it is not valid
+    bool parse_json_body(request& req, response& res, nlohmann::json& json) const;
 
 #ifdef THINGER_HTTP_VALIJSON_ENABLED
     nlohmann::json json_schema_;

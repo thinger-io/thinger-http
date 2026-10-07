@@ -463,10 +463,10 @@ void http_server_base::setup_connection_handler() {
                     res.error(http_response::status::payload_too_large, "Payload Too Large");
                     co_return;
                 }
-                matched_route->handle_request(*req, res);
+                co_await matched_route->handle_request_coro(*req, res);
             } else {
                 // NO BODY: dispatch directly
-                matched_route->handle_request(*req, res);
+                co_await matched_route->handle_request_coro(*req, res);
             }
 
             // Drop any body left unread (unmatched route, or a deferred handler that did
