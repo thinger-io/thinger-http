@@ -112,36 +112,39 @@ route& http_server_base::options(const std::string& path, route_callback_request
 }
 
 // Middleware
-void http_server_base::use(middleware_function middleware) {
+void http_server_base::use(async_middleware_function middleware) {
     middlewares_.push_back(std::move(middleware));
+}
+
+void http_server_base::use(middleware_function middleware) {
+    use([middleware = std::move(middleware)](request& req, response& res) -> awaitable<bool> {
+        // shared flag: a misbehaving middleware may still call next() after returning
+        auto passed = std::make_shared<bool>(false);
+        middleware(req, res, [passed]() { *passed = true; });
+        co_return *passed;
+    });
 }
 
 // Basic Auth helpers
 void http_server_base::set_basic_auth(const std::string& path_prefix, 
                                  const std::string& realm,
                                  auth_verify_function verify) {
-    use([path_prefix, realm, verify](request& req, response& res, std::function<void()> next) {
+    use([path_prefix, realm, verify](request& req, response& res) -> awaitable<bool> {
         // Get the request path
         auto http_request = req.get_http_request();
-        if (!http_request) {
-            next();
-            return;
-        }
-        
+        if (!http_request) co_return true;
+
         const std::string& path = http_request->get_uri();
-        
+
         // Check if this path requires auth
-        if (!path.starts_with(path_prefix)) {
-            next();
-            return;
-        }
+        if (!path.starts_with(path_prefix)) co_return true;
         
         // Check for Authorization header
         if (!http_request->has_header("Authorization")) {
             res.status(http_response::status::unauthorized);
             res.header("WWW-Authenticate", "Basic realm=\"" + realm + "\"");
             res.send("Authentication required");
-            return;
+            co_return false;
         }
         
         auto auth_header = http_request->get_header("Authorization");
@@ -149,7 +152,7 @@ void http_server_base::set_basic_auth(const std::string& path_prefix,
             res.status(http_response::status::unauthorized);
             res.header("WWW-Authenticate", "Basic realm=\"" + realm + "\"");
             res.send("Invalid authentication");
-            return;
+            co_return false;
         }
         
         // Decode base64 credentials
@@ -160,7 +163,7 @@ void http_server_base::set_basic_auth(const std::string& path_prefix,
         } catch (...) {
             res.status(http_response::status::unauthorized);
             res.send("Invalid credentials format");
-            return;
+            co_return false;
         }
         
         // Parse username:password
@@ -168,7 +171,7 @@ void http_server_base::set_basic_auth(const std::string& path_prefix,
         if (colon_pos == std::string::npos) {
             res.status(http_response::status::unauthorized);
             res.send("Invalid credentials format");
-            return;
+            co_return false;
         }
         
         std::string username = decoded.substr(0, colon_pos);
@@ -177,12 +180,13 @@ void http_server_base::set_basic_auth(const std::string& path_prefix,
         // Verify credentials
         if (verify(username, password)) {
             req.set_auth_user(username);
-            next();
-        } else {
-            res.status(http_response::status::unauthorized);
-            res.header("WWW-Authenticate", "Basic realm=\"" + realm + "\"");
-            res.send("Invalid username or password");
+            co_return true;
         }
+
+        res.status(http_response::status::unauthorized);
+        res.header("WWW-Authenticate", "Basic realm=\"" + realm + "\"");
+        res.send("Invalid username or password");
+        co_return false;
     });
 }
 
@@ -429,29 +433,34 @@ void http_server_base::setup_connection_handler() {
             // 1. Match route
             auto* matched_route = router_.find_route(req);
 
-            // 2. Run middlewares (synchronous)
-            bool passed = false;
-            execute_middlewares(*req, stream, 0, [&passed]() { passed = true; });
-            if (!passed) co_return;
-
-            // 3. Three-way dispatch
+            // 2. Run middlewares (before reading the body), sharing the handler response
             response res(http_connection, stream, http_request, cors_enabled_);
 
+            if (!co_await run_middlewares(*req, res)) {
+                co_await discard_unread_body(*req);
+                co_return;
+            }
+
+            // 3. Three-way dispatch
             if (!matched_route) {
                 // No route matched → fallback / 404
                 router_.handle_unmatched(req);
+                co_await discard_unread_body(*req);
             } else if (matched_route->is_deferred_body()) {
                 // DEFERRED: handler reads body at its discretion
                 co_await matched_route->handle_request_coro(*req, res);
             } else if (http_request->has_pending_body()) {
                 // PENDING BODY: check size limit, read, then dispatch
                 if (!http_request->is_chunked_transfer() && req->content_length() > max_body_size_) {
+                    // body left unread on the socket: close after responding
+                    stream->set_keep_alive(false);
                     res.error(http_response::status::payload_too_large, "Payload Too Large");
                     co_return;
                 }
                 req->set_max_body_size(max_body_size_);
                 bool ok = co_await req->read_body();
                 if (!ok) {
+                    stream->set_keep_alive(false);
                     res.error(http_response::status::payload_too_large, "Payload Too Large");
                     co_return;
                 }
@@ -469,26 +478,36 @@ void http_server_base::setup_connection_handler() {
     });
 }
 
-void http_server_base::execute_middlewares(request& req, std::shared_ptr<http_stream> stream, 
-                                      size_t index, std::function<void()> final_handler) {
-    if (index >= middlewares_.size()) {
-        // All middlewares executed, call final handler
-        final_handler();
-        return;
+awaitable<bool> http_server_base::run_middlewares(request& req, response& res) {
+    for (const auto& middleware : middlewares_) {
+        bool next = false;
+        try {
+            next = co_await middleware(req, res);
+        } catch (const std::exception& e) {
+            LOG_ERROR("Exception in middleware: {}", e.what());
+            if (!res.has_responded()) res.error(http_response::status::internal_server_error);
+            co_return false;
+        }
+
+        if (res.has_responded()) co_return false;
+
+        if (!next) {
+            // stopped without responding: answer anyway so the stream is not left pending
+            LOG_ERROR("Middleware stopped the request without sending a response");
+            res.error(http_response::status::internal_server_error);
+            co_return false;
+        }
     }
-    
-    // Create response object for middleware
-    auto connection = req.get_http_connection();
-    auto http_request = req.get_http_request();
-    
-    if (connection) {
-        response res(connection, stream, http_request, cors_enabled_);
-        
-        // Execute current middleware
-        middlewares_[index](req, res, [this, &req, stream, index, final_handler]() {
-            // Middleware called next(), execute next middleware
-            execute_middlewares(req, stream, index + 1, final_handler);
-        });
+    co_return true;
+}
+
+awaitable<void> http_server_base::discard_unread_body(request& req) {
+    // Consume a body nobody read so the connection can be reused for the next request,
+    // or close it after the response if the body is too large or cannot be read.
+    if (!co_await req.discard_body(max_body_size_)) {
+        if (auto stream = req.get_http_stream()) {
+            stream->set_keep_alive(false);
+        }
     }
 }
 

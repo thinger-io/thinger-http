@@ -36,13 +36,6 @@ namespace thinger::http {
 #define EMAIL_PATTERN   "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"
 #define SLUG_PATTERN    "[a-z0-9]+(?:-[a-z0-9]+)*"   // URL-friendly slug
 
-// Authorization levels
-enum class auth_level {
-    PUBLIC,     // No authentication required
-    USER,       // Valid user required
-    ADMIN       // Admin user required
-};
-
 // Forward declarations
 class request;
 class response;
@@ -76,9 +69,6 @@ public:
     // Set JSON Schema for request body validation
     route& schema(const nlohmann::json& json_schema);
 
-    // Set authorization level
-    route& auth(auth_level level);
-
     // Set description for API documentation
     route& description(const std::string& desc);
     
@@ -87,9 +77,6 @@ public:
     
     // Get route parameters from regex
     const std::vector<std::string>& get_parameters() const { return parameters_; }
-    
-    // Get authorization level
-    auth_level get_auth_level() const { return auth_level_; }
     
     // Handle the request (synchronous)
     void handle_request(request& req, response& res) const;
@@ -104,7 +91,6 @@ private:
     std::string pattern_;
     std::regex regex_;
     std::vector<std::string> parameters_;
-    auth_level auth_level_ = auth_level::PUBLIC;
     std::string description_;
     bool deferred_body_ = false;
     std::variant<

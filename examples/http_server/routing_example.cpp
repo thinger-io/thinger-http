@@ -193,9 +193,8 @@ int main(int argc, char* argv[]) {
         response.json(json);
     };
     
-    // Example with authentication requirement
+    // Example with route description
     (*router)[http::method::GET]["/api/v1/admin/stats"]
-        .auth(http::auth_level::ADMIN)
         .description("Get system statistics (admin only)")
         = [](http::request& request, http::response& response) {
             nlohmann::json stats = {

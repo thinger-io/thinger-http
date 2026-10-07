@@ -170,6 +170,14 @@ TEMPLATE_TEST_CASE("HTTP Server route management", "[http][server][unit]",
         
         REQUIRE(true);
     }
+
+    SECTION("Add async middleware") {
+        server.use([](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+            co_return true;
+        });
+
+        REQUIRE(true);
+    }
     
     SECTION("Static file serving") {
         server.serve_static("/static", "./public");

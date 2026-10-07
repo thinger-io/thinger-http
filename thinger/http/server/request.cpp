@@ -70,10 +70,6 @@ namespace thinger::http{
         return matched_route_;
     }
     
-    auth_level request::get_required_auth_level() const {
-        return matched_route_ ? matched_route_->get_auth_level() : auth_level::PUBLIC;
-    }
-
     void request::set_uri_parameter(const std::string& param, const std::string& value){
         // erase all existing entries with the specified key
         params_.erase(param);
@@ -532,6 +528,33 @@ namespace thinger::http{
             }
         }
 
+        co_return true;
+    }
+
+    thinger::awaitable<bool> request::discard_body(size_t max_size) {
+        if (!http_request_ || !http_request_->has_pending_body()) co_return true;
+
+        uint8_t buf[8192];
+
+        if (is_chunked()) {
+            size_t discarded = 0;
+            while (chunk_state_ != chunk_state::done) {
+                size_t bytes = co_await read_some_chunked(buf, sizeof(buf));
+                if (bytes == 0) break;
+                discarded += bytes;
+                if (discarded > max_size) co_return false;
+            }
+            co_return chunk_state_ == chunk_state::done;
+        }
+
+        size_t remaining = http_request_->pending_body_size();
+        if (remaining > max_size) co_return false;
+
+        while (remaining > 0) {
+            size_t bytes = co_await raw_read_some(buf, std::min(remaining, sizeof(buf)));
+            if (bytes == 0) co_return false;
+            remaining -= bytes;
+        }
         co_return true;
     }
 

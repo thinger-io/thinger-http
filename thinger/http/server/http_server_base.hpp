@@ -19,14 +19,23 @@ namespace thinger::http {
 class request;
 class response;
 
-// Middleware function type
+// Middlewares run after route matching (request::get_matched_route() is set, or null
+// if no route matched) and before the request body is read, so they cannot see it.
+// They share the response object with the route handler.
+
+// Asynchronous middleware: co_return true to continue the chain, or respond through
+// the response and co_return false to stop it (the route handler is not called).
+using async_middleware_function = std::function<thinger::awaitable<bool>(request&, response&)>;
+
+// Synchronous middleware: call next() before returning to continue the chain, or
+// respond through the response to stop it. next() must not be called asynchronously.
 using middleware_function = std::function<void(request&, response&, std::function<void()>)>;
 
 class http_server_base {
 protected:
     route_handler router_;
     std::unique_ptr<asio::socket_server_base> socket_server_;
-    std::vector<middleware_function> middlewares_;
+    std::vector<async_middleware_function> middlewares_;
     std::string host_ = "0.0.0.0";
     std::string port_ = "8080";
     std::string unix_path_;
@@ -121,7 +130,8 @@ public:
         return router_[method::PATCH][path] = route_callback_awaitable(std::forward<F>(handler));
     }
 
-    // Middleware
+    // Middleware (register before listen(), executed in registration order)
+    void use(async_middleware_function middleware);
     void use(middleware_function middleware);
     
     // Basic Auth helpers
@@ -199,7 +209,8 @@ protected:
     
 private:
     void setup_connection_handler();
-    void execute_middlewares(request& req, std::shared_ptr<http_stream> stream, size_t index, std::function<void()> final_handler);
+    awaitable<bool> run_middlewares(request& req, response& res);
+    awaitable<void> discard_unread_body(request& req);
 };
 
 } // namespace thinger::http

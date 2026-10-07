@@ -1801,3 +1801,284 @@ TEST_CASE("Server Connection Timeout", "[server][timeout][keepalive][integration
         REQUIRE(ec);
     }
 }
+
+// ============================================================================
+// Async Middleware Tests
+// ============================================================================
+
+TEST_CASE("Async middleware awaits before letting the request pass", "[server][middleware][async][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    server.use([](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+        boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 50ms);
+        co_await timer.async_wait(thinger::use_awaitable);
+        req.set_auth_user("async-user");
+        co_return true;
+    });
+
+    server.get("/async", [](http::request& req, http::response& res) {
+        res.json({{"user", req.get_auth_user()}});
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    auto response = client.get(fixture.base_url + "/async");
+    REQUIRE(response.ok());
+    REQUIRE(response.json()["user"] == "async-user");
+}
+
+TEST_CASE("Async middleware stops the chain with 401", "[server][middleware][async][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    std::atomic<bool> handler_called{false};
+
+    server.use([](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+        boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 10ms);
+        co_await timer.async_wait(thinger::use_awaitable);
+        if (req.header("Authorization") != "Bearer good-token") {
+            res.error(http::http_response::status::unauthorized, "invalid token");
+            co_return false;
+        }
+        co_return true;
+    });
+
+    server.get("/private", [&handler_called](http::response& res) {
+        handler_called = true;
+        res.json({{"secret", "data"}});
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    SECTION("Request without valid token is rejected") {
+        auto response = client.get(fixture.base_url + "/private", {{"Authorization", "Bearer bad"}});
+        REQUIRE(response.status() == 401);
+        REQUIRE(response.body() == "invalid token");
+        REQUIRE_FALSE(handler_called);
+    }
+
+    SECTION("Request with valid token reaches the handler") {
+        auto response = client.get(fixture.base_url + "/private", {{"Authorization", "Bearer good-token"}});
+        REQUIRE(response.ok());
+        REQUIRE(response.json()["secret"] == "data");
+        REQUIRE(handler_called);
+    }
+}
+
+TEST_CASE("Sync and async middlewares execute in registration order", "[server][middleware][async][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    server.use([](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+        boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 10ms);
+        co_await timer.async_wait(thinger::use_awaitable);
+        req.set_auth_user("async1");
+        co_return true;
+    });
+
+    server.use([](http::request& req, http::response& res, std::function<void()> next) {
+        req.set_auth_user(req.get_auth_user() + "+sync");
+        next();
+    });
+
+    server.use([](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+        req.set_auth_user(req.get_auth_user() + "+async2");
+        co_return true;
+    });
+
+    server.get("/order", [](http::request& req, http::response& res) {
+        res.json({{"order", req.get_auth_user()}});
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    auto response = client.get(fixture.base_url + "/order");
+    REQUIRE(response.ok());
+    REQUIRE(response.json()["order"] == "async1+sync+async2");
+}
+
+TEST_CASE("Async middleware can read the matched route", "[server][middleware][async][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    server.use([](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+        auto* route = req.get_matched_route();
+        req.set_auth_user(route ? route->get_pattern() : "none");
+        co_return true;
+    });
+
+    server.get("/users/:id", [](http::request& req, http::response& res) {
+        res.json({{"route", req.get_auth_user()}, {"id", req["id"]}});
+    });
+
+    server.set_not_found_handler([](http::request& req, http::response& res) {
+        res.json({{"route", req.get_auth_user()}}, http::http_response::status::not_found);
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    SECTION("Matched route is visible to the middleware") {
+        auto response = client.get(fixture.base_url + "/users/42");
+        REQUIRE(response.ok());
+        REQUIRE(response.json()["route"] == "/users/:id");
+        REQUIRE(response.json()["id"] == "42");
+    }
+
+    SECTION("Unmatched request has no route") {
+        auto response = client.get(fixture.base_url + "/missing");
+        REQUIRE(response.status() == 404);
+        REQUIRE(response.json()["route"] == "none");
+    }
+}
+
+TEST_CASE("Middleware shares the response with the handler", "[server][middleware][async][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    server.use([](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+        res.header("X-Request-Tag", "from-middleware");
+        co_return true;
+    });
+
+    server.get("/tagged", [](http::response& res) {
+        res.json({{"ok", true}});
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    auto response = client.get(fixture.base_url + "/tagged");
+    REQUIRE(response.ok());
+    REQUIRE(response.header("X-Request-Tag") == "from-middleware");
+}
+
+TEST_CASE("Middleware that stops without responding gets a 500", "[server][middleware][async][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    server.use([](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+        if (req.header("X-Mode") == "throw") throw std::runtime_error("middleware failure");
+        co_return req.header("X-Mode") != "silent";
+    });
+
+    server.get("/check", [](http::response& res) {
+        res.json({{"ok", true}});
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    SECTION("Returning false without a response") {
+        auto response = client.get(fixture.base_url + "/check", {{"X-Mode", "silent"}});
+        REQUIRE(response.status() == 500);
+    }
+
+    SECTION("Throwing an exception") {
+        auto response = client.get(fixture.base_url + "/check", {{"X-Mode", "throw"}});
+        REQUIRE(response.status() == 500);
+    }
+
+    SECTION("Passing through") {
+        auto response = client.get(fixture.base_url + "/check");
+        REQUIRE(response.ok());
+    }
+}
+
+TEST_CASE("Middlewares run before the request body is read", "[server][middleware][async][body][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    server.use([](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+        res.header("X-Body-Seen", std::to_string(req.body().size()));
+        co_return true;
+    });
+
+    server.post("/echo", [](http::request& req, http::response& res) {
+        res.json({{"size", req.body().size()}});
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    auto response = client.post(fixture.base_url + "/echo", std::string(100, 'x'), "text/plain");
+    REQUIRE(response.ok());
+    REQUIRE(response.header("X-Body-Seen") == "0");
+    REQUIRE(response.json()["size"] == 100);
+}
+
+TEST_CASE("Body of a request stopped by a middleware is discarded", "[server][middleware][async][body][pipelining][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    server.set_max_body_size(1024);
+    server.set_connection_timeout(10s);
+
+    server.use([](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+        if (req.get_http_request()->get_path() == "/protected") {
+            res.error(http::http_response::status::unauthorized, "denied");
+            co_return false;
+        }
+        co_return true;
+    });
+
+    server.post("/protected", [](http::request& req, http::response& res) {
+        res.json({{"size", req.body().size()}});
+    });
+
+    server.get("/open", [](http::response& res) {
+        res.send("open-ok");
+    });
+
+    fixture.start_server();
+
+    auto count = [](const std::string& haystack, const std::string& needle) {
+        size_t n = 0;
+        for (size_t pos = haystack.find(needle); pos != std::string::npos; pos = haystack.find(needle, pos + 1)) n++;
+        return n;
+    };
+
+    SECTION("Rejected Content-Length body followed by pipelined GET") {
+        std::string body(100, 'B');
+        auto response = raw_http_exchange(fixture.port,
+            "POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + std::to_string(body.size()) +
+            "\r\n\r\n" + body +
+            "GET /open HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+
+        REQUIRE(count(response, "HTTP/1.1 401") == 1);
+        REQUIRE(count(response, "HTTP/1.1 200") == 1);
+        REQUIRE(response.find("open-ok") != std::string::npos);
+        REQUIRE(count(response, "HTTP/1.1 400") == 0);
+    }
+
+    SECTION("Rejected chunked body followed by pipelined GET") {
+        auto response = raw_http_exchange(fixture.port,
+            "POST /protected HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+            "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+            "GET /open HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+
+        REQUIRE(count(response, "HTTP/1.1 401") == 1);
+        REQUIRE(count(response, "HTTP/1.1 200") == 1);
+        REQUIRE(response.find("open-ok") != std::string::npos);
+    }
+
+    SECTION("Rejected body above max_body_size closes the connection") {
+        auto start = std::chrono::steady_clock::now();
+        // Announce a large body but do not send it: the server must answer and close
+        auto response = raw_http_exchange(fixture.port,
+            "POST /protected HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100000\r\n\r\n");
+        auto elapsed = std::chrono::steady_clock::now() - start;
+
+        REQUIRE(count(response, "HTTP/1.1 401") == 1);
+        REQUIRE(elapsed < 5s);
+    }
+}

@@ -282,6 +282,46 @@ server.post("/api/status", [](nlohmann::json& json, auto& res) {
 
 Valijson is enabled by default. Disable with `-DTHINGER_HTTP_ENABLE_VALIJSON=OFF`.
 
+### Middleware
+
+Middlewares run for every request, in registration order, before the route handler. Register them before `listen()`/`start()`. A middleware is a coroutine that returns `true` to continue the chain, or responds and returns `false` to stop it (the route handler is not called):
+
+```cpp
+server.use([&tokens](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+    // The matched route is already known (nullptr if no route matched)
+    auto* route = req.get_matched_route();
+
+    // Asynchronous work, e.g. validating a token against a database
+    auto user = co_await tokens.validate(req.header("Authorization"));
+    if (!user) {
+        res.error(http::http_response::status::unauthorized, "Invalid token");
+        co_return false;
+    }
+
+    req.set_auth_user(*user);
+    co_return true;
+});
+```
+
+Synchronous middlewares with a `next()` callback are still supported; `next()` must be called before returning:
+
+```cpp
+server.use([](http::request& req, http::response& res, std::function<void()> next) {
+    res.header("X-Powered-By", "thinger-http");
+    next();
+});
+```
+
+Notes:
+
+- Middlewares run after route matching and **before the request body is read**, so `req.body()` is empty inside them. The body is read afterwards (or left to the handler on deferred-body routes).
+- Middlewares and the route handler share the same `response`, so headers set by a middleware are kept in the final response.
+- If a middleware stops the chain, any unread request body is discarded so the connection can be reused. If the body is larger than `set_max_body_size()`, the connection is closed after the response.
+- A middleware that returns `false` without responding, or throws, gets a `500 Internal Server Error`.
+- `request` and `response` are only valid until the middleware returns: do not keep references to them in detached work.
+
+`set_basic_auth()` is a ready-made middleware for HTTP Basic authentication on a path prefix (see `examples/http_server/server_auth_example.cpp`).
+
 ### CORS
 
 ```cpp

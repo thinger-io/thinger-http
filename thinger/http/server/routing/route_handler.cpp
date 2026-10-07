@@ -78,12 +78,6 @@ const route* route_handler::find_route(std::shared_ptr<request> req) {
             // Set the matched route in request
             req->set_matched_route(&route);
 
-            // Check authorization if required
-            if (route.get_auth_level() != auth_level::PUBLIC) {
-                LOG_DEBUG("Route requires authentication level: {}",
-                         static_cast<int>(route.get_auth_level()));
-            }
-
             return &route;
         }
     }

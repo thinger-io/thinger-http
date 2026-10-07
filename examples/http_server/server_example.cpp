@@ -31,16 +31,15 @@ std::pair<std::string, std::string> parse_basic_auth(const std::string& auth_hea
     return {"", ""};
 }
 
-// Basic Auth middleware
+// Basic Auth middleware (asynchronous: co_return true to continue, false to stop)
 auto create_basic_auth_middleware(const std::string& realm) {
-    return [realm](http::request& req, http::response& res, std::function<void()> next) {
+    return [realm](http::request& req, http::response& res) -> thinger::awaitable<bool> {
         // Get the requested path
         auto uri = req.get_http_request()->get_uri();
         
         // Only protect /admin paths
         if (!uri.starts_with("/admin")) {
-            next(); // Not protected, continue
-            return;
+            co_return true; // Not protected, continue
         }
         
         // Get Authorization header
@@ -56,7 +55,7 @@ auto create_basic_auth_middleware(const std::string& realm) {
             // Valid credentials - save username and continue
             req.set_auth_user(username);
             LOG_INFO("User '%s' authenticated for %s", username.c_str(), uri.c_str());
-            next();
+            co_return true;
         } else {
             // Invalid credentials - send 401 with WWW-Authenticate header
             LOG_WARNING("Authentication failed for %s", uri.c_str());
@@ -77,6 +76,7 @@ auto create_basic_auth_middleware(const std::string& realm) {
                 </html>
             )");
             res.send_response(http_response);
+            co_return false;
         }
     };
 }

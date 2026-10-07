@@ -100,11 +100,6 @@ route& route::deferred_body(bool enabled) {
     return *this;
 }
 
-route& route::auth(auth_level level) {
-    auth_level_ = level;
-    return *this;
-}
-
 route& route::description(const std::string& desc) {
     description_ = desc;
     return *this;

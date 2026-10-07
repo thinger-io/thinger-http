@@ -17,7 +17,6 @@ namespace thinger::http{
 
     // Forward declarations
     class route;
-    enum class auth_level;
 
     /**
      * Class that represents a single HTTP request over the API. It means, that the HTTP request
@@ -90,8 +89,6 @@ namespace thinger::http{
         void set_matched_route(const route* route);
         
         const route* get_matched_route() const;
-        
-        auth_level get_required_auth_level() const;
 
 
         bool keep_alive() const;
@@ -109,6 +106,10 @@ namespace thinger::http{
 
         /// Read full body into http_request content (for non-deferred dispatch).
         thinger::awaitable<bool> read_body();
+
+        /// Read and drop an unread body so the connection can be reused.
+        /// Returns false if the body exceeds `max_size` or the read fails.
+        thinger::awaitable<bool> discard_body(size_t max_size);
 
         /// Content-Length convenience (0 for chunked requests)
         size_t content_length() const;

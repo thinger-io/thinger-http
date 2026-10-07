@@ -133,18 +133,6 @@ TEST_CASE("Route configuration", "[route][unit]") {
         REQUIRE(&ref == &r); // returns self for chaining
     }
 
-    SECTION("auth default is PUBLIC") {
-        route r("/test");
-        REQUIRE(r.get_auth_level() == auth_level::PUBLIC);
-    }
-
-    SECTION("auth setter") {
-        route r("/test");
-        auto& ref = r.auth(auth_level::ADMIN);
-        REQUIRE(r.get_auth_level() == auth_level::ADMIN);
-        REQUIRE(&ref == &r);
-    }
-
     SECTION("description setter returns self") {
         route r("/test");
         auto& ref = r.description("A test route");
