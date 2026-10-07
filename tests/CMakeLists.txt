@@ -140,6 +140,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/compression_test.cpp)
 endif()
 
 # Integration tests - Unix Socket Server
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/memory_dispatch_test.cpp)
+    add_thinger_test(test_integration_memory_dispatch integration/memory_dispatch_test.cpp)
+endif()
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/unix_socket_server_test.cpp)
     add_thinger_test(test_integration_unix_socket_server integration/unix_socket_server_test.cpp)
 endif()

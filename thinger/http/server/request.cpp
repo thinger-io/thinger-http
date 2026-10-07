@@ -115,6 +115,7 @@ namespace thinger::http{
     }
 
     std::string request::get_request_ip() const{
+        if (!request_ip_.empty()) return request_ip_;
         auto http_connection = http_connection_.lock();
         return http_connection ? http_connection->get_socket()->get_remote_ip() : "";
     }

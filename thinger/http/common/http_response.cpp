@@ -45,6 +45,8 @@ namespace thinger::http{
                 "HTTP/1.1 502 Bad Gateway";
         const std::string service_unavailable =
                 "HTTP/1.1 503 Service Unavailable";
+        const std::string gateway_timeout =
+                "HTTP/1.1 504 Gateway Timeout";
         const std::string switching_protocols =
                 "HTTP/1.1 101 Switching Protocols";
         const std::string too_many_requests =
@@ -104,6 +106,8 @@ namespace thinger::http{
                     return bad_gateway;
                 case http_response::status::service_unavailable:
                     return service_unavailable;
+                case http_response::status::gateway_timeout:
+                    return gateway_timeout;
                 case http_response::status::switching_protocols:
                     return switching_protocols;
                 case http_response::status::too_many_requests:
@@ -267,6 +271,12 @@ namespace thinger::http{
                 "<body><h1>503 Service Unavailable</h1></body>"
                 "</html>");
 
+        static const std::string gateway_timeout(
+                "<html>"
+                "<head><title>Gateway Timeout</title></head>"
+                "<body><h1>504 Gateway Timeout</h1></body>"
+                "</html>");
+
         static const std::string too_many_requests(
                 "<html>"
                 "<head><title>Too Many Requests</title></head>"
@@ -325,6 +335,8 @@ namespace thinger::http{
                     return bad_gateway;
                 case http_response::status::service_unavailable:
                     return service_unavailable;
+                case http_response::status::gateway_timeout:
+                    return gateway_timeout;
                 case http_response::status::too_many_requests:
                     return too_many_requests;
                 case http_response::status::payload_too_large:

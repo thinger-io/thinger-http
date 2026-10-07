@@ -49,6 +49,7 @@ using route_callback_json_response = std::function<void(nlohmann::json&, respons
 using route_callback_request_response = std::function<void(request&, response&)>;
 using route_callback_request_json_response = std::function<void(request&, nlohmann::json&, response&)>;
 using route_callback_awaitable = std::function<thinger::awaitable<void>(request&, response&)>;
+using route_callback_awaitable_response_only = std::function<thinger::awaitable<void>(response&)>;
 using route_callback_awaitable_json = std::function<thinger::awaitable<void>(nlohmann::json&, response&)>;
 using route_callback_awaitable_request_json = std::function<thinger::awaitable<void>(request&, nlohmann::json&, response&)>;
 
@@ -58,6 +59,11 @@ using route_callback_awaitable_request_json = std::function<thinger::awaitable<v
 template<typename F>
 concept awaitable_handler = requires(F f, request& req, response& res) {
     { f(req, res) } -> std::same_as<thinger::awaitable<void>>;
+};
+
+template<typename F>
+concept awaitable_response_handler = requires(F f, response& res) {
+    { f(res) } -> std::same_as<thinger::awaitable<void>>;
 };
 
 template<typename F>
@@ -72,7 +78,8 @@ concept awaitable_json_handler = !awaitable_handler<F> && requires(F f, nlohmann
 };
 
 template<typename F>
-concept coroutine_handler = awaitable_handler<F> || awaitable_json_handler<F> || awaitable_request_json_handler<F>;
+concept coroutine_handler = awaitable_handler<F> || awaitable_response_handler<F>
+                         || awaitable_json_handler<F> || awaitable_request_json_handler<F>;
 
 // Legacy callback types (for backward compatibility if needed)
 using route_callback = route_callback_request_response;
@@ -104,6 +111,7 @@ public:
     route& operator=(route_callback_request_response callback);
     route& operator=(route_callback_request_json_response callback);
     route& operator=(route_callback_awaitable callback);
+    route& operator=(route_callback_awaitable_response_only callback);
     route& operator=(route_callback_awaitable_json callback);
     route& operator=(route_callback_awaitable_request_json callback);
 
@@ -113,6 +121,8 @@ public:
     route& operator=(F&& callback) {
         if constexpr (awaitable_handler<F>) {
             return *this = route_callback_awaitable(std::forward<F>(callback));
+        } else if constexpr (awaitable_response_handler<F>) {
+            return *this = route_callback_awaitable_response_only(std::forward<F>(callback));
         } else if constexpr (awaitable_request_json_handler<F>) {
             return *this = route_callback_awaitable_request_json(std::forward<F>(callback));
         } else {
@@ -213,6 +223,7 @@ private:
         route_callback_request_response,
         route_callback_request_json_response,
         route_callback_awaitable,
+        route_callback_awaitable_response_only,
         route_callback_awaitable_json,
         route_callback_awaitable_request_json
     > callback_;

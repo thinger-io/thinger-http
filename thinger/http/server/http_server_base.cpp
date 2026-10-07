@@ -435,60 +435,128 @@ void http_server_base::setup_connection_handler() {
         connection->set_handler([this](std::shared_ptr<request> req) -> awaitable<void> {
             auto http_connection = req->get_http_connection();
             auto stream = req->get_http_stream();
-            auto http_request = req->get_http_request();
 
             if (!http_connection || !stream) {
                 LOG_ERROR("Invalid connection or stream");
                 co_return;
             }
 
-            // 1. Match route
-            auto* matched_route = router_.find_route(req);
-
-            // 2. Run middlewares (before reading the body), sharing the handler response
-            response res(http_connection, stream, http_request, cors_enabled_);
-
-            if (!co_await run_middlewares(*req, res)) {
-                co_await discard_unread_body(*req);
-                co_return;
-            }
-
-            // 3. Three-way dispatch
-            if (!matched_route) {
-                // No route matched → fallback / 404
-                router_.handle_unmatched(req, res);
-            } else if (matched_route->is_deferred_body()) {
-                // DEFERRED: handler reads body at its discretion
-                co_await matched_route->handle_request_coro(*req, res);
-            } else if (req->has_pending_body()) {
-                // PENDING BODY: check size limit, read, then dispatch
-                if (!http_request->is_chunked_transfer() && req->content_length() > max_body_size_) {
-                    // body left unread on the socket: close after responding
-                    stream->set_keep_alive(false);
-                    res.error(http_response::status::payload_too_large, "Payload Too Large");
-                    co_return;
-                }
-                req->set_max_body_size(max_body_size_);
-                bool ok = co_await req->read_body();
-                if (!ok) {
-                    stream->set_keep_alive(false);
-                    res.error(http_response::status::payload_too_large, "Payload Too Large");
-                    co_return;
-                }
-                co_await matched_route->handle_request_coro(*req, res);
-            } else {
-                // NO BODY: dispatch directly
-                co_await matched_route->handle_request_coro(*req, res);
-            }
-
-            // Drop any body left unread (unmatched route, or a deferred handler that did
-            // not read it all) so it is not parsed as the next request
-            co_await discard_unread_body(*req);
+            response res(http_connection, stream, req->get_http_request(), cors_enabled_);
+            co_await process_request(req, res);
         });
 
         // Start handling the connection with configured timeout
         connection->start(connection_timeout_);
     });
+}
+
+awaitable<void> http_server_base::process_request(std::shared_ptr<request> req, response& res) {
+    auto http_request = req->get_http_request();
+
+    // The body is left unread on the connection: close it after responding
+    auto close_after_response = [&req]() {
+        if (auto stream = req->get_http_stream()) stream->set_keep_alive(false);
+    };
+
+    // 1. Match route
+    auto* matched_route = router_.find_route(req);
+
+    // 2. Run middlewares (before reading the body), sharing the handler response
+    if (!co_await run_middlewares(*req, res)) {
+        co_await discard_unread_body(*req);
+        co_return;
+    }
+
+    // 3. Three-way dispatch
+    if (!matched_route) {
+        // No route matched → fallback / 404
+        router_.handle_unmatched(req, res);
+    } else if (matched_route->is_deferred_body()) {
+        // DEFERRED: handler reads body at its discretion
+        co_await matched_route->handle_request_coro(*req, res);
+    } else if (req->has_pending_body()) {
+        // PENDING BODY: check size limit, read, then dispatch
+        if (!http_request->is_chunked_transfer() && req->content_length() > max_body_size_) {
+            close_after_response();
+            res.error(http_response::status::payload_too_large, "Payload Too Large");
+            co_return;
+        }
+        req->set_max_body_size(max_body_size_);
+        bool ok = co_await req->read_body();
+        if (!ok) {
+            close_after_response();
+            res.error(http_response::status::payload_too_large, "Payload Too Large");
+            co_return;
+        }
+        co_await matched_route->handle_request_coro(*req, res);
+    } else {
+        // NO BODY: dispatch directly
+        co_await matched_route->handle_request_coro(*req, res);
+    }
+
+    // Drop any body left unread (unmatched route, or a deferred handler that did
+    // not read it all) so it is not parsed as the next request
+    co_await discard_unread_body(*req);
+}
+
+// In-memory dispatch
+awaitable<std::shared_ptr<http_response>> http_server_base::dispatch(std::shared_ptr<http_request> http_request,
+                                                                     dispatch_options options) {
+    auto error_response = [](http_response::status status, const std::string& message) {
+        auto result = std::make_shared<http_response>();
+        result->set_status(status);
+        result->set_content(message, "text/plain");
+        return result;
+    };
+
+    if (!http_request) co_return error_response(http_response::status::bad_request, "Missing request");
+    if (http_request->is_chunked_transfer()) {
+        co_return error_response(http_response::status::bad_request, "Chunked requests cannot be dispatched in memory");
+    }
+
+    // Serve the body from memory, as if just received from the client: handlers read it
+    // like on a connection (read_body(), or read()/read_some() on deferred routes)
+    std::string body = std::move(http_request->get_body());
+    http_request->get_body().clear();
+    http_request->remove_header(header::content_length);
+    http_request->process_header(header::content_length, std::to_string(body.size()));
+
+    auto req = std::make_shared<request>(nullptr, nullptr, http_request);
+    req->set_request_ip(options.remote_ip);
+    if (!body.empty()) {
+        req->set_read_ahead(reinterpret_cast<const uint8_t*>(body.data()), body.size());
+    }
+
+    auto memory = std::make_shared<memory_response>(co_await boost::asio::this_coro::executor);
+    response res(memory, http_request, cors_enabled_);
+
+    try {
+        co_await process_request(req, res);
+    } catch (const std::exception& e) {
+        LOG_ERROR("Exception dispatching in-memory request: {}", e.what());
+        if (!res.has_responded()) res.error(http_response::status::internal_server_error);
+    }
+
+    // Handlers may answer later (e.g. from a copy of the response kept elsewhere)
+    auto result = co_await memory->wait(options.timeout);
+    if (!result) {
+        co_return error_response(http_response::status::gateway_timeout, "No response within the timeout");
+    }
+    co_return result;
+}
+
+void http_server_base::dispatch(const boost::asio::any_io_executor& executor,
+                                std::shared_ptr<http_request> request,
+                                std::function<void(std::shared_ptr<http_response>)> callback,
+                                dispatch_options options) {
+    co_spawn(executor, dispatch(std::move(request), std::move(options)),
+        [callback = std::move(callback)](std::exception_ptr error, std::shared_ptr<http_response> result) {
+            if (error || !result) {
+                result = std::make_shared<http_response>();
+                result->set_status(http_response::status::internal_server_error);
+            }
+            callback(std::move(result));
+        });
 }
 
 awaitable<bool> http_server_base::run_middlewares(request& req, response& res) {

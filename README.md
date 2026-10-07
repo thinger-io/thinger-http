@@ -452,6 +452,24 @@ auto document = server.openapi().generate(); // or build it directly
 
 Register shared schemas before the routes that reference them. See `examples/http_server/openapi_example.cpp`, which also serves Swagger UI.
 
+### In-Memory Dispatch
+
+`server.dispatch()` runs a request without any connection, through the same steps as a network request: route matching, middlewares, body reading and validation, the handler, and 404/405. It is useful for tests, internal calls between modules and gateways (e.g. an MCP server calling the API with the caller's credentials):
+
+```cpp
+auto request = http::http_request::create_http_request(http::method::POST, "http://localhost/devices");
+request->set_content(R"({"name":"sensor"})", "application/json");
+request->add_header("Authorization", "Bearer " + token);   // checked by your middlewares
+
+auto response = co_await server.dispatch(request, {.remote_ip = "10.0.0.7", .timeout = 5s});
+// response->get_status_code(), response->get_content()
+
+// Outside a coroutine
+server.dispatch(executor, request, [](std::shared_ptr<http::http_response> response) { /* ... */ });
+```
+
+The server does not need to be listening. Chunked responses are collected whole. Handlers can keep a copy of the response and answer later; without an answer within the timeout the result is `504`. WebSockets, SSE and `take_over()` answer `501`, as there is no connection. `get_request_ip()` returns `remote_ip`, which is empty unless set: internal calls never pass as a trusted local address by default.
+
 ### CORS
 
 ```cpp

@@ -21,6 +21,16 @@ class request;
 class response;
 class route_group;
 
+// Options for requests dispatched in memory (see http_server_base::dispatch)
+struct dispatch_options {
+    // Client IP reported by request::get_request_ip() (empty by default: never assume a
+    // trusted address such as 127.0.0.1 for internal calls)
+    std::string remote_ip;
+
+    // Maximum time to wait for the response; 504 Gateway Timeout if exceeded
+    std::chrono::milliseconds timeout{30000};
+};
+
 // Middlewares run after route matching (request::get_matched_route() is set, or null
 // if no route matched) and before the request body is read, so they cannot see it.
 // They share the response object with the route handler.
@@ -133,6 +143,20 @@ public:
     // Serve the OpenAPI document as JSON at `path` (not served unless called)
     route& serve_openapi(const std::string& path = "/openapi.json");
 
+    // Dispatch a request in memory, without a connection, through the same steps as a
+    // network request: route matching, middlewares, body reading and validation, handler,
+    // and the same 404/405 handling. Useful for tests, internal calls and gateways.
+    // The body is taken from the request content (set_content); chunked requests are not
+    // supported. WebSocket, SSE and connection takeover answer 501.
+    awaitable<std::shared_ptr<http_response>> dispatch(std::shared_ptr<http_request> request,
+                                                       dispatch_options options = {});
+
+    // Same, calling `callback` with the response; runs on `executor`
+    void dispatch(const boost::asio::any_io_executor& executor,
+                  std::shared_ptr<http_request> request,
+                  std::function<void(std::shared_ptr<http_response>)> callback,
+                  dispatch_options options = {});
+
     // Middleware (register before listen(), executed in registration order)
     void use(async_middleware_function middleware);
     void use(middleware_function middleware);
@@ -212,6 +236,7 @@ protected:
     
 private:
     void setup_connection_handler();
+    awaitable<void> process_request(std::shared_ptr<request> req, response& res);
     awaitable<bool> run_middlewares(request& req, response& res);
     awaitable<void> discard_unread_body(request& req);
 };

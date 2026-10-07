@@ -41,6 +41,7 @@ public:
         not_implemented = 501,
         bad_gateway = 502,
         service_unavailable = 503,
+        gateway_timeout = 504,
         switching_protocols = 101
     } ;
 

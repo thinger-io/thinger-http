@@ -92,6 +92,12 @@ route& route::operator=(route_callback_awaitable callback) {
     return *this;
 }
 
+route& route::operator=(route_callback_awaitable_response_only callback) {
+    callback_ = std::move(callback);
+    deferred_body_ = true;  // the handler cannot read the body: it is discarded afterwards
+    return *this;
+}
+
 route& route::operator=(route_callback_awaitable_json callback) {
     callback_ = std::move(callback);
     return *this;
@@ -238,6 +244,8 @@ void route::handle_request(request& req, response& res) const {
 thinger::awaitable<void> route::handle_request_coro(request& req, response& res) const {
     if (std::holds_alternative<route_callback_awaitable>(callback_)) {
         co_await std::get<route_callback_awaitable>(callback_)(req, res);
+    } else if (std::holds_alternative<route_callback_awaitable_response_only>(callback_)) {
+        co_await std::get<route_callback_awaitable_response_only>(callback_)(res);
     } else if (std::holds_alternative<route_callback_awaitable_json>(callback_)) {
         nlohmann::json json;
         if (parse_json_body(req, res, json)) {

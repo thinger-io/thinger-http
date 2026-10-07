@@ -74,6 +74,7 @@ void response::send_file(const std::filesystem::path& path, bool force_download)
 void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_connection>)> handler,
                                 const std::set<std::string>& supported_protocols) {
     if (!ensure_not_responded()) return;
+    if (reject_in_memory("WebSocket upgrade")) return;
     
     auto conn = connection_.lock();
     auto str = stream_.lock();
@@ -147,6 +148,7 @@ void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_co
 
 void response::take_over(takeover_handler handler) {
     if (!ensure_not_responded()) return;
+    if (reject_in_memory("Connection takeover")) return;
 
     auto conn = connection_.lock();
     auto str = stream_.lock();
@@ -168,6 +170,7 @@ void response::take_over(takeover_handler handler) {
 // Server-Sent Events implementation
 void response::start_sse(std::function<void(std::shared_ptr<sse_connection>)> handler) {
     if (!ensure_not_responded()) return;
+    if (reject_in_memory("Server-Sent Events")) return;
     
     auto conn = connection_.lock();
     auto str = stream_.lock();
@@ -202,6 +205,15 @@ void response::start_sse(std::function<void(std::shared_ptr<sse_connection>)> ha
 bool response::start_chunked(const std::string& content_type, http::http_response::status status) {
     if (!ensure_not_responded()) return false;
 
+    if (memory_) {
+        prepare_response();
+        response_->set_status(status);
+        response_->set_content_type(content_type);
+        memory_->begin(response_);
+        responded_ = true;
+        return true;
+    }
+
     auto conn = connection_.lock();
     auto str = stream_.lock();
     if (!conn || !str) {
@@ -230,6 +242,11 @@ bool response::write_chunk(const std::string& data) {
         return false;
     }
 
+    if (memory_) {
+        memory_->append(data);
+        return true;
+    }
+
     auto conn = connection_.lock();
     auto str = stream_.lock();
     if (!conn || !str) {
@@ -247,6 +264,11 @@ bool response::end_chunked() {
     if (!responded_) {
         LOG_ERROR("Must call start_chunked() before ending chunks");
         return false;
+    }
+
+    if (memory_) {
+        memory_->finish();
+        return true;
     }
 
     auto conn = connection_.lock();

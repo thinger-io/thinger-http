@@ -47,6 +47,9 @@ namespace thinger::http{
 
         std::string get_request_ip() const;
 
+        /// Client IP to report for requests without a connection (in-memory dispatch)
+        void set_request_ip(std::string ip) { request_ip_ = std::move(ip); }
+
         // Convenience methods for accessing request data
 
         /// Get query parameter by key
@@ -163,6 +166,8 @@ namespace thinger::http{
         std::multimap<std::string, std::string> params_;
 
         std::string auth_user_;
+
+        std::string request_ip_;
 
         std::set<std::string> groups_;
         

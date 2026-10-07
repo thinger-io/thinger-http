@@ -7,6 +7,7 @@
 #include "http_stream.hpp"
 #include "websocket_connection.hpp"
 #include "sse_connection.hpp"
+#include "memory_response.hpp"
 #include "../../util/compression.hpp"
 #include <nlohmann/json.hpp>
 #include <memory>
@@ -26,6 +27,7 @@ private:
     std::weak_ptr<http_stream> stream_;
     std::shared_ptr<http::http_request> http_request_;
     std::shared_ptr<http_response> response_;
+    std::shared_ptr<memory_response> memory_;   // set for requests dispatched in memory
     bool responded_ = false;
     bool cors_enabled_ = false;
 
@@ -97,13 +99,29 @@ private:
         if (!ensure_not_responded()) return;
         prepare_response();
         compress_response_if_needed();
+        deliver();
+        responded_ = true;
+    }
 
+    // Send response_ to the connection, or to memory for in-memory requests
+    void deliver() {
+        if (memory_) {
+            memory_->complete(response_);
+            return;
+        }
         if (auto conn = connection_.lock()) {
             if (auto str = stream_.lock()) {
                 conn->handle_stream(str, response_);
             }
         }
-        responded_ = true;
+    }
+
+    // Answers with 501 if this is an in-memory request (no connection to upgrade or own)
+    bool reject_in_memory(const char* feature) {
+        if (!memory_) return false;
+        error(http::http_response::status::not_implemented,
+              std::string(feature) + " is not available for in-memory requests");
+        return true;
     }
 
 public:
@@ -112,6 +130,12 @@ public:
              const std::shared_ptr<http::http_request>& http_request,
              bool cors_enabled = false)
         : connection_(connection), stream_(stream), http_request_(http_request), cors_enabled_(cors_enabled) {}
+
+    // Response of a request dispatched in memory: written to `memory` instead of a connection
+    response(std::shared_ptr<memory_response> memory,
+             const std::shared_ptr<http::http_request>& http_request,
+             bool cors_enabled = false)
+        : http_request_(http_request), memory_(std::move(memory)), cors_enabled_(cors_enabled) {}
 
     // JSON response
     void json(const nlohmann::json& data, http::http_response::status status = http::http_response::status::ok) {
@@ -174,12 +198,7 @@ public:
         }
 
         compress_response_if_needed();
-
-        if (auto conn = connection_.lock()) {
-            if (auto str = stream_.lock()) {
-                conn->handle_stream(str, response_);
-            }
-        }
+        deliver();
         responded_ = true;
     }
 
