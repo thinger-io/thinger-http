@@ -2244,24 +2244,125 @@ TEST_CASE("Middleware headers are kept on unmatched requests", "[server][middlew
     REQUIRE(response.header("X-Request-Id") == "abc123");
 }
 
-TEST_CASE("Body read straight from the socket can be marked as consumed", "[server][deferred][body][pipelining][integration]") {
+// ============================================================================
+// Connection takeover
+// ============================================================================
+
+namespace {
+    // Read from a raw socket until `needle` shows up (or the connection ends)
+    std::string read_until_contains(boost::asio::ip::tcp::socket& sock, std::string& pending, const std::string& needle) {
+        char tmp[1024];
+        while (pending.find(needle) == std::string::npos) {
+            boost::system::error_code ec;
+            size_t n = sock.read_some(boost::asio::buffer(tmp), ec);
+            if (ec) break;
+            pending.append(tmp, n);
+        }
+        return pending;
+    }
+
+    // Echo server on a taken-over socket: first reports the buffered bytes, then echoes
+    thinger::awaitable<void> echo_session(std::shared_ptr<thinger::asio::socket> socket, std::string buffered) {
+        co_await socket->write("buffered:[" + buffered + "]\n");
+        uint8_t buf[256];
+        while (true) {
+            auto [ec, bytes] = co_await socket->read_some(buf, sizeof(buf));
+            if (ec || bytes == 0) break;
+            co_await socket->write(buf, bytes);
+        }
+    }
+}
+
+TEST_CASE("Connection takeover hands the socket and buffered bytes to the new owner", "[server][takeover][integration]") {
     ServerBaseTestFixture fixture;
     auto& server = fixture.server;
     std::atomic<int> check_count{0};
 
-    // Reads the body bypassing read()/read_some(), as a forwarding proxy would
-    server.post("/forward", [](http::request& req, http::response& res) -> thinger::awaitable<void> {
-        std::string body(req.content_length(), '\0');
-        auto* data = reinterpret_cast<uint8_t*>(body.data());
-        size_t total = co_await req.read(data, req.read_ahead_available());
-        auto [ec, bytes] = co_await req.get_socket()->read(data + total, body.size() - total);
-        total += bytes;
-        req.mark_body_consumed();
-        res.json({{"forwarded", body.substr(0, total)}, {"pending", req.has_pending_body()}});
+    auto take_over = [](http::request& req, http::response& res) {
+        res.status(http::http_response::status::switching_protocols);
+        res.header("Upgrade", "echo");
+        res.header("Connection", "Upgrade");
+        res.take_over([](std::shared_ptr<thinger::asio::socket> socket, std::string buffered) {
+            thinger::co_spawn(socket->get_io_context(), echo_session(socket, std::move(buffered)), thinger::detached);
+        });
+    };
+
+    // Synchronous handler
+    server.get("/echo", [take_over](http::request& req, http::response& res) {
+        take_over(req, res);
+    });
+
+    // Coroutine handler that keeps running after the response is sent
+    server.get("/echo-async", [take_over](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        take_over(req, res);
+        boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 100ms);
+        co_await timer.async_wait(thinger::use_awaitable);
     });
 
     server.get("/check", [&check_count](http::response& res) {
         check_count++;
+        res.send("check-ok");
+    });
+
+    fixture.start_server();
+
+    for (std::string path : {"/echo", "/echo-async"}) {
+        DYNAMIC_SECTION("Takeover from " << path) {
+            boost::asio::io_context ioc;
+            boost::asio::ip::tcp::socket sock(ioc);
+            boost::asio::ip::tcp::resolver resolver(ioc);
+            boost::asio::connect(sock, resolver.resolve("127.0.0.1", std::to_string(fixture.port)));
+
+            // Bytes sent right after the request (even one that looks like HTTP) belong to the new owner
+            boost::asio::write(sock, boost::asio::buffer(
+                "GET " + path + " HTTP/1.1\r\nHost: localhost\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n"
+                "EARLY GET /check HTTP/1.1\r\n\r\n"));
+
+            std::string received;
+            read_until_contains(sock, received, "]\n");
+            REQUIRE(received.starts_with("HTTP/1.1 101"));
+            REQUIRE(received.find("buffered:[EARLY GET /check HTTP/1.1\r\n\r\n]") != std::string::npos);
+
+            // The socket now speaks the new protocol
+            received.clear();
+            boost::asio::write(sock, boost::asio::buffer(std::string("ping")));
+            read_until_contains(sock, received, "ping");
+            REQUIRE(received == "ping");
+            REQUIRE(check_count == 0);
+        }
+    }
+}
+
+TEST_CASE("WebSocket client sending data before the handshake is closed", "[server][takeover][websocket][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    std::atomic<bool> opened{false};
+
+    server.get("/ws", [&opened](http::request& req, http::response& res) {
+        res.upgrade_websocket([&opened](std::shared_ptr<http::websocket_connection>) { opened = true; });
+    });
+
+    fixture.start_server();
+
+    auto response = raw_http_exchange(fixture.port,
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    REQUIRE(response.starts_with("HTTP/1.1 101"));
+    REQUIRE(response.find("HTTP/1.1 400") == std::string::npos);
+    REQUIRE_FALSE(opened);
+}
+
+TEST_CASE("Pipelined request after a chunked body spanning several reads", "[server][chunked-request][pipelining][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    server.post("/upload", [](http::request& req, http::response& res) {
+        res.json({{"body", req.body()}});
+    });
+
+    server.get("/check", [](http::response& res) {
         res.send("check-ok");
     });
 
@@ -2272,14 +2373,13 @@ TEST_CASE("Body read straight from the socket can be marked as consumed", "[serv
     boost::asio::ip::tcp::resolver resolver(ioc);
     boost::asio::connect(sock, resolver.resolve("127.0.0.1", std::to_string(fixture.port)));
 
-    // Headers first, then the body together with the next request, so the body arrives
-    // on the socket after the handler has started
-    const std::string body = "0123456789abcdef";
-    boost::asio::write(sock, boost::asio::buffer(
-        "POST /forward HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n"));
+    // First chunk with the headers; the rest of the body and the next request arrive later,
+    // so the decoder reads them from the socket rather than from the header buffer
+    boost::asio::write(sock, boost::asio::buffer(std::string(
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")));
     std::this_thread::sleep_for(200ms);
-    boost::asio::write(sock, boost::asio::buffer(
-        body + "GET /check HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"));
+    boost::asio::write(sock, boost::asio::buffer(std::string(
+        "6\r\n world\r\n0\r\n\r\nGET /check HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")));
 
     boost::system::error_code ec;
     boost::asio::streambuf response_buf;
@@ -2287,8 +2387,6 @@ TEST_CASE("Body read straight from the socket can be marked as consumed", "[serv
     std::string response(boost::asio::buffers_begin(response_buf.data()),
                          boost::asio::buffers_end(response_buf.data()));
 
-    REQUIRE(response.find("\"forwarded\":\"0123456789abcdef\"") != std::string::npos);
-    REQUIRE(response.find("\"pending\":false") != std::string::npos);
+    REQUIRE(response.find("\"body\":\"hello world\"") != std::string::npos);
     REQUIRE(response.find("check-ok") != std::string::npos);
-    REQUIRE(check_count == 1);
 }

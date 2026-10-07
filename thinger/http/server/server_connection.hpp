@@ -16,6 +16,10 @@ namespace thinger::http {
 
 class request;
 
+// Receives a connection taken over from the HTTP server: the socket, and any bytes the
+// server had already read past the request that took it over
+using takeover_handler = std::function<void(std::shared_ptr<asio::socket>, std::string buffered)>;
+
 class server_connection : public std::enable_shared_from_this<server_connection>, public boost::noncopyable {
 
     static constexpr size_t MAX_BUFFER_SIZE = 4096;
@@ -33,6 +37,16 @@ public:
 
     // Release the socket for upgrades (WebSocket, etc.)
     std::shared_ptr<asio::socket> release_socket();
+
+    // Take over the connection: once the current request has been handled and its
+    // response written, stop serving HTTP and hand the socket to `handler`
+    void begin_takeover(takeover_handler handler);
+
+    // Called when the response of the request taking over the connection is written
+    void takeover_response_sent();
+
+    // Whether the connection is being (or has been) taken over
+    bool is_taken_over() const { return takeover_requested_; }
 
     // Release this instance without touching the socket
     void release();
@@ -75,6 +89,9 @@ private:
     // Close connection
     void close();
 
+    // Hand the socket over once the response is written and the read loop has stopped
+    void complete_takeover();
+
 private:
     std::shared_ptr<asio::socket> socket_;
     boost::asio::steady_timer timeout_timer_;
@@ -95,6 +112,13 @@ private:
     bool running_{false};
     stream_id request_id_{0};
     size_t max_body_size_{DEFAULT_MAX_BODY_SIZE};
+
+    // Connection takeover
+    takeover_handler takeover_handler_;
+    std::string takeover_buffer_;
+    bool takeover_requested_{false};
+    bool takeover_response_sent_{false};
+    bool takeover_reader_stopped_{false};
 };
 
 }

@@ -124,30 +124,45 @@ void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_co
         response_->add_header("Sec-WebSocket-Protocol", protocol);
     }
     
-    // Register callback to be executed after response is sent
-    str->on_completed([handler = std::move(handler), conn, str]() {
-        // Release the socket from HTTP connection
-        auto socket = conn->release_socket();
-        if (!socket) {
-            LOG_ERROR("Failed to release socket for WebSocket upgrade");
+    // Send the upgrade response and take over the connection
+    take_over([handler = std::move(handler)](std::shared_ptr<asio::socket> socket, std::string buffered) {
+        // A client must wait for the handshake response before sending frames (RFC 6455)
+        if (!buffered.empty()) {
+            LOG_WARNING("WebSocket client sent data before the handshake completed, closing");
+            socket->close();
             return;
         }
-        
+
         // Create WebSocket from the socket
         auto websocket = std::make_shared<asio::websocket>(socket, true, true); // binary=true, server=true
         auto ws_connection = std::make_shared<websocket_connection>(websocket);
-        
+
         // Call user handler
         handler(ws_connection);
-        
+
         // Start the WebSocket connection
         ws_connection->start();
     });
-    
-    // Send the upgrade response
-    conn->handle_stream(str, response_);
-    
-    responded_ = true;
+}
+
+void response::take_over(takeover_handler handler) {
+    if (!ensure_not_responded()) return;
+
+    auto conn = connection_.lock();
+    auto str = stream_.lock();
+    if (!conn || !str) {
+        LOG_ERROR("Cannot take over a closed connection");
+        return;
+    }
+
+    // Stop the connection from reading further requests, then hand the socket over
+    // once this response has been written
+    conn->begin_takeover(std::move(handler));
+    str->on_completed([conn]() {
+        conn->takeover_response_sent();
+    });
+
+    send_prepared_response();
 }
 
 // Server-Sent Events implementation
@@ -169,29 +184,18 @@ void response::start_sse(std::function<void(std::shared_ptr<sse_connection>)> ha
     response_->add_header("Connection", "keep-alive");
     response_->add_header("X-Accel-Buffering", "no"); // Disable nginx buffering
     
-    // Register callback to be executed after headers are sent
-    str->on_completed([handler = std::move(handler), conn]() {
-        // Release the socket from HTTP connection
-        auto socket = conn->release_socket();
-        if (!socket) {
-            LOG_ERROR("Failed to release socket for SSE");
-            return;
-        }
-        
+    // Send the SSE headers and take over the connection (anything the client sends
+    // afterwards is not part of the event stream)
+    take_over([handler = std::move(handler)](std::shared_ptr<asio::socket> socket, std::string) {
         // Create SSE connection
         auto sse_conn = std::make_shared<sse_connection>(socket);
-        
+
         // Start the SSE connection
         sse_conn->start();
-        
+
         // Call user handler
         handler(sse_conn);
     });
-    
-    // Send the SSE headers
-    conn->handle_stream(str, response_);
-    
-    responded_ = true;
 }
 
 // Chunked response support

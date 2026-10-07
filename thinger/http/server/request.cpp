@@ -236,6 +236,13 @@ namespace thinger::http{
         return conn ? conn->get_socket() : nullptr;
     }
 
+    std::vector<uint8_t> request::take_read_ahead() {
+        std::vector<uint8_t> data(read_ahead_.begin() + (read_ahead_.size() - read_ahead_available()), read_ahead_.end());
+        read_ahead_.clear();
+        read_ahead_offset_ = 0;
+        return data;
+    }
+
     size_t request::read_ahead_available() const {
         return read_ahead_.size() > read_ahead_offset_ ? read_ahead_.size() - read_ahead_offset_ : 0;
     }
@@ -550,11 +557,6 @@ namespace thinger::http{
         if (!http_request_) return false;
         if (is_chunked()) return chunk_state_ != chunk_state::done;
         return body_remaining_ > 0;
-    }
-
-    void request::mark_body_consumed() {
-        body_remaining_ = 0;
-        chunk_state_ = chunk_state::done;
     }
 
     thinger::awaitable<bool> request::discard_body(size_t max_size) {

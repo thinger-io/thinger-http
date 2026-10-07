@@ -503,6 +503,11 @@ awaitable<bool> http_server_base::run_middlewares(request& req, response& res) {
 }
 
 awaitable<void> http_server_base::discard_unread_body(request& req) {
+    // A connection taken over belongs to its new owner, unread body included
+    if (auto connection = req.get_http_connection(); connection && connection->is_taken_over()) {
+        co_return;
+    }
+
     // Consume a body nobody read so the connection can be reused for the next request,
     // or close it after the response if the body is too large or cannot be read.
     if (!co_await req.discard_body(max_body_size_)) {

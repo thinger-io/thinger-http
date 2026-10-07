@@ -114,13 +114,8 @@ namespace thinger::http{
         /// Returns false if the body exceeds `max_size` or the read fails.
         thinger::awaitable<bool> discard_body(size_t max_size);
 
-        /// Whether part of the body is still unread. Tracks read(), read_some() and
-        /// read_body(); reading the socket directly through get_socket() is not tracked.
+        /// Whether part of the body is still unread by read(), read_some() or read_body().
         bool has_pending_body() const;
-
-        /// Declare the body fully consumed after reading it outside read()/read_some()
-        /// (e.g. straight from get_socket()), so the server does not try to discard it.
-        void mark_body_consumed();
 
         /// Content-Length convenience (0 for chunked requests)
         size_t content_length() const;
@@ -131,9 +126,11 @@ namespace thinger::http{
         /// Bytes remaining in read-ahead buffer
         size_t read_ahead_available() const;
 
-        /// Direct socket access (for pipe-style forwarding). Body bytes read this way are
-        /// not tracked: consume read_ahead_available() bytes with read() first, and call
-        /// mark_body_consumed() once the body has been read from the socket.
+        /// Remove and return the unconsumed read-ahead bytes (data following this request)
+        std::vector<uint8_t> take_read_ahead();
+
+        /// Underlying socket. Do not read or write it while the server owns the connection:
+        /// read the body with read()/read_some(), or own the socket with response::take_over().
         std::shared_ptr<asio::socket> get_socket() const;
 
         //exec_result get_request_data() const;

@@ -213,8 +213,23 @@ server.post("/upload", [](http::request& req, http::response& res) -> thinger::a
 
 Reads never go past the end of the body. Whatever the handler leaves unread is discarded after it returns, so it is never parsed as the next request on a keep-alive connection; if it exceeds `set_max_body_size()`, the connection is closed instead.
 
-- Handlers that read the body straight from the socket (`req.get_socket()`, e.g. to forward it) must first take the bytes already buffered with `req.read()` (`req.read_ahead_available()` tells how many), and call `req.mark_body_consumed()` when done, so the server does not try to discard it again.
+- Do not read the body straight from `req.get_socket()`: use `read()`/`read_some()`, or take over the connection (below).
 - `co_await req.read_body()` loads the remaining body into `req.body()`. Do not mix it with `read()`/`read_some()` on the same request: the stored body would miss the part already read (and fail to decompress if the request is compressed).
+
+### Taking Over the Connection
+
+`res.take_over()` hands the connection to your code, for custom protocol upgrades or tunnels (WebSockets and SSE are built on it). The response set so far is sent first (200 by default); then the server stops reading from the connection and calls the handler with the socket and any bytes the client had already sent past the request. From then on the handler owns the socket.
+
+```cpp
+server.get("/tunnel", [](http::request& req, http::response& res) {
+    res.status(http::http_response::status::switching_protocols);
+    res.header("Upgrade", "my-protocol");
+    res.header("Connection", "Upgrade");
+    res.take_over([](std::shared_ptr<thinger::asio::socket> socket, std::string buffered) {
+        // `buffered` holds bytes already received after the request; process them first
+    });
+});
+```
 
 ### Response Types
 

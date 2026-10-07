@@ -103,18 +103,25 @@ awaitable<void> server_connection::read_loop() {
                 reset_timeout();
             }
 
-            // After handler completes, compute leftover for pipelining.
-            // The request tracks how many read-ahead bytes remain unconsumed.
-            // Any leftover read-ahead bytes are pipelined data for the next request.
-            size_t remaining_ahead = req->read_ahead_available();
-            if (remaining_ahead > 0) {
-                // Copy residual read-ahead back to buffer_ for the next iteration
-                size_t ahead_start = unconsumed - remaining_ahead;
-                std::memmove(buffer_, begin + ahead_start, remaining_ahead);
-                buffered = remaining_ahead;
-            } else {
-                buffered = 0;
+            // Read-ahead bytes the request did not consume belong to whatever follows it
+            // (they may come from later socket reads, e.g. after a chunked body)
+            auto leftover = req->take_read_ahead();
+
+            // Connection taken over: stop reading and hand the leftover to the new owner
+            if (takeover_requested_) {
+                takeover_buffer_.assign(leftover.begin(), leftover.end());
+                takeover_reader_stopped_ = true;
+                complete_takeover();
+                co_return;
             }
+
+            // Otherwise it is pipelined data for the next request
+            if (leftover.size() > MAX_BUFFER_SIZE) {
+                LOG_ERROR("pipelined data exceeds the connection buffer");
+                break;
+            }
+            std::memcpy(buffer_, leftover.data(), leftover.size());
+            buffered = leftover.size();
 
             // If not keep-alive, stop reading after this request
             if (!stream->keep_alive()) {
@@ -155,6 +162,9 @@ awaitable<void> server_connection::write_frame(std::shared_ptr<http_stream> stre
     // Check if stream is complete
     if (frame->end_stream()) {
         stream->completed();
+
+        // The socket may now belong to someone else: never close it from here
+        if (takeover_requested_) co_return;
 
         if (!stream->keep_alive()) {
             close();
@@ -233,6 +243,26 @@ std::shared_ptr<asio::socket> server_connection::release_socket() {
     socket_->cancel();
     timeout_timer_.cancel();
     return socket_;
+}
+
+void server_connection::begin_takeover(takeover_handler handler) {
+    takeover_handler_ = std::move(handler);
+    takeover_requested_ = true;
+}
+
+void server_connection::takeover_response_sent() {
+    takeover_response_sent_ = true;
+    complete_takeover();
+}
+
+void server_connection::complete_takeover() {
+    // Both the response must be written and the read loop stopped, in either order
+    if (!takeover_response_sent_ || !takeover_reader_stopped_ || !takeover_handler_) return;
+
+    auto handler = std::move(takeover_handler_);
+    takeover_handler_ = nullptr;
+    auto socket = release_socket();
+    handler(std::move(socket), std::move(takeover_buffer_));
 }
 
 void server_connection::release() {
