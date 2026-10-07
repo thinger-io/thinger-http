@@ -111,6 +111,10 @@ namespace thinger::http{
         /// Returns false if the body exceeds `max_size` or the read fails.
         thinger::awaitable<bool> discard_body(size_t max_size);
 
+        /// Whether part of the body is still unread. Tracks read(), read_some() and
+        /// read_body(); reading the socket directly through get_socket() is not tracked.
+        bool has_pending_body() const;
+
         /// Content-Length convenience (0 for chunked requests)
         size_t content_length() const;
 
@@ -120,7 +124,8 @@ namespace thinger::http{
         /// Bytes remaining in read-ahead buffer
         size_t read_ahead_available() const;
 
-        /// Direct socket access (for pipe-style forwarding)
+        /// Direct socket access (for pipe-style forwarding). Body bytes read this way are
+        /// not tracked: the server will still discard what it considers unread.
         std::shared_ptr<asio::socket> get_socket() const;
 
         //exec_result get_request_data() const;
@@ -164,6 +169,13 @@ namespace thinger::http{
 
         /// Raw read (bypasses chunked decoding) — reads from read-ahead, then socket
         thinger::awaitable<size_t> raw_read_some(uint8_t* buffer, size_t max_size);
+
+        /// Unread bytes of a Content-Length body; reads never go past it, so the next
+        /// pipelined request is left untouched
+        size_t body_remaining_ = 0;
+
+        /// Read up to `max_size` bytes of a Content-Length body
+        thinger::awaitable<size_t> read_some_body(uint8_t* buffer, size_t max_size);
 
         /// Chunked transfer encoding decoder state
         enum class chunk_state { size, size_lf, data, data_cr, data_lf, trailer_lf, done };

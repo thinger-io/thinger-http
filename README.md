@@ -196,6 +196,23 @@ server.post("/api/data", [](auto& req, auto& res) {
 });
 ```
 
+### Streaming Request Body
+
+Coroutine handlers read the body themselves, as it arrives (both `Content-Length` and chunked bodies):
+
+```cpp
+server.post("/upload", [](http::request& req, http::response& res) -> thinger::awaitable<void> {
+    uint8_t buf[8192];
+    size_t total = 0;
+    while (size_t bytes = co_await req.read_some(buf, sizeof(buf))) {
+        total += bytes; // process the data
+    }
+    res.json({{"received", total}});
+});
+```
+
+Reads never go past the end of the body. Whatever the handler leaves unread is discarded after it returns, so it is never parsed as the next request on a keep-alive connection; if it exceeds `set_max_body_size()`, the connection is closed instead.
+
 ### Response Types
 
 ```cpp

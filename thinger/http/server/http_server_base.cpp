@@ -444,12 +444,11 @@ void http_server_base::setup_connection_handler() {
             // 3. Three-way dispatch
             if (!matched_route) {
                 // No route matched → fallback / 404
-                router_.handle_unmatched(req);
-                co_await discard_unread_body(*req);
+                router_.handle_unmatched(req, res);
             } else if (matched_route->is_deferred_body()) {
                 // DEFERRED: handler reads body at its discretion
                 co_await matched_route->handle_request_coro(*req, res);
-            } else if (http_request->has_pending_body()) {
+            } else if (req->has_pending_body()) {
                 // PENDING BODY: check size limit, read, then dispatch
                 if (!http_request->is_chunked_transfer() && req->content_length() > max_body_size_) {
                     // body left unread on the socket: close after responding
@@ -470,7 +469,9 @@ void http_server_base::setup_connection_handler() {
                 matched_route->handle_request(*req, res);
             }
 
-            co_return;
+            // Drop any body left unread (unmatched route, or a deferred handler that did
+            // not read it all) so it is not parsed as the next request
+            co_await discard_unread_body(*req);
         });
 
         // Start handling the connection with configured timeout

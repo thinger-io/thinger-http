@@ -11,6 +11,8 @@
 #include <future>
 #include <fstream>
 #include <filesystem>
+#include <sstream>
+#include <atomic>
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -2081,4 +2083,163 @@ TEST_CASE("Body of a request stopped by a middleware is discarded", "[server][mi
         REQUIRE(count(response, "HTTP/1.1 401") == 1);
         REQUIRE(elapsed < 5s);
     }
+}
+
+// ============================================================================
+// Unread body after deferred (awaitable) routes
+// ============================================================================
+
+TEST_CASE("Body not read by an awaitable route is not run as another request", "[server][deferred][body][pipelining][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    std::atomic<int> ping_count{0};
+
+    server.post("/ignore", [](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        res.send("ignored");
+        co_return;
+    });
+
+    server.post("/partial", [](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        uint8_t buf[5];
+        size_t bytes = co_await req.read(buf, sizeof(buf));
+        res.send(std::string(reinterpret_cast<char*>(buf), bytes));
+    });
+
+    server.get("/ping", [&ping_count](http::response& res) {
+        ping_count++;
+        res.send("pong");
+    });
+
+    fixture.start_server();
+
+    auto count = [](const std::string& haystack, const std::string& needle) {
+        size_t n = 0;
+        for (size_t pos = haystack.find(needle); pos != std::string::npos; pos = haystack.find(needle, pos + 1)) n++;
+        return n;
+    };
+
+    // A body that looks like a request: it must never be executed
+    const std::string smuggled = "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n";
+    const std::string legit_ping = "GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+    SECTION("Content-Length body ignored by the handler") {
+        auto response = raw_http_exchange(fixture.port,
+            "POST /ignore HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + std::to_string(smuggled.size()) +
+            "\r\n\r\n" + smuggled + legit_ping);
+
+        REQUIRE(ping_count == 1);
+        REQUIRE(count(response, "HTTP/1.1 200") == 2);
+        REQUIRE(response.find("ignored") != std::string::npos);
+        REQUIRE(response.find("pong") != std::string::npos);
+    }
+
+    SECTION("Content-Length body partially read by the handler") {
+        std::string body = "12345" + smuggled;
+        auto response = raw_http_exchange(fixture.port,
+            "POST /partial HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + std::to_string(body.size()) +
+            "\r\n\r\n" + body + legit_ping);
+
+        REQUIRE(ping_count == 1);
+        REQUIRE(count(response, "HTTP/1.1 200") == 2);
+        REQUIRE(response.find("12345") != std::string::npos);
+    }
+
+    SECTION("Chunked body ignored by the handler") {
+        std::ostringstream chunk_size;
+        chunk_size << std::hex << smuggled.size();
+        auto response = raw_http_exchange(fixture.port,
+            "POST /ignore HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n" +
+            chunk_size.str() + "\r\n" + smuggled + "\r\n0\r\n\r\n" + legit_ping);
+
+        REQUIRE(ping_count == 1);
+        REQUIRE(count(response, "HTTP/1.1 200") == 2);
+    }
+}
+
+TEST_CASE("Body reads stop at the end of the body", "[server][deferred][body][pipelining][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    // Reads with a buffer larger than the body until read_some() reports the end
+    server.post("/drain", [](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        uint8_t buf[4096];
+        size_t total = 0;
+        while (size_t bytes = co_await req.read_some(buf, sizeof(buf))) total += bytes;
+        res.json({{"total", total}, {"pending", req.has_pending_body()}});
+    });
+
+    // read() asking for more than the body returns only the body
+    server.post("/read-more", [](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        uint8_t buf[4096];
+        size_t bytes = co_await req.read(buf, sizeof(buf));
+        res.json({{"total", bytes}});
+    });
+
+    // read_body() called twice keeps the body and succeeds
+    server.post("/twice", [](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        bool first = co_await req.read_body();
+        bool second = co_await req.read_body();
+        res.json({{"first", first}, {"second", second}, {"body", req.body()}});
+    });
+
+    server.get("/check", [](http::response& res) {
+        res.send("check-ok");
+    });
+
+    fixture.start_server();
+    const std::string next_request = "GET /check HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+    SECTION("read_some() loop") {
+        auto response = raw_http_exchange(fixture.port,
+            "POST /drain HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n0123456789" + next_request);
+        REQUIRE(response.find("\"total\":10") != std::string::npos);
+        REQUIRE(response.find("\"pending\":false") != std::string::npos);
+        REQUIRE(response.find("check-ok") != std::string::npos);
+    }
+
+    SECTION("read() larger than the body") {
+        auto response = raw_http_exchange(fixture.port,
+            "POST /read-more HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n0123456789" + next_request);
+        REQUIRE(response.find("\"total\":10") != std::string::npos);
+        REQUIRE(response.find("check-ok") != std::string::npos);
+    }
+
+    SECTION("read_body() twice with Content-Length") {
+        auto response = raw_http_exchange(fixture.port,
+            "POST /twice HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello" + next_request);
+        REQUIRE(response.find("\"first\":true") != std::string::npos);
+        REQUIRE(response.find("\"second\":true") != std::string::npos);
+        REQUIRE(response.find("\"body\":\"hello\"") != std::string::npos);
+        REQUIRE(response.find("check-ok") != std::string::npos);
+    }
+
+    SECTION("read_body() twice with chunked encoding") {
+        auto response = raw_http_exchange(fixture.port,
+            "POST /twice HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n" + next_request);
+        REQUIRE(response.find("\"second\":true") != std::string::npos);
+        REQUIRE(response.find("\"body\":\"hello\"") != std::string::npos);
+        REQUIRE(response.find("check-ok") != std::string::npos);
+    }
+}
+
+TEST_CASE("Middleware headers are kept on unmatched requests", "[server][middleware][notfound][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    server.use([](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+        res.header("X-Request-Id", "abc123");
+        co_return true;
+    });
+
+    server.get("/exists", [](http::response& res) {
+        res.send("ok");
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    auto response = client.get(fixture.base_url + "/missing");
+    REQUIRE(response.status() == 404);
+    REQUIRE(response.header("X-Request-Id") == "abc123");
 }

@@ -27,6 +27,9 @@ public:
     // Handle an unmatched request (404/fallback)
     void handle_unmatched(std::shared_ptr<request> req);
 
+    // Same, answering through an existing response (e.g. one shared with middlewares)
+    void handle_unmatched(std::shared_ptr<request> req, response& res);
+
     // Enable CORS support
     void enable_cors(bool enabled = true);
     

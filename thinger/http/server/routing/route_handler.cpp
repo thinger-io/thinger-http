@@ -87,26 +87,26 @@ const route* route_handler::find_route(std::shared_ptr<request> req) {
 }
 
 void route_handler::handle_unmatched(std::shared_ptr<request> req) {
-    auto http_request = req->get_http_request();
+    auto connection = req->get_http_connection();
+    auto stream = req->get_http_stream();
+    if (!connection || !stream) return;
 
+    response res(connection, stream, req->get_http_request(), cors_enabled_);
+    handle_unmatched(req, res);
+}
+
+void route_handler::handle_unmatched(std::shared_ptr<request> req, response& res) {
     if (fallback_handler_) {
-        auto connection = req->get_http_connection();
-        auto stream = req->get_http_stream();
-        if (connection && stream) {
-            response res(connection, stream, http_request, cors_enabled_);
-            fallback_handler_(*req, res);
-            return;
-        }
+        fallback_handler_(*req, res);
+        return;
     }
 
     // Check if the method has no routes at all → 405, otherwise 404
-    const auto& request_method = http_request->get_method();
-    auto method_routes = routes_.find(request_method);
-    if (method_routes == routes_.end()) {
-        send_error_response(req, http_response::status::not_allowed);
-    } else {
-        send_error_response(req, http_response::status::not_found);
-    }
+    const auto& request_method = req->get_http_request()->get_method();
+    auto status = routes_.contains(request_method) ? http_response::status::not_found
+                                                   : http_response::status::not_allowed;
+    res.status(status);
+    res.send("");
 }
 
 bool route_handler::handle_request(std::shared_ptr<request> request) {

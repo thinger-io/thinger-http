@@ -18,7 +18,9 @@ namespace thinger::http{
         http_stream_{http_stream},
         http_request_{std::move(http_request)}
     {
-
+        if (http_request_ && !http_request_->is_chunked_transfer()) {
+            body_remaining_ = http_request_->pending_body_size();
+        }
     }
 
     request::~request()= default;
@@ -417,7 +419,8 @@ namespace thinger::http{
             co_return total;
         }
 
-        // Non-chunked: read exact size
+        // Non-chunked: read exact size, never past the end of the body
+        size = std::min(size, body_remaining_);
         size_t total = 0;
 
         // Consume from read-ahead first
@@ -443,20 +446,31 @@ namespace thinger::http{
             }
         }
 
+        body_remaining_ -= total;
         co_return total;
+    }
+
+    thinger::awaitable<size_t> request::read_some_body(uint8_t* buffer, size_t max_size) {
+        size_t to_read = std::min(max_size, body_remaining_);
+        if (to_read == 0) co_return 0;
+        size_t bytes = co_await raw_read_some(buffer, to_read);
+        body_remaining_ -= bytes;
+        co_return bytes;
     }
 
     thinger::awaitable<size_t> request::read_some(uint8_t* buffer, size_t max_size) {
         if (is_chunked()) {
             co_return co_await read_some_chunked(buffer, max_size);
         }
-        co_return co_await raw_read_some(buffer, max_size);
+        co_return co_await read_some_body(buffer, max_size);
     }
 
     thinger::awaitable<bool> request::read_body() {
         if (!http_request_) co_return false;
 
         if (is_chunked()) {
+            if (chunk_state_ == chunk_state::done) co_return true;
+
             // Chunked: read decoded chunks until EOF, respecting max_body_size
             auto& body = http_request_->get_body();
             uint8_t buf[8192];
@@ -494,15 +508,16 @@ namespace thinger::http{
             co_return true;
         }
 
-        // Content-Length based
-        size_t cl = http_request_->get_content_length();
-        if (cl == 0) co_return true;
+        // Content-Length based (nothing left to read if it was already consumed)
+        size_t pending = body_remaining_;
+        if (pending == 0) co_return true;
 
         auto& body = http_request_->get_body();
-        body.resize(cl);
+        size_t offset = body.size();
+        body.resize(offset + pending);
 
-        size_t bytes_read = co_await read(reinterpret_cast<uint8_t*>(body.data()), cl);
-        if (bytes_read != cl) co_return false;
+        size_t bytes_read = co_await read(reinterpret_cast<uint8_t*>(body.data()) + offset, pending);
+        if (bytes_read != pending) co_return false;
 
         // Decompress body if Content-Encoding is set
         if (http_request_->has_header("Content-Encoding")) {
@@ -531,8 +546,14 @@ namespace thinger::http{
         co_return true;
     }
 
+    bool request::has_pending_body() const {
+        if (!http_request_) return false;
+        if (is_chunked()) return chunk_state_ != chunk_state::done;
+        return body_remaining_ > 0;
+    }
+
     thinger::awaitable<bool> request::discard_body(size_t max_size) {
-        if (!http_request_ || !http_request_->has_pending_body()) co_return true;
+        if (!has_pending_body()) co_return true;
 
         uint8_t buf[8192];
 
@@ -547,13 +568,11 @@ namespace thinger::http{
             co_return chunk_state_ == chunk_state::done;
         }
 
-        size_t remaining = http_request_->pending_body_size();
-        if (remaining > max_size) co_return false;
+        if (body_remaining_ > max_size) co_return false;
 
-        while (remaining > 0) {
-            size_t bytes = co_await raw_read_some(buf, std::min(remaining, sizeof(buf)));
+        while (body_remaining_ > 0) {
+            size_t bytes = co_await read_some_body(buf, sizeof(buf));
             if (bytes == 0) co_return false;
-            remaining -= bytes;
         }
         co_return true;
     }
