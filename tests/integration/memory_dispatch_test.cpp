@@ -183,6 +183,15 @@ TEST_CASE("In-memory dispatch of handlers answering later", "[server][dispatch][
 
     server.get("/never", [](http::response&) {});
 
+    // Coroutine that would hang far longer than the timeout
+    std::atomic<bool> cancelled{false};
+    server.get("/hangs", [&cancelled](http::response& res) -> thinger::awaitable<void> {
+        boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 30s);
+        auto [ec] = co_await timer.async_wait(boost::asio::as_tuple(thinger::use_awaitable));
+        if (ec == boost::asio::error::operation_aborted) cancelled = true;
+        res.send("too late");
+    });
+
     SECTION("Response sent later from a copy") {
         auto response = run_dispatch(server, make_request(http::method::GET, "/later"));
         REQUIRE(response->get_status_code() == 200);
@@ -194,6 +203,14 @@ TEST_CASE("In-memory dispatch of handlers answering later", "[server][dispatch][
         auto response = run_dispatch(server, make_request(http::method::GET, "/never"), {.timeout = 100ms});
         REQUIRE(response->get_status_code() == 504);
         REQUIRE(std::chrono::steady_clock::now() - start < 2s);
+    }
+
+    SECTION("Timeout also covers a handler that is still running, which is cancelled") {
+        auto start = std::chrono::steady_clock::now();
+        auto response = run_dispatch(server, make_request(http::method::GET, "/hangs"), {.timeout = 100ms});
+        REQUIRE(response->get_status_code() == 504);
+        REQUIRE(std::chrono::steady_clock::now() - start < 2s);
+        REQUIRE(cancelled);
     }
 
     SECTION("Callback variant") {

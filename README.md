@@ -468,7 +468,7 @@ auto response = co_await server.dispatch(request, {.remote_ip = "10.0.0.7", .tim
 server.dispatch(executor, request, [](std::shared_ptr<http::http_response> response) { /* ... */ });
 ```
 
-The server does not need to be listening. Chunked responses are collected whole. Handlers can keep a copy of the response and answer later; without an answer within the timeout the result is `504`. WebSockets, SSE and `take_over()` answer `501`, as there is no connection. `get_request_ip()` returns `remote_ip`, which is empty unless set: internal calls never pass as a trusted local address by default.
+The server does not need to be listening. Chunked responses are collected whole. Handlers can keep a copy of the response and answer later. The timeout covers the whole request, handler included: if it expires the result is `504` and the handler is cancelled (its pending awaits are aborted). WebSockets, SSE and `take_over()` answer `501`, as there is no connection. `get_request_ip()` returns `remote_ip`, which is empty unless set: internal calls never pass as a trusted local address by default.
 
 ### CORS
 

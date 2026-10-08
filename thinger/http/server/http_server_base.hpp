@@ -27,7 +27,8 @@ struct dispatch_options {
     // trusted address such as 127.0.0.1 for internal calls)
     std::string remote_ip;
 
-    // Maximum time to wait for the response; 504 Gateway Timeout if exceeded
+    // Maximum time to wait for the response, handler execution included; 504 Gateway
+    // Timeout if exceeded (the handler is then cancelled: its pending awaits are aborted)
     std::chrono::milliseconds timeout{30000};
 };
 
