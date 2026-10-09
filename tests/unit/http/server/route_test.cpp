@@ -433,7 +433,12 @@ TEST_CASE("Route patterns with special characters and mixed parameters", "[route
 TEST_CASE("Response-only coroutine handlers are coroutines", "[route][coroutine][unit]") {
     auto handler = [](response&) -> thinger::awaitable<void> { co_return; };
     STATIC_REQUIRE(awaitable_response_handler<decltype(handler)>);
-    STATIC_REQUIRE(coroutine_handler<decltype(handler)>);
+    STATIC_REQUIRE_FALSE(awaitable_handler<decltype(handler)>);
+
+    // A generic coroutine accepting both forms is taken as (request&, response&) only
+    auto generic = [](auto&...) -> thinger::awaitable<void> { co_return; };
+    STATIC_REQUIRE(awaitable_handler<decltype(generic)>);
+    STATIC_REQUIRE_FALSE(awaitable_response_handler<decltype(generic)>);
     route r("/test");
     r = handler;
     REQUIRE(r.is_deferred_body());

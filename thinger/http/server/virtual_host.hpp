@@ -49,11 +49,13 @@ public:
                       const std::string& fallback = "index.html");
 
     // Fallback handler, called instead of answering 404/405 when no route matches: takes
-    // (request&, response&) or (response&), synchronous or coroutine
-    template<typename F> requires request_response_callback<F> || response_callback<F>
+    // (request&, response&) or (response&), synchronous or coroutine. nullptr (or an empty
+    // std::function) removes it.
+    template<request_handler_callable F>
     void set_not_found_handler(F&& handler) {
         router_.set_fallback_handler(std::forward<F>(handler));
     }
+    void set_not_found_handler(std::nullptr_t) { router_.set_fallback_handler(nullptr); }
 
     // Name the host was registered with ("*" for the default host)
     const std::string& name() const { return name_; }

@@ -57,8 +57,9 @@ public:
                       const std::string& fallback = "index.html") {
         app_->serve_static(url_prefix, directory, fallback);
     }
-    template<typename F> requires request_response_callback<F> || response_callback<F>
+    template<request_handler_callable F>
     void set_not_found_handler(F&& handler) { app_->set_not_found_handler(std::forward<F>(handler)); }
+    void set_not_found_handler(std::nullptr_t) { app_->set_not_found_handler(nullptr); }
     route_handler& router() { return app_->router(); }
     const route_handler& router() const { return app_->router(); }
 

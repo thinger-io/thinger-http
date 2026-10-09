@@ -48,10 +48,8 @@ using route_callback_response_only = std::function<void(response&)>;
 using route_callback_json_response = std::function<void(nlohmann::json&, response&)>;
 using route_callback_request_response = std::function<void(request&, response&)>;
 using route_callback_request_json_response = std::function<void(request&, nlohmann::json&, response&)>;
+// What every route callback is turned into: a coroutine taking (request&, response&)
 using route_callback_awaitable = std::function<thinger::awaitable<void>(request&, response&)>;
-using route_callback_awaitable_response_only = std::function<thinger::awaitable<void>(response&)>;
-using route_callback_awaitable_json = std::function<thinger::awaitable<void>(nlohmann::json&, response&)>;
-using route_callback_awaitable_request_json = std::function<thinger::awaitable<void>(request&, nlohmann::json&, response&)>;
 
 // Route callback signatures, synchronous or coroutines returning awaitable<void>. Those
 // taking a JSON body get it read, parsed and validated against the route schema before
@@ -70,9 +68,13 @@ concept request_json_callback = std::invocable<F&, request&, nlohmann::json&, re
 template<typename F>
 concept json_callback = !request_response_callback<F> && std::invocable<F&, nlohmann::json&, response&>;
 
+// Callbacks that do not take the JSON body (they may read the body themselves), as the
+// not found handlers
 template<typename F>
-concept route_callable = request_response_callback<F> || response_callback<F>
-                      || request_json_callback<F> || json_callback<F>;
+concept request_handler_callable = request_response_callback<F> || response_callback<F>;
+
+template<typename F>
+concept route_callable = request_handler_callable<F> || request_json_callback<F> || json_callback<F>;
 
 // The same signatures, as coroutines
 template<typename F, typename... Args>
@@ -82,7 +84,7 @@ template<typename F>
 concept awaitable_handler = request_response_callback<F> && returns_awaitable<F, request&, response&>;
 
 template<typename F>
-concept awaitable_response_handler = std::invocable<F&, response&> && returns_awaitable<F, response&>;
+concept awaitable_response_handler = response_callback<F> && returns_awaitable<F, response&>;
 
 template<typename F>
 concept awaitable_request_json_handler = request_json_callback<F>
@@ -91,10 +93,6 @@ concept awaitable_request_json_handler = request_json_callback<F>
 template<typename F>
 concept awaitable_json_handler = json_callback<F> && returns_awaitable<F, nlohmann::json&, response&>;
 
-template<typename F>
-concept coroutine_handler = awaitable_handler<F> || awaitable_response_handler<F>
-                         || awaitable_json_handler<F> || awaitable_request_json_handler<F>;
-
 namespace detail {
 
     template<typename T>
@@ -102,6 +100,23 @@ namespace detail {
 
     template<typename T, typename Executor>
     inline constexpr bool is_awaitable_v<boost::asio::awaitable<T, Executor>> = true;
+
+    template<typename T>
+    inline constexpr bool is_std_function_v = false;
+
+    template<typename R, typename... Args>
+    inline constexpr bool is_std_function_v<std::function<R(Args...)>> = true;
+
+    // Whether a callback is empty: a null std::function or function pointer
+    template<typename F>
+    bool is_empty_callback(const F& callback) {
+        using type = std::remove_cvref_t<F>;
+        if constexpr (is_std_function_v<type> || std::is_pointer_v<type>) {
+            return !callback;
+        } else {
+            return false;
+        }
+    }
 
     template<typename F, typename... Args>
     thinger::awaitable<void> call_synchronously(F& callback, Args&... args) {
@@ -125,9 +140,10 @@ namespace detail {
 }
 
 // A callback taking (request&, response&) or (response&), as the coroutine every route
-// callback is turned into
-template<typename F> requires request_response_callback<F> || response_callback<F>
+// callback is turned into; empty if the callback is (a null std::function or pointer)
+template<request_handler_callable F>
 route_callback_awaitable make_route_callback(F&& callback) {
+    if (detail::is_empty_callback(callback)) return nullptr;
     if constexpr (request_response_callback<F>) {
         return [callback = std::forward<F>(callback)](request& req, response& res) mutable {
             return detail::call_callback(callback, req, res);
@@ -138,10 +154,6 @@ route_callback_awaitable make_route_callback(F&& callback) {
         };
     }
 }
-
-// Legacy callback types (for backward compatibility if needed)
-using route_callback = route_callback_request_response;
-using route_callback_json = route_callback_request_json_response;
 
 // Documented request parameter (path or query), for API documentation
 struct route_parameter {
@@ -167,7 +179,7 @@ public:
     // stored as a coroutine taking (request&, response&) and whether it takes the JSON body.
     template<route_callable F>
     route& operator=(F&& callback) {
-        if constexpr (request_response_callback<F> || response_callback<F>) {
+        if constexpr (request_handler_callable<F>) {
             callback_ = make_route_callback(std::forward<F>(callback));
             takes_json_body_ = false;
             // coroutines read the body themselves; the others get it read first

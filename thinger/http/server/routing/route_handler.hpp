@@ -30,11 +30,13 @@ public:
     void enable_cors(bool enabled = true);
     
     // Add a catch-all handler for unmatched routes, taking (request&, response&) or
-    // (response&), synchronous or coroutine
-    template<typename F> requires request_response_callback<F> || response_callback<F>
+    // (response&), synchronous or coroutine. An empty one (nullptr, or an empty
+    // std::function) removes it: unmatched requests are answered 404/405 again.
+    template<request_handler_callable F>
     void set_fallback_handler(F&& handler) {
         fallback_handler_ = make_route_callback(std::forward<F>(handler));
     }
+    void set_fallback_handler(std::nullptr_t) { fallback_handler_ = nullptr; }
     
     // Get all registered routes (useful for API documentation). Routes are never moved
     // once registered: references to them stay valid while more routes are added.

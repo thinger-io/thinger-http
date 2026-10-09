@@ -343,3 +343,30 @@ TEST_CASE("Route registration accepts every callback form on every method", "[se
         REQUIRE(run_dispatch(server, make_request(http::method::GET, "/missing"))->get_content() == "fallback");
     }
 }
+
+TEST_CASE("Empty not found handlers answer 404 and 405", "[server][dispatch][routes][integration]") {
+    http::server server;
+    server.get("/exists", [](http::response& res) { res.send("exists"); });
+    server.set_not_found_handler([](http::response& res) { res.send("fallback"); });
+    REQUIRE(run_dispatch(server, make_request(http::method::GET, "/missing"))->get_content() == "fallback");
+
+    SECTION("nullptr removes the handler") {
+        server.set_not_found_handler(nullptr);
+    }
+
+    SECTION("An empty std::function removes the handler") {
+        server.set_not_found_handler(std::function<void(http::response&)>{});
+    }
+
+    SECTION("An empty coroutine std::function removes the handler") {
+        server.set_not_found_handler(std::function<thinger::awaitable<void>(http::request&, http::response&)>{});
+    }
+
+    SECTION("A null function pointer removes the handler") {
+        void (*handler)(http::request&, http::response&) = nullptr;
+        server.set_not_found_handler(handler);
+    }
+
+    REQUIRE(run_dispatch(server, make_request(http::method::GET, "/missing"))->get_status_code() == 404);
+    REQUIRE(run_dispatch(server, make_request(http::method::POST, "/missing"))->get_status_code() == 405);
+}
