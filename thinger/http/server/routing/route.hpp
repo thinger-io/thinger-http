@@ -176,17 +176,24 @@ public:
     route(const std::string& pattern);
     
     // Set the callback: any route_callable signature, synchronous or coroutine. It is
-    // stored as a coroutine taking (request&, response&) and whether it takes the JSON body.
+    // stored as a callable taking (request&, response&), synchronous (called directly,
+    // without a coroutine frame per request) or coroutine, and whether it takes the JSON body.
     template<route_callable F>
     route& operator=(F&& callback) {
-        if constexpr (request_handler_callable<F>) {
-            callback_ = make_route_callback(std::forward<F>(callback));
-            takes_json_body_ = false;
-            // coroutines read the body themselves; the others get it read first
-            if constexpr (awaitable_handler<F> || awaitable_response_handler<F>) deferred_body_ = true;
+        takes_json_body_ = !request_handler_callable<F>;
+        auto adapted = [callback = std::forward<F>(callback)](request& req, response& res) mutable -> decltype(auto) {
+            return invoke_callback(callback, req, res);
+        };
+        using result = std::invoke_result_t<decltype(adapted)&, request&, response&>;
+        if constexpr (std::same_as<result, thinger::awaitable<void>>) {
+            callback_ = std::move(adapted);
+            sync_callback_ = nullptr;
+            // coroutines not taking the JSON body read it themselves; the others get it read first
+            if (!takes_json_body_) deferred_body_ = true;
         } else {
-            callback_ = make_json_callback(std::forward<F>(callback));
-            takes_json_body_ = true;
+            static_assert(!detail::is_awaitable_v<result>, "coroutine route callbacks must return thinger::awaitable<void>");
+            sync_callback_ = std::move(adapted);
+            callback_ = nullptr;
         }
         return *this;
     }
@@ -278,19 +285,22 @@ private:
     const nlohmann::json* schema_components_ = nullptr;
     bool deferred_body_ = false;
     bool takes_json_body_ = false;
+    // The callback, either synchronous or coroutine (the other one is empty)
+    route_callback_request_response sync_callback_;
     route_callback_awaitable callback_;
 
-    // A callback taking the JSON body: it gets the body parsed by handle_request_coro()
+    // Call a callback with the arguments it takes; those taking the JSON body get the body
+    // parsed by handle_request_coro()
     template<typename F>
-    static route_callback_awaitable make_json_callback(F&& callback) {
-        if constexpr (request_json_callback<F>) {
-            return [callback = std::forward<F>(callback)](request& req, response& res) mutable {
-                return detail::call_callback(callback, req, req.json_body_, res);
-            };
+    static decltype(auto) invoke_callback(F& callback, request& req, response& res) {
+        if constexpr (request_response_callback<F>) {
+            return callback(req, res);
+        } else if constexpr (response_callback<F>) {
+            return callback(res);
+        } else if constexpr (request_json_callback<F>) {
+            return callback(req, req.json_body_, res);
         } else {
-            return [callback = std::forward<F>(callback)](request& req, response& res) mutable {
-                return detail::call_callback(callback, req.json_body_, res);
-            };
+            return callback(req.json_body_, res);
         }
     }
 

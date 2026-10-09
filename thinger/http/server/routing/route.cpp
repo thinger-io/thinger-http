@@ -176,7 +176,11 @@ thinger::awaitable<void> route::handle_request_coro(request& req, response& res)
         req.json_body_ = nullptr;
         if (!parse_json_body(req, res, req.json_body_)) co_return;
     }
-    co_await callback_(req, res);
+    if (sync_callback_) {
+        sync_callback_(req, res);
+    } else {
+        co_await callback_(req, res);
+    }
 }
 
 route& route::schema(const nlohmann::json& json_schema) {
