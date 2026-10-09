@@ -15,8 +15,8 @@ namespace thinger::asio{
             // start the async work in the child
             async_worker();
 
-            // flag starts to true, so the caller can return
-            promise.set_value(thread_.get_id());
+            // flag starts to true, so the caller can return (thread_ may not be assigned yet)
+            promise.set_value(std::this_thread::get_id());
 
             // call async worker
             worker_.start();
