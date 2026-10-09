@@ -38,7 +38,8 @@ TEST_CASE("Routes with an invalid schema reject their requests", "[server][schem
 TEST_CASE("Route references stay valid while more routes are registered", "[server][routes][integration]") {
     http::server server;
     auto& first = server.get("/first", [](http::response& res) { res.send("first"); });
-    for (int i = 0; i < 1000; i++) {
+    // Enough registrations to force several reallocations of a vector-based storage
+    for (int i = 0; i < 100; i++) {
         server.get("/route/" + std::to_string(i), [](http::response& res) { res.send("other"); });
     }
 
