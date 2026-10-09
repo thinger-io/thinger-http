@@ -120,7 +120,10 @@ awaitable<void> server_connection::read_loop() {
                 co_return;
             }
 
-            // Otherwise it is pipelined data for the next request
+            // Otherwise it is pipelined data for the next request. The leftover is at most
+            // what was read at once: the connection buffer, or the body reader framing reads
+            static_assert(body_reader::framing_read_size <= MAX_BUFFER_SIZE,
+                          "body framing reads must fit in the connection buffer, or the leftover is dropped");
             if (leftover.size() > MAX_BUFFER_SIZE) {
                 LOG_ERROR("pipelined data exceeds the connection buffer");
                 break;
