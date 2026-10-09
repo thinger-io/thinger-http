@@ -125,7 +125,9 @@ awaitable<void> server_connection::read_loop() {
                 LOG_ERROR("pipelined data exceeds the connection buffer");
                 break;
             }
-            std::memcpy(buffer_, leftover.data(), leftover.size());
+            if (!leftover.empty()) {
+                std::memcpy(buffer_, leftover.data(), leftover.size());
+            }
             buffered = leftover.size();
 
             // If not keep-alive, stop reading after this request
