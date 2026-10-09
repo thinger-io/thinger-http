@@ -144,3 +144,49 @@ TEST_CASE("Coroutine handlers run on every registration method", "[server][corou
         REQUIRE(result->get_content() == "sync-not-found");
     }
 }
+
+TEST_CASE("Responding twice does not modify the first response", "[server][response][dispatch][integration]") {
+    http::server server;
+    server.get("/json", [](http::response& res) {
+        res.json({{"first", true}});
+        res.json({{"second", true}}, http::http_response::status::created);
+    });
+    server.get("/send", [](http::response& res) {
+        res.send("first");
+        res.send("second", "text/html");
+    });
+    server.get("/redirect", [](http::response& res) {
+        res.send("first");
+        res.redirect("/elsewhere");
+    });
+    server.get("/after-redirect", [](http::response& res) {
+        res.redirect("/first");
+        res.redirect("/second", http::http_response::status::moved_permanently);
+        res.json({{"third", true}}, http::http_response::status::accepted);
+    });
+    server.get("/file", [](http::response& res) {
+        res.send("first");
+        res.send_file("/nonexistent/file");
+    });
+
+    auto result = run_dispatch(server, make_request(http::method::GET, "/json"));
+    REQUIRE(result->get_status() == http::http_response::status::ok);
+    REQUIRE(result->get_content() == R"({"first":true})");
+
+    result = run_dispatch(server, make_request(http::method::GET, "/send"));
+    REQUIRE(result->get_content() == "first");
+    REQUIRE(result->get_content_type() == "text/plain");
+
+    result = run_dispatch(server, make_request(http::method::GET, "/redirect"));
+    REQUIRE(result->get_status() == http::http_response::status::ok);
+    REQUIRE_FALSE(result->has_header("Location"));
+
+    result = run_dispatch(server, make_request(http::method::GET, "/after-redirect"));
+    REQUIRE(result->get_status() == http::http_response::status::moved_temporarily);
+    REQUIRE(result->get_headers_with_key("Location") == std::vector<std::string>{"/first"});
+    REQUIRE(result->get_content().empty());
+
+    result = run_dispatch(server, make_request(http::method::GET, "/file"));
+    REQUIRE(result->get_status() == http::http_response::status::ok);
+    REQUIRE(result->get_content() == "first");
+}

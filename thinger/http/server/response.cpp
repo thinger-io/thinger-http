@@ -15,6 +15,7 @@ namespace thinger::http {
 
 // Redirect implementation
 void response::redirect(const std::string& url, http::http_response::status redirect_type) {
+    if (!ensure_not_responded()) return;
     prepare_response();
     response_->set_status(redirect_type);
     response_->add_header(header::location, url);

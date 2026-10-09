@@ -141,6 +141,7 @@ public:
 
     // JSON response
     void json(const nlohmann::json& data, http::http_response::status status = http::http_response::status::ok) {
+        if (!ensure_not_responded()) return;
         prepare_response();
         response_->set_status(status);
         response_->set_content(data.dump(), "application/json");
@@ -149,6 +150,7 @@ public:
 
     // Text response
     void send(const std::string& text, const std::string& content_type = "text/plain") {
+        if (!ensure_not_responded()) return;
         prepare_response();
         response_->set_content(text, content_type);
         send_prepared_response();
