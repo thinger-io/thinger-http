@@ -44,7 +44,7 @@ void connection_sink::take_over(std::shared_ptr<http_response> response, takeove
     auto connection = connection_.lock();
     auto stream = stream_.lock();
     if (!connection || !stream) {
-        LOG_ERROR("Cannot take over a closed connection");
+        LOG_WARNING("connection closed before it could be taken over: the takeover handler is not called");
         return;
     }
 

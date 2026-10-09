@@ -27,6 +27,10 @@ public:
     awaitable<io_result> read(boost::asio::streambuf& buffer, size_t size) override;
     awaitable<io_result> read_until(boost::asio::streambuf& buffer, std::string_view delim) override;
 
+    // wait
+    awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type) override;
+    awaitable<bool> peer_closed() override;
+
     // write operations
     awaitable<io_result> write(const uint8_t buffer[], size_t size) override;
     awaitable<io_result> write(std::string_view str) override;
@@ -36,7 +40,14 @@ public:
     bool is_secure() const override;
 
 private:
+    // Move up to `size` bytes of read_ahead_ to `buffer`; how many were moved
+    size_t take_read_ahead(uint8_t buffer[], size_t size);
+    // Move read_ahead_ to `buffer`
+    void take_read_ahead(boost::asio::streambuf& buffer, size_t max_size);
+
     boost::asio::ssl::stream<boost::asio::ip::tcp::socket&> ssl_stream_;
+    // Data already decrypted by peer_closed(), served before reading from the stream
+    std::string read_ahead_;
     std::shared_ptr<boost::asio::ssl::context> ssl_context_;
 };
 

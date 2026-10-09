@@ -80,7 +80,9 @@ public:
     // Take over the connection (e.g. for a custom protocol upgrade or a tunnel): sends
     // this response (status and headers set so far, 200 by default), then the server
     // stops handling the connection and passes the socket to `handler`, together with
-    // any bytes already read past this request. The handler fully owns the socket.
+    // any bytes already read past this request. The handler fully owns the socket. If the
+    // connection was closed before (e.g. the client closed or half-closed it while the
+    // response was pending), the handler is not called, only released.
     void take_over(takeover_handler handler);
 
     // File sending

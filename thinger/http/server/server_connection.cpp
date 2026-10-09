@@ -120,8 +120,7 @@ awaitable<void> server_connection::read_loop() {
 
             // Connection taken over: stop reading and hand the leftover to the new owner
             if (stream->takes_over()) {
-                takeover_buffer_.assign(leftover.begin(), leftover.end());
-                takeover_reader_stopped_ = true;
+                stream->takeover_reader_stopped(std::string(leftover.begin(), leftover.end()));
                 complete_takeover(*stream);
                 co_return;
             }
@@ -165,15 +164,17 @@ awaitable<void> server_connection::read_loop() {
         }
     }
 
-    // Connection ended
+    // Connection ended, without being taken over
     running_ = false;
+    reader_stopped_ = true;
     timeout_timer_.cancel();
 }
 
 awaitable<void> server_connection::wait_response(const http_stream& stream) {
-    // Watch the socket meanwhile, so a client leaving before a late response is noticed now
-    // and not at the connection timeout. Waiting for readability consumes nothing: whatever
-    // the client sends next stays in the socket for the next request or a takeover
+    // Watch the client meanwhile, so a client leaving (closing or half-closing the
+    // connection, or resetting it) before a late response is noticed now and not at the
+    // connection timeout. Nothing the client sends is lost: it stays readable from the
+    // socket for the next request or a takeover
     bool watch_peer = true;
     while (!stream.responded() && running_ && socket_->is_open()) {
         response_started_.expires_at(boost::asio::steady_timer::time_point::max());
@@ -181,21 +182,23 @@ awaitable<void> server_connection::wait_response(const http_stream& stream) {
             co_await response_started_.async_wait(use_nothrow_awaitable);
             continue;
         }
-        auto result = co_await (response_started_.async_wait(use_nothrow_awaitable) ||
-                                socket_->wait(boost::asio::socket_base::wait_read));
+        auto result = co_await (response_started_.async_wait(use_nothrow_awaitable) || wait_peer_closed());
         if (result.index() == 0) continue;
 
-        // Readable with nothing to read: the client closed (or reset) the connection
-        auto ec = std::get<1>(result);
-        if (ec || socket_->available() == 0) {
+        if (std::get<1>(result)) {
             LOG_DEBUG("http client left while waiting for a response");
             close();
             co_return;
         }
 
-        // A pipelined request (or TLS data) is waiting: leave it for later
+        // A pipelined request (or data for a takeover) is waiting: leave it for later
         watch_peer = false;
     }
+}
+
+awaitable<bool> server_connection::wait_peer_closed() {
+    if (co_await socket_->wait(boost::asio::socket_base::wait_read)) co_return true;
+    co_return co_await socket_->peer_closed();
 }
 
 awaitable<void> server_connection::write_frame(std::shared_ptr<http_stream> stream,
@@ -217,7 +220,7 @@ awaitable<void> server_connection::write_frame(std::shared_ptr<http_stream> stre
         // Response of a request taking over the connection: the socket may now belong to
         // someone else, never close it from here
         if (stream->takes_over()) {
-            takeover_response_sent_ = true;
+            stream->takeover_response_written();
             complete_takeover(*stream);
             co_return;
         }
@@ -307,6 +310,12 @@ void server_connection::take_over(std::shared_ptr<http_stream> stream, std::shar
     boost::asio::dispatch(socket_->get_io_context(),
         [this, self = shared_from_this(), stream = std::move(stream), response = std::move(response),
          handler = std::move(handler)]() mutable {
+            // The read loop already stopped (the client left, the connection timed out...):
+            // the connection is gone and cannot be handed over
+            if (reader_stopped_) {
+                LOG_WARNING("connection closed before it could be taken over: the takeover handler is not called");
+                return;
+            }
             stream->set_takeover(std::move(handler));
             queue_frame(stream, std::move(response));
         });
@@ -328,12 +337,10 @@ std::shared_ptr<asio::socket> server_connection::release_socket() {
 
 void server_connection::complete_takeover(http_stream& stream) {
     // Both the response must be written and the read loop stopped, in either order
-    if (!takeover_response_sent_ || !takeover_reader_stopped_) return;
-
-    auto handler = stream.release_takeover();
+    auto [handler, buffered] = stream.release_takeover();
     if (!handler) return;
     auto socket = release_socket();
-    handler(std::move(socket), std::move(takeover_buffer_));
+    handler(std::move(socket), std::move(buffered));
 }
 
 void server_connection::release() {

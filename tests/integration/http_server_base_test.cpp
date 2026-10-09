@@ -7,6 +7,7 @@
 #include <thinger/util/compression.hpp>
 #include <nlohmann/json.hpp>
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <chrono>
 #include <thread>
 #include <future>
@@ -2360,7 +2361,8 @@ TEST_CASE("Connection takeover hands the socket and buffered bytes to the new ow
 
 namespace {
     // Same as read_until_contains, giving up after `timeout` (false if `needle` did not show up)
-    bool read_until_contains_within(boost::asio::ip::tcp::socket& sock, std::string& pending,
+    template<typename Stream>
+    bool read_until_contains_within(Stream& sock, std::string& pending,
                                     const std::string& needle, std::chrono::milliseconds timeout) {
         auto& ioc = static_cast<boost::asio::io_context&>(sock.get_executor().context());
         auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -2377,7 +2379,7 @@ namespace {
             ioc.restart();
             ioc.run_until(deadline);
             if (!done) {
-                sock.cancel();
+                sock.lowest_layer().cancel();
                 ioc.restart();
                 ioc.run();
                 return false;
@@ -2534,6 +2536,160 @@ TEST_CASE("Request pipelined while a late response is pending", "[server][deferr
     auto first = received.find("later-ok");
     REQUIRE(first != std::string::npos);
     REQUIRE(first < received.find("next-ok"));
+}
+
+namespace {
+    // TLS client of a test server (certificate not verified)
+    struct tls_client {
+        boost::asio::io_context ioc;
+        boost::asio::ssl::context context{boost::asio::ssl::context::tls_client};
+        boost::asio::ssl::stream<boost::asio::ip::tcp::socket> stream{ioc, context};
+
+        explicit tls_client(uint16_t port) {
+            stream.set_verify_mode(boost::asio::ssl::verify_none);
+            boost::asio::ip::tcp::resolver resolver(ioc);
+            boost::asio::connect(stream.lowest_layer(), resolver.resolve("127.0.0.1", std::to_string(port)));
+            stream.handshake(boost::asio::ssl::stream_base::client);
+        }
+
+        void write(const std::string& data) {
+            boost::asio::write(stream, boost::asio::buffer(data));
+        }
+
+        // Send close_notify, as TLS clients do before closing, then close the socket
+        void close() {
+            stream.async_shutdown([](boost::system::error_code) {});
+            ioc.restart();
+            ioc.run_for(1s);
+            boost::system::error_code ec;
+            stream.lowest_layer().close(ec);
+        }
+    };
+
+    // Wait until the connection of a response is released
+    bool connection_released_within(const http::response& res, std::chrono::milliseconds timeout) {
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (res.get_connection() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(10ms);
+        }
+        return !res.get_connection();
+    }
+}
+
+TEST_CASE("TLS client leaving before a late response releases the connection", "[server][deferred][ssl][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    server.enable_ssl(true);
+
+    std::promise<http::response> held;
+    server.get("/hold", [&](http::response& res) { held.set_value(res); });
+
+    fixture.start_server();
+
+    tls_client client(fixture.port);
+    client.write("GET /hold HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    auto future = held.get_future();
+    REQUIRE(future.wait_for(5s) == std::future_status::ready);
+    auto res = future.get();
+    REQUIRE(res.get_connection());
+
+    // The close_notify alert arrives before the FIN: the client is gone all the same
+    client.close();
+    REQUIRE(connection_released_within(res, 5s));
+    res.send("too late");
+}
+
+TEST_CASE("TLS request pipelined while a late response is pending", "[server][deferred][pipelining][ssl][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    server.enable_ssl(true);
+
+    std::promise<void> handled;
+    server.get("/later", [&](http::response& res) {
+        handled.set_value();
+        std::thread([res]() mutable {
+            std::this_thread::sleep_for(100ms);
+            res.send("later-ok");
+        }).detach();
+    });
+    server.get("/next", [](http::response& res) { res.send("next-ok"); });
+
+    fixture.start_server();
+
+    // The second request is decrypted while the first response is pending, to tell it
+    // from a close_notify: it is kept for the next request
+    tls_client client(fixture.port);
+    client.write("GET /later HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    REQUIRE(handled.get_future().wait_for(5s) == std::future_status::ready);
+    client.write("GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n");
+
+    std::string received;
+    REQUIRE(read_until_contains_within(client.stream, received, "next-ok", 5s));
+    auto first = received.find("later-ok");
+    REQUIRE(first != std::string::npos);
+    REQUIRE(first < received.find("next-ok"));
+}
+
+TEST_CASE("TLS takeover gets the data sent while its response was pending", "[server][takeover][ssl][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+    server.enable_ssl(true);
+
+    std::promise<http::response> held;
+    server.get("/echo-later", [&](http::response& res) { held.set_value(res); });
+
+    fixture.start_server();
+
+    tls_client client(fixture.port);
+    client.write("GET /echo-later HTTP/1.1\r\nHost: localhost\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n");
+    auto future = held.get_future();
+    REQUIRE(future.wait_for(5s) == std::future_status::ready);
+    auto res = future.get();
+
+    // Sent (and decrypted by the server) before the connection is taken over
+    client.write("EARLY");
+    std::this_thread::sleep_for(100ms);
+    take_over_with_echo(res);
+
+    std::string received;
+    REQUIRE(read_until_contains_within(client.stream, received, "EARLY", 5s));
+    REQUIRE(received.starts_with("HTTP/1.1 101"));
+
+    received.clear();
+    client.write("ping");
+    REQUIRE(read_until_contains_within(client.stream, received, "ping", 5s));
+}
+
+TEST_CASE("Taking over the connection of a client that left", "[server][takeover][deferred][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    std::promise<http::response> held;
+    server.get("/hold", [&](http::response& res) { held.set_value(res); });
+
+    fixture.start_server();
+
+    boost::asio::io_context ioc;
+    boost::asio::ip::tcp::socket sock(ioc);
+    boost::asio::ip::tcp::resolver resolver(ioc);
+    boost::asio::connect(sock, resolver.resolve("127.0.0.1", std::to_string(fixture.port)));
+    boost::asio::write(sock, boost::asio::buffer(std::string("GET /hold HTTP/1.1\r\nHost: localhost\r\n\r\n")));
+
+    auto future = held.get_future();
+    REQUIRE(future.wait_for(5s) == std::future_status::ready);
+    auto res = future.get();
+    sock.close();
+    REQUIRE(connection_released_within(res, 5s));
+
+    // The handler is not called, and not kept either
+    auto alive = std::make_shared<int>(0);
+    std::atomic<bool> called{false};
+    res.take_over([alive, &called](std::shared_ptr<thinger::asio::socket>, std::string) { called = true; });
+    std::this_thread::sleep_for(50ms);
+    REQUIRE_FALSE(called);
+    REQUIRE(alive.use_count() == 1);
+    REQUIRE(res.has_responded());
 }
 
 TEST_CASE("WebSocket client sending data before the handshake is closed", "[server][takeover][websocket][integration]") {

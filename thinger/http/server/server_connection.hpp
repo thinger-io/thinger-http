@@ -34,7 +34,9 @@ public:
 
     // Take over the connection from a stream: send `response`, then, once its request
     // has been handled, stop serving HTTP and hand the socket to `handler` (can be called
-    // from any thread)
+    // from any thread). If the connection was closed meanwhile (e.g. the client left while
+    // the response was pending), nothing is sent and the handler is released without
+    // being called.
     void take_over(std::shared_ptr<http_stream> stream, std::shared_ptr<http_frame> response,
                    takeover_handler handler);
 
@@ -61,6 +63,9 @@ private:
 
     // Wait until the response of a stream has started, or the connection is closed
     awaitable<void> wait_response(const http_stream& stream);
+
+    // Wait until the client sends data (false) or closes the connection (true)
+    awaitable<bool> wait_peer_closed();
 
     // Queue a response frame (on the connection executor)
     void queue_frame(const std::shared_ptr<http_stream>& stream, std::shared_ptr<http_frame> frame);
@@ -104,12 +109,9 @@ private:
     // State
     bool writing_{false};
     bool running_{false};
+    // The read loop stopped without handing the connection over: it cannot be taken over
+    bool reader_stopped_{false};
     stream_id request_id_{0};
-
-    // Connection takeover (the handler belongs to the stream taking it over)
-    std::string takeover_buffer_;
-    bool takeover_response_sent_{false};
-    bool takeover_reader_stopped_{false};
 };
 
 }

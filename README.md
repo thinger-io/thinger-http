@@ -262,7 +262,7 @@ Reads never go past the end of the body. Whatever the handler leaves unread is d
 
 ### Taking Over the Connection
 
-`res.take_over()` hands the connection to your code, for custom protocol upgrades or tunnels (WebSockets and SSE are built on it). The response set so far is sent first (200 by default); then the server stops reading from the connection and calls the handler with the socket and any bytes the client had already sent past the request. From then on the handler owns the socket. It can also be called later from a copy of the response: until the response starts, the server reads nothing more from that connection.
+`res.take_over()` hands the connection to your code, for custom protocol upgrades or tunnels (WebSockets and SSE are built on it). The response set so far is sent first (200 by default); then the server stops reading from the connection and calls the handler with the socket and any bytes the client had already sent past the request. From then on the handler owns the socket. It can also be called later from a copy of the response: until the response starts, the server handles nothing else the client sends on that connection (it stays readable from the socket, for the handler), but it notices a client that closes or half-closes the connection meanwhile, over TLS too, and closes it. A `take_over()` arriving after that does not call its handler: it is released, and a warning logged.
 
 ```cpp
 server.get("/tunnel", [](http::request& req, http::response& res) {

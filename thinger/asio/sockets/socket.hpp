@@ -45,6 +45,11 @@ public:
     // wait
     virtual awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type) = 0;
 
+    // Once the socket is readable (see wait()): whether the peer closed the connection
+    // (closed it, half-closed it or reset it) instead of sending data. Data is not consumed:
+    // it stays available to the next read. It may wait for the rest of a TLS record.
+    virtual awaitable<bool> peer_closed();
+
     // some getters to check the state
     virtual bool is_open() const = 0;
     virtual bool is_secure() const = 0;

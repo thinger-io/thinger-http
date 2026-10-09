@@ -32,6 +32,11 @@ namespace thinger::asio {
         co_return boost::system::error_code{};
     }
 
+    awaitable<bool> socket::peer_closed() {
+        // readable with nothing to read: end of stream, or an error
+        co_return available() == 0;
+    }
+
     std::map<std::string, unsigned long> socket::context_count;
     std::mutex socket::mutex_;
 }
