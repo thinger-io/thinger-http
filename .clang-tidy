@@ -1,0 +1,17 @@
+# Static analysis checks, reported (not enforced) by .github/workflows/quality.yml.
+# Disabled checks:
+# - bugprone-easily-swappable-parameters: flags most multi-argument functions
+# - performance-unnecessary-value-param: coroutines take their parameters by value on purpose,
+#   references would dangle once the coroutine suspends
+# - performance-enum-size: shrinking enum storage does not matter here
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  concurrency-*,
+  performance-*,
+  -bugprone-easily-swappable-parameters,
+  -performance-unnecessary-value-param,
+  -performance-enum-size
+HeaderFilterRegex: '.*/thinger/.*'
+WarningsAsErrors: ''

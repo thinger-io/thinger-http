@@ -1,0 +1,62 @@
+name: Quality
+
+# Complexity (lizard), duplication (jscpd) and static analysis (clang-tidy, see .clang-tidy).
+# Reported in the job summary and as an artifact: findings never fail the build.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+# Authenticate dependency downloads (CMake FetchContent clones) with the job token:
+# anonymous clones hit GitHub rate limits when several jobs run at once
+env:
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: url.https://x-access-token:${{ github.token }}@github.com/.insteadOf
+  GIT_CONFIG_VALUE_0: https://github.com/
+
+jobs:
+  quality:
+    runs-on: self-hosted
+    container:
+      image: thinger/compiler:mold-latest
+      options: --memory=36g --memory-swap=36g
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends clang-tidy-18 python3-pip
+          pip3 install -q --break-system-packages lizard==1.24.1
+          mkdir -p reports
+
+      - name: Configure
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          -DTHINGER_HTTP_BUILD_TESTS=OFF -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Complexity
+        run: lizard thinger -l cpp --csv > reports/lizard.csv
+
+      - name: Duplication
+        run: npx --yes jscpd@4.3.0 thinger --min-tokens 70 --reporters json --output reports/jscpd --silent
+
+      - name: Static analysis
+        run: |
+          run-clang-tidy-18 -p build -j $(( $(nproc) / 4 )) -quiet "$PWD/thinger/.*\.cpp$" \
+            > reports/clang-tidy.txt 2> reports/clang-tidy.log || true
+
+      - name: Summary
+        if: always()
+        run: python3 .github/scripts/quality_summary.py reports . | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-reports
+          path: reports/
