@@ -46,9 +46,9 @@ using middleware_function = std::function<void(request&, response&, std::functio
 // What a server serves: the virtual hosts and their routes, the middlewares, and how
 // requests are processed (error format, trusted proxies, limits). The application is the
 // default virtual host: the routes registered on it (see virtual_host for the registration
-// methods) answer every host without a virtual host of its own. Servers (see
-// http_server_base) pass it the requests they receive; requests can also be dispatched
-// to it in memory, without a connection.
+// methods) answer every host without a virtual host of its own. A server (see
+// http_server_base) is an application served on a listener; an application can also be
+// used on its own, to dispatch requests in memory, without a connection.
 class http_application : public virtual_host {
 public:
     http_application() = default;

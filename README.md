@@ -151,7 +151,7 @@ server.options("/path", handler);
 // Handler signature
 void handler(thinger::http::request& req, thinger::http::response& res);
 
-// Requests matching no route (404/405 by default)
+// Requests matching no route (404/405 by default; nullptr restores them)
 server.set_not_found_handler(handler);
 ```
 
@@ -495,7 +495,7 @@ server.dispatch(executor, request, [](std::shared_ptr<http::http_response> respo
 
 The server does not need to be listening. Chunked responses are collected whole. Handlers can keep a copy of the response and answer later. The timeout covers the whole request, handler included: if it expires the result is `504` and the handler is cancelled (its pending awaits are aborted). WebSockets, SSE and `take_over()` answer `501`, as there is no connection. The request is served by the [virtual host](#virtual-hosts) of its URL (or `Host` header). `remote_ip` is the peer address: `get_request_ip()` returns it (or the forwarded client address, if it is a [trusted proxy](#client-ip-behind-proxies)), and it is empty unless set: internal calls never pass as a trusted local address by default.
 
-Routes, hosts, middlewares and the request settings (error format, trusted proxies, body limit, CORS) belong to the server's `http::http_application` (`server.application()`); the server methods for them forward to it. An application can also be used on its own, only for `dispatch()`, or served by several servers with `set_application()`.
+Everything about routes, hosts, middlewares and request settings (error format, trusted proxies, body limit, CORS), `dispatch()` included, comes from `http::http_application`, which the server extends with its listeners, TLS and connection settings. An `http::http_application` can also be used on its own, without a server, only to dispatch requests in memory.
 
 ### Virtual Hosts
 
@@ -525,7 +525,7 @@ server.host_regex("(.+)\\.proxy\\.example\\.com").get("/:path(.*)", proxy_handle
 server.get("/", [](http::response& res) { res.send("default site"); });
 ```
 
-Hosts are matched in order: exact names, then patterns in registration order, then the default host (`server.host("*")` returns it: the server's application). Register them before `listen()`. Once the host is chosen, everything works as for a single host: routes and `404`/`405` come from that host only, and the global middlewares (`server.use()`) run for every host after route matching, with `req.get_matched_route()` set to the route of the matched host and `req.get_virtual_host()` to the host. `server.openapi()` documents the default host; for another one build a generator over its router: `http::openapi_generator(server.host("api.example.com").router())`.
+Hosts are matched in order: exact names, then patterns in registration order, then the default host (`server.host("*")` returns the server itself). Register them before `listen()`. Once the host is chosen, everything works as for a single host: routes and `404`/`405` come from that host only, and the global middlewares (`server.use()`) run for every host after route matching, with `req.get_matched_route()` set to the route of the matched host and `req.get_virtual_host()` to the host. `server.openapi()` documents the default host; for another one build a generator over its router: `http::openapi_generator(server.host("api.example.com").router())`.
 
 For HTTPS, the certificate is chosen per domain before any request is read, through SNI: register one per host name (wildcards such as `*.devices.example.com` included) with `thinger::asio::certificate_manager::instance().set_certificate(hostname, certificate, private_key)`. Virtual hosts then pick the routes for the same name from the `Host` header. See `examples/http_server/virtual_hosts_example.cpp`.
 

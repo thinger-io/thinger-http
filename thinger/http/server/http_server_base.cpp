@@ -123,9 +123,8 @@ void http_server_base::setup_connection_handler() {
     socket_server_->set_handler([this](std::shared_ptr<asio::socket> socket) {
         auto connection = std::make_shared<server_connection>(socket);
 
-        // Requests are answered by the application (the one set when the connection starts)
-        connection->set_handler([app = app_](std::shared_ptr<request> req) -> awaitable<void> {
-            co_await app->handle(req, std::make_shared<connection_sink>(req->get_http_connection(), req->get_http_stream()));
+        connection->set_handler([this](std::shared_ptr<request> req) -> awaitable<void> {
+            co_await handle(req, std::make_shared<connection_sink>(req->get_http_connection(), req->get_http_stream()));
         });
 
         // Start handling the connection with configured timeout

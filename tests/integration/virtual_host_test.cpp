@@ -257,8 +257,8 @@ TEST_CASE("Virtual hosts in in-memory dispatch", "[server][vhost][dispatch][inte
     REQUIRE(run_dispatch(server, http::method::GET, "http://localhost/whoami")->get_content() == "default");
     REQUIRE(run_dispatch(server, http::method::POST, "http://api.example.com/whoami")->get_status_code() == 405);
 
-    SECTION("host(\"*\") is the application itself, and hosts are registered once") {
-        REQUIRE(&server.host("*") == &server.application());
+    SECTION("host(\"*\") is the server itself, and hosts are registered once") {
+        REQUIRE(&server.host("*") == &server);
         REQUIRE(&server.host("API.example.com") == &server.host("api.example.com"));
         REQUIRE(&server.host("*.example.com") == &server.host("*.example.com"));
     }
