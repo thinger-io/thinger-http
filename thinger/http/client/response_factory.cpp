@@ -112,10 +112,8 @@ namespace thinger::http{
                     state_ = expecting_newline_3;
                     return boost::indeterminate;
                 }
-                else if (!empty_headers() && (input == ' ' || input == '\t')) {
-                    state_ = header_lws;
-                    return boost::indeterminate;
-                }
+                // A line starting with whitespace (obsolete line folding, RFC 9112 section 5.2)
+                // is rejected, as is any other byte that cannot start a header name
                 else if (!is_char(input) || is_ctl(input) || is_tspecial(input)) {
                     return false;
                 }
@@ -123,22 +121,6 @@ namespace thinger::http{
                     tempString1_.clear();
                     tempString1_.push_back(input);
                     state_ = header_name;
-                    return boost::indeterminate;
-                }
-            case header_lws:
-                if (input == '\r') {
-                    state_ = expecting_newline_2;
-                    return boost::indeterminate;
-                }
-                else if (input == ' ' || input == '\t') {
-                    return boost::indeterminate;
-                }
-                else if (is_ctl(input)) {
-                    return false;
-                }
-                else {
-                    state_ = header_value;
-                    tempString1_.push_back(input);
                     return boost::indeterminate;
                 }
             case header_name:
@@ -422,10 +404,6 @@ namespace thinger::http{
 
     size_t response_factory::get_content_read(){
         return resp->get_content().size();
-    }
-
-    bool response_factory::empty_headers(){
-        return resp->empty_headers();
     }
 
     int response_factory::get_status_code() const {

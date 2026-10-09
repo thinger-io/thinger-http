@@ -89,8 +89,6 @@ namespace thinger::http {
 
         size_t get_content_read();
 
-        bool empty_headers();
-
         /**
          * Get the HTTP status code (available after headers are parsed).
          */
@@ -181,7 +179,6 @@ namespace thinger::http {
             reason_phrase,
             expecting_newline_1,
             header_line_start,
-            header_lws,
             header_name,
             space_before_header_value,
             header_value,

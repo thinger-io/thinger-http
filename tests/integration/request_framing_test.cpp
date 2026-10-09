@@ -272,3 +272,30 @@ TEST_CASE("Chunked body split across many TCP writes", "[server][framing][chunke
     REQUIRE(data.find("body=[hello world]") != std::string::npos);
     REQUIRE(count(data, "HTTP/1.1 200") == 2);
 }
+
+TEST_CASE("Folded header lines (obs-fold) are rejected", "[server][framing][smuggling][integration]") {
+    framing_server fixture;
+    fixture.start();
+
+    // A line starting with whitespace continues the previous one (obsolete line folding):
+    // it must never be merged into the previous header name, which turned
+    // "Transfer-Encodin: chunked\r\n g" into "Transfer-Encoding: chunked"
+    SECTION("Folding completes Transfer-Encoding") {
+        require_rejected(fixture, post_headers("Transfer-Encodin: chunked\r\n g\r\n") + "5\r\nhello\r\n0\r\n\r\n");
+    }
+    SECTION("Folding completes Content-Length") {
+        require_rejected(fixture, post_headers("Content-Lengt: 5\r\n h\r\n") + "hello");
+    }
+    SECTION("Folding completes Host") {
+        require_rejected(fixture, "GET /health HTTP/1.1\r\nHos: evil.example\r\n t\r\n\r\n");
+    }
+    SECTION("Folding with a tab") {
+        require_rejected(fixture, "GET /health HTTP/1.1\r\nHost: localhost\r\nX-Custom: a\r\n\tb\r\n\r\n");
+    }
+    SECTION("Folding a value") {
+        require_rejected(fixture, "GET /health HTTP/1.1\r\nHost: localhost\r\nX-Custom: a\r\n b\r\n\r\n");
+    }
+    SECTION("Whitespace before the first header") {
+        require_rejected(fixture, "GET /health HTTP/1.1\r\n Host: localhost\r\n\r\n");
+    }
+}

@@ -134,3 +134,18 @@ TEST_CASE("Request factory headers_only can be toggled", "[request_factory][unit
     parser.set_headers_only(false);
     REQUIRE(parser.get_headers_only() == false);
 }
+
+TEST_CASE("Request factory rejects folded header lines (obs-fold)", "[request_factory][unit]") {
+    auto parse = [](const std::string& raw) {
+        request_factory parser;
+        parser.set_headers_only(true);
+        auto* it = reinterpret_cast<const uint8_t*>(raw.data());
+        auto* end = it + raw.size();
+        return parser.parse(it, end);
+    };
+
+    REQUIRE(bool(parse("GET / HTTP/1.1\r\nHost: localhost\r\nX-A: 1\r\n\r\n")));
+    REQUIRE(!parse("GET / HTTP/1.1\r\nTransfer-Encodin: chunked\r\n g\r\n\r\n"));
+    REQUIRE(!parse("GET / HTTP/1.1\r\nHost: localhost\r\nX-A: 1\r\n\t2\r\n\r\n"));
+    REQUIRE(!parse("GET / HTTP/1.1\r\n Host: localhost\r\n\r\n"));
+}

@@ -61,8 +61,6 @@ namespace thinger::http {
 
         size_t get_content_read();
 
-        bool empty_headers();
-
     private:
         /// Handle the next character of input.
         boost::tribool consume(char input);
@@ -102,7 +100,6 @@ namespace thinger::http {
             http_version_minor,
             expecting_newline_1,
             header_line_start,
-            header_lws,
             header_name,
             space_before_header_value,
             header_value,
