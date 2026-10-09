@@ -89,7 +89,11 @@ public:
     // Redirect response
     void redirect(const std::string& url, http::http_response::status redirect_type = http::http_response::status::moved_temporarily);
     
-    // Chunked response support
+    // Chunked response: start_chunked() sends the headers (false if another answer was sent
+    // first, or the connection is gone), then write_chunk() each chunk and end_chunked() the
+    // last one. Chunks are only written on a response started with start_chunked(), once it
+    // returned true (from any copy, any thread) and until end_chunked(): otherwise they
+    // return false and write nothing.
     bool start_chunked(const std::string& content_type, http::http_response::status status = http::http_response::status::ok);
     bool write_chunk(const std::string& data);
     bool end_chunked();

@@ -9,6 +9,7 @@
 #include <fstream>
 #include <sstream>
 #include <atomic>
+#include <mutex>
 
 namespace thinger::http {
 
@@ -21,6 +22,11 @@ struct response::state {
     std::shared_ptr<const error_formatter> formatter;           // default format if null
     std::atomic<bool> responded{false};
     bool cors_enabled = false;
+
+    // Chunked response: chunks are only written between its headers and its end
+    enum class chunked_phase { none, open, ended };
+    std::mutex chunked_mutex;
+    chunked_phase chunked = chunked_phase::none;
 };
 
 namespace {
@@ -356,29 +362,37 @@ void response::start_sse(std::function<void(std::shared_ptr<sse_connection>)> ha
     });
 }
 
-// Chunked response support: the sink writes the headers, then each chunk
+// Chunked response support: the sink writes the headers, then each chunk. Chunks are
+// written in order (the lock), only once the headers are queued and until the end
 bool response::start_chunked(const std::string& content_type, http::http_response::status status) {
     if (!ensure_not_responded()) return false;
     auto response = new_response();
     response->set_status(status);
     response->set_content_type(content_type);
     if (!mark_responded()) return false;
-    return state_->sink->begin(std::move(response));
+
+    std::lock_guard lock(state_->chunked_mutex);
+    if (!state_->sink->begin(std::move(response))) return false;
+    state_->chunked = state::chunked_phase::open;
+    return true;
 }
 
 bool response::write_chunk(const std::string& data) {
-    if (!state_->responded) {
-        LOG_ERROR("Must call start_chunked() before writing chunks");
+    std::lock_guard lock(state_->chunked_mutex);
+    if (state_->chunked != state::chunked_phase::open) {
+        LOG_ERROR("Chunks can only be written between start_chunked() and end_chunked()");
         return false;
     }
     return state_->sink->append(data);
 }
 
 bool response::end_chunked() {
-    if (!state_->responded) {
-        LOG_ERROR("Must call start_chunked() before ending chunks");
+    std::lock_guard lock(state_->chunked_mutex);
+    if (state_->chunked != state::chunked_phase::open) {
+        LOG_ERROR("Only a response started with start_chunked() can be ended, once");
         return false;
     }
+    state_->chunked = state::chunked_phase::ended;
     return state_->sink->finish();
 }
 

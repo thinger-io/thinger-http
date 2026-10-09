@@ -979,6 +979,28 @@ TEST_CASE("Server Chunked Response", "[server][chunked][integration]") {
     }
 }
 
+TEST_CASE("Chunked response started on another thread and continued on the IO thread", "[server][chunked][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    server.get("/chunked/threads", [](http::response& res) {
+        // The headers are queued from another thread while the IO thread is busy here;
+        // the chunks written afterwards from the IO thread must go after them
+        std::thread([res]() mutable { res.start_chunked("text/plain"); }).join();
+        res.write_chunk("from the ");
+        res.write_chunk("io thread");
+        res.end_chunked();
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    auto response = client.get(fixture.base_url + "/chunked/threads");
+    REQUIRE(response.ok());
+    REQUIRE(response.body() == "from the io thread");
+}
+
 // ============================================================================
 // On-Demand Body Reading Tests (coroutine-based body read)
 // ============================================================================

@@ -145,3 +145,67 @@ TEST_CASE("Concurrent answers from copies of a response send only the first one"
         }
     }
 }
+
+TEST_CASE("Chunks are only written on a response started with start_chunked", "[server][response][chunked][unit]") {
+    auto sink = std::make_shared<recording_sink>();
+    response res(sink, make_request());
+
+    SECTION("Not started") {
+        REQUIRE_FALSE(res.write_chunk("data"));
+        REQUIRE_FALSE(res.end_chunked());
+        REQUIRE(sink->events().empty());
+    }
+
+    SECTION("Answered whole") {
+        res.send("whole");
+        REQUIRE_FALSE(res.write_chunk("data"));
+        REQUIRE_FALSE(res.end_chunked());
+        REQUIRE(sink->events() == std::vector<std::string>{"send"});
+    }
+
+    SECTION("Started by a copy, and ended") {
+        response copy = res;
+        REQUIRE(copy.start_chunked("text/plain"));
+        REQUIRE(res.write_chunk("one"));
+        REQUIRE(copy.end_chunked());
+
+        // Nothing goes after the end, which is only sent once
+        REQUIRE_FALSE(res.write_chunk("two"));
+        REQUIRE_FALSE(res.end_chunked());
+        REQUIRE_FALSE(res.start_chunked("text/plain"));
+        REQUIRE(sink->events() == std::vector<std::string>{"begin", "chunk:one", "finish"});
+    }
+}
+
+TEST_CASE("Chunks written while the headers are being queued go after them", "[server][response][chunked][unit]") {
+    // Sink holding the headers until released, as if their thread was preempted
+    class slow_begin_sink : public recording_sink {
+    public:
+        bool begin(std::shared_ptr<http_response> headers) override {
+            entered.count_down();
+            release.wait();
+            return recording_sink::begin(std::move(headers));
+        }
+        std::latch entered{1};
+        std::latch release{1};
+    };
+
+    auto sink = std::make_shared<slow_begin_sink>();
+    response res(sink, make_request());
+    response copy = res;
+
+    std::atomic<bool> started{false};
+    std::thread starter([&] { started = res.start_chunked("text/plain"); });
+    sink->entered.wait();
+
+    // Another copy writes a chunk once the response counts as answered
+    REQUIRE(copy.has_responded());
+    std::thread writer([&] { copy.write_chunk("chunk"); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    sink->release.count_down();
+    starter.join();
+    writer.join();
+
+    REQUIRE(started);
+    REQUIRE(sink->events() == std::vector<std::string>{"begin", "chunk:chunk"});
+}

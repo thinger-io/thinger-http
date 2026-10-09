@@ -44,7 +44,7 @@ public:
     // Get the raw socket
     std::shared_ptr<asio::socket> get_socket();
 
-    // Handle a response frame (can be called from any thread)
+    // Queue a response frame, in call order (can be called from any thread)
     void handle_stream(std::shared_ptr<http_stream> stream, std::shared_ptr<http_frame> frame);
 
     // Update connection timeout

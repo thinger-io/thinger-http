@@ -286,7 +286,10 @@ void server_connection::queue_frame(const std::shared_ptr<http_stream>& stream, 
 
 void server_connection::handle_stream(std::shared_ptr<http_stream> stream,
                                        std::shared_ptr<http_frame> frame) {
-    boost::asio::dispatch(socket_->get_io_context(),
+    // Always posted, never run inline: frames are queued in the order of the calls, from
+    // whatever threads they come (e.g. chunks written from the IO thread after headers
+    // sent from another one)
+    boost::asio::post(socket_->get_io_context(),
         [this, self = shared_from_this(), stream = std::move(stream), frame = std::move(frame)]() mutable {
             queue_frame(stream, std::move(frame));
         });
