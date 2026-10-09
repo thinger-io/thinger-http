@@ -5,6 +5,7 @@
 #include "../../util/logger.hpp"
 #include "../../util/base64.hpp"
 #include <boost/algorithm/string.hpp>
+#include <optional>
 
 namespace thinger::http {
 
@@ -363,8 +364,26 @@ awaitable<void> http_server_base::process_request(std::shared_ptr<request> req, 
         co_return;
     }
 
-    // Route matching, middlewares, body reading and handler
-    co_await handle_request(req, res);
+    // Route matching, middlewares, body reading and handler; any exception is answered
+    // with 500 (or, if the response was already started, the connection is closed)
+    std::optional<std::string> failure;
+    try {
+        co_await handle_request(req, res);
+    } catch (const std::exception& e) {
+        failure = e.what();
+    } catch (...) {
+        failure = "unknown exception";
+    }
+    if (failure) {
+        LOG_ERROR("Exception handling {} {}: {}", get_method(http_request->get_method()),
+                  http_request->get_path(), *failure);
+        if (res.has_responded()) {
+            // The response may be incomplete (e.g. a chunked response): do not reuse the connection
+            close_after_response(*req);
+        } else {
+            res.error(http_response::status::internal_server_error);
+        }
+    }
 
     // A body that could not be read (too large, malformed, truncated) fails the request,
     // and leaves the connection at an unknown position

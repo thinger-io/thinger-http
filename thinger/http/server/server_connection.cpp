@@ -36,11 +36,16 @@ void server_connection::start(std::chrono::seconds timeout) {
 
 void server_connection::reset_timeout() {
     timeout_timer_.expires_after(timeout_);
-    timeout_timer_.async_wait([this, self = shared_from_this()](const boost::system::error_code& ec) {
+    // The timer does not keep the connection alive: once neither the read loop nor a write
+    // holds it (e.g. the read loop stopped with a response left unfinished), it is released
+    // and the socket closed
+    timeout_timer_.async_wait([weak = weak_from_this()](const boost::system::error_code& ec) {
         if (ec) return; // Timer was cancelled
+        auto self = weak.lock();
+        if (!self) return;
 
-        LOG_DEBUG("http server connection timed out after {} seconds", timeout_.count());
-        close();
+        LOG_DEBUG("http server connection timed out after {} seconds", self->timeout_.count());
+        self->close();
     });
 }
 
