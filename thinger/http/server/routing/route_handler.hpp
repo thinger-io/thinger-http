@@ -11,6 +11,9 @@ namespace thinger::http {
 
 class route_handler {
 public:
+    // Fallback for unmatched requests
+    using fallback_handler = std::function<thinger::awaitable<void>(request&, response&)>;
+
     route_handler();
     virtual ~route_handler() = default;
     
@@ -21,13 +24,20 @@ public:
     const route* find_route(std::shared_ptr<request> req);
 
     // Handle an unmatched request (fallback handler, or 404/405) through the response
-    void handle_unmatched(std::shared_ptr<request> req, response& res);
+    thinger::awaitable<void> handle_unmatched(std::shared_ptr<request> req, response& res);
 
     // Enable CORS support: answer preflight OPTIONS requests on any path
     void enable_cors(bool enabled = true);
     
     // Add a catch-all handler for unmatched routes
     void set_fallback_handler(std::function<void(request&, response&)> handler);
+
+    // Same, with a coroutine handler (picked before the overload above, which would
+    // otherwise also accept it, discarding the awaitable)
+    template<awaitable_handler F>
+    void set_fallback_handler(F&& handler) {
+        fallback_handler_ = fallback_handler(std::forward<F>(handler));
+    }
     
     // Get all registered routes (useful for API documentation). Routes are never moved
     // once registered: references to them stay valid while more routes are added.
@@ -43,7 +53,7 @@ public:
 private:
     std::map<method, std::deque<route>> routes_;
     nlohmann::json schema_components_ = nlohmann::json::object();
-    std::function<void(request&, response&)> fallback_handler_;
+    fallback_handler fallback_handler_;
     
     // Friend class to allow route_builder to access routes_
     friend class route_builder;

@@ -94,6 +94,16 @@ public:
         return router_[method::PATCH][path] = std::forward<F>(handler);
     }
 
+    template<coroutine_handler F>
+    route& head(const std::string& path, F&& handler) {
+        return router_[method::HEAD][path] = std::forward<F>(handler);
+    }
+
+    template<coroutine_handler F>
+    route& options(const std::string& path, F&& handler) {
+        return router_[method::OPTIONS][path] = std::forward<F>(handler);
+    }
+
     // Group of routes sharing a path prefix, tags and metadata (see route_group)
     route_group group(const std::string& prefix);
 
@@ -109,6 +119,20 @@ public:
     // Fallback handler, called instead of answering 404/405 when no route matches
     void set_not_found_handler(route_callback_response_only handler);
     void set_not_found_handler(route_callback_request_response handler);
+
+    // Same, with a coroutine taking (request&, response&) or (response&)
+    template<typename F> requires awaitable_handler<F> || awaitable_response_handler<F>
+    void set_not_found_handler(F&& handler) {
+        if constexpr (awaitable_handler<F>) {
+            router_.set_fallback_handler(std::forward<F>(handler));
+        } else {
+            router_.set_fallback_handler(route_callback_awaitable(
+                [handler = route_callback_awaitable_response_only(std::forward<F>(handler))](
+                        request&, response& res) {
+                    return handler(res);
+                }));
+        }
+    }
 
     // Name the host was registered with ("*" for the default host)
     const std::string& name() const { return name_; }

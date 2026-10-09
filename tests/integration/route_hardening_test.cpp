@@ -60,3 +60,87 @@ TEST_CASE("Route references stay valid while more routes are registered", "[serv
     REQUIRE(result->get_content() == "first");
     REQUIRE(result->get_header("X-Meta") == "kept");
 }
+
+TEST_CASE("Coroutine handlers run on every registration method", "[server][coroutine][integration]") {
+    http::server server;
+    http::dispatch_options options;
+    options.timeout = 2s;
+
+    server.head("/head", [](http::response& res) -> thinger::awaitable<void> {
+        res.header("X-Head", "coro");
+        res.send("");
+        co_return;
+    });
+    server.head("/head-request", [](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        res.header("X-Path", req.get_http_request()->get_path());
+        res.send("");
+        co_return;
+    });
+    server.options("/options", [](http::response& res) -> thinger::awaitable<void> {
+        res.header("Allow", "GET, OPTIONS");
+        res.send("");
+        co_return;
+    });
+    server.options("/options-request", [](http::request&, http::response& res) -> thinger::awaitable<void> {
+        res.send("options-request");
+        co_return;
+    });
+    auto group = server.group("/group");
+    group.head("/head", [](http::response& res) -> thinger::awaitable<void> {
+        res.send("");
+        co_return;
+    });
+    group.options("/options", [](http::request&, http::response& res) -> thinger::awaitable<void> {
+        res.send("group-options");
+        co_return;
+    });
+
+    SECTION("head") {
+        auto result = run_dispatch(server, make_request(http::method::HEAD, "/head"), options);
+        REQUIRE(result->get_status() == http::http_response::status::ok);
+        REQUIRE(result->get_header("X-Head") == "coro");
+        result = run_dispatch(server, make_request(http::method::HEAD, "/head-request"), options);
+        REQUIRE(result->get_header("X-Path") == "/head-request");
+    }
+
+    SECTION("options") {
+        auto result = run_dispatch(server, make_request(http::method::OPTIONS, "/options"), options);
+        REQUIRE(result->get_status() == http::http_response::status::ok);
+        REQUIRE(result->get_header("Allow") == "GET, OPTIONS");
+        result = run_dispatch(server, make_request(http::method::OPTIONS, "/options-request"), options);
+        REQUIRE(result->get_content() == "options-request");
+    }
+
+    SECTION("group head and options") {
+        auto result = run_dispatch(server, make_request(http::method::HEAD, "/group/head"), options);
+        REQUIRE(result->get_status() == http::http_response::status::ok);
+        result = run_dispatch(server, make_request(http::method::OPTIONS, "/group/options"), options);
+        REQUIRE(result->get_content() == "group-options");
+    }
+
+    SECTION("not found handler taking the response") {
+        server.set_not_found_handler([](http::response& res) -> thinger::awaitable<void> {
+            boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 10ms);
+            co_await timer.async_wait(thinger::use_awaitable);
+            res.error(http::http_response::status::not_found, "coro-not-found");
+        });
+        auto result = run_dispatch(server, make_request(http::method::GET, "/missing"), options);
+        REQUIRE(result->get_status() == http::http_response::status::not_found);
+        REQUIRE(result->get_content() == "coro-not-found");
+    }
+
+    SECTION("not found handler taking the request") {
+        server.set_not_found_handler([](http::request& req, http::response& res) -> thinger::awaitable<void> {
+            res.send("missing " + req.get_http_request()->get_path());
+            co_return;
+        });
+        auto result = run_dispatch(server, make_request(http::method::GET, "/missing"), options);
+        REQUIRE(result->get_content() == "missing /missing");
+    }
+
+    SECTION("synchronous not found handlers still work") {
+        server.set_not_found_handler([](http::response& res) { res.send("sync-not-found"); });
+        auto result = run_dispatch(server, make_request(http::method::GET, "/missing"), options);
+        REQUIRE(result->get_content() == "sync-not-found");
+    }
+}

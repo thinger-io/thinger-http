@@ -31,7 +31,14 @@ void route_handler::enable_cors(bool enabled) {
 }
 
 void route_handler::set_fallback_handler(std::function<void(request&, response&)> handler) {
-    fallback_handler_ = std::move(handler);
+    if (!handler) {
+        fallback_handler_ = nullptr;
+        return;
+    }
+    fallback_handler_ = [handler = std::move(handler)](request& req, response& res) -> thinger::awaitable<void> {
+        handler(req, res);
+        co_return;
+    };
 }
 
 const route* route_handler::find_route(std::shared_ptr<request> req) {
@@ -73,10 +80,10 @@ const route* route_handler::find_route(std::shared_ptr<request> req) {
     return nullptr;
 }
 
-void route_handler::handle_unmatched(std::shared_ptr<request> req, response& res) {
+thinger::awaitable<void> route_handler::handle_unmatched(std::shared_ptr<request> req, response& res) {
     if (fallback_handler_) {
-        fallback_handler_(*req, res);
-        return;
+        co_await fallback_handler_(*req, res);
+        co_return;
     }
 
     // Check if the method has no routes at all → 405, otherwise 404

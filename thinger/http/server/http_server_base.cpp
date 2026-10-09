@@ -414,7 +414,7 @@ awaitable<void> http_server_base::handle_request(std::shared_ptr<request> req, r
     // 3. Three-way dispatch
     if (!matched_route) {
         // No route matched → fallback / 404
-        host.router().handle_unmatched(req, res);
+        co_await host.router().handle_unmatched(req, res);
     } else if (matched_route->is_deferred_body() || !req->has_pending_body()) {
         // DEFERRED: handler reads body at its discretion (bounded by the maximum body size
         // in read_body()); or NO BODY: dispatch directly
