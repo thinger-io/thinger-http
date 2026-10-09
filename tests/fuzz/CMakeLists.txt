@@ -6,5 +6,8 @@ function(add_fuzz_target name source)
 endfunction()
 
 add_fuzz_target(fuzz_http_request_parser fuzz_http_request_parser.cpp)
+add_fuzz_target(fuzz_chunked_decoder fuzz_chunked_decoder.cpp)
+# Differential against Boost.Beast (header-only, used only by this target as a reference)
+add_fuzz_target(fuzz_http_differential fuzz_http_differential.cpp)
 add_fuzz_target(fuzz_url_decode fuzz_url_decode.cpp)
 add_fuzz_target(fuzz_utf8_validate fuzz_utf8_validate.cpp)

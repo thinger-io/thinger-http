@@ -1,0 +1,9 @@
+5
+hello
+6
+ world
+0
+
+GET /next HTTP/1.1
+Host: localhost
+

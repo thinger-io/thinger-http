@@ -1,0 +1,3 @@
+GET / http/1.1
+Host: localhost
+

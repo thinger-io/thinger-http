@@ -1,0 +1,8 @@
+POST /echo HTTP/1.1
+Host: localhost
+Content-Lengt: 5
+ h
+
+helloGET /smuggled HTTP/1.1
+Host: localhost
+

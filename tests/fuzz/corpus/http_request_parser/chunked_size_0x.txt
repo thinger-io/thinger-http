@@ -1,0 +1,11 @@
+POST /echo HTTP/1.1
+Host: localhost
+Transfer-Encoding: chunked
+
+0x5
+hello
+0
+
+GET /smuggled HTTP/1.1
+Host: localhost
+

@@ -1,0 +1,9 @@
+5
+hello
+0
+X-Trailer: a
+Other: b	 c
+
+GET /next HTTP/1.1
+Host: localhost
+

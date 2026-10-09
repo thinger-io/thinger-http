@@ -1,0 +1,7 @@
+5;name=value
+hello
+0;a
+
+GET /next HTTP/1.1
+Host: localhost
+

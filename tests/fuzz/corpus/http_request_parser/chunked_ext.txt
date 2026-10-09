@@ -1,0 +1,13 @@
+POST /echo HTTP/1.1
+Host: localhost
+Transfer-Encoding: chunked
+
+5;name=value
+hello
+1;ext;other="quoted"
+!
+0;last=1
+
+GET /next HTTP/1.1
+Host: localhost
+

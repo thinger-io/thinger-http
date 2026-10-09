@@ -45,8 +45,13 @@ jobs:
       - name: Prepare corpus directories
         run: |
           mkdir -p build-fuzz/corpus/http_request_parser
+          mkdir -p build-fuzz/corpus/chunked_decoder
+          mkdir -p build-fuzz/corpus/http_differential
           mkdir -p build-fuzz/corpus/url_decode
           cp -rn tests/fuzz/corpus/http_request_parser/* build-fuzz/corpus/http_request_parser/ 2>/dev/null || true
+          cp -rn tests/fuzz/corpus/chunked_decoder/* build-fuzz/corpus/chunked_decoder/ 2>/dev/null || true
+          # The differential target parses the same requests as the request parser target
+          cp -rn tests/fuzz/corpus/http_request_parser/* build-fuzz/corpus/http_differential/ 2>/dev/null || true
           cp -rn tests/fuzz/corpus/url_decode/* build-fuzz/corpus/url_decode/ 2>/dev/null || true
 
       - name: Fuzz HTTP request parser
@@ -54,6 +59,18 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: build-fuzz/tests/fuzz/fuzz_http_request_parser build-fuzz/corpus/http_request_parser -max_total_time=300 -max_len=4096
+
+      - name: Fuzz chunked decoder
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: build-fuzz/tests/fuzz/fuzz_chunked_decoder build-fuzz/corpus/chunked_decoder -max_total_time=300 -max_len=4096
+
+      - name: Fuzz HTTP parsing against Boost.Beast (differential)
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: build-fuzz/tests/fuzz/fuzz_http_differential build-fuzz/corpus/http_differential -max_total_time=300 -max_len=4096
 
       - name: Fuzz URL decode
         env:

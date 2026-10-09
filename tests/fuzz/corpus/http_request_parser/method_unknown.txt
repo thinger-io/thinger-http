@@ -1,0 +1,7 @@
+PROPFIND / HTTP/1.1
+Host: localhost
+Content-Length: 2
+
+abGET /next HTTP/1.1
+Host: localhost
+

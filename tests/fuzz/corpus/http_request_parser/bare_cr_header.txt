@@ -1,0 +1,6 @@
+GET / HTTP/1.1
+Host: localhostX: y
+
+GET /next HTTP/1.1
+Host: localhost
+

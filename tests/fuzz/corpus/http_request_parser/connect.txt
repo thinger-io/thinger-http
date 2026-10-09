@@ -1,0 +1,6 @@
+CONNECT /example.com:443 HTTP/1.1
+Host: example.com
+
+GET /next HTTP/1.1
+Host: localhost
+
