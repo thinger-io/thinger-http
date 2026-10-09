@@ -182,7 +182,7 @@ TEMPLATE_TEST_CASE("HTTP Server route management", "[http][server][unit]",
             .get("/:resource", [](http::response& res) { res.send("ok"); });
 
         const auto& get_routes = server.router().get_routes().at(http::method::GET);
-        auto find = [](const std::vector<http::route>& routes, const std::string& pattern) -> const http::route* {
+        auto find = [](const std::deque<http::route>& routes, const std::string& pattern) -> const http::route* {
             for (const auto& r : routes) if (r.get_pattern() == pattern) return &r;
             return nullptr;
         };

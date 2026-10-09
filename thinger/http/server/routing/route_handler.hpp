@@ -1,8 +1,8 @@
 #ifndef THINGER_HTTP_ROUTE_HANDLER_HPP
 #define THINGER_HTTP_ROUTE_HANDLER_HPP
 
+#include <deque>
 #include <map>
-#include <vector>
 #include <memory>
 #include "route.hpp"
 #include "route_builder.hpp"
@@ -29,8 +29,9 @@ public:
     // Add a catch-all handler for unmatched routes
     void set_fallback_handler(std::function<void(request&, response&)> handler);
     
-    // Get all registered routes (useful for API documentation)
-    const std::map<method, std::vector<route>>& get_routes() const { return routes_; }
+    // Get all registered routes (useful for API documentation). Routes are never moved
+    // once registered: references to them stay valid while more routes are added.
+    const std::map<method, std::deque<route>>& get_routes() const { return routes_; }
 
     // Shared JSON schemas (OpenAPI components), referenced from route schemas with
     // {"$ref": "#/components/schemas/<name>"}. Register them before the routes using them.
@@ -40,7 +41,7 @@ public:
     const nlohmann::json& get_schema_components() const { return schema_components_; }
     
 private:
-    std::map<method, std::vector<route>> routes_;
+    std::map<method, std::deque<route>> routes_;
     nlohmann::json schema_components_ = nlohmann::json::object();
     std::function<void(request&, response&)> fallback_handler_;
     
