@@ -269,3 +269,77 @@ TEST_CASE("Response copies share the response", "[server][dispatch][response][in
     REQUIRE(response->get_content() == "from copy");
     REQUIRE(response->get_header("X-From") == "copy");
 }
+
+namespace {
+    void function_handler(http::request& req, http::response& res) {
+        res.send("function " + req["id"]);
+    }
+
+    thinger::awaitable<void> delayed_send(http::response& res, std::string text) {
+        boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 5ms);
+        co_await timer.async_wait(thinger::use_awaitable);
+        res.send(text);
+    }
+}
+
+TEST_CASE("Route registration accepts every callback form on every method", "[server][dispatch][routes][integration]") {
+    http::server server;
+    const std::vector<http::method> methods = {http::method::GET, http::method::POST, http::method::PUT,
+        http::method::DELETE, http::method::PATCH, http::method::HEAD, http::method::OPTIONS};
+
+    // Coroutines answering after a suspension: they would never answer if they were
+    // taken as synchronous callbacks (and their awaitable discarded)
+    auto group = server.group("/group");
+    for (auto method : methods) {
+        auto name = http::get_method(method);
+        auto coroutine = [name](http::response& res) -> thinger::awaitable<void> {
+            co_await delayed_send(res, "coroutine " + name);
+        };
+        auto json_coroutine = [name](nlohmann::json& body, http::response& res) -> thinger::awaitable<void> {
+            co_await delayed_send(res, "json " + name + " " + body["value"].get<std::string>());
+        };
+        switch (method) {
+            case http::method::GET: server.get("/coro", coroutine); group.get("/json", json_coroutine); break;
+            case http::method::POST: server.post("/coro", coroutine); group.post("/json", json_coroutine); break;
+            case http::method::PUT: server.put("/coro", coroutine); group.put("/json", json_coroutine); break;
+            case http::method::DELETE: server.del("/coro", coroutine); group.del("/json", json_coroutine); break;
+            case http::method::PATCH: server.patch("/coro", coroutine); group.patch("/json", json_coroutine); break;
+            case http::method::HEAD: server.head("/coro", coroutine); group.head("/json", json_coroutine); break;
+            default: server.options("/coro", coroutine); group.options("/json", json_coroutine); break;
+        }
+    }
+
+    // Synchronous forms: function, mutable lambda, std::function, JSON body
+    server.get("/function/:id", function_handler);
+    int calls = 0;
+    server.get("/mutable", [calls](http::response& res) mutable { res.send("call " + std::to_string(++calls)); });
+    http::route_callback_request_json_response std_function = [](http::request&, nlohmann::json& body, http::response& res) {
+        res.json(body);
+    };
+    server.post("/std-function", std_function);
+    server.set_not_found_handler([](http::response& res) -> thinger::awaitable<void> {
+        co_await delayed_send(res, "fallback");
+    });
+
+    for (auto method : methods) {
+        DYNAMIC_SECTION("Coroutines on " << http::get_method(method)) {
+            auto response = run_dispatch(server, make_request(method, "/coro"));
+            REQUIRE(response->get_content() == "coroutine " + http::get_method(method));
+            response = run_dispatch(server, make_request(method, "/group/json", R"({"value":"v"})"));
+            REQUIRE(response->get_content() == "json " + http::get_method(method) + " v");
+        }
+    }
+
+    SECTION("Synchronous forms") {
+        REQUIRE(run_dispatch(server, make_request(http::method::GET, "/function/7"))->get_content() == "function 7");
+        REQUIRE(run_dispatch(server, make_request(http::method::GET, "/mutable"))->get_content() == "call 1");
+        REQUIRE(run_dispatch(server, make_request(http::method::GET, "/mutable"))->get_content() == "call 2");
+        auto response = run_dispatch(server, make_request(http::method::POST, "/std-function", R"({"a":1})"));
+        REQUIRE(nlohmann::json::parse(response->get_content()) == nlohmann::json{{"a", 1}});
+        REQUIRE(run_dispatch(server, make_request(http::method::POST, "/std-function", "{bad"))->get_status_code() == 400);
+    }
+
+    SECTION("Coroutine fallback") {
+        REQUIRE(run_dispatch(server, make_request(http::method::GET, "/missing"))->get_content() == "fallback");
+    }
+}

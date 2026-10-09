@@ -199,6 +199,15 @@ namespace {
     auto make_response(const std::shared_ptr<http_request>& http_req) {
         return response(nullptr, nullptr, http_req);
     }
+
+    // Helper: run the route handler to completion
+    void handle(const route& r, request& req, response& res) {
+        boost::asio::io_context ioc;
+        thinger::co_spawn(ioc, r.handle_request_coro(req, res), [](std::exception_ptr e) {
+            if (e) std::rethrow_exception(e);
+        });
+        ioc.run();
+    }
 }
 
 TEST_CASE("Route handle_request dispatch", "[route][unit]") {
@@ -212,7 +221,7 @@ TEST_CASE("Route handle_request dispatch", "[route][unit]") {
 
         auto req = make_request();
         auto res = make_response(req->get_http_request());
-        r.handle_request(*req, res);
+        handle(r, *req, res);
         REQUIRE(called);
     }
 
@@ -225,7 +234,7 @@ TEST_CASE("Route handle_request dispatch", "[route][unit]") {
 
         auto req = make_request();
         auto res = make_response(req->get_http_request());
-        r.handle_request(*req, res);
+        handle(r, *req, res);
         REQUIRE(called);
     }
 
@@ -238,7 +247,7 @@ TEST_CASE("Route handle_request dispatch", "[route][unit]") {
 
         auto req = make_request(R"({"key":"value"})");
         auto res = make_response(req->get_http_request());
-        r.handle_request(*req, res);
+        handle(r, *req, res);
         REQUIRE(received_key == "value");
     }
 
@@ -251,7 +260,7 @@ TEST_CASE("Route handle_request dispatch", "[route][unit]") {
 
         auto req = make_request();
         auto res = make_response(req->get_http_request());
-        r.handle_request(*req, res);
+        handle(r, *req, res);
         REQUIRE(called);
     }
 
@@ -264,7 +273,7 @@ TEST_CASE("Route handle_request dispatch", "[route][unit]") {
 
         auto req = make_request(R"({"data":"hello"})");
         auto res = make_response(req->get_http_request());
-        r.handle_request(*req, res);
+        handle(r, *req, res);
         REQUIRE(received_value == "hello");
     }
 
@@ -277,7 +286,7 @@ TEST_CASE("Route handle_request dispatch", "[route][unit]") {
 
         auto req = make_request();
         auto res = make_response(req->get_http_request());
-        r.handle_request(*req, res);
+        handle(r, *req, res);
         REQUIRE(called);
     }
 
@@ -290,20 +299,22 @@ TEST_CASE("Route handle_request dispatch", "[route][unit]") {
 
         auto req = make_request("{invalid json}");
         auto res = make_response(req->get_http_request());
-        r.handle_request(*req, res);
+        handle(r, *req, res);
         REQUIRE_FALSE(called); // callback not invoked on invalid JSON
     }
 
-    SECTION("Awaitable callback invoked synchronously returns error") {
+    SECTION("Awaitable callback is awaited") {
         route r("/test");
-        r = route_callback_awaitable([](request&, response&) -> thinger::awaitable<void> {
+        bool called = false;
+        r = route_callback_awaitable([&called](request&, response&) -> thinger::awaitable<void> {
+            called = true;
             co_return;
         });
 
         auto req = make_request();
         auto res = make_response(req->get_http_request());
-        // Should not crash — sets 500 error on response
-        REQUIRE_NOTHROW(r.handle_request(*req, res));
+        handle(r, *req, res);
+        REQUIRE(called);
     }
 }
 

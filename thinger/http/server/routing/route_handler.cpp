@@ -30,17 +30,6 @@ void route_handler::enable_cors(bool enabled) {
     }
 }
 
-void route_handler::set_fallback_handler(std::function<void(request&, response&)> handler) {
-    if (!handler) {
-        fallback_handler_ = nullptr;
-        return;
-    }
-    fallback_handler_ = [handler = std::move(handler)](request& req, response& res) -> thinger::awaitable<void> {
-        handler(req, res);
-        co_return;
-    };
-}
-
 const route* route_handler::find_route(std::shared_ptr<request> req) {
     auto http_request = req->get_http_request();
     const auto& request_method = http_request->get_method();

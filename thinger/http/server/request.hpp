@@ -212,6 +212,10 @@ namespace thinger::http{
 
         /// Max body size for read_body()
         size_t max_body_size_ = 8 * 1024 * 1024;
+
+        /// Body parsed as JSON by the matched route, for callbacks taking it
+        friend class route;
+        nlohmann::json json_body_;
     };
 
 }

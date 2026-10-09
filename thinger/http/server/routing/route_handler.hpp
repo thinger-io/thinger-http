@@ -12,7 +12,7 @@ namespace thinger::http {
 class route_handler {
 public:
     // Fallback for unmatched requests
-    using fallback_handler = std::function<thinger::awaitable<void>(request&, response&)>;
+    using fallback_handler = route_callback_awaitable;
 
     route_handler();
     virtual ~route_handler() = default;
@@ -29,14 +29,11 @@ public:
     // Enable CORS support: answer preflight OPTIONS requests on any path
     void enable_cors(bool enabled = true);
     
-    // Add a catch-all handler for unmatched routes
-    void set_fallback_handler(std::function<void(request&, response&)> handler);
-
-    // Same, with a coroutine handler (picked before the overload above, which would
-    // otherwise also accept it, discarding the awaitable)
-    template<awaitable_handler F>
+    // Add a catch-all handler for unmatched routes, taking (request&, response&) or
+    // (response&), synchronous or coroutine
+    template<typename F> requires request_response_callback<F> || response_callback<F>
     void set_fallback_handler(F&& handler) {
-        fallback_handler_ = fallback_handler(std::forward<F>(handler));
+        fallback_handler_ = make_route_callback(std::forward<F>(handler));
     }
     
     // Get all registered routes (useful for API documentation). Routes are never moved

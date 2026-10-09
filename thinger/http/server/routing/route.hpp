@@ -2,7 +2,7 @@
 #define THINGER_HTTP_ROUTE_DESCRIPTOR_HPP
 
 #include <concepts>
-#include <variant>
+#include <type_traits>
 #include <map>
 #include <functional>
 #include <regex>
@@ -53,33 +53,91 @@ using route_callback_awaitable_response_only = std::function<thinger::awaitable<
 using route_callback_awaitable_json = std::function<thinger::awaitable<void>(nlohmann::json&, response&)>;
 using route_callback_awaitable_request_json = std::function<thinger::awaitable<void>(request&, nlohmann::json&, response&)>;
 
-// Coroutine handler signatures. Those taking a JSON body get it read, parsed and validated
-// against the route schema before they run; (request&, response&) reads the body itself
-// (deferred body) unless deferred_body(false) is set.
+// Route callback signatures, synchronous or coroutines returning awaitable<void>. Those
+// taking a JSON body get it read, parsed and validated against the route schema before
+// they run; coroutines taking (request&, response&) or (response&) read the body
+// themselves (deferred body) unless deferred_body(false) is set on the route.
 template<typename F>
-concept awaitable_handler = requires(F f, request& req, response& res) {
-    { f(req, res) } -> std::same_as<thinger::awaitable<void>>;
-};
+concept request_response_callback = std::invocable<F&, request&, response&>;
 
 template<typename F>
-concept awaitable_response_handler = requires(F f, response& res) {
-    { f(res) } -> std::same_as<thinger::awaitable<void>>;
-};
+concept response_callback = !request_response_callback<F> && std::invocable<F&, response&>;
 
 template<typename F>
-concept awaitable_request_json_handler = requires(F f, request& req, nlohmann::json& json, response& res) {
-    { f(req, json, res) } -> std::same_as<thinger::awaitable<void>>;
-};
+concept request_json_callback = std::invocable<F&, request&, nlohmann::json&, response&>;
 
 // Generic lambdas taking two arguments are treated as (request&, response&)
 template<typename F>
-concept awaitable_json_handler = !awaitable_handler<F> && requires(F f, nlohmann::json& json, response& res) {
-    { f(json, res) } -> std::same_as<thinger::awaitable<void>>;
-};
+concept json_callback = !request_response_callback<F> && std::invocable<F&, nlohmann::json&, response&>;
+
+template<typename F>
+concept route_callable = request_response_callback<F> || response_callback<F>
+                      || request_json_callback<F> || json_callback<F>;
+
+// The same signatures, as coroutines
+template<typename F, typename... Args>
+concept returns_awaitable = std::same_as<std::invoke_result_t<F&, Args...>, thinger::awaitable<void>>;
+
+template<typename F>
+concept awaitable_handler = request_response_callback<F> && returns_awaitable<F, request&, response&>;
+
+template<typename F>
+concept awaitable_response_handler = std::invocable<F&, response&> && returns_awaitable<F, response&>;
+
+template<typename F>
+concept awaitable_request_json_handler = request_json_callback<F>
+                                      && returns_awaitable<F, request&, nlohmann::json&, response&>;
+
+template<typename F>
+concept awaitable_json_handler = json_callback<F> && returns_awaitable<F, nlohmann::json&, response&>;
 
 template<typename F>
 concept coroutine_handler = awaitable_handler<F> || awaitable_response_handler<F>
                          || awaitable_json_handler<F> || awaitable_request_json_handler<F>;
+
+namespace detail {
+
+    template<typename T>
+    inline constexpr bool is_awaitable_v = false;
+
+    template<typename T, typename Executor>
+    inline constexpr bool is_awaitable_v<boost::asio::awaitable<T, Executor>> = true;
+
+    template<typename F, typename... Args>
+    thinger::awaitable<void> call_synchronously(F& callback, Args&... args) {
+        callback(args...);
+        co_return;
+    }
+
+    // Call a route callback as a coroutine: coroutines as they are, synchronous callbacks
+    // from one (their result, if any, is ignored)
+    template<typename F, typename... Args>
+    thinger::awaitable<void> call_callback(F& callback, Args&... args) {
+        using result = std::invoke_result_t<F&, Args&...>;
+        if constexpr (std::same_as<result, thinger::awaitable<void>>) {
+            return callback(args...);
+        } else {
+            static_assert(!is_awaitable_v<result>, "coroutine route callbacks must return thinger::awaitable<void>");
+            return call_synchronously(callback, args...);
+        }
+    }
+
+}
+
+// A callback taking (request&, response&) or (response&), as the coroutine every route
+// callback is turned into
+template<typename F> requires request_response_callback<F> || response_callback<F>
+route_callback_awaitable make_route_callback(F&& callback) {
+    if constexpr (request_response_callback<F>) {
+        return [callback = std::forward<F>(callback)](request& req, response& res) mutable {
+            return detail::call_callback(callback, req, res);
+        };
+    } else {
+        return [callback = std::forward<F>(callback)](request&, response& res) mutable {
+            return detail::call_callback(callback, res);
+        };
+    }
+}
 
 // Legacy callback types (for backward compatibility if needed)
 using route_callback = route_callback_request_response;
@@ -105,29 +163,20 @@ class route {
 public:
     route(const std::string& pattern);
     
-    // Set the callback handler - multiple signatures supported
-    route& operator=(route_callback_response_only callback);
-    route& operator=(route_callback_json_response callback);
-    route& operator=(route_callback_request_response callback);
-    route& operator=(route_callback_request_json_response callback);
-    route& operator=(route_callback_awaitable callback);
-    route& operator=(route_callback_awaitable_response_only callback);
-    route& operator=(route_callback_awaitable_json callback);
-    route& operator=(route_callback_awaitable_request_json callback);
-
-    // Coroutine lambdas: picked before the std::function<void(...)> overloads above,
-    // which would otherwise also accept them (discarding the awaitable)
-    template<coroutine_handler F>
+    // Set the callback: any route_callable signature, synchronous or coroutine. It is
+    // stored as a coroutine taking (request&, response&) and whether it takes the JSON body.
+    template<route_callable F>
     route& operator=(F&& callback) {
-        if constexpr (awaitable_handler<F>) {
-            return *this = route_callback_awaitable(std::forward<F>(callback));
-        } else if constexpr (awaitable_response_handler<F>) {
-            return *this = route_callback_awaitable_response_only(std::forward<F>(callback));
-        } else if constexpr (awaitable_request_json_handler<F>) {
-            return *this = route_callback_awaitable_request_json(std::forward<F>(callback));
+        if constexpr (request_response_callback<F> || response_callback<F>) {
+            callback_ = make_route_callback(std::forward<F>(callback));
+            takes_json_body_ = false;
+            // coroutines read the body themselves; the others get it read first
+            if constexpr (awaitable_handler<F> || awaitable_response_handler<F>) deferred_body_ = true;
         } else {
-            return *this = route_callback_awaitable_json(std::forward<F>(callback));
+            callback_ = make_json_callback(std::forward<F>(callback));
+            takes_json_body_ = true;
         }
+        return *this;
     }
 
     // Deferred body mode - handler reads body at its discretion. Ignored by handlers
@@ -167,7 +216,7 @@ public:
     bool is_hidden() const { return hidden_; }
 
     // Whether the callback receives the request body parsed as JSON
-    bool takes_json_body() const;
+    bool takes_json_body() const { return takes_json_body_; }
 
     // Shared schemas (OpenAPI components) that route schemas can reference with
     // {"$ref": "#/components/schemas/<name>"}; set by the router that owns the route
@@ -189,10 +238,8 @@ public:
     // Get route parameters from regex
     const std::vector<std::string>& get_parameters() const { return parameters_; }
     
-    // Handle the request (synchronous)
-    void handle_request(request& req, response& res) const;
-
-    // Handle the request (coroutine — works for all callback types)
+    // Handle the request: parse and validate the JSON body for callbacks taking it, then
+    // run the callback
     thinger::awaitable<void> handle_request_coro(request& req, response& res) const;
     
     // Get the original pattern
@@ -218,16 +265,22 @@ private:
     nlohmann::json metadata_ = nlohmann::json::object();
     const nlohmann::json* schema_components_ = nullptr;
     bool deferred_body_ = false;
-    std::variant<
-        route_callback_response_only,
-        route_callback_json_response,
-        route_callback_request_response,
-        route_callback_request_json_response,
-        route_callback_awaitable,
-        route_callback_awaitable_response_only,
-        route_callback_awaitable_json,
-        route_callback_awaitable_request_json
-    > callback_;
+    bool takes_json_body_ = false;
+    route_callback_awaitable callback_;
+
+    // A callback taking the JSON body: it gets the body parsed by handle_request_coro()
+    template<typename F>
+    static route_callback_awaitable make_json_callback(F&& callback) {
+        if constexpr (request_json_callback<F>) {
+            return [callback = std::forward<F>(callback)](request& req, response& res) mutable {
+                return detail::call_callback(callback, req, req.json_body_, res);
+            };
+        } else {
+            return [callback = std::forward<F>(callback)](request& req, response& res) mutable {
+                return detail::call_callback(callback, req.json_body_, res);
+            };
+        }
+    }
 
     // Parse the request body as JSON and validate it against the schema; responds with
     // an error and returns false if it is not valid

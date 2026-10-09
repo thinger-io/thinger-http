@@ -66,48 +66,6 @@ route::route(const std::string& pattern)
     regex_ = std::regex(regex_pattern);
 }
 
-route& route::operator=(route_callback_response_only callback) {
-    callback_ = std::move(callback);
-    return *this;
-}
-
-route& route::operator=(route_callback_json_response callback) {
-    callback_ = std::move(callback);
-    return *this;
-}
-
-route& route::operator=(route_callback_request_response callback) {
-    callback_ = std::move(callback);
-    return *this;
-}
-
-route& route::operator=(route_callback_request_json_response callback) {
-    callback_ = std::move(callback);
-    return *this;
-}
-
-route& route::operator=(route_callback_awaitable callback) {
-    callback_ = std::move(callback);
-    deferred_body_ = true;  // auto-enable deferred body for awaitable callbacks
-    return *this;
-}
-
-route& route::operator=(route_callback_awaitable_response_only callback) {
-    callback_ = std::move(callback);
-    deferred_body_ = true;  // the handler cannot read the body: it is discarded afterwards
-    return *this;
-}
-
-route& route::operator=(route_callback_awaitable_json callback) {
-    callback_ = std::move(callback);
-    return *this;
-}
-
-route& route::operator=(route_callback_awaitable_request_json callback) {
-    callback_ = std::move(callback);
-    return *this;
-}
-
 route& route::deferred_body(bool enabled) {
     deferred_body_ = enabled;
     return *this;
@@ -198,13 +156,6 @@ bool route::matches(const std::string& path, std::smatch& matches) const {
     return std::regex_match(path, matches, regex_);
 }
 
-bool route::takes_json_body() const {
-    return std::holds_alternative<route_callback_json_response>(callback_)
-        || std::holds_alternative<route_callback_request_json_response>(callback_)
-        || std::holds_alternative<route_callback_awaitable_json>(callback_)
-        || std::holds_alternative<route_callback_awaitable_request_json>(callback_);
-}
-
 bool route::parse_json_body(request& req, response& res, nlohmann::json& json) const {
     const auto& body = req.get_http_request()->get_body();
     if (!body.empty()) {
@@ -220,45 +171,12 @@ bool route::parse_json_body(request& req, response& res, nlohmann::json& json) c
     return true;
 }
 
-void route::handle_request(request& req, response& res) const {
-    std::visit([&](const auto& callback) {
-        using callback_type = std::decay_t<decltype(callback)>;
-        if constexpr (std::is_same_v<callback_type, route_callback_response_only>) {
-            callback(res);
-        } else if constexpr (std::is_same_v<callback_type, route_callback_request_response>) {
-            callback(req, res);
-        } else if constexpr (std::is_same_v<callback_type, route_callback_json_response>) {
-            nlohmann::json json;
-            if (parse_json_body(req, res, json)) callback(json, res);
-        } else if constexpr (std::is_same_v<callback_type, route_callback_request_json_response>) {
-            nlohmann::json json;
-            if (parse_json_body(req, res, json)) callback(req, json, res);
-        } else {
-            // Coroutine callbacks cannot be called synchronously
-            res.error(http_response::status::internal_server_error,
-                      "Awaitable route handler invoked synchronously; use handle_request_coro() instead");
-        }
-    }, callback_);
-}
-
 thinger::awaitable<void> route::handle_request_coro(request& req, response& res) const {
-    if (std::holds_alternative<route_callback_awaitable>(callback_)) {
-        co_await std::get<route_callback_awaitable>(callback_)(req, res);
-    } else if (std::holds_alternative<route_callback_awaitable_response_only>(callback_)) {
-        co_await std::get<route_callback_awaitable_response_only>(callback_)(res);
-    } else if (std::holds_alternative<route_callback_awaitable_json>(callback_)) {
-        nlohmann::json json;
-        if (parse_json_body(req, res, json)) {
-            co_await std::get<route_callback_awaitable_json>(callback_)(json, res);
-        }
-    } else if (std::holds_alternative<route_callback_awaitable_request_json>(callback_)) {
-        nlohmann::json json;
-        if (parse_json_body(req, res, json)) {
-            co_await std::get<route_callback_awaitable_request_json>(callback_)(req, json, res);
-        }
-    } else {
-        handle_request(req, res);
+    if (takes_json_body_) {
+        req.json_body_ = nullptr;
+        if (!parse_json_body(req, res, req.json_body_)) co_return;
     }
+    co_await callback_(req, res);
 }
 
 route& route::schema(const nlohmann::json& json_schema) {

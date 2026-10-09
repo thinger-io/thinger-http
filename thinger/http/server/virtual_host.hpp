@@ -3,6 +3,7 @@
 
 #include "routing/route_handler.hpp"
 #include "routing/route.hpp"
+#include "routing/route_registrar.hpp"
 #include <optional>
 #include <regex>
 #include <string>
@@ -14,7 +15,7 @@ class route_group;
 
 // Set of routes served for a host name (see http_server_base::host). The server itself is
 // the default virtual host: its routes answer the requests for hosts not registered.
-class virtual_host {
+class virtual_host : public route_registrar<virtual_host> {
 public:
     // Default host ("*")
     virtual_host();
@@ -33,76 +34,7 @@ public:
     virtual_host(const virtual_host&) = delete;
     virtual_host& operator=(const virtual_host&) = delete;
 
-    // Route registration methods - all return route& for chaining
-    route& get(const std::string& path, route_callback_response_only handler);
-    route& get(const std::string& path, route_callback_json_response handler);
-    route& get(const std::string& path, route_callback_request_response handler);
-    route& get(const std::string& path, route_callback_request_json_response handler);
-
-    route& post(const std::string& path, route_callback_response_only handler);
-    route& post(const std::string& path, route_callback_json_response handler);
-    route& post(const std::string& path, route_callback_request_response handler);
-    route& post(const std::string& path, route_callback_request_json_response handler);
-
-    route& put(const std::string& path, route_callback_response_only handler);
-    route& put(const std::string& path, route_callback_json_response handler);
-    route& put(const std::string& path, route_callback_request_response handler);
-    route& put(const std::string& path, route_callback_request_json_response handler);
-
-    route& del(const std::string& path, route_callback_response_only handler);  // delete is keyword
-    route& del(const std::string& path, route_callback_json_response handler);
-    route& del(const std::string& path, route_callback_request_response handler);
-    route& del(const std::string& path, route_callback_request_json_response handler);
-
-    route& patch(const std::string& path, route_callback_response_only handler);
-    route& patch(const std::string& path, route_callback_json_response handler);
-    route& patch(const std::string& path, route_callback_request_response handler);
-    route& patch(const std::string& path, route_callback_request_json_response handler);
-
-    route& head(const std::string& path, route_callback_response_only handler);
-    route& head(const std::string& path, route_callback_request_response handler);
-
-    route& options(const std::string& path, route_callback_response_only handler);
-    route& options(const std::string& path, route_callback_request_response handler);
-
-    // Coroutine route registration. See coroutine_handler (route.hpp) for the signatures:
-    // handlers taking a JSON body get it read, parsed and validated first; (request&, response&)
-    // handlers read the body themselves unless deferred_body(false) is set on the route.
-    // Templates avoid ambiguity with the std::function<void(...)> overloads above.
-    template<coroutine_handler F>
-    route& get(const std::string& path, F&& handler) {
-        return router_[method::GET][path] = std::forward<F>(handler);
-    }
-
-    template<coroutine_handler F>
-    route& post(const std::string& path, F&& handler) {
-        return router_[method::POST][path] = std::forward<F>(handler);
-    }
-
-    template<coroutine_handler F>
-    route& put(const std::string& path, F&& handler) {
-        return router_[method::PUT][path] = std::forward<F>(handler);
-    }
-
-    template<coroutine_handler F>
-    route& del(const std::string& path, F&& handler) {
-        return router_[method::DELETE][path] = std::forward<F>(handler);
-    }
-
-    template<coroutine_handler F>
-    route& patch(const std::string& path, F&& handler) {
-        return router_[method::PATCH][path] = std::forward<F>(handler);
-    }
-
-    template<coroutine_handler F>
-    route& head(const std::string& path, F&& handler) {
-        return router_[method::HEAD][path] = std::forward<F>(handler);
-    }
-
-    template<coroutine_handler F>
-    route& options(const std::string& path, F&& handler) {
-        return router_[method::OPTIONS][path] = std::forward<F>(handler);
-    }
+    // Route registration: get, post, put, del, patch, head and options (see route_registrar)
 
     // Group of routes sharing a path prefix, tags and metadata (see route_group)
     route_group group(const std::string& prefix);
@@ -116,22 +48,11 @@ public:
                       const std::string& directory,
                       const std::string& fallback = "index.html");
 
-    // Fallback handler, called instead of answering 404/405 when no route matches
-    void set_not_found_handler(route_callback_response_only handler);
-    void set_not_found_handler(route_callback_request_response handler);
-
-    // Same, with a coroutine taking (request&, response&) or (response&)
-    template<typename F> requires awaitable_handler<F> || awaitable_response_handler<F>
+    // Fallback handler, called instead of answering 404/405 when no route matches: takes
+    // (request&, response&) or (response&), synchronous or coroutine
+    template<typename F> requires request_response_callback<F> || response_callback<F>
     void set_not_found_handler(F&& handler) {
-        if constexpr (awaitable_handler<F>) {
-            router_.set_fallback_handler(std::forward<F>(handler));
-        } else {
-            router_.set_fallback_handler(route_callback_awaitable(
-                [handler = route_callback_awaitable_response_only(std::forward<F>(handler))](
-                        request&, response& res) {
-                    return handler(res);
-                }));
-        }
+        router_.set_fallback_handler(std::forward<F>(handler));
     }
 
     // Name the host was registered with ("*" for the default host)
@@ -162,6 +83,11 @@ protected:
     route_handler router_;
 
 private:
+    friend class route_registrar<virtual_host>;
+    route& make_route(method http_method, const std::string& path) {
+        return router_[http_method][path];
+    }
+
     std::string name_;
     std::optional<std::regex> pattern_;
     std::vector<std::string> parameters_;
@@ -169,7 +95,7 @@ private:
 
 // Routes registered through a group get its path prefix, and inherit its tags and
 // metadata (a route can still override a metadata key with its own meta()).
-class route_group {
+class route_group : public route_registrar<route_group> {
 public:
     route_group(virtual_host& host, std::string prefix)
         : host_(host), prefix_(std::move(prefix)) {}
@@ -193,30 +119,10 @@ public:
 
     const std::string& prefix() const { return prefix_; }
 
-    template<typename F> route& get(const std::string& path, F&& handler) {
-        return apply(host_.get(prefix_ + path, std::forward<F>(handler)));
-    }
-    template<typename F> route& post(const std::string& path, F&& handler) {
-        return apply(host_.post(prefix_ + path, std::forward<F>(handler)));
-    }
-    template<typename F> route& put(const std::string& path, F&& handler) {
-        return apply(host_.put(prefix_ + path, std::forward<F>(handler)));
-    }
-    template<typename F> route& del(const std::string& path, F&& handler) {
-        return apply(host_.del(prefix_ + path, std::forward<F>(handler)));
-    }
-    template<typename F> route& patch(const std::string& path, F&& handler) {
-        return apply(host_.patch(prefix_ + path, std::forward<F>(handler)));
-    }
-    template<typename F> route& head(const std::string& path, F&& handler) {
-        return apply(host_.head(prefix_ + path, std::forward<F>(handler)));
-    }
-    template<typename F> route& options(const std::string& path, F&& handler) {
-        return apply(host_.options(prefix_ + path, std::forward<F>(handler)));
-    }
-
 private:
-    route& apply(route& r) const {
+    friend class route_registrar<route_group>;
+    route& make_route(method http_method, const std::string& path) {
+        auto& r = host_.router()[http_method][prefix_ + path];
         r.tags(tags_);
         for (const auto& [key, value] : metadata_.items()) {
             r.meta(key, value);
