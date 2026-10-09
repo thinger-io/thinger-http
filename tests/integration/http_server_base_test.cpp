@@ -2447,6 +2447,73 @@ TEST_CASE("Connection takeover from a copy of the response after the handler ret
     REQUIRE(read_until_contains_within(sock, received, "ping", 5s));
 }
 
+TEST_CASE("Client leaving before a late response releases the connection", "[server][deferred][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    // The response is kept, and only sent once the client is gone
+    std::promise<http::response> held;
+    server.get("/hold", [&](http::response& res) { held.set_value(res); });
+
+    fixture.start_server();
+
+    boost::asio::io_context ioc;
+    boost::asio::ip::tcp::socket sock(ioc);
+    boost::asio::ip::tcp::resolver resolver(ioc);
+    boost::asio::connect(sock, resolver.resolve("127.0.0.1", std::to_string(fixture.port)));
+    boost::asio::write(sock, boost::asio::buffer(std::string("GET /hold HTTP/1.1\r\nHost: localhost\r\n\r\n")));
+
+    auto future = held.get_future();
+    REQUIRE(future.wait_for(5s) == std::future_status::ready);
+    auto res = future.get();
+    REQUIRE(res.get_connection());
+    sock.close();
+
+    // The connection is released well before its timeout (120 s)
+    auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (res.get_connection() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(10ms);
+    }
+    REQUIRE_FALSE(res.get_connection());
+
+    // Answering afterwards is harmless
+    res.send("too late");
+}
+
+TEST_CASE("Request pipelined while a late response is pending", "[server][deferred][pipelining][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    std::promise<void> handled;
+    server.get("/later", [&](http::response& res) {
+        handled.set_value();
+        std::thread([res]() mutable {
+            std::this_thread::sleep_for(100ms);
+            res.send("later-ok");
+        }).detach();
+    });
+    server.get("/next", [](http::response& res) { res.send("next-ok"); });
+
+    fixture.start_server();
+
+    boost::asio::io_context ioc;
+    boost::asio::ip::tcp::socket sock(ioc);
+    boost::asio::ip::tcp::resolver resolver(ioc);
+    boost::asio::connect(sock, resolver.resolve("127.0.0.1", std::to_string(fixture.port)));
+
+    // The second request arrives on its own while the first response is pending: it is
+    // left in the socket and answered after the first one
+    boost::asio::write(sock, boost::asio::buffer(std::string("GET /later HTTP/1.1\r\nHost: localhost\r\n\r\n")));
+    REQUIRE(handled.get_future().wait_for(5s) == std::future_status::ready);
+    boost::asio::write(sock, boost::asio::buffer(std::string("GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n")));
+
+    std::string received;
+    REQUIRE(read_until_contains_within(sock, received, "next-ok", 5s));
+    auto first = received.find("later-ok");
+    REQUIRE(first != std::string::npos);
+    REQUIRE(first < received.find("next-ok"));
+}
+
 TEST_CASE("WebSocket client sending data before the handshake is closed", "[server][takeover][websocket][integration]") {
     ServerBaseTestFixture fixture;
     auto& server = fixture.server;

@@ -171,9 +171,30 @@ awaitable<void> server_connection::read_loop() {
 }
 
 awaitable<void> server_connection::wait_response(const http_stream& stream) {
+    // Watch the socket meanwhile, so a client leaving before a late response is noticed now
+    // and not at the connection timeout. Waiting for readability consumes nothing: whatever
+    // the client sends next stays in the socket for the next request or a takeover
+    bool watch_peer = true;
     while (!stream.responded() && running_ && socket_->is_open()) {
         response_started_.expires_at(boost::asio::steady_timer::time_point::max());
-        co_await response_started_.async_wait(use_nothrow_awaitable);
+        if (!watch_peer) {
+            co_await response_started_.async_wait(use_nothrow_awaitable);
+            continue;
+        }
+        auto result = co_await (response_started_.async_wait(use_nothrow_awaitable) ||
+                                socket_->wait(boost::asio::socket_base::wait_read));
+        if (result.index() == 0) continue;
+
+        // Readable with nothing to read: the client closed (or reset) the connection
+        auto ec = std::get<1>(result);
+        if (ec || socket_->available() == 0) {
+            LOG_DEBUG("http client left while waiting for a response");
+            close();
+            co_return;
+        }
+
+        // A pipelined request (or TLS data) is waiting: leave it for later
+        watch_peer = false;
     }
 }
 
