@@ -147,9 +147,9 @@ TEST_CASE("Request factory rejects folded header lines (obs-fold)", "[request_fa
     };
 
     REQUIRE(bool(parse("GET / HTTP/1.1\r\nHost: localhost\r\nX-A: 1\r\n\r\n")));
-    REQUIRE(!parse("GET / HTTP/1.1\r\nTransfer-Encodin: chunked\r\n g\r\n\r\n"));
-    REQUIRE(!parse("GET / HTTP/1.1\r\nHost: localhost\r\nX-A: 1\r\n\t2\r\n\r\n"));
-    REQUIRE(!parse("GET / HTTP/1.1\r\n Host: localhost\r\n\r\n"));
+    REQUIRE(bool(!parse("GET / HTTP/1.1\r\nTransfer-Encodin: chunked\r\n g\r\n\r\n")));
+    REQUIRE(bool(!parse("GET / HTTP/1.1\r\nHost: localhost\r\nX-A: 1\r\n\t2\r\n\r\n")));
+    REQUIRE(bool(!parse("GET / HTTP/1.1\r\n Host: localhost\r\n\r\n")));
 }
 
 namespace {
@@ -179,7 +179,7 @@ TEST_CASE("Request factory limits the number of header lines", "[request_factory
     REQUIRE(bool(parse_headers(accepted, request_with_headers(100))));
 
     request_factory rejected;
-    REQUIRE(!parse_headers(rejected, request_with_headers(101)));
+    REQUIRE(bool(!parse_headers(rejected, request_with_headers(101))));
 }
 
 TEST_CASE("Request factory limits the size of the header section", "[request_factory][unit]") {
@@ -187,7 +187,7 @@ TEST_CASE("Request factory limits the size of the header section", "[request_fac
     REQUIRE(bool(parse_headers(accepted, request_of_size(16 * 1024))));
 
     request_factory rejected;
-    REQUIRE(!parse_headers(rejected, request_of_size(16 * 1024 + 1)));
+    REQUIRE(bool(!parse_headers(rejected, request_of_size(16 * 1024 + 1))));
 }
 
 TEST_CASE("Request factory rejects many repeated Content-Length headers quickly", "[request_factory][unit]") {
@@ -199,6 +199,6 @@ TEST_CASE("Request factory rejects many repeated Content-Length headers quickly"
     auto start = std::chrono::steady_clock::now();
     auto result = parse_headers(parser, raw);
     auto elapsed = std::chrono::steady_clock::now() - start;
-    REQUIRE(!result);
+    REQUIRE(bool(!result));
     REQUIRE(elapsed < std::chrono::seconds(2));
 }

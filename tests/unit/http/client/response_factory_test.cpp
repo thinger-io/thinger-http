@@ -25,10 +25,10 @@ TEST_CASE("Response factory rejects folded header lines (obs-fold)", "[response_
     // which turned "Content-Lengt: 5\r\n h" into "Content-Length: 5"
     SECTION("Folding completes Content-Length") {
         response_factory parser;
-        REQUIRE(!parse_response(parser, "HTTP/1.1 200 OK\r\nContent-Lengt: 5\r\n h\r\n\r\nhello"));
+        REQUIRE(bool(!parse_response(parser, "HTTP/1.1 200 OK\r\nContent-Lengt: 5\r\n h\r\n\r\nhello")));
     }
     SECTION("Folding a value with a tab") {
         response_factory parser;
-        REQUIRE(!parse_response(parser, "HTTP/1.1 200 OK\r\nX-A: 1\r\n\t2\r\nContent-Length: 0\r\n\r\n"));
+        REQUIRE(bool(!parse_response(parser, "HTTP/1.1 200 OK\r\nX-A: 1\r\n\t2\r\nContent-Length: 0\r\n\r\n")));
     }
 }
