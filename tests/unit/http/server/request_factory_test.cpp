@@ -3,7 +3,9 @@
 #include <thinger/http/common/http_request.hpp>
 #include <cstring>
 #include <chrono>
+#include <optional>
 #include <string>
+#include <utility>
 
 using namespace thinger::http;
 
@@ -201,4 +203,27 @@ TEST_CASE("Request factory rejects many repeated Content-Length headers quickly"
     auto elapsed = std::chrono::steady_clock::now() - start;
     REQUIRE(bool(!result));
     REQUIRE(elapsed < std::chrono::seconds(2));
+}
+
+// Found by differential fuzzing against Boost.Beast (tests/fuzz/fuzz_http_differential.cpp):
+// multi-digit versions were accepted and truncated to 8 bits ("HTTP/1.257" read as 1.1)
+TEST_CASE("Request factory accepts only HTTP/1.x with single-digit versions", "[request_factory][unit]") {
+    auto version_of = [](const std::string& version) -> std::optional<std::pair<int, int>> {
+        request_factory parser;
+        auto result = parse_headers(parser, "GET / HTTP/" + version + "\r\nHost: localhost\r\n\r\n");
+        if (!result) return std::nullopt;
+        REQUIRE(bool(result));
+        auto request = parser.consume_request();
+        return std::make_pair(request->get_http_version_major(), request->get_http_version_minor());
+    };
+
+    REQUIRE(version_of("1.1") == std::make_pair(1, 1));
+    REQUIRE(version_of("1.0") == std::make_pair(1, 0));
+    // A higher minor version is handled as the highest one supported (RFC 9110, section 2.5)
+    REQUIRE(version_of("1.2") == std::make_pair(1, 2));
+
+    for (const char* version : {"1.10", "1.01", "1.257", "01.1", "11.1", "257.1", "2.0", "0.9", "9.9", "1.", ".1", "1"}) {
+        INFO("version: " << version);
+        REQUIRE_FALSE(version_of(version).has_value());
+    }
 }

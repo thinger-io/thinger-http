@@ -45,18 +45,28 @@ namespace thinger::http {
         bool failed() const { return state_ == state::error; }
 
     private:
+        // The states of the chunk size line (size and extensions) come first, up to ext_bws
         enum class state {
-            size_start,     // first hex digit of the chunk size
-            size,           // more hex digits, ';' or CR
-            extension,      // chunk extension, skipped up to CR
+            size_start,         // first hex digit of the chunk size
+            size,               // more hex digits, ';' or CR
+            ext_name_start,     // after ';': whitespace or the first character of a name
+            ext_name,           // within an extension name
+            ext_after_name,     // whitespace after an extension name, then '=' or ';'
+            ext_value_start,    // after '=': whitespace, then a token or a quoted string
+            ext_value,          // within a token value
+            ext_quoted,         // within a quoted string value
+            ext_quoted_pair,    // after a backslash in a quoted string
+            ext_after_quoted,   // after a quoted string: whitespace, ';' or CR
+            ext_bws,            // whitespace after a value, before the next ';'
             size_lf,
             data,
             data_cr,
             data_lf,
-            trailer_start,  // start of a trailer field line, or CR of the final CRLF
-            trailer,        // within a trailer field line
+            trailer_start,      // start of a trailer field line, or CR of the final CRLF
+            trailer_name,       // within a trailer field name, up to ':'
+            trailer,            // within a trailer field value
             trailer_lf,
-            end_lf,         // LF of the final CRLF
+            end_lf,             // LF of the final CRLF
             done,
             error
         };

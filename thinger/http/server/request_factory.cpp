@@ -98,8 +98,12 @@ namespace thinger::http {
                     return boost::indeterminate;
                 }
                 return false;
+            // HTTP-version = HTTP-name "/" DIGIT "." DIGIT (RFC 9112, section 2.3): a single
+            // digit each, as longer numbers would be truncated (e.g. "HTTP/1.10" as 1.1). Only
+            // major version 1 uses this message syntax; a higher minor version is handled as
+            // 1.1 (RFC 9110, section 2.5)
             case http_version_major_start:
-                if (is_digit(input)) {
+                if (input == '1') {
                     tempInt_ = input - '0';
                     state_ = http_version_major;
                     return boost::indeterminate;
@@ -111,10 +115,6 @@ namespace thinger::http {
                     state_ = http_version_minor_start;
                     return boost::indeterminate;
                 }
-                else if (is_digit(input)) {
-                    tempInt_ = tempInt_ * 10 + input - '0';
-                    return boost::indeterminate;
-                }
                 return false;
             case http_version_minor_start:
                 if (is_digit(input)) {
@@ -124,11 +124,7 @@ namespace thinger::http {
                 }
                 return false;
             case http_version_minor:
-                if (is_digit(input)) {
-                    tempInt_ = tempInt_ * 10 + input - '0';
-                    return boost::indeterminate;
-                }
-                else if (input == '\r') {
+                if (input == '\r') {
                     on_http_minor_version(tempInt_);
                     tempInt_ = -1; // reserve temp int for storing content-lenght value
                     state_ = expecting_newline_1;

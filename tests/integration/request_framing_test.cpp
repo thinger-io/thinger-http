@@ -205,6 +205,18 @@ TEST_CASE("Malformed chunked bodies are rejected with 400 and close", "[server][
     SECTION("Bare LF in the trailer section") {
         require_rejected(fixture, chunked_post("5\r\nhello\r\n0\r\nX-Trailer: a\n\r\n"));
     }
+    // Found by differential fuzzing against Boost.Beast: without the final CRLF, the next
+    // request was read as the trailer section (its request line taken as a field line), so
+    // the server and a front end that ends the body at "0\r\n" disagreed on the requests
+    SECTION("Request following a body without its final CRLF") {
+        require_rejected(fixture, chunked_post("5\r\nhello\r\n0\r\n"));
+    }
+    SECTION("Trailer line that is not a field line") {
+        require_rejected(fixture, chunked_post("5\r\nhello\r\n0\r\nX-Trailer\r\n\r\n"));
+    }
+    SECTION("Chunk extension not following the grammar") {
+        require_rejected(fixture, chunked_post("5;a=b c\r\nhello\r\n0\r\n\r\n"));
+    }
 }
 
 TEST_CASE("Trailer section is consumed completely", "[server][framing][chunked-request][pipelining][integration]") {

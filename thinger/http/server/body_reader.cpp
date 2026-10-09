@@ -19,6 +19,32 @@ namespace thinger::http {
             return (c < 32 && c != '\t') || c == 127;
         }
 
+        bool is_whitespace(uint8_t c) {
+            return c == ' ' || c == '\t';
+        }
+
+        // tchar (RFC 9110, section 5.6.2)
+        bool is_token_char(uint8_t c) {
+            if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return true;
+            switch (c) {
+                case '!': case '#': case '$': case '%': case '&': case '\'': case '*': case '+':
+                case '-': case '.': case '^': case '_': case '`': case '|': case '~':
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        // qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text (RFC 9110, section 5.6.4)
+        bool is_qdtext(uint8_t c) {
+            return c == '\t' || c == ' ' || c == 0x21 || (c >= 0x23 && c <= 0x5B) || (c >= 0x5D && c <= 0x7E) || c >= 0x80;
+        }
+
+        // quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )
+        bool is_quoted_pair_char(uint8_t c) {
+            return c == '\t' || (c >= 0x20 && c != 0x7F);
+        }
+
     }
 
     // --- chunked_decoder ---
@@ -52,11 +78,13 @@ namespace thinger::http {
     }
 
     bool chunked_decoder::consume(uint8_t c) {
+        // bound the chunk size line: size and extensions (the states up to ext_bws)
+        if (state_ <= state::ext_bws && ++line_size_ > max_line_size) return fail();
+
         switch (state_) {
-            // chunk-size = 1*HEXDIG, then [ chunk-ext ] CRLF
+            // chunk-size = 1*HEXDIG, then [ chunk-ext ] CRLF, with no whitespace between them
             case state::size_start:
             case state::size: {
-                if (++line_size_ > max_line_size) return fail();
                 int digit = hex_value(c);
                 if (digit >= 0) {
                     if (chunk_size_ > (std::numeric_limits<size_t>::max() >> 4)) return fail();
@@ -66,7 +94,7 @@ namespace thinger::http {
                 }
                 if (state_ == state::size_start) return fail();
                 if (c == ';') {
-                    state_ = state::extension;
+                    state_ = state::ext_name_start;
                     return true;
                 }
                 if (c == '\r') {
@@ -76,14 +104,112 @@ namespace thinger::http {
                 return fail();
             }
 
-            // chunk-ext = *( BWS ";" BWS ext-name [ BWS "=" BWS ext-val ] ): ignored
-            case state::extension:
-                if (++line_size_ > max_line_size) return fail();
+            // chunk-ext = *( BWS ";" BWS ext-name [ BWS "=" BWS ext-val ] ), ext-val = token /
+            // quoted-string (RFC 9112, section 7.1.1). Extensions are ignored, but must follow
+            // the grammar: anything else could be read differently by another parser.
+            case state::ext_name_start:
+                if (is_whitespace(c)) return true;
+                if (!is_token_char(c)) return fail();
+                state_ = state::ext_name;
+                return true;
+
+            case state::ext_name:
+                if (is_token_char(c)) return true;
+                if (is_whitespace(c)) {
+                    state_ = state::ext_after_name;
+                    return true;
+                }
+                if (c == '=') {
+                    state_ = state::ext_value_start;
+                    return true;
+                }
+                if (c == ';') {
+                    state_ = state::ext_name_start;
+                    return true;
+                }
                 if (c == '\r') {
                     state_ = state::size_lf;
                     return true;
                 }
-                return is_ctl(c) ? fail() : true;
+                return fail();
+
+            case state::ext_after_name:
+                if (is_whitespace(c)) return true;
+                if (c == '=') {
+                    state_ = state::ext_value_start;
+                    return true;
+                }
+                if (c == ';') {
+                    state_ = state::ext_name_start;
+                    return true;
+                }
+                return fail();
+
+            case state::ext_value_start:
+                if (is_whitespace(c)) return true;
+                if (c == '"') {
+                    state_ = state::ext_quoted;
+                    return true;
+                }
+                if (!is_token_char(c)) return fail();
+                state_ = state::ext_value;
+                return true;
+
+            case state::ext_value:
+                if (is_token_char(c)) return true;
+                if (is_whitespace(c)) {
+                    state_ = state::ext_bws;
+                    return true;
+                }
+                if (c == ';') {
+                    state_ = state::ext_name_start;
+                    return true;
+                }
+                if (c == '\r') {
+                    state_ = state::size_lf;
+                    return true;
+                }
+                return fail();
+
+            case state::ext_quoted:
+                if (c == '"') {
+                    state_ = state::ext_after_quoted;
+                    return true;
+                }
+                if (c == '\\') {
+                    state_ = state::ext_quoted_pair;
+                    return true;
+                }
+                return is_qdtext(c) ? true : fail();
+
+            case state::ext_quoted_pair:
+                if (!is_quoted_pair_char(c)) return fail();
+                state_ = state::ext_quoted;
+                return true;
+
+            case state::ext_after_quoted:
+                if (is_whitespace(c)) {
+                    state_ = state::ext_bws;
+                    return true;
+                }
+                if (c == ';') {
+                    state_ = state::ext_name_start;
+                    return true;
+                }
+                if (c == '\r') {
+                    state_ = state::size_lf;
+                    return true;
+                }
+                return fail();
+
+            // whitespace after a value: only before another extension (BWS ";")
+            case state::ext_bws:
+                if (is_whitespace(c)) return true;
+                if (c == ';') {
+                    state_ = state::ext_name_start;
+                    return true;
+                }
+                return fail();
 
             case state::size_lf:
                 if (c != '\n') return fail();
@@ -102,17 +228,27 @@ namespace thinger::http {
                 state_ = state::size_start;
                 return true;
 
-            // trailer-section = *( field-line CRLF ), then the final CRLF
+            // trailer-section = *( field-line CRLF ), then the final CRLF, with
+            // field-line = field-name ":" OWS field-value OWS (RFC 9112, section 5)
             case state::trailer_start:
                 if (++trailer_size_ > max_trailer_size) return fail();
                 if (c == '\r') {
                     state_ = state::end_lf;
                     return true;
                 }
-                // a field line starts with its name (no obsolete line folding)
-                if (is_ctl(c) || c == ' ' || c == '\t') return fail();
-                state_ = state::trailer;
+                // a field line starts with its name (no obsolete line folding), so that what
+                // is not a field line (e.g. a request line) is never taken as a trailer
+                if (!is_token_char(c)) return fail();
+                state_ = state::trailer_name;
                 return true;
+
+            case state::trailer_name:
+                if (++trailer_size_ > max_trailer_size) return fail();
+                if (c == ':') {
+                    state_ = state::trailer;
+                    return true;
+                }
+                return is_token_char(c) ? true : fail();
 
             case state::trailer:
                 if (++trailer_size_ > max_trailer_size) return fail();

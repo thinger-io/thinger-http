@@ -113,6 +113,10 @@ TEST_CASE("Chunked decoder accepts valid bodies split at any position", "[body_r
         {"0000005\r\nhello\r\n000\r\n\r\n", "hello"},
         {"5;name=value\r\nhello\r\n0;a\r\n\r\n", "hello"},
         {"3;x=\"a;b\";y\r\nabc\r\n0;last\r\n\r\n", "abc"},
+        {"3;x = y ;z;  w=\"q\" ; v\r\nabc\r\n0\r\n\r\n", "abc"},
+        {"3;x=\"a\\\"b\\\\ \t\x80\"\r\nabc\r\n0\r\n\r\n", "abc"},
+        {"3;a=b;c=\"\"\r\nabc\r\n0;z=\"y\"\r\n\r\n", "abc"},
+        {"0\r\nX-Empty:\r\nX-Spaces:  a b \r\n\r\n", ""},
         {"5\r\nhello\r\n0\r\nX-Trailer: a\r\nOther: b\t c\r\n\r\n", "hello"},
         {"2\r\n\r\n\r\n0\r\n\r\n", "\r\n"},
     };
@@ -150,6 +154,29 @@ TEST_CASE("Chunked decoder rejects malformed bodies split at any position", "[bo
         "0\r\n\n",                              // bare LF as the final line
         "0\r\n folded\r\n\r\n",                 // obsolete line folding in trailers
         "0\r\n\r\r",                            // final CR not followed by LF
+        // Chunk extensions must follow the grammar (found by differential fuzzing)
+        "5;\r\nhello\r\n0\r\n\r\n",             // extension without a name
+        "5;;a\r\nhello\r\n0\r\n\r\n",           // empty extension
+        "5;a@b\r\nhello\r\n0\r\n\r\n",          // separator in the name
+        "5;a=\r\nhello\r\n0\r\n\r\n",           // empty value
+        "5;a=b c\r\nhello\r\n0\r\n\r\n",        // two tokens as a value
+        "5;a \r\nhello\r\n0\r\n\r\n",           // whitespace before the end of the line
+        "5;a=b \r\nhello\r\n0\r\n\r\n",         // whitespace after a value at the end
+        "5;a=\"b\r\nhello\r\n0\r\n\r\n",        // unterminated quoted string
+        "5;a=\"b\"c\r\nhello\r\n0\r\n\r\n",     // characters after a quoted string
+        "5;a=\"\x01\"\r\nhello\r\n0\r\n\r\n",   // control character in a quoted string
+        "5;a=\"\\\x01\"\r\nhello\r\n0\r\n\r\n", // control character in a quoted pair
+        "5;a=\"\r\n\"\r\nhello\r\n0\r\n\r\n",   // CRLF in a quoted string
+        "5;a\x7f\r\nhello\r\n0\r\n\r\n",        // DEL in an extension
+        "5 ;a\r\nhello\r\n0\r\n\r\n",           // whitespace between the size and ';'
+        // Trailer lines must be field lines (found by differential fuzzing: a request
+        // following a body that lacks its final CRLF was taken as its trailer section)
+        "5\r\nhello\r\n0\r\nGET /smuggled HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "0\r\nX-Trailer\r\n\r\n",               // no colon
+        "0\r\n: value\r\n\r\n",                 // empty name
+        "0\r\nX Trailer: a\r\n\r\n",            // space in the name
+        "0\r\nX-Trailer : a\r\n\r\n",           // space before the colon
+        "0\r\nX-Trailer: a\x01\r\n\r\n",        // control character in the value
     };
 
     for (const auto& input : cases) {
