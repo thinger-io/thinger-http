@@ -214,6 +214,8 @@ Request framing is strict, as a lenient parser could read a request differently 
 
 The request line and headers are limited to 16 KB and 100 header lines: larger requests are answered with `431 Request Header Fields Too Large` and the connection is closed.
 
+A connection is kept alive by the server only while it reads requests, runs a handler or writes a response. When it closes after the response (`Connection: close`, HTTP/1.0, or a request body that could not be read), nothing keeps it once the handler returned and what was sent so far is written: a response sent from detached code after the handler returned (e.g. from a timer or another thread) is lost, and a chunked response that goes on writing that way loses the connection after its first frames (`write_chunk()` returns `false`). Finish such responses within the handler (a coroutine handler can `co_await` between chunks).
+
 ### Coroutine Handlers
 
 Handlers can be coroutines that `co_await` other work (database queries, HTTP calls, timers). Declaring the JSON body in the signature makes the server read it, parse it and validate it against the route schema before the handler runs; invalid JSON or a body that does not match the schema is answered with `400` and the handler is not called:

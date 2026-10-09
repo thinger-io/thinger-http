@@ -172,7 +172,10 @@ awaitable<void> server_connection::write_frame(std::shared_ptr<http_stream> stre
     // Write frame to socket
     co_await frame->to_socket(socket_);
 
-    // Reset timeout on activity
+    // Reset timeout on activity. The timer holds a weak reference: once the read loop stopped
+    // (the connection closes after this response), only this write keeps the connection, so
+    // a response still unfinished when its queued frames are written (e.g. chunks written
+    // from detached code after the handler returned) loses the connection here
     reset_timeout();
 
     // Check if stream is complete
