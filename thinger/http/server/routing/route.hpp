@@ -239,8 +239,6 @@ private:
 
     bool validate_json(const nlohmann::json& json, response& res) const;
 #endif
-
-    void parse_parameters();
 };
 
 } // namespace thinger::http

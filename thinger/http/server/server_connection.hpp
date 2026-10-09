@@ -9,7 +9,6 @@
 #include "../common/http_request.hpp"
 #include "../common/http_response.hpp"
 #include "http_stream.hpp"
-#include "request_handler.hpp"
 #include "../../util/types.hpp"
 
 namespace thinger::http {
@@ -24,7 +23,6 @@ class server_connection : public std::enable_shared_from_this<server_connection>
 
     static constexpr size_t MAX_BUFFER_SIZE = 4096;
     static constexpr auto DEFAULT_TIMEOUT = std::chrono::seconds{120};
-    static constexpr size_t DEFAULT_MAX_BODY_SIZE = 8 * 1024 * 1024; // 8MB
 
 public:
     static std::atomic<unsigned long> connections;
@@ -63,11 +61,6 @@ public:
     // Set request handler (awaitable — dispatch coroutine)
     void set_handler(std::function<awaitable<void>(std::shared_ptr<request>)> handler) {
         handler_ = std::move(handler);
-    }
-
-    // Set maximum allowed body size
-    void set_max_body_size(size_t size) {
-        max_body_size_ = size;
     }
 
 private:
@@ -111,7 +104,6 @@ private:
     bool writing_{false};
     bool running_{false};
     stream_id request_id_{0};
-    size_t max_body_size_{DEFAULT_MAX_BODY_SIZE};
 
     // Connection takeover
     takeover_handler takeover_handler_;

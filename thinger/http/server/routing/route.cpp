@@ -261,10 +261,6 @@ thinger::awaitable<void> route::handle_request_coro(request& req, response& res)
     }
 }
 
-void route::parse_parameters() {
-    // Parameters are now parsed in the constructor
-}
-
 route& route::schema(const nlohmann::json& json_schema) {
     json_schema_ = json_schema;
 #ifdef THINGER_HTTP_VALIJSON_ENABLED

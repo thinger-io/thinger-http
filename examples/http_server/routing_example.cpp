@@ -1,8 +1,6 @@
-#include <thinger/asio/socket_server.hpp>
-#include <thinger/asio/workers.hpp>
-#include <thinger/http/server/server_connection.hpp>
-#include <thinger/http/server/routing/route_handler.hpp>
+#include <thinger/http/server/server_standalone.hpp>
 #include <thinger/http/server/routing/route.hpp>  // For pattern macros
+#include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/util/logger.hpp>
 #include <nlohmann/json.hpp>
@@ -15,11 +13,10 @@ int main(int argc, char* argv[]) {
     LOG_INFO("Starting HTTP Server with Routing Example");
     
     
-    // Start worker threads (uses hardware concurrency by default)
-    asio::get_workers().start();
-    
-    // Create route handler
-    auto router = std::make_shared<http::route_handler>();
+    // The server runs the routes of its router (route matching, body reading and
+    // validation, error handling...)
+    http::server server;
+    auto* router = &server.router();
     
     // Enable CORS
     router->enable_cors(true);
@@ -215,27 +212,9 @@ int main(int argc, char* argv[]) {
         response.error(http::http_response::status::not_found, "Route not found");
     });
     
-    // Create HTTP server
-    std::string port = argc > 1 ? argv[1] : "8090";
-    auto http_server = std::make_shared<asio::socket_server>("0.0.0.0", port);
-    
-    // Set up connection handler
-    http_server->set_handler([router](std::shared_ptr<asio::socket> socket) {
-        // Create HTTP connection
-        auto connection = std::make_shared<http::server_connection>(socket);
-        
-        // Set request handler
-        connection->set_handler([router](std::shared_ptr<http::request> request) -> thinger::awaitable<void> {
-            router->handle_request(request);
-            co_return;
-        });
-        
-        // Start handling the connection
-        connection->start();
-    });
-    
     // Start the server
-    if (!http_server->start()) {
+    std::string port = argc > 1 ? argv[1] : "8090";
+    if (!server.listen("0.0.0.0", static_cast<uint16_t>(std::stoi(port)))) {
         LOG_ERROR("Failed to start HTTP server on port %s", port.c_str());
         return 1;
     }
@@ -256,7 +235,7 @@ int main(int argc, char* argv[]) {
     LOG_INFO("Press Ctrl+C to stop");
     
     // Wait for shutdown
-    asio::get_workers().wait();
+    server.wait();
     
     LOG_INFO("Server stopped");
     

@@ -12,8 +12,6 @@ route_builder route_handler::operator[](method http_method) {
 }
 
 void route_handler::enable_cors(bool enabled) {
-    cors_enabled_ = enabled;
-    
     if (enabled) {
         // Add OPTIONS handler for all routes
         (*this)[method::OPTIONS][":path(.*)"] = [](request& req, response& res) {
@@ -34,17 +32,6 @@ void route_handler::enable_cors(bool enabled) {
 
 void route_handler::set_fallback_handler(std::function<void(request&, response&)> handler) {
     fallback_handler_ = std::move(handler);
-}
-
-void route_handler::send_error_response(std::shared_ptr<request> req, http_response::status status) {
-    auto connection = req->get_http_connection();
-    auto stream = req->get_http_stream();
-    auto http_request = req->get_http_request();
-    
-    if (connection && stream && http_request) {
-        response res(connection, stream, http_request, cors_enabled_);
-        res.error(status);
-    }
 }
 
 const route* route_handler::find_route(std::shared_ptr<request> req) {
@@ -86,15 +73,6 @@ const route* route_handler::find_route(std::shared_ptr<request> req) {
     return nullptr;
 }
 
-void route_handler::handle_unmatched(std::shared_ptr<request> req) {
-    auto connection = req->get_http_connection();
-    auto stream = req->get_http_stream();
-    if (!connection || !stream) return;
-
-    response res(connection, stream, req->get_http_request(), cors_enabled_);
-    handle_unmatched(req, res);
-}
-
 void route_handler::handle_unmatched(std::shared_ptr<request> req, response& res) {
     if (fallback_handler_) {
         fallback_handler_(*req, res);
@@ -106,34 +84,6 @@ void route_handler::handle_unmatched(std::shared_ptr<request> req, response& res
     auto status = routes_.contains(request_method) ? http_response::status::not_found
                                                    : http_response::status::not_allowed;
     res.error(status);
-}
-
-bool route_handler::handle_request(std::shared_ptr<request> request) {
-    auto* matched = find_route(request);
-
-    if (!matched) {
-        handle_unmatched(request);
-        return true;
-    }
-
-    // Handle the request
-    try {
-        auto connection = request->get_http_connection();
-        auto stream = request->get_http_stream();
-        auto http_request = request->get_http_request();
-        if (!connection || !stream) {
-            LOG_ERROR("No connection or stream available");
-            return false;
-        }
-
-        response res(connection, stream, http_request, cors_enabled_);
-        matched->handle_request(*request, res);
-        return true;
-    } catch (const std::exception& e) {
-        LOG_ERROR("Exception handling route: {}", e.what());
-        send_error_response(request, http_response::status::internal_server_error);
-        return true;
-    }
 }
 
 } // namespace thinger::http

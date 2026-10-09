@@ -4,33 +4,26 @@
 #include <map>
 #include <vector>
 #include <memory>
-#include "../request_handler.hpp"
 #include "route.hpp"
 #include "route_builder.hpp"
 
 namespace thinger::http {
 
-class route_handler : public request_handler {
+class route_handler {
 public:
     route_handler();
     virtual ~route_handler() = default;
     
     // Access route builders for different HTTP methods
     route_builder operator[](method http_method);
-    
-    // Handle incoming requests
-    bool handle_request(std::shared_ptr<request> request) override;
 
     // Find the matching route for a request (without executing the handler)
     const route* find_route(std::shared_ptr<request> req);
 
-    // Handle an unmatched request (404/fallback), in the default error format
-    void handle_unmatched(std::shared_ptr<request> req);
-
-    // Same, answering through an existing response (e.g. one shared with middlewares)
+    // Handle an unmatched request (fallback handler, or 404/405) through the response
     void handle_unmatched(std::shared_ptr<request> req, response& res);
 
-    // Enable CORS support
+    // Enable CORS support: answer preflight OPTIONS requests on any path
     void enable_cors(bool enabled = true);
     
     // Add a catch-all handler for unmatched routes
@@ -49,11 +42,7 @@ public:
 private:
     std::map<method, std::vector<route>> routes_;
     nlohmann::json schema_components_ = nlohmann::json::object();
-    bool cors_enabled_ = false;
     std::function<void(request&, response&)> fallback_handler_;
-    
-    // Helper function to send error responses
-    void send_error_response(std::shared_ptr<request> req, http_response::status status);
     
     // Friend class to allow route_builder to access routes_
     friend class route_builder;
