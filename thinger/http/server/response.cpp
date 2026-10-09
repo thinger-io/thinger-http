@@ -12,11 +12,12 @@
 
 namespace thinger::http {
 
-// State shared by the copies of a response
+// State shared by the copies of a response. Each answer builds its own message and sends it
+// only if it is the first one (responded); the others drop theirs
 struct response::state {
     std::shared_ptr<response_sink> sink;
     std::shared_ptr<http_request> request;
-    std::shared_ptr<http_response> message;                     // being built, if started
+    std::shared_ptr<http_response> draft;                       // status and headers set so far
     std::shared_ptr<const error_formatter> formatter;           // default format if null
     std::atomic<bool> responded{false};
     bool cors_enabled = false;
@@ -74,17 +75,23 @@ bool response::mark_responded() {
     return true;
 }
 
-http_response& response::prepare_response() {
-    if (!state_->message) {
-        state_->message = std::make_shared<http_response>();
-        state_->message->set_keep_alive(state_->request->keep_alive());
-        if (state_->cors_enabled) add_cors_headers(*state_->message);
-    }
-    return *state_->message;
+std::shared_ptr<http_response> response::new_response() const {
+    auto message = state_->draft ? std::make_shared<http_response>(*state_->draft)
+                                 : std::make_shared<http_response>();
+    message->set_keep_alive(state_->request->keep_alive());
+    if (!state_->draft && state_->cors_enabled) add_cors_headers(*message);
+    return message;
 }
 
-void response::compress_response_if_needed() {
-    auto& response = *state_->message;
+http_response& response::draft() {
+    if (!state_->draft) {
+        state_->draft = std::make_shared<http_response>();
+        if (state_->cors_enabled) add_cors_headers(*state_->draft);
+    }
+    return *state_->draft;
+}
+
+void response::compress_if_needed(http_response& response) const {
 
     // Only compress if there's a body worth compressing
     const auto& content = response.get_content();
@@ -116,11 +123,10 @@ void response::compress_response_if_needed() {
     }
 }
 
-void response::send_prepared_response() {
-    prepare_response();
-    compress_response_if_needed();
+void response::send_message(std::shared_ptr<http_response> message) {
+    compress_if_needed(*message);
     if (!mark_responded()) return;
-    state_->sink->send(state_->message);
+    state_->sink->send(std::move(message));
 }
 
 bool response::reject_takeover(const char* feature) {
@@ -132,24 +138,26 @@ bool response::reject_takeover(const char* feature) {
 
 void response::json(const nlohmann::json& data, http::http_response::status status) {
     if (!ensure_not_responded()) return;
-    prepare_response().set_status(status);
-    state_->message->set_content(data.dump(), "application/json");
-    send_prepared_response();
+    auto message = new_response();
+    message->set_status(status);
+    message->set_content(data.dump(), "application/json");
+    send_message(std::move(message));
 }
 
 void response::send(const std::string& text, const std::string& content_type) {
     if (!ensure_not_responded()) return;
-    prepare_response().set_content(text, content_type);
-    send_prepared_response();
+    auto message = new_response();
+    message->set_content(text, content_type);
+    send_message(std::move(message));
 }
 
 void response::error(http::http_response::status status, const std::string& message,
                      const nlohmann::json& details) {
     if (!ensure_not_responded()) return;
-    auto& response = prepare_response();
-    response.set_status(status);
-    format_error(state_->formatter.get(), {status, message, details}, response);
-    send_prepared_response();
+    auto response = new_response();
+    response->set_status(status);
+    format_error(state_->formatter.get(), {status, message, details}, *response);
+    send_message(std::move(response));
 }
 
 void response::set_error_formatter(std::shared_ptr<const error_formatter> formatter) {
@@ -158,20 +166,19 @@ void response::set_error_formatter(std::shared_ptr<const error_formatter> format
 
 void response::status(http::http_response::status s) {
     if (!ensure_not_responded()) return;
-    prepare_response().set_status(s);
+    draft().set_status(s);
 }
 
 void response::header(const std::string& key, const std::string& value) {
     if (!ensure_not_responded()) return;
-    prepare_response().add_header(key, value);
+    draft().add_header(key, value);
 }
 
 void response::send_response(const std::shared_ptr<http_response>& response) {
     if (!ensure_not_responded()) return;
     response->set_keep_alive(state_->request->keep_alive());
     if (state_->cors_enabled) add_cors_headers(*response);
-    state_->message = response;
-    send_prepared_response();
+    send_message(response);
 }
 
 bool response::has_responded() const {
@@ -185,10 +192,10 @@ std::shared_ptr<server_connection> response::get_connection() const {
 // Redirect implementation
 void response::redirect(const std::string& url, http::http_response::status redirect_type) {
     if (!ensure_not_responded()) return;
-    auto& response = prepare_response();
-    response.set_status(redirect_type);
-    response.add_header(header::location, url);
-    send_prepared_response();
+    auto response = new_response();
+    response->set_status(redirect_type);
+    response->add_header(header::location, url);
+    send_message(std::move(response));
 }
 
 // File sending implementation
@@ -228,16 +235,16 @@ void response::send_file(const std::filesystem::path& path, bool force_download)
     std::string content_type = mime_types::extension_to_type(path.extension().string());
     
     // Create response
-    auto& response = prepare_response();
-    response.set_status(http_response::status::ok);
-    response.set_content(content, content_type);
+    auto response = new_response();
+    response->set_status(http_response::status::ok);
+    response->set_content(std::move(content), content_type);
     
     // Add Content-Disposition header if force_download is true
     if (force_download) {
-        response.add_header("Content-Disposition", "attachment; filename=\"" + path.filename().string() + "\"");
+        response->add_header("Content-Disposition", "attachment; filename=\"" + path.filename().string() + "\"");
     }
     
-    send_prepared_response();
+    send_message(std::move(response));
 }
 
 // WebSocket upgrade implementation
@@ -279,18 +286,18 @@ void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_co
     accept_key = ::thinger::util::base64::encode(hash);
     
     // Create upgrade response
-    auto& response = prepare_response();
-    response.set_status(http_response::status::switching_protocols);
-    response.add_header(header::upgrade, "websocket");
-    response.add_header(header::connection, "Upgrade");
-    response.add_header("Sec-WebSocket-Accept", accept_key);
+    auto response = new_response();
+    response->set_status(http_response::status::switching_protocols);
+    response->add_header(header::upgrade, "websocket");
+    response->add_header(header::connection, "Upgrade");
+    response->add_header("Sec-WebSocket-Accept", accept_key);
     
     if (!protocol.empty()) {
-        response.add_header("Sec-WebSocket-Protocol", protocol);
+        response->add_header("Sec-WebSocket-Protocol", protocol);
     }
     
     // Send the upgrade response and take over the connection
-    take_over([handler = std::move(handler)](std::shared_ptr<asio::socket> socket, std::string buffered) {
+    take_over(std::move(response), [handler = std::move(handler)](std::shared_ptr<asio::socket> socket, std::string buffered) {
         // A client must wait for the handshake response before sending frames (RFC 6455)
         if (!buffered.empty()) {
             LOG_WARNING("WebSocket client sent data before the handshake completed, closing");
@@ -313,11 +320,13 @@ void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_co
 void response::take_over(takeover_handler handler) {
     if (!ensure_not_responded()) return;
     if (reject_takeover("Connection takeover")) return;
+    take_over(new_response(), std::move(handler));
+}
 
-    prepare_response();
-    compress_response_if_needed();
+void response::take_over(std::shared_ptr<http_response> message, takeover_handler handler) {
+    compress_if_needed(*message);
     if (!mark_responded()) return;
-    state_->sink->take_over(state_->message, std::move(handler));
+    state_->sink->take_over(std::move(message), std::move(handler));
 }
 
 // Server-Sent Events implementation
@@ -326,16 +335,16 @@ void response::start_sse(std::function<void(std::shared_ptr<sse_connection>)> ha
     if (reject_takeover("Server-Sent Events")) return;
 
     // Create SSE response headers
-    auto& response = prepare_response();
-    response.set_status(http_response::status::ok);
-    response.set_content_type("text/event-stream");
-    response.add_header("Cache-Control", "no-cache");
-    response.add_header("Connection", "keep-alive");
-    response.add_header("X-Accel-Buffering", "no"); // Disable nginx buffering
+    auto response = new_response();
+    response->set_status(http_response::status::ok);
+    response->set_content_type("text/event-stream");
+    response->add_header("Cache-Control", "no-cache");
+    response->add_header("Connection", "keep-alive");
+    response->add_header("X-Accel-Buffering", "no"); // Disable nginx buffering
     
     // Send the SSE headers and take over the connection (anything the client sends
     // afterwards is not part of the event stream)
-    take_over([handler = std::move(handler)](std::shared_ptr<asio::socket> socket, std::string) {
+    take_over(std::move(response), [handler = std::move(handler)](std::shared_ptr<asio::socket> socket, std::string) {
         // Create SSE connection
         auto sse_conn = std::make_shared<sse_connection>(socket);
 
@@ -350,11 +359,11 @@ void response::start_sse(std::function<void(std::shared_ptr<sse_connection>)> ha
 // Chunked response support: the sink writes the headers, then each chunk
 bool response::start_chunked(const std::string& content_type, http::http_response::status status) {
     if (!ensure_not_responded()) return false;
-    auto& response = prepare_response();
-    response.set_status(status);
-    response.set_content_type(content_type);
+    auto response = new_response();
+    response->set_status(status);
+    response->set_content_type(content_type);
     if (!mark_responded()) return false;
-    return state_->sink->begin(state_->message);
+    return state_->sink->begin(std::move(response));
 }
 
 bool response::write_chunk(const std::string& data) {

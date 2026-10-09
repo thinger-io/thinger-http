@@ -24,7 +24,10 @@ class websocket_connection;
 class sse_connection;
 
 // Response to a request. It is a handle: copies share the response, so a handler may keep
-// a copy and answer later, from any thread. Only the first answer is sent.
+// a copy and answer later, from any thread. Only the first answer is sent: the others are
+// dropped, even when they run at the same time from several threads. Setting the status or
+// headers before answering (status(), header()) is not thread-safe: do it from one thread,
+// before any answer.
 class response {
 public:
     response(const std::shared_ptr<server_connection>& connection,
@@ -57,10 +60,11 @@ public:
     // Formatter used by error() (set by the server)
     void set_error_formatter(std::shared_ptr<const error_formatter> formatter);
 
-    // Set status code (for building custom responses)
+    // Set status code (for building custom responses: used by the answers that do not set
+    // their own, such as send() and take_over(); not thread-safe)
     void status(http::http_response::status s);
 
-    // Set header (for building custom responses)
+    // Add a header to the response sent, whatever answer sends it (not thread-safe)
     void header(const std::string& key, const std::string& value);
 
     // Send raw http_response object (for advanced use cases)
@@ -101,12 +105,17 @@ private:
     struct state;
 
     bool ensure_not_responded() const;
-    // Response being built, created on first use
-    http_response& prepare_response();
-    void compress_response_if_needed();
+    // Status and headers set before answering, created on first use
+    http_response& draft();
+    // New message to answer with: a copy of the draft, if any
+    std::shared_ptr<http_response> new_response() const;
+    void compress_if_needed(http_response& response) const;
     // Mark the response as sent; false (and nothing must be sent) if it already was
     bool mark_responded();
-    void send_prepared_response();
+    // Send a message, unless another answer was sent first
+    void send_message(std::shared_ptr<http_response> message);
+    // Send a message and take the connection over, unless another answer was sent first
+    void take_over(std::shared_ptr<http_response> message, takeover_handler handler);
     // Answers 501 if the connection cannot be taken over (in-memory requests)
     bool reject_takeover(const char* feature);
 
