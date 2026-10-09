@@ -7,5 +7,8 @@ stress_test
 *.txt
 *.json
 
+# Build files
+!CMakeLists.txt
+
 # OS files
 .DS_Store
