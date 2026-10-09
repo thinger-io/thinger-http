@@ -89,6 +89,8 @@ public:
     bool is_content_type(const std::string& value) const;
     bool empty_headers() const;
     size_t get_content_length() const;
+    // Whether a Content-Length header was not a valid number, or repeated with different values
+    bool has_invalid_content_length() const { return invalid_content_length_; }
     int get_http_version_major() const;
     int get_http_version_minor() const;
     bool keep_alive() const;
@@ -108,6 +110,7 @@ protected:
     bool upgrade_                 = false;
     bool stream_                  = false;
     size_t content_length_        = 0;
+    bool invalid_content_length_  = false;
     uint8_t http_version_major_   = 1;
     uint8_t http_version_minor_   = 1;
 };

@@ -337,58 +337,73 @@ void http_server_base::setup_connection_handler() {
     });
 }
 
+// The connection cannot be reused after this request (unread or broken body, failed
+// handler...): close it once the response is sent. The response, unless already
+// prepared, also tells the client.
+static void close_after_response(request& req) {
+    if (auto stream = req.get_http_stream()) stream->set_keep_alive(false);
+    if (auto http_request = req.get_http_request()) http_request->set_keep_alive(false);
+}
+
 awaitable<void> http_server_base::process_request(std::shared_ptr<request> req, response& res) {
     auto http_request = req->get_http_request();
-
-    // The body is left unread on the connection: close it after responding
-    auto close_after_response = [&req]() {
-        if (auto stream = req->get_http_stream()) stream->set_keep_alive(false);
-    };
 
     // Server settings the request and its response depend on
     res.set_error_formatter(error_formatter_);
     req->set_trusted_proxies(trusted_proxies_);
+    req->set_max_body_size(max_body_size_);
 
+    // Ambiguous body framing (invalid Content-Length, unsupported Transfer-Encoding, or
+    // both): where this request ends, and so where the next one starts, is unknown
+    if (!http_request->has_valid_framing()) {
+        LOG_WARNING("Rejecting request with invalid body framing: {} {}",
+                    get_method(http_request->get_method()), http_request->get_path());
+        close_after_response(*req);
+        res.error(http_response::status::bad_request, "Invalid request framing");
+        co_return;
+    }
+
+    // Route matching, middlewares, body reading and handler
+    co_await handle_request(req, res);
+
+    // A body that could not be read (too large, malformed, truncated) fails the request,
+    // and leaves the connection at an unknown position
+    if (auto error = req->get_body_error(); error != body_error::none) {
+        close_after_response(*req);
+        if (!res.has_responded()) {
+            if (error == body_error::too_large) {
+                res.error(http_response::status::payload_too_large, "Payload Too Large");
+            } else {
+                res.error(http_response::status::bad_request, "Invalid request body");
+            }
+        }
+    }
+
+    // Drop any body left unread (unmatched route, or a handler that did not read it all)
+    // so it is not parsed as the next request
+    co_await discard_unread_body(*req);
+}
+
+awaitable<void> http_server_base::handle_request(std::shared_ptr<request> req, response& res) {
     // 1. Match the virtual host (by the Host header), then the route among its routes
     auto& host = resolve_host(*req);
     auto* matched_route = host.router().find_route(req);
 
     // 2. Run middlewares (before reading the body), sharing the handler response
-    if (!co_await run_middlewares(*req, res)) {
-        co_await discard_unread_body(*req);
-        co_return;
-    }
+    if (!co_await run_middlewares(*req, res)) co_return;
 
     // 3. Three-way dispatch
     if (!matched_route) {
         // No route matched → fallback / 404
         host.router().handle_unmatched(req, res);
-    } else if (matched_route->is_deferred_body()) {
-        // DEFERRED: handler reads body at its discretion
+    } else if (matched_route->is_deferred_body() || !req->has_pending_body()) {
+        // DEFERRED: handler reads body at its discretion (bounded by the maximum body size
+        // in read_body()); or NO BODY: dispatch directly
         co_await matched_route->handle_request_coro(*req, res);
-    } else if (req->has_pending_body()) {
-        // PENDING BODY: check size limit, read, then dispatch
-        if (!http_request->is_chunked_transfer() && req->content_length() > max_body_size_) {
-            close_after_response();
-            res.error(http_response::status::payload_too_large, "Payload Too Large");
-            co_return;
-        }
-        req->set_max_body_size(max_body_size_);
-        bool ok = co_await req->read_body();
-        if (!ok) {
-            close_after_response();
-            res.error(http_response::status::payload_too_large, "Payload Too Large");
-            co_return;
-        }
-        co_await matched_route->handle_request_coro(*req, res);
-    } else {
-        // NO BODY: dispatch directly
+    } else if (co_await req->read_body()) {
+        // PENDING BODY: read (up to the maximum body size, or failing the request), then dispatch
         co_await matched_route->handle_request_coro(*req, res);
     }
-
-    // Drop any body left unread (unmatched route, or a deferred handler that did
-    // not read it all) so it is not parsed as the next request
-    co_await discard_unread_body(*req);
 }
 
 // In-memory dispatch

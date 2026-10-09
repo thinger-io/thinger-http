@@ -202,6 +202,7 @@ private:
     virtual_host& resolve_host(request& req);
     std::shared_ptr<http_response> make_error_response(http_response::status status, const std::string& message) const;
     awaitable<void> process_request(std::shared_ptr<request> req, response& res);
+    awaitable<void> handle_request(std::shared_ptr<request> req, response& res);
     awaitable<bool> run_middlewares(request& req, response& res);
     awaitable<void> discard_unread_body(request& req);
 };

@@ -10,6 +10,7 @@
 
 #include "http_stream.hpp"
 #include "server_connection.hpp"
+#include "body_reader.hpp"
 #include "../common/http_response.hpp"
 #include "../../util/types.hpp"
 
@@ -91,8 +92,6 @@ namespace thinger::http{
         
         std::shared_ptr<http_stream> get_http_stream() const;
 
-        //void add_matched_param(const std::string& param);
-
         void set_uri_parameter(const std::string& param, const std::string& value);
 
         void add_uri_parameter(const std::string& param, const std::string& value);
@@ -116,18 +115,22 @@ namespace thinger::http{
 
         bool keep_alive() const;
 
-        // --- Deferred body reading support ---
+        // --- Body reading (see body_reader) ---
 
         /// Store read-ahead data (called by server_connection before dispatch)
         void set_read_ahead(const uint8_t* data, size_t size);
 
         /// Read exactly `size` bytes (read-ahead first, then socket). TCP backpressure.
+        /// Returns less at the end of the body, or if it fails (see get_body_error()).
         thinger::awaitable<size_t> read(uint8_t* buffer, size_t size);
 
-        /// Read up to `max_size` bytes (read-ahead first, then socket).
+        /// Read up to `max_size` bytes (read-ahead first, then socket); 0 at the end of the
+        /// body, or if it fails (see get_body_error()).
         thinger::awaitable<size_t> read_some(uint8_t* buffer, size_t max_size);
 
-        /// Read full body into http_request content (for non-deferred dispatch).
+        /// Read full body into http_request content (for non-deferred dispatch), decoding
+        /// its Content-Encoding (gzip, deflate). Fails if the body exceeds the maximum body
+        /// size (set_max_body_size, the server limit), without reading it.
         /// Only reads what is still pending: do not mix it with read()/read_some() on
         /// the same request, or the stored body will be incomplete (and fail to
         /// decompress if Content-Encoding is set).
@@ -139,6 +142,10 @@ namespace thinger::http{
 
         /// Whether part of the body is still unread by read(), read_some() or read_body().
         bool has_pending_body() const;
+
+        /// Why reading the body failed (body_error::none if it did not): too large, invalid
+        /// chunked framing, connection closed before its end, or undecodable Content-Encoding
+        body_error get_body_error() const;
 
         /// Content-Length convenience (0 for chunked requests)
         size_t content_length() const;
@@ -152,11 +159,12 @@ namespace thinger::http{
         /// Remove and return the unconsumed read-ahead bytes (data following this request)
         std::vector<uint8_t> take_read_ahead();
 
+        /// Maximum body size accepted by read_body() (set by the server)
+        void set_max_body_size(size_t size) { max_body_size_ = size; }
+
         /// Underlying socket. Do not read or write it while the server owns the connection:
         /// read the body with read()/read_some(), or own the socket with response::take_over().
         std::shared_ptr<asio::socket> get_socket() const;
-
-        //exec_result get_request_data() const;
 
     private:
 
@@ -199,34 +207,11 @@ namespace thinger::http{
         
         const route* matched_route_ = nullptr;
 
-        /// Leftover data from header parsing buffer (for deferred body reading)
-        std::vector<uint8_t> read_ahead_;
-        size_t read_ahead_offset_ = 0;
+        /// Body framing and reading: read-ahead bytes, then the connection
+        body_reader body_reader_;
 
-        /// Raw read (bypasses chunked decoding) — reads from read-ahead, then socket
-        thinger::awaitable<size_t> raw_read_some(uint8_t* buffer, size_t max_size);
-
-        /// Unread bytes of a Content-Length body; reads never go past it, so the next
-        /// pipelined request is left untouched
-        size_t body_remaining_ = 0;
-
-        /// Read up to `max_size` bytes of a Content-Length body
-        thinger::awaitable<size_t> read_some_body(uint8_t* buffer, size_t max_size);
-
-        /// Chunked transfer encoding decoder state
-        enum class chunk_state { size, size_lf, data, data_cr, data_lf, trailer_lf, done };
-        chunk_state chunk_state_ = chunk_state::size;
-        size_t chunk_remaining_ = 0;
-        size_t chunk_size_accum_ = 0;
-
-        /// Read with chunked decoding (transparent to caller)
-        thinger::awaitable<size_t> read_some_chunked(uint8_t* buffer, size_t max_size);
-
-        /// Max body size for non-deferred chunked read_body()
+        /// Max body size for read_body()
         size_t max_body_size_ = 8 * 1024 * 1024;
-
-    public:
-        void set_max_body_size(size_t size) { max_body_size_ = size; }
     };
 
 }

@@ -19,8 +19,17 @@ namespace thinger::http{
         http_stream_{http_stream},
         http_request_{std::move(http_request)}
     {
-        if (http_request_ && !http_request_->is_chunked_transfer()) {
-            body_remaining_ = http_request_->pending_body_size();
+        if (http_request_) {
+            body_reader_.set_framing(http_request_->is_chunked_transfer(), http_request_->pending_body_size());
+        }
+        if (http_connection) {
+            body_reader_.set_source([connection = std::weak_ptr<server_connection>(http_connection)](
+                    uint8_t* buffer, size_t size) -> thinger::awaitable<size_t> {
+                auto conn = connection.lock();
+                if (!conn) co_return 0;
+                auto [ec, bytes] = co_await conn->get_socket()->read_some(buffer, size);
+                co_return bytes;
+            });
         }
     }
 
@@ -49,13 +58,6 @@ namespace thinger::http{
     std::shared_ptr<http_stream> request::get_http_stream() const {
         return http_stream_.lock();
     }
-
-    /*
-    void request::add_matched_param(const std::string& param){
-        uri_params_.emplace_back(param);
-    }
-     */
-
 
     void request::set_auth_user(const std::string& auth_user){
         auth_user_ = auth_user;
@@ -127,58 +129,6 @@ namespace thinger::http{
         return trusted_proxies_->client_ip(peer, http_request_->get_headers_with_key(trusted_proxies_->header_name()));
     }
 
-    /*
-    exec_result request::get_request_data() const{
-        const std::string& content = http_request_->get_body();
-        const std::string& content_type = http_request_->get_content_type();
-
-        // set content
-        if(!content.empty()){
-            if(boost::istarts_with(content_type, mime_types::application_json)){
-                try{
-                    return {true, nlohmann::json::parse(content)};
-                }catch(...){
-                    return {false, "invalid json payload", http_response::status::bad_request};
-                }
-            }else if(boost::istarts_with(content_type, mime_types::application_octect_stream)){
-                std::vector<uint8_t> data(content.begin(), content.end());
-                return {true, nlohmann::json::binary(std::move(data))};
-            }else if(boost::istarts_with(content_type, mime_types::text_html) || boost::istarts_with(content_type, mime_types::text_plain)){
-                return {true, content};
-            }else if(boost::istarts_with(content_type, mime_types::application_form_urlencoded)){
-                std::multimap<std::string, std::string> parameters;
-                util::url::parse_url_encoded_data(content, parameters);
-                return {true, std::move(parameters)};
-            }else if(boost::istarts_with(content_type, mime_types::application_msgpack)){
-                try{
-                    return {true, nlohmann::json::from_msgpack(content)};
-                }catch(...){
-                    return {false, "invalid msgpack payload", http_response::status::bad_request};
-                }
-            }
-            else if(boost::istarts_with(content_type, mime_types::application_cbor)){
-                try{
-                    return {true, nlohmann::json::from_cbor(content)};
-                }catch(...){
-                    return {false, "invalid cbor payload", http_response::status::bad_request};
-                }
-            }
-            else if(boost::istarts_with(content_type, mime_types::application_ubjson)){
-                try{
-                    return {true, nlohmann::json::from_ubjson(content)};
-                }catch(...){
-                    return {false, "invalid ubjson payload", http_response::status::bad_request};
-                }
-            }else{
-                // unknown content type, return as binary
-                std::vector<uint8_t> vec(content.begin(), content.end());
-                return {true, nlohmann::json::binary_t(std::move(vec))};
-            }
-        }
-
-        return {true, nullptr};
-    }*/
-
     bool request::keep_alive() const{
         return http_request_ && http_request_->keep_alive();
     }
@@ -222,13 +172,10 @@ namespace thinger::http{
         return http_request_ ? http_request_->get_header(key) : "";
     }
 
-    // --- Deferred body reading support ---
+    // --- Body reading ---
 
     void request::set_read_ahead(const uint8_t* data, size_t size) {
-        if (data && size > 0) {
-            read_ahead_.assign(data, data + size);
-            read_ahead_offset_ = 0;
-        }
+        body_reader_.set_read_ahead(data, size);
     }
 
     size_t request::content_length() const {
@@ -245,351 +192,76 @@ namespace thinger::http{
     }
 
     std::vector<uint8_t> request::take_read_ahead() {
-        std::vector<uint8_t> data(read_ahead_.begin() + (read_ahead_.size() - read_ahead_available()), read_ahead_.end());
-        read_ahead_.clear();
-        read_ahead_offset_ = 0;
-        return data;
+        return body_reader_.take_read_ahead();
     }
 
     size_t request::read_ahead_available() const {
-        return read_ahead_.size() > read_ahead_offset_ ? read_ahead_.size() - read_ahead_offset_ : 0;
+        return body_reader_.read_ahead_available();
     }
-
-    // --- Raw I/O (bypasses chunked decoding) ---
-
-    thinger::awaitable<size_t> request::raw_read_some(uint8_t* buffer, size_t max_size) {
-        // Consume from read-ahead first (using offset, O(1) per call)
-        size_t avail = read_ahead_available();
-        if (avail > 0) {
-            size_t from_ahead = std::min(avail, max_size);
-            std::memcpy(buffer, read_ahead_.data() + read_ahead_offset_, from_ahead);
-            read_ahead_offset_ += from_ahead;
-            if (read_ahead_offset_ >= read_ahead_.size()) {
-                read_ahead_.clear();
-                read_ahead_offset_ = 0;
-            }
-            co_return from_ahead;
-        }
-
-        // Read from socket
-        auto sock = get_socket();
-        if (sock) {
-            auto [ec, bytes] = co_await sock->read_some(buffer, max_size);
-            co_return bytes;
-        }
-
-        co_return 0;
-    }
-
-    // --- Chunked transfer encoding decoder ---
-
-    static bool is_hex_char(uint8_t c) {
-        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-    }
-
-    static size_t hex_value(uint8_t c) {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return 0;
-    }
-
-    thinger::awaitable<size_t> request::read_some_chunked(uint8_t* buffer, size_t max_size) {
-        size_t output = 0;
-
-        while (output == 0 && chunk_state_ != chunk_state::done) {
-            if (chunk_state_ == chunk_state::data && chunk_remaining_ > 0) {
-                // Fast path: read data directly into user buffer (no copy overhead)
-                size_t to_read = std::min(chunk_remaining_, max_size - output);
-                size_t bytes = co_await raw_read_some(buffer + output, to_read);
-                if (bytes == 0) co_return output;
-                chunk_remaining_ -= bytes;
-                output += bytes;
-                if (chunk_remaining_ == 0) {
-                    chunk_state_ = chunk_state::data_cr;
-                }
-            } else {
-                // Slow path: read a batch of raw bytes for framing
-                uint8_t raw[512];
-                size_t raw_bytes = co_await raw_read_some(raw, sizeof(raw));
-                if (raw_bytes == 0) co_return output;
-
-                size_t i = 0;
-                while (i < raw_bytes && chunk_state_ != chunk_state::done && output < max_size) {
-                    uint8_t byte = raw[i];
-
-                    switch (chunk_state_) {
-                        case chunk_state::size:
-                            if (is_hex_char(byte)) {
-                                chunk_size_accum_ = chunk_size_accum_ * 16 + hex_value(byte);
-                                i++;
-                            } else if (byte == '\r') {
-                                chunk_state_ = chunk_state::size_lf;
-                                i++;
-                            } else {
-                                // Skip chunk extensions (e.g. ";ext=val")
-                                i++;
-                            }
-                            break;
-
-                        case chunk_state::size_lf:
-                            if (byte == '\n') {
-                                if (chunk_size_accum_ == 0) {
-                                    // Last chunk — expect trailing CRLF
-                                    chunk_state_ = chunk_state::trailer_lf;
-                                } else {
-                                    chunk_remaining_ = chunk_size_accum_;
-                                    chunk_size_accum_ = 0;
-                                    chunk_state_ = chunk_state::data;
-                                }
-                                i++;
-
-                                // If entering data state and raw buffer has more bytes,
-                                // copy data directly from raw buffer (avoid another read)
-                                if (chunk_state_ == chunk_state::data && i < raw_bytes) {
-                                    size_t data_avail = std::min(chunk_remaining_, raw_bytes - i);
-                                    size_t to_copy = std::min(data_avail, max_size - output);
-                                    std::memcpy(buffer + output, raw + i, to_copy);
-                                    output += to_copy;
-                                    i += to_copy;
-                                    chunk_remaining_ -= to_copy;
-                                    if (chunk_remaining_ == 0) {
-                                        chunk_state_ = chunk_state::data_cr;
-                                    }
-                                }
-                            } else {
-                                i++; // malformed, skip
-                            }
-                            break;
-
-                        case chunk_state::data:
-                            // We shouldn't reach here (handled above), but safety
-                            {
-                                size_t data_avail = std::min(chunk_remaining_, raw_bytes - i);
-                                size_t to_copy = std::min(data_avail, max_size - output);
-                                std::memcpy(buffer + output, raw + i, to_copy);
-                                output += to_copy;
-                                i += to_copy;
-                                chunk_remaining_ -= to_copy;
-                                if (chunk_remaining_ == 0) {
-                                    chunk_state_ = chunk_state::data_cr;
-                                }
-                            }
-                            break;
-
-                        case chunk_state::data_cr:
-                            if (byte == '\r') chunk_state_ = chunk_state::data_lf;
-                            i++;
-                            break;
-
-                        case chunk_state::data_lf:
-                            if (byte == '\n') {
-                                chunk_state_ = chunk_state::size;
-                                chunk_size_accum_ = 0;
-                            }
-                            i++;
-                            break;
-
-                        case chunk_state::trailer_lf:
-                            if (byte == '\r') {
-                                i++;
-                                // Expect final \n
-                                if (i < raw_bytes && raw[i] == '\n') {
-                                    i++;
-                                }
-                                chunk_state_ = chunk_state::done;
-                            } else {
-                                // Trailer header line — skip until we find empty CRLF
-                                i++;
-                            }
-                            break;
-
-                        case chunk_state::done:
-                            break;
-                    }
-                }
-
-                // Push unconsumed raw bytes back to read-ahead for next call
-                if (i < raw_bytes) {
-                    read_ahead_.assign(raw + i, raw + raw_bytes);
-                    read_ahead_offset_ = 0;
-                }
-            }
-        }
-
-        co_return output;
-    }
-
-    // --- Public read API (dispatches to raw or chunked) ---
 
     thinger::awaitable<size_t> request::read(uint8_t* buffer, size_t size) {
-        if (is_chunked()) {
-            // For chunked, read decoded data until we have `size` bytes or EOF
-            size_t total = 0;
-            while (total < size) {
-                size_t bytes = co_await read_some_chunked(buffer + total, size - total);
-                if (bytes == 0) break;
-                total += bytes;
-            }
-            co_return total;
-        }
-
-        // Non-chunked: read exact size, never past the end of the body
-        size = std::min(size, body_remaining_);
-        size_t total = 0;
-
-        // Consume from read-ahead first
-        size_t avail = read_ahead_available();
-        if (avail > 0) {
-            size_t from_ahead = std::min(avail, size);
-            std::memcpy(buffer, read_ahead_.data() + read_ahead_offset_, from_ahead);
-            read_ahead_offset_ += from_ahead;
-            total += from_ahead;
-            if (read_ahead_offset_ >= read_ahead_.size()) {
-                read_ahead_.clear();
-                read_ahead_offset_ = 0;
-            }
-        }
-
-        // Read remaining from socket
-        if (total < size) {
-            auto sock = get_socket();
-            if (sock) {
-                size_t remaining = size - total;
-                auto [ec, bytes] = co_await sock->read(buffer + total, remaining);
-                total += bytes;
-            }
-        }
-
-        body_remaining_ -= total;
-        co_return total;
-    }
-
-    thinger::awaitable<size_t> request::read_some_body(uint8_t* buffer, size_t max_size) {
-        size_t to_read = std::min(max_size, body_remaining_);
-        if (to_read == 0) co_return 0;
-        size_t bytes = co_await raw_read_some(buffer, to_read);
-        body_remaining_ -= bytes;
-        co_return bytes;
+        co_return co_await body_reader_.read(buffer, size);
     }
 
     thinger::awaitable<size_t> request::read_some(uint8_t* buffer, size_t max_size) {
-        if (is_chunked()) {
-            co_return co_await read_some_chunked(buffer, max_size);
+        co_return co_await body_reader_.read_some(buffer, max_size);
+    }
+
+    // Decode the body in place according to its Content-Encoding (gzip or deflate; any
+    // other encoding is left to the handler), up to `max_size` bytes once decoded
+    static body_error decode_content_encoding(http_request& http_request, size_t max_size) {
+        if (!http_request.has_header("Content-Encoding")) return body_error::none;
+
+        const std::string encoding = http_request.get_header("Content-Encoding");
+        std::optional<std::string> decoded;
+        bool too_large = false;
+        if (encoding == "gzip") {
+            decoded = ::thinger::util::gzip::decompress(http_request.get_body(), max_size, &too_large);
+        } else if (encoding == "deflate") {
+            decoded = ::thinger::util::deflate::decompress(http_request.get_body(), max_size, &too_large);
+        } else {
+            return body_error::none;
         }
-        co_return co_await read_some_body(buffer, max_size);
+
+        if (!decoded) {
+            if (too_large) {
+                LOG_ERROR("Decompressed {} request body exceeds the maximum body size", encoding);
+                return body_error::too_large;
+            }
+            LOG_ERROR("Failed to decompress {} request body", encoding);
+            return body_error::bad_encoding;
+        }
+        http_request.get_body() = std::move(*decoded);
+        http_request.remove_header("Content-Encoding");
+        return body_error::none;
     }
 
     thinger::awaitable<bool> request::read_body() {
         if (!http_request_) co_return false;
 
-        if (is_chunked()) {
-            if (chunk_state_ == chunk_state::done) co_return true;
+        // Nothing left to read (already read, or no body)
+        if (!body_reader_.has_pending()) co_return body_reader_.error() == body_error::none;
 
-            // Chunked: read decoded chunks until EOF, respecting max_body_size
-            auto& body = http_request_->get_body();
-            uint8_t buf[8192];
-            while (true) {
-                size_t bytes = co_await read_some_chunked(buf, sizeof(buf));
-                if (bytes == 0) break;
-                if (body.size() + bytes > max_body_size_) co_return false;
-                body.append(reinterpret_cast<char*>(buf), bytes);
-            }
+        if (!co_await body_reader_.read_all(http_request_->get_body(), max_body_size_)) co_return false;
 
-            // Decompress chunked body if Content-Encoding is set
-            if (http_request_->has_header("Content-Encoding")) {
-                std::string encoding = http_request_->get_header("Content-Encoding");
-                if (encoding == "gzip") {
-                    auto decompressed = ::thinger::util::gzip::decompress(body);
-                    if (decompressed) {
-                        body = std::move(*decompressed);
-                        http_request_->remove_header("Content-Encoding");
-                    } else {
-                        LOG_ERROR("Failed to decompress gzip request body");
-                        co_return false;
-                    }
-                } else if (encoding == "deflate") {
-                    auto decompressed = ::thinger::util::deflate::decompress(body);
-                    if (decompressed) {
-                        body = std::move(*decompressed);
-                        http_request_->remove_header("Content-Encoding");
-                    } else {
-                        LOG_ERROR("Failed to decompress deflate request body");
-                        co_return false;
-                    }
-                }
-            }
-
-            co_return true;
+        auto error = decode_content_encoding(*http_request_, max_body_size_);
+        if (error != body_error::none) {
+            body_reader_.set_error(error);
+            co_return false;
         }
-
-        // Content-Length based (nothing left to read if it was already consumed)
-        size_t pending = body_remaining_;
-        if (pending == 0) co_return true;
-
-        auto& body = http_request_->get_body();
-        size_t offset = body.size();
-        body.resize(offset + pending);
-
-        size_t bytes_read = co_await read(reinterpret_cast<uint8_t*>(body.data()) + offset, pending);
-        if (bytes_read != pending) co_return false;
-
-        // Decompress body if Content-Encoding is set
-        if (http_request_->has_header("Content-Encoding")) {
-            std::string encoding = http_request_->get_header("Content-Encoding");
-            if (encoding == "gzip") {
-                auto decompressed = ::thinger::util::gzip::decompress(body);
-                if (decompressed) {
-                    body = std::move(*decompressed);
-                    http_request_->remove_header("Content-Encoding");
-                } else {
-                    LOG_ERROR("Failed to decompress gzip request body");
-                    co_return false;
-                }
-            } else if (encoding == "deflate") {
-                auto decompressed = ::thinger::util::deflate::decompress(body);
-                if (decompressed) {
-                    body = std::move(*decompressed);
-                    http_request_->remove_header("Content-Encoding");
-                } else {
-                    LOG_ERROR("Failed to decompress deflate request body");
-                    co_return false;
-                }
-            }
-        }
-
         co_return true;
     }
 
     bool request::has_pending_body() const {
-        if (!http_request_) return false;
-        if (is_chunked()) return chunk_state_ != chunk_state::done;
-        return body_remaining_ > 0;
+        return http_request_ && body_reader_.has_pending();
+    }
+
+    body_error request::get_body_error() const {
+        return body_reader_.error();
     }
 
     thinger::awaitable<bool> request::discard_body(size_t max_size) {
-        if (!has_pending_body()) co_return true;
-
-        uint8_t buf[8192];
-
-        if (is_chunked()) {
-            size_t discarded = 0;
-            while (chunk_state_ != chunk_state::done) {
-                size_t bytes = co_await read_some_chunked(buf, sizeof(buf));
-                if (bytes == 0) break;
-                discarded += bytes;
-                if (discarded > max_size) co_return false;
-            }
-            co_return chunk_state_ == chunk_state::done;
-        }
-
-        if (body_remaining_ > max_size) co_return false;
-
-        while (body_remaining_ > 0) {
-            size_t bytes = co_await read_some_body(buf, sizeof(buf));
-            if (bytes == 0) co_return false;
-        }
-        co_return true;
+        co_return co_await body_reader_.discard(max_size);
     }
 
 }

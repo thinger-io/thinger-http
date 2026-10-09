@@ -65,6 +65,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/trusted_proxies_test.cpp)
     add_thinger_test(test_trusted_proxies unit/http/server/trusted_proxies_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/body_reader_test.cpp)
+    add_thinger_test(test_body_reader unit/http/server/body_reader_test.cpp)
+endif()
+
 # Unit tests - HTTP Common
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/common/headers_test.cpp)
     add_thinger_test(test_headers unit/http/common/headers_test.cpp)
@@ -190,6 +194,17 @@ endif()
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/trusted_proxies_test.cpp)
     add_thinger_test(test_integration_trusted_proxies integration/trusted_proxies_test.cpp)
 endif()
+
+# Integration tests - Request framing (smuggling, chunked decoding)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/request_framing_test.cpp)
+    add_thinger_test(test_integration_request_framing integration/request_framing_test.cpp)
+endif()
+
+# Integration tests - Request body limits
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/request_body_limits_test.cpp)
+    add_thinger_test(test_integration_request_body_limits integration/request_body_limits_test.cpp)
+endif()
+
 
 # ==================== ALL TESTS RUNNER ====================
 

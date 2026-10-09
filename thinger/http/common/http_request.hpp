@@ -130,6 +130,14 @@ public:
 
     bool is_chunked_transfer() const { return chunked_transfer_; }
 
+    // Whether the body framing is unambiguous (RFC 9112, section 6.3): a valid Content-Length,
+    // or "Transfer-Encoding: chunked" alone, but not both. A server must reject the request
+    // otherwise, and close the connection, as it cannot tell where the next request starts.
+    bool has_valid_framing() const {
+        return !has_invalid_content_length() && !invalid_transfer_encoding_
+            && !(chunked_transfer_ && has_header(http::header::content_length));
+    }
+
     // other
     void refresh_uri();
 
@@ -145,6 +153,7 @@ private:
     std::string protocol_;
     std::string unix_socket_;
     bool chunked_transfer_ = false;
+    bool invalid_transfer_encoding_ = false;
     cookie_store cookie_store_;
     std::function<void(int, const std::string&)> on_chunked_;
 

@@ -30,10 +30,17 @@ namespace thinger::http{
         if(is_header(key, header::accept)){
             stream_ = boost::iequals(value, accept::event_stream);
         }else if(is_header(key, header::content_length)){
-            auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), content_length_);
-            if (ec != std::errc{}) {
-                content_length_ = 0;
+            // Content-Length = 1*DIGIT: anything else (sign, spaces, lists, overflow) or a
+            // repeated header with a different value makes the message framing ambiguous
+            size_t length = 0;
+            auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), length);
+            if (ec != std::errc{} || ptr != value.data() + value.size()) {
+                invalid_content_length_ = true;
+                length = 0;
+            } else if (has_header(header::content_length) && length != content_length_) {
+                invalid_content_length_ = true;
             }
+            content_length_ = length;
         }
 
         headers_.emplace_back(std::move(key), std::move(value));

@@ -394,9 +394,14 @@ namespace thinger::http {
         if(boost::iequals(key, http::header::host)){
             set_host(std::move(value));
         }else{
-            // detect chunked transfer encoding
-            if(boost::iequals(key, http::header::transfer_encoding) && boost::iequals(value, "chunked")){
-                chunked_transfer_ = true;
+            // detect chunked transfer encoding: it must be the only coding, in a single header,
+            // as no other is supported (and the body could not be framed safely)
+            if(boost::iequals(key, http::header::transfer_encoding)){
+                if(boost::iequals(value, "chunked") && !has_header(http::header::transfer_encoding)){
+                    chunked_transfer_ = true;
+                }else{
+                    invalid_transfer_encoding_ = true;
+                }
             }
             // handle header by parent
             headers::process_header(std::move(key), std::move(value));

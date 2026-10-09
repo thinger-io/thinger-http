@@ -1,11 +1,58 @@
 #ifndef THINGER_UTIL_COMPRESSION_HPP
 #define THINGER_UTIL_COMPRESSION_HPP
 
+#include <limits>
 #include <string>
 #include <optional>
 #include <zlib.h>
 
 namespace thinger::util {
+
+namespace detail {
+
+    // Inflate `data` (`window_bits` selects the zlib or gzip format), up to `max_size` bytes
+    inline std::optional<std::string> inflate_data(const std::string& data, int window_bits,
+                                                   size_t max_size, bool* too_large) {
+        if (too_large) *too_large = false;
+
+        z_stream strm{};
+        if (inflateInit2(&strm, window_bits) != Z_OK) {
+            return std::nullopt;
+        }
+
+        strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data.data()));
+        strm.avail_in = static_cast<uInt>(data.size());
+
+        std::string result;
+        char buffer[16384];
+
+        int ret;
+        do {
+            strm.next_out = reinterpret_cast<Bytef*>(buffer);
+            strm.avail_out = sizeof(buffer);
+
+            // Anything but progress is an error; Z_BUF_ERROR means the input ended before
+            // the compressed stream did (it would never reach Z_STREAM_END)
+            ret = inflate(&strm, Z_NO_FLUSH);
+            if (ret != Z_OK && ret != Z_STREAM_END) {
+                inflateEnd(&strm);
+                return std::nullopt;
+            }
+
+            size_t produced = sizeof(buffer) - strm.avail_out;
+            if (produced > max_size - result.size()) {
+                if (too_large) *too_large = true;
+                inflateEnd(&strm);
+                return std::nullopt;
+            }
+            result.append(buffer, produced);
+        } while (ret != Z_STREAM_END);
+
+        inflateEnd(&strm);
+        return result;
+    }
+
+}
 
 class gzip {
 public:
@@ -37,36 +84,13 @@ public:
         return result;
     }
 
-    // Decompress gzip data
-    static std::optional<std::string> decompress(const std::string& data) {
-        z_stream strm{};
+    // Decompress gzip data. Fails on invalid or truncated data, or if the result would
+    // exceed `max_size` bytes (then `too_large` is set, if given).
+    static std::optional<std::string> decompress(const std::string& data,
+                                                 size_t max_size = std::numeric_limits<size_t>::max(),
+                                                 bool* too_large = nullptr) {
         // windowBits = 15 + 16 enables gzip decoding
-        if (inflateInit2(&strm, 15 + 16) != Z_OK) {
-            return std::nullopt;
-        }
-
-        strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data.data()));
-        strm.avail_in = static_cast<uInt>(data.size());
-
-        std::string result;
-        char buffer[16384];
-
-        int ret;
-        do {
-            strm.next_out = reinterpret_cast<Bytef*>(buffer);
-            strm.avail_out = sizeof(buffer);
-
-            ret = inflate(&strm, Z_NO_FLUSH);
-            if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
-                inflateEnd(&strm);
-                return std::nullopt;
-            }
-
-            result.append(buffer, sizeof(buffer) - strm.avail_out);
-        } while (ret != Z_STREAM_END);
-
-        inflateEnd(&strm);
-        return result;
+        return detail::inflate_data(data, 15 + 16, max_size, too_large);
     }
 
     // Check if data might be gzip compressed (by checking magic bytes)
@@ -107,35 +131,12 @@ public:
         return result;
     }
 
-    // Decompress deflate data (zlib format)
-    static std::optional<std::string> decompress(const std::string& data) {
-        z_stream strm{};
-        if (inflateInit(&strm) != Z_OK) {
-            return std::nullopt;
-        }
-
-        strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data.data()));
-        strm.avail_in = static_cast<uInt>(data.size());
-
-        std::string result;
-        char buffer[16384];
-
-        int ret;
-        do {
-            strm.next_out = reinterpret_cast<Bytef*>(buffer);
-            strm.avail_out = sizeof(buffer);
-
-            ret = inflate(&strm, Z_NO_FLUSH);
-            if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
-                inflateEnd(&strm);
-                return std::nullopt;
-            }
-
-            result.append(buffer, sizeof(buffer) - strm.avail_out);
-        } while (ret != Z_STREAM_END);
-
-        inflateEnd(&strm);
-        return result;
+    // Decompress deflate data (zlib format). Fails on invalid or truncated data, or if the
+    // result would exceed `max_size` bytes (then `too_large` is set, if given).
+    static std::optional<std::string> decompress(const std::string& data,
+                                                 size_t max_size = std::numeric_limits<size_t>::max(),
+                                                 bool* too_large = nullptr) {
+        return detail::inflate_data(data, 15, max_size, too_large);
     }
 };
 
