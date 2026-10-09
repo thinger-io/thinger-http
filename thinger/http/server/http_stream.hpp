@@ -1,6 +1,7 @@
 #ifndef HTTP_STREAM_HPP
 #define HTTP_STREAM_HPP
 
+#include <atomic>
 #include <queue>
 #include <memory>
 #include <functional>
@@ -49,6 +50,12 @@ namespace thinger::http {
         takeover_handler takeover_;
 
         /**
+         * Frames posted to the connection thread and not queued yet (frames are queued in
+         * call order: none runs inline while one is posted)
+         */
+        std::atomic<unsigned> posted_frames_{0};
+
+        /**
          * Whether the response has started: a frame was queued, or a takeover requested
          */
         bool responded_ = false;
@@ -92,6 +99,18 @@ namespace thinger::http {
 
         takeover_handler release_takeover() {
             return std::exchange(takeover_, nullptr);
+        }
+
+        void frame_posted() {
+            ++posted_frames_;
+        }
+
+        void posted_frame_queued() {
+            --posted_frames_;
+        }
+
+        bool has_posted_frames() const {
+            return posted_frames_ > 0;
         }
 
         stream_id id() const;
