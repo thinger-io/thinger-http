@@ -10,6 +10,7 @@
 #include <sstream>
 #include <atomic>
 #include <mutex>
+#include <optional>
 
 namespace thinger::http {
 
@@ -18,7 +19,7 @@ namespace thinger::http {
 struct response::state {
     std::shared_ptr<response_sink> sink;
     std::shared_ptr<http_request> request;
-    std::shared_ptr<http_response> draft;                       // status and headers set so far
+    std::optional<http_response> draft;                         // status and headers set so far
     std::shared_ptr<const error_formatter> formatter;           // default format if null
     std::atomic<bool> responded{false};
     bool cors_enabled = false;
@@ -91,7 +92,7 @@ std::shared_ptr<http_response> response::new_response() const {
 
 http_response& response::draft() {
     if (!state_->draft) {
-        state_->draft = std::make_shared<http_response>();
+        state_->draft.emplace();
         if (state_->cors_enabled) add_cors_headers(*state_->draft);
     }
     return *state_->draft;
