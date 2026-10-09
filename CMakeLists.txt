@@ -72,6 +72,7 @@ FetchContent_Declare(
     json
     GIT_REPOSITORY https://github.com/nlohmann/json.git
     GIT_TAG v3.11.3
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(json)
 
@@ -83,6 +84,7 @@ if(THINGER_HTTP_ENABLE_LOGGING)
             spdlog
             GIT_REPOSITORY https://github.com/gabime/spdlog.git
             GIT_TAG        v1.12.0
+            GIT_SHALLOW    TRUE
         )
         FetchContent_MakeAvailable(spdlog)
     endif()
@@ -94,6 +96,7 @@ if(THINGER_HTTP_ENABLE_VALIJSON)
         GIT_REPOSITORY https://github.com/tristanpenman/valijson.git
         GIT_TAG v1.0.3
         GIT_SHALLOW TRUE
+        GIT_SUBMODULES ""   # header-only: its third-party submodules (rapidjson, gtest...) are not needed
     )
     set(valijson_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(valijson_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
