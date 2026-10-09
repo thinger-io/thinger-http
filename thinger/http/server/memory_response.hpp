@@ -2,6 +2,7 @@
 #define THINGER_HTTP_SERVER_MEMORY_RESPONSE_HPP
 
 #include "../common/http_response.hpp"
+#include "response_sink.hpp"
 #include "../../util/types.hpp"
 #include <boost/asio/experimental/concurrent_channel.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -14,38 +15,40 @@ namespace thinger::http {
 // Collects the response of a request dispatched in memory (see http_server_base::dispatch).
 // It is shared by every copy of the response object, so a handler may keep a copy and
 // answer later, from any thread.
-class memory_response {
+class memory_response : public response_sink {
 public:
     explicit memory_response(const boost::asio::any_io_executor& executor) : done_(executor, 1) {}
 
     // Whole response
-    void complete(std::shared_ptr<http_response> response) {
+    void send(std::shared_ptr<http_response> response) override {
         std::lock_guard lock(mutex_);
         if (complete_) return;
         response_ = std::move(response);
         finish_locked();
     }
 
-    // Chunked response: headers first, then the data, then the end
-    void begin(std::shared_ptr<http_response> headers) {
+    // Chunked response, collected whole: headers first, then the data, then the end
+    bool begin(std::shared_ptr<http_response> headers) override {
         std::lock_guard lock(mutex_);
-        if (complete_ || response_) return;
+        if (complete_ || response_) return false;
         response_ = std::move(headers);
-        response_->remove_header("Transfer-Encoding");
-        response_->get_content().clear();
+        return true;
     }
 
-    void append(const std::string& data) {
+    bool append(const std::string& data) override {
         std::lock_guard lock(mutex_);
-        if (!complete_ && response_) response_->get_content().append(data);
+        if (complete_ || !response_) return false;
+        response_->get_content().append(data);
+        return true;
     }
 
-    void finish() {
+    bool finish() override {
         std::lock_guard lock(mutex_);
-        if (complete_ || !response_) return;
+        if (complete_ || !response_) return false;
         response_->set_content_length(response_->get_content().size());
         response_->set_last_frame(true);
         finish_locked();
+        return true;
     }
 
     bool is_complete() const {

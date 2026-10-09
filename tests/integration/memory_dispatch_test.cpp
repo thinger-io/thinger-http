@@ -249,3 +249,23 @@ TEST_CASE("In-memory dispatch replaces every Content-Length header", "[server][d
         REQUIRE(request->get_headers_with_key("Content-Length") == std::vector<std::string>{"5"});
     }
 }
+
+TEST_CASE("Response copies share the response", "[server][dispatch][response][integration]") {
+    http::server server;
+    std::atomic<bool> original_saw_answer{false};
+
+    server.get("/copy", [&original_saw_answer](http::response& res) {
+        http::response copy = res;
+        copy.header("X-From", "copy");
+        copy.send("from copy");
+
+        // The original sees the answer, and cannot send another one
+        original_saw_answer = res.has_responded();
+        res.send("from original");
+    });
+
+    auto response = run_dispatch(server, make_request(http::method::GET, "/copy"));
+    REQUIRE(original_saw_answer);
+    REQUIRE(response->get_content() == "from copy");
+    REQUIRE(response->get_header("X-From") == "copy");
+}

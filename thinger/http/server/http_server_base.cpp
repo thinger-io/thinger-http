@@ -2,6 +2,7 @@
 #include "server_connection.hpp"
 #include "request.hpp"
 #include "response.hpp"
+#include "memory_response.hpp"
 #include "../../util/logger.hpp"
 #include "../../util/base64.hpp"
 #include <boost/algorithm/string.hpp>

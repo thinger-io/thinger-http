@@ -6,19 +6,188 @@
 #include "../../util/sha1.hpp"
 #include "../../asio/sockets/websocket.hpp"
 #include <boost/algorithm/string.hpp>
-#include "../common/http_data.hpp"
-#include "../data/out_chunk.hpp"
 #include <fstream>
 #include <sstream>
+#include <atomic>
 
 namespace thinger::http {
+
+// State shared by the copies of a response
+struct response::state {
+    std::shared_ptr<response_sink> sink;
+    std::shared_ptr<http_request> request;
+    std::shared_ptr<http_response> message;                     // being built, if started
+    std::shared_ptr<const error_formatter> formatter;           // default format if null
+    std::atomic<bool> responded{false};
+    bool cors_enabled = false;
+};
+
+namespace {
+
+    void add_cors_headers(http_response& response) {
+        response.add_header("Access-Control-Allow-Origin", "*");
+        response.add_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH");
+        response.add_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+        response.add_header("Access-Control-Allow-Credentials", "true");
+    }
+
+    bool is_compressible_content_type(const std::string& content_type) {
+        // Only compress text-based content types
+        return content_type.starts_with("text/")
+            || content_type.starts_with("application/json")
+            || content_type.starts_with("application/xml")
+            || content_type.starts_with("application/javascript")
+            || content_type.starts_with("application/x-javascript")
+            || content_type.starts_with("image/svg+xml");
+    }
+
+}
+
+response::response(const std::shared_ptr<server_connection>& connection,
+                   const std::shared_ptr<http_stream>& stream,
+                   const std::shared_ptr<http::http_request>& http_request,
+                   bool cors_enabled)
+    : response(std::make_shared<connection_sink>(connection, stream), http_request, cors_enabled) {}
+
+response::response(std::shared_ptr<response_sink> sink,
+                   const std::shared_ptr<http::http_request>& http_request,
+                   bool cors_enabled)
+    : state_(std::make_shared<state>()) {
+    state_->sink = std::move(sink);
+    state_->request = http_request;
+    state_->cors_enabled = cors_enabled;
+}
+
+bool response::ensure_not_responded() const {
+    if (state_->responded) {
+        LOG_ERROR("Response already sent");
+        return false;
+    }
+    return true;
+}
+
+bool response::mark_responded() {
+    if (state_->responded.exchange(true)) {
+        LOG_ERROR("Response already sent");
+        return false;
+    }
+    return true;
+}
+
+http_response& response::prepare_response() {
+    if (!state_->message) {
+        state_->message = std::make_shared<http_response>();
+        state_->message->set_keep_alive(state_->request->keep_alive());
+        if (state_->cors_enabled) add_cors_headers(*state_->message);
+    }
+    return *state_->message;
+}
+
+void response::compress_response_if_needed() {
+    auto& response = *state_->message;
+
+    // Only compress if there's a body worth compressing
+    const auto& content = response.get_content();
+    if (content.size() < 200) return;
+
+    // Don't compress if already compressed
+    if (response.has_header("Content-Encoding")) return;
+
+    // Only compress text-based content types
+    const auto& ct = response.get_content_type();
+    if (ct.empty() || !is_compressible_content_type(ct)) return;
+
+    // Check what the client accepts
+    std::string accept_encoding = state_->request->get_header("Accept-Encoding");
+    if (accept_encoding.empty()) return;
+
+    if (accept_encoding.find("gzip") != std::string::npos) {
+        auto compressed = ::thinger::util::gzip::compress(content);
+        if (compressed) {
+            response.set_content(std::move(*compressed));
+            response.add_header("Content-Encoding", "gzip");
+        }
+    } else if (accept_encoding.find("deflate") != std::string::npos) {
+        auto compressed = ::thinger::util::deflate::compress(content);
+        if (compressed) {
+            response.set_content(std::move(*compressed));
+            response.add_header("Content-Encoding", "deflate");
+        }
+    }
+}
+
+void response::send_prepared_response() {
+    prepare_response();
+    compress_response_if_needed();
+    if (!mark_responded()) return;
+    state_->sink->send(state_->message);
+}
+
+bool response::reject_takeover(const char* feature) {
+    if (state_->sink->can_take_over()) return false;
+    error(http::http_response::status::not_implemented,
+          std::string(feature) + " is not available for in-memory requests");
+    return true;
+}
+
+void response::json(const nlohmann::json& data, http::http_response::status status) {
+    if (!ensure_not_responded()) return;
+    prepare_response().set_status(status);
+    state_->message->set_content(data.dump(), "application/json");
+    send_prepared_response();
+}
+
+void response::send(const std::string& text, const std::string& content_type) {
+    if (!ensure_not_responded()) return;
+    prepare_response().set_content(text, content_type);
+    send_prepared_response();
+}
+
+void response::error(http::http_response::status status, const std::string& message,
+                     const nlohmann::json& details) {
+    if (!ensure_not_responded()) return;
+    auto& response = prepare_response();
+    response.set_status(status);
+    format_error(state_->formatter.get(), {status, message, details}, response);
+    send_prepared_response();
+}
+
+void response::set_error_formatter(std::shared_ptr<const error_formatter> formatter) {
+    state_->formatter = std::move(formatter);
+}
+
+void response::status(http::http_response::status s) {
+    if (!ensure_not_responded()) return;
+    prepare_response().set_status(s);
+}
+
+void response::header(const std::string& key, const std::string& value) {
+    if (!ensure_not_responded()) return;
+    prepare_response().add_header(key, value);
+}
+
+void response::send_response(const std::shared_ptr<http_response>& response) {
+    if (!ensure_not_responded()) return;
+    response->set_keep_alive(state_->request->keep_alive());
+    if (state_->cors_enabled) add_cors_headers(*response);
+    state_->message = response;
+    send_prepared_response();
+}
+
+bool response::has_responded() const {
+    return state_->responded;
+}
+
+std::shared_ptr<server_connection> response::get_connection() const {
+    return state_->sink->connection();
+}
 
 // Redirect implementation
 void response::redirect(const std::string& url, http::http_response::status redirect_type) {
     if (!ensure_not_responded()) return;
-    prepare_response();
-    response_->set_status(redirect_type);
-    response_->add_header(header::location, url);
+    auto& response = prepare_response();
+    response.set_status(redirect_type);
+    response.add_header(header::location, url);
     send_prepared_response();
 }
 
@@ -59,13 +228,13 @@ void response::send_file(const std::filesystem::path& path, bool force_download)
     std::string content_type = mime_types::extension_to_type(path.extension().string());
     
     // Create response
-    prepare_response();
-    response_->set_status(http_response::status::ok);
-    response_->set_content(content, content_type);
+    auto& response = prepare_response();
+    response.set_status(http_response::status::ok);
+    response.set_content(content, content_type);
     
     // Add Content-Disposition header if force_download is true
     if (force_download) {
-        response_->add_header("Content-Disposition", "attachment; filename=\"" + path.filename().string() + "\"");
+        response.add_header("Content-Disposition", "attachment; filename=\"" + path.filename().string() + "\"");
     }
     
     send_prepared_response();
@@ -75,23 +244,17 @@ void response::send_file(const std::filesystem::path& path, bool force_download)
 void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_connection>)> handler,
                                 const std::set<std::string>& supported_protocols) {
     if (!ensure_not_responded()) return;
-    if (reject_in_memory("WebSocket upgrade")) return;
-    
-    auto conn = connection_.lock();
-    auto str = stream_.lock();
-    if (!conn || !str) {
-        error(http_response::status::internal_server_error, "Connection lost");
-        return;
-    }
-    
+    if (reject_takeover("WebSocket upgrade")) return;
+    const auto& request = *state_->request;
+
     // Check if this is a WebSocket upgrade request
-    if (!boost::iequals(http_request_->get_header(http::header::upgrade), "websocket")) {
+    if (!boost::iequals(request.get_header(http::header::upgrade), "websocket")) {
         error(http_response::status::upgrade_required, "This service requires use of WebSockets");
         return;
     }
     
     // Check WebSocket protocol if specified
-    auto protocol = http_request_->get_header("Sec-WebSocket-Protocol");
+    auto protocol = request.get_header("Sec-WebSocket-Protocol");
     if (!protocol.empty()) {
         LOG_DEBUG("Received WebSocket protocol: {}", protocol);
         if (!supported_protocols.contains(protocol)) {
@@ -104,7 +267,7 @@ void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_co
     }
     
     // Get WebSocket key
-    auto ws_key = http_request_->get_header("Sec-WebSocket-Key");
+    auto ws_key = request.get_header("Sec-WebSocket-Key");
     if (ws_key.empty()) {
         error(http_response::status::bad_request, "Missing Sec-WebSocket-Key header");
         return;
@@ -116,14 +279,14 @@ void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_co
     accept_key = ::thinger::util::base64::encode(hash);
     
     // Create upgrade response
-    prepare_response();
-    response_->set_status(http_response::status::switching_protocols);
-    response_->add_header(header::upgrade, "websocket");
-    response_->add_header(header::connection, "Upgrade");
-    response_->add_header("Sec-WebSocket-Accept", accept_key);
+    auto& response = prepare_response();
+    response.set_status(http_response::status::switching_protocols);
+    response.add_header(header::upgrade, "websocket");
+    response.add_header(header::connection, "Upgrade");
+    response.add_header("Sec-WebSocket-Accept", accept_key);
     
     if (!protocol.empty()) {
-        response_->add_header("Sec-WebSocket-Protocol", protocol);
+        response.add_header("Sec-WebSocket-Protocol", protocol);
     }
     
     // Send the upgrade response and take over the connection
@@ -149,44 +312,26 @@ void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_co
 
 void response::take_over(takeover_handler handler) {
     if (!ensure_not_responded()) return;
-    if (reject_in_memory("Connection takeover")) return;
+    if (reject_takeover("Connection takeover")) return;
 
-    auto conn = connection_.lock();
-    auto str = stream_.lock();
-    if (!conn || !str) {
-        LOG_ERROR("Cannot take over a closed connection");
-        return;
-    }
-
-    // Stop the connection from reading further requests, then hand the socket over
-    // once this response has been written
-    conn->begin_takeover(std::move(handler));
-    str->on_completed([conn]() {
-        conn->takeover_response_sent();
-    });
-
-    send_prepared_response();
+    prepare_response();
+    compress_response_if_needed();
+    if (!mark_responded()) return;
+    state_->sink->take_over(state_->message, std::move(handler));
 }
 
 // Server-Sent Events implementation
 void response::start_sse(std::function<void(std::shared_ptr<sse_connection>)> handler) {
     if (!ensure_not_responded()) return;
-    if (reject_in_memory("Server-Sent Events")) return;
-    
-    auto conn = connection_.lock();
-    auto str = stream_.lock();
-    if (!conn || !str) {
-        error(http_response::status::internal_server_error, "Connection lost");
-        return;
-    }
-    
+    if (reject_takeover("Server-Sent Events")) return;
+
     // Create SSE response headers
-    prepare_response();
-    response_->set_status(http_response::status::ok);
-    response_->set_content_type("text/event-stream");
-    response_->add_header("Cache-Control", "no-cache");
-    response_->add_header("Connection", "keep-alive");
-    response_->add_header("X-Accel-Buffering", "no"); // Disable nginx buffering
+    auto& response = prepare_response();
+    response.set_status(http_response::status::ok);
+    response.set_content_type("text/event-stream");
+    response.add_header("Cache-Control", "no-cache");
+    response.add_header("Connection", "keep-alive");
+    response.add_header("X-Accel-Buffering", "no"); // Disable nginx buffering
     
     // Send the SSE headers and take over the connection (anything the client sends
     // afterwards is not part of the event stream)
@@ -202,87 +347,30 @@ void response::start_sse(std::function<void(std::shared_ptr<sse_connection>)> ha
     });
 }
 
-// Chunked response support
+// Chunked response support: the sink writes the headers, then each chunk
 bool response::start_chunked(const std::string& content_type, http::http_response::status status) {
     if (!ensure_not_responded()) return false;
-
-    if (memory_) {
-        prepare_response();
-        response_->set_status(status);
-        response_->set_content_type(content_type);
-        memory_->begin(response_);
-        responded_ = true;
-        return true;
-    }
-
-    auto conn = connection_.lock();
-    auto str = stream_.lock();
-    if (!conn || !str) {
-        LOG_ERROR("Connection lost while starting chunked response");
-        return false;
-    }
-
-    // Create chunked response headers
-    prepare_response();
-    response_->set_status(status);
-    response_->set_content_type(content_type);
-    response_->add_header("Transfer-Encoding", "chunked");
-    response_->add_header("X-Content-Type-Options", "nosniff");
-    response_->set_last_frame(false);
-
-    // Send headers (stream stays open for subsequent chunks)
-    conn->handle_stream(str, response_);
-
-    responded_ = true;
-    return true;
+    auto& response = prepare_response();
+    response.set_status(status);
+    response.set_content_type(content_type);
+    if (!mark_responded()) return false;
+    return state_->sink->begin(state_->message);
 }
 
 bool response::write_chunk(const std::string& data) {
-    if (!responded_) {
+    if (!state_->responded) {
         LOG_ERROR("Must call start_chunked() before writing chunks");
         return false;
     }
-
-    if (memory_) {
-        memory_->append(data);
-        return true;
-    }
-
-    auto conn = connection_.lock();
-    auto str = stream_.lock();
-    if (!conn || !str) {
-        LOG_ERROR("Connection lost while writing chunk");
-        return false;
-    }
-
-    auto chunk = std::make_shared<http_data>(std::make_shared<data::out_chunk>(data));
-    chunk->set_last_frame(false);
-    conn->handle_stream(str, chunk);
-    return true;
+    return state_->sink->append(data);
 }
 
 bool response::end_chunked() {
-    if (!responded_) {
+    if (!state_->responded) {
         LOG_ERROR("Must call start_chunked() before ending chunks");
         return false;
     }
-
-    if (memory_) {
-        memory_->finish();
-        return true;
-    }
-
-    auto conn = connection_.lock();
-    auto str = stream_.lock();
-    if (!conn || !str) {
-        return false;
-    }
-
-    // Send final zero-length chunk to terminate the response
-    auto chunk = std::make_shared<http_data>(std::make_shared<data::out_chunk>());
-    chunk->set_last_frame(true);
-    conn->handle_stream(str, chunk);
-    return true;
+    return state_->sink->finish();
 }
 
 } // namespace thinger::http

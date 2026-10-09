@@ -7,7 +7,7 @@
 #include "http_stream.hpp"
 #include "websocket_connection.hpp"
 #include "sse_connection.hpp"
-#include "memory_response.hpp"
+#include "response_sink.hpp"
 #include "error_format.hpp"
 #include "../../util/compression.hpp"
 #include <nlohmann/json.hpp>
@@ -15,6 +15,7 @@
 #include <functional>
 #include <filesystem>
 #include <set>
+#include <string>
 
 namespace thinger::http {
 
@@ -22,139 +23,25 @@ namespace thinger::http {
 class websocket_connection;
 class sse_connection;
 
+// Response to a request. It is a handle: copies share the response, so a handler may keep
+// a copy and answer later, from any thread. Only the first answer is sent.
 class response {
-private:
-    std::weak_ptr<server_connection> connection_;
-    std::weak_ptr<http_stream> stream_;
-    std::shared_ptr<http::http_request> http_request_;
-    std::shared_ptr<http_response> response_;
-    std::shared_ptr<memory_response> memory_;   // set for requests dispatched in memory
-    std::shared_ptr<const error_formatter> error_formatter_;    // default format if null
-    bool responded_ = false;
-    bool cors_enabled_ = false;
-
-    bool ensure_not_responded() const {
-        if (responded_) {
-            LOG_ERROR("Response already sent");
-            return false;
-        }
-        return true;
-    }
-    
-    void prepare_response() {
-        if (!response_) {
-            response_ = std::make_shared<http_response>();
-            response_->set_keep_alive(http_request_->keep_alive());
-            
-            // Add CORS headers if enabled
-            if (cors_enabled_) {
-                response_->add_header("Access-Control-Allow-Origin", "*");
-                response_->add_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH");
-                response_->add_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-                response_->add_header("Access-Control-Allow-Credentials", "true");
-            }
-        }
-    }
-    
-    static bool is_compressible_content_type(const std::string& content_type) {
-        // Only compress text-based content types
-        return content_type.starts_with("text/")
-            || content_type.starts_with("application/json")
-            || content_type.starts_with("application/xml")
-            || content_type.starts_with("application/javascript")
-            || content_type.starts_with("application/x-javascript")
-            || content_type.starts_with("image/svg+xml");
-    }
-
-    void compress_response_if_needed() {
-        // Only compress if there's a body worth compressing
-        const auto& content = response_->get_content();
-        if (content.size() < 200) return;
-
-        // Don't compress if already compressed
-        if (response_->has_header("Content-Encoding")) return;
-
-        // Only compress text-based content types
-        const auto& ct = response_->get_content_type();
-        if (ct.empty() || !is_compressible_content_type(ct)) return;
-
-        // Check what the client accepts
-        std::string accept_encoding = http_request_->get_header("Accept-Encoding");
-        if (accept_encoding.empty()) return;
-
-        if (accept_encoding.find("gzip") != std::string::npos) {
-            auto compressed = ::thinger::util::gzip::compress(content);
-            if (compressed) {
-                response_->set_content(std::move(*compressed));
-                response_->add_header("Content-Encoding", "gzip");
-            }
-        } else if (accept_encoding.find("deflate") != std::string::npos) {
-            auto compressed = ::thinger::util::deflate::compress(content);
-            if (compressed) {
-                response_->set_content(std::move(*compressed));
-                response_->add_header("Content-Encoding", "deflate");
-            }
-        }
-    }
-
-    void send_prepared_response() {
-        if (!ensure_not_responded()) return;
-        prepare_response();
-        compress_response_if_needed();
-        deliver();
-        responded_ = true;
-    }
-
-    // Send response_ to the connection, or to memory for in-memory requests
-    void deliver() {
-        if (memory_) {
-            memory_->complete(response_);
-            return;
-        }
-        if (auto conn = connection_.lock()) {
-            if (auto str = stream_.lock()) {
-                conn->handle_stream(str, response_);
-            }
-        }
-    }
-
-    // Answers with 501 if this is an in-memory request (no connection to upgrade or own)
-    bool reject_in_memory(const char* feature) {
-        if (!memory_) return false;
-        error(http::http_response::status::not_implemented,
-              std::string(feature) + " is not available for in-memory requests");
-        return true;
-    }
-
 public:
     response(const std::shared_ptr<server_connection>& connection,
-             const std::shared_ptr<http_stream>& stream, 
+             const std::shared_ptr<http_stream>& stream,
              const std::shared_ptr<http::http_request>& http_request,
-             bool cors_enabled = false)
-        : connection_(connection), stream_(stream), http_request_(http_request), cors_enabled_(cors_enabled) {}
+             bool cors_enabled = false);
 
-    // Response of a request dispatched in memory: written to `memory` instead of a connection
-    response(std::shared_ptr<memory_response> memory,
+    // Response written to `sink`, e.g. a memory_response for requests dispatched in memory
+    response(std::shared_ptr<response_sink> sink,
              const std::shared_ptr<http::http_request>& http_request,
-             bool cors_enabled = false)
-        : http_request_(http_request), memory_(std::move(memory)), cors_enabled_(cors_enabled) {}
+             bool cors_enabled = false);
 
     // JSON response
-    void json(const nlohmann::json& data, http::http_response::status status = http::http_response::status::ok) {
-        if (!ensure_not_responded()) return;
-        prepare_response();
-        response_->set_status(status);
-        response_->set_content(data.dump(), "application/json");
-        send_prepared_response();
-    }
+    void json(const nlohmann::json& data, http::http_response::status status = http::http_response::status::ok);
 
     // Text response
-    void send(const std::string& text, const std::string& content_type = "text/plain") {
-        if (!ensure_not_responded()) return;
-        prepare_response();
-        response_->set_content(text, content_type);
-        send_prepared_response();
-    }
+    void send(const std::string& text, const std::string& content_type = "text/plain");
 
     // HTML response
     void html(const std::string& html) {
@@ -165,53 +52,19 @@ public:
     // http_server_base::set_error_formatter): by default the message as text/plain, or a
     // JSON object for errors with details
     void error(http::http_response::status status, const std::string& message = "",
-               const nlohmann::json& details = nullptr) {
-        if (!ensure_not_responded()) return;
-        prepare_response();
-        response_->set_status(status);
-        format_error(error_formatter_.get(), {status, message, details}, *response_);
-        send_prepared_response();
-    }
+               const nlohmann::json& details = nullptr);
 
     // Formatter used by error() (set by the server)
-    void set_error_formatter(std::shared_ptr<const error_formatter> formatter) {
-        error_formatter_ = std::move(formatter);
-    }
+    void set_error_formatter(std::shared_ptr<const error_formatter> formatter);
 
     // Set status code (for building custom responses)
-    void status(http::http_response::status s) {
-        if (!ensure_not_responded()) return;
-        prepare_response();
-        response_->set_status(s);
-    }
+    void status(http::http_response::status s);
 
     // Set header (for building custom responses)
-    void header(const std::string& key, const std::string& value) {
-        if (!ensure_not_responded()) return;
-        prepare_response();
-        response_->add_header(key, value);
-    }
+    void header(const std::string& key, const std::string& value);
 
     // Send raw http_response object (for advanced use cases)
-    void send_response(const std::shared_ptr<http_response>& response) {
-        if (!ensure_not_responded()) return;
-        response_ = response;
-
-        // Ensure keep-alive is set properly
-        response_->set_keep_alive(http_request_->keep_alive());
-
-        // Add CORS headers if enabled
-        if (cors_enabled_) {
-            response_->add_header("Access-Control-Allow-Origin", "*");
-            response_->add_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH");
-            response_->add_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-            response_->add_header("Access-Control-Allow-Credentials", "true");
-        }
-
-        compress_response_if_needed();
-        deliver();
-        responded_ = true;
-    }
+    void send_response(const std::shared_ptr<http_response>& response);
 
     // WebSocket upgrade
     void upgrade_websocket(std::function<void(std::shared_ptr<websocket_connection>)> handler,
@@ -238,14 +91,26 @@ public:
     bool end_chunked();
 
     // Check if response has been sent
-    bool has_responded() const {
-        return responded_;
-    }
+    bool has_responded() const;
 
-    // Get the underlying connection (for advanced use cases)
-    std::shared_ptr<server_connection> get_connection() const {
-        return connection_.lock();
-    }
+    // Get the underlying connection (for advanced use cases); null for requests
+    // dispatched in memory
+    std::shared_ptr<server_connection> get_connection() const;
+
+private:
+    struct state;
+
+    bool ensure_not_responded() const;
+    // Response being built, created on first use
+    http_response& prepare_response();
+    void compress_response_if_needed();
+    // Mark the response as sent; false (and nothing must be sent) if it already was
+    bool mark_responded();
+    void send_prepared_response();
+    // Answers 501 if the connection cannot be taken over (in-memory requests)
+    bool reject_takeover(const char* feature);
+
+    std::shared_ptr<state> state_;
 };
 
 } // namespace thinger::http
