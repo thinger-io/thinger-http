@@ -7,6 +7,7 @@ on:
     branches: [ main ]
   schedule:
     - cron: '30 4 * * 1'
+  workflow_dispatch:
 
 # Authenticate dependency downloads (CMake FetchContent clones) with the job token:
 # anonymous clones hit GitHub rate limits when several jobs run at once
