@@ -1,4 +1,5 @@
 #include "route.hpp"
+#include "route_pattern.hpp"
 #include "../response.hpp"
 #include <regex>
 #include <algorithm>
@@ -9,61 +10,21 @@ namespace thinger::http {
 route::route(const std::string& pattern)
     : pattern_(pattern)
 {
-    // Convert route pattern to regex
-    // Support two syntaxes:
-    // 1. :param_name - matches any non-slash characters
-    // 2. :param_name(regex) - matches the specified regex pattern
-    
-    std::string regex_pattern = pattern;
-    
-    // Collect parameters in order of appearance, as they map to the regex capture groups:
-    // :name or :name(regex)
-    std::regex custom_param_regex(":([a-zA-Z_][a-zA-Z0-9_]*)\\(([^)]+)\\)");
-    std::regex simple_param_regex(":([a-zA-Z_][a-zA-Z0-9_]*)(?![\\(])");
-    std::regex any_param_regex(":([a-zA-Z_][a-zA-Z0-9_]*)(?:\\(([^)]+)\\))?");
-    std::smatch match;
-    std::string temp;
-
-    for (std::sregex_iterator it(pattern.begin(), pattern.end(), any_param_regex), end; it != end; ++it) {
-        std::string param_name = (*it)[1];
-        if ((*it)[2].matched) {
-            parameter_patterns_[param_name] = (*it)[2];
+    // Parameters in order of appearance (the first one of a repeated name), and their
+    // custom regex if they have one
+    auto tokens = detail::parse_route_pattern(pattern);
+    for (const auto& token : tokens) {
+        if (!token.parameter) continue;
+        if (!token.regex.empty()) {
+            parameter_patterns_[token.text] = token.regex;
         }
-        if (std::find(parameters_.begin(), parameters_.end(), param_name) == parameters_.end()) {
-            parameters_.push_back(param_name);
+        if (std::find(parameters_.begin(), parameters_.end(), token.text) == parameters_.end()) {
+            parameters_.push_back(token.text);
         }
     }
 
-    // Escape special regex characters in the pattern (but not in our parameter patterns)
-    std::string escaped = pattern;
-    
-    // First, temporarily replace our parameter patterns to protect them
-    escaped = std::regex_replace(escaped, custom_param_regex, "__CUSTOM_PARAM_$1__");
-    escaped = std::regex_replace(escaped, simple_param_regex, "__SIMPLE_PARAM_$1__");
-    
-    // Escape special characters
-    // (the replacement format only treats $ specially: a single backslash is literal)
-    escaped = std::regex_replace(escaped, std::regex("([.^$*+?{}\\[\\]\\\\|])"), "\\$1");
-    
-    // Now replace parameters with their regex groups
-    // Custom parameters: restore the custom regex
-    temp = pattern;
-    std::string result = escaped;
-    while (std::regex_search(temp, match, custom_param_regex)) {
-        std::string param_name = match[1];
-        std::string param_regex = match[2];
-        std::string placeholder = "__CUSTOM_PARAM_" + param_name + "__";
-        result = std::regex_replace(result, std::regex(placeholder), "(" + param_regex + ")");
-        temp = match.suffix();
-    }
-    
-    // Simple parameters: use default regex
-    result = std::regex_replace(result, std::regex("__SIMPLE_PARAM_([a-zA-Z_][a-zA-Z0-9_]*)__"), "([^/]+)");
-    
-    // Add anchors
-    regex_pattern = "^" + result + "$";
-    
-    regex_ = std::regex(regex_pattern);
+    // Regex of the whole pattern, for matches(); also validates the parameter regexes
+    regex_ = std::regex(detail::pattern_regex(tokens));
 }
 
 route& route::deferred_body(bool enabled) {

@@ -25,12 +25,29 @@ namespace thinger::http {
 // Route parameters syntax:
 // 1. Simple parameters: :param_name
 //    Example: "/api/v1/users/:user/devices/:device"
-//    Matches any non-slash characters
+//    Matches any non-empty text without slashes
 //
 // 2. Parameters with custom regex: :param_name(regex)
 //    Example: "/api/v1/users/:id([0-9]+)"         - numeric ID only
 //    Example: "/api/v1/users/:user([a-zA-Z0-9_-]{1,32})" - alphanumeric with length limit
 //    Example: "/files/:path(.+)"                   - match everything including slashes
+//    The regex extends to the matching closing parenthesis, so it may contain groups.
+//
+// Matching (see route_tree): the path is matched segment by segment (the text between
+// slashes), with this priority whatever the registration order: static segments, then
+// segments with a regex constraint (or mixing text and parameters, as ":name.:ext"), then
+// simple parameters, then parameters that may match slashes (as ":path(.+)"), which take
+// the rest of the path. If the rest of the path does not match below the chosen option,
+// the next one is tried. Different constraints at the same position are tried in the
+// order they were first registered there, and wildcards in registration order; registering
+// a route with the same structure as another one, or one that may match the same paths as
+// another one where only that order decides, logs a warning. A parameter regex that
+// depends on what surrounds it (anchors ^ $, word boundaries, lookaheads, back-references)
+// makes its route match the whole path with its regex, after all the other options.
+// - The path is matched as received, before percent-decoding: "%2F" is not a slash, and
+//   parameters get the encoded text ("/files/:name" on "/files/a%20b" gives "a%20b").
+// - Trailing slashes and empty segments are significant: "/users" does not match
+//   "/users/", and a parameter does not match an empty segment ("/users//devices").
 //
 // Common patterns:
 #define ID_PATTERN      "[0-9]+"                      // Numeric ID

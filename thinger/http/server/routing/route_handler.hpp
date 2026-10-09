@@ -6,6 +6,7 @@
 #include <memory>
 #include "route.hpp"
 #include "route_builder.hpp"
+#include "route_tree.hpp"
 
 namespace thinger::http {
 
@@ -20,7 +21,10 @@ public:
     // Access route builders for different HTTP methods
     route_builder operator[](method http_method);
 
-    // Find the matching route for a request (without executing the handler)
+    // Find the matching route for a request (without executing the handler), setting it
+    // and its path parameters on the request. Routes are matched by path segments, by
+    // priority: static segments, then segments with a regex constraint, then parameters,
+    // then parameters that may match '/' (see route_tree), whatever their registration order.
     const route* find_route(std::shared_ptr<request> req);
 
     // Handle an unmatched request (fallback handler, or 404/405) through the response
@@ -51,6 +55,8 @@ public:
     
 private:
     std::map<method, std::deque<route>> routes_;
+    // The same routes, by method, as trees of path segments for matching
+    std::map<method, route_tree> trees_;
     nlohmann::json schema_components_ = nlohmann::json::object();
     fallback_handler fallback_handler_;
     

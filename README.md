@@ -165,11 +165,19 @@ server.get("/users/:id", [](auto& req, auto& res) {
     res.json({{"user_id", id}});
 });
 
-server.get("/files/*path", [](auto& req, auto& res) {
-    std::string path = req["path"];  // Wildcard capture
+server.get("/users/:id([0-9]+)", [](auto& req, auto& res) {
+    // Only numeric ids: the regex constrains the segment
+});
+
+server.get("/files/:path(.+)", [](auto& req, auto& res) {
+    std::string path = req["path"];  // Wildcard capture: "a/b/c.txt"
     res.send_file("/data/" + path);
 });
 ```
+
+Routes are matched segment by segment (the text between slashes) on a tree, so the cost of finding a route hardly depends on how many there are. Whatever the registration order, a segment is matched first by static text (`/users/me`), then by a constrained parameter (`:id([0-9]+)`, or text mixed with parameters as `:name.:ext`), then by a parameter (`:id`), and last by a parameter that may match slashes (`:path(.+)`), which takes the rest of the path; if the rest of the path does not match below the first option, the next one is tried. Different constraints at the same position are tried in the order they were first registered there, and wildcards in registration order. Registering a route with the same structure as another one (it would never match), or one that may match the same paths as another one where only that order decides, logs a warning. A parameter regex that depends on its surroundings (anchors, word boundaries, lookaheads, back-references) makes its route match the whole path, after every other option.
+
+Paths are matched as received, before percent-decoding (`%2F` is not a slash, and parameters get the encoded text), and trailing slashes and empty segments are significant: `/users` does not match `/users/`, nor `/users/:id/devices` match `/users//devices`. Simple regexes (characters, classes, quantifiers, alternative words) are checked without `std::regex`, which is kept for the rest.
 
 ### Query Parameters
 

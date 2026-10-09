@@ -1,8 +1,8 @@
 #include "openapi.hpp"
+#include "routing/route_pattern.hpp"
 #include "../../util/logger.hpp"
 #include <algorithm>
 #include <cctype>
-#include <regex>
 #include <set>
 
 namespace thinger::http {
@@ -16,10 +16,11 @@ openapi_generator& openapi_generator::server(const std::string& url, const std::
 
 std::string openapi_generator::to_openapi_path(const std::string& pattern) {
     // Same parameter syntax as route: :name(regex) and :name
-    static const std::regex custom_param(":([a-zA-Z_][a-zA-Z0-9_]*)\\(([^)]+)\\)");
-    static const std::regex simple_param(":([a-zA-Z_][a-zA-Z0-9_]*)");
-    auto path = std::regex_replace(pattern, custom_param, "{$1}");
-    return std::regex_replace(path, simple_param, "{$1}");
+    std::string path;
+    for (const auto& token : detail::parse_route_pattern(pattern)) {
+        path += token.parameter ? "{" + token.text + "}" : token.text;
+    }
+    return path;
 }
 
 nlohmann::json openapi_generator::build_operation(const route& r) const {

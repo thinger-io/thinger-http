@@ -219,3 +219,38 @@ TEST_CASE("Routing: 404 for no matching path",
         REQUIRE(response.status() == 404);
     }
 }
+
+TEST_CASE("Routing: 404 and 405 with routes matched by path segments",
+          "[routing][errors][integration]") {
+    RoutingTestFixture fixture;
+    auto& server = fixture.server;
+
+    server.get("/items/:id([0-9]+)", [](http::request& req, http::response& res) {
+        res.send("item " + req["id"]);
+    });
+    server.get("/items/:path(.+)", [](http::request& req, http::response& res) {
+        res.send("path " + req["path"]);
+    });
+    server.post("/items", [](http::response& res) {
+        res.send("created");
+    });
+
+    fixture.start_server();
+    http::client client;
+    client.timeout(10s);
+
+    SECTION("Matched routes") {
+        REQUIRE(client.get(fixture.base_url + "/items/42").body() == "item 42");
+        REQUIRE(client.get(fixture.base_url + "/items/a/b").body() == "path a/b");
+    }
+
+    SECTION("A method with routes, none matching the path: 404") {
+        REQUIRE(client.post(fixture.base_url + "/items/42").status() == 404);
+        REQUIRE(client.get(fixture.base_url + "/items").status() == 404);
+        REQUIRE(client.get(fixture.base_url + "/items/").status() == 404);
+    }
+
+    SECTION("A method without routes: 405") {
+        REQUIRE(client.del(fixture.base_url + "/items/42").status() == 405);
+    }
+}

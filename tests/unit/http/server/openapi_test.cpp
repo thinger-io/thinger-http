@@ -13,6 +13,8 @@ TEST_CASE("OpenAPI path conversion", "[openapi][unit]") {
     REQUIRE(openapi_generator::to_openapi_path("/users/:user/devices/:device") == "/users/{user}/devices/{device}");
     REQUIRE(openapi_generator::to_openapi_path("/items/:id([0-9]+)/tags/:tag") == "/items/{id}/tags/{tag}");
     REQUIRE(openapi_generator::to_openapi_path("/files/:path(.+)") == "/files/{path}");
+    // Regexes with groups
+    REQUIRE(openapi_generator::to_openapi_path("/posts/:slug([a-z]+(?:-[a-z]+)*)/:page") == "/posts/{slug}/{page}");
 }
 
 TEST_CASE("OpenAPI document from documented routes", "[openapi][unit]") {

@@ -1,14 +1,13 @@
 #include "route_handler.hpp"
 #include "../response.hpp"
 #include "../../../util/logger.hpp"
-#include <regex>
 
 namespace thinger::http {
 
 route_handler::route_handler() = default;
 
 route_builder route_handler::operator[](method http_method) {
-    return route_builder(http_method, routes_[http_method], &schema_components_);
+    return route_builder(http_method, routes_[http_method], trees_[http_method], &schema_components_);
 }
 
 void route_handler::enable_cors(bool enabled) {
@@ -33,40 +32,34 @@ void route_handler::enable_cors(bool enabled) {
 const route* route_handler::find_route(std::shared_ptr<request> req) {
     auto http_request = req->get_http_request();
     const auto& request_method = http_request->get_method();
-    const auto path = http_request->get_path();
+    std::string_view path = http_request->get_uri();
+    path = path.substr(0, path.find('?'));
 
     LOG_DEBUG("Finding route for {} {}", get_method(request_method), path);
 
-    // Find routes for this method
-    auto method_routes = routes_.find(request_method);
-    if (method_routes == routes_.end()) {
+    auto tree = trees_.find(request_method);
+    if (tree == trees_.end()) {
         LOG_DEBUG("No routes registered for method {}", get_method(request_method));
         return nullptr;
     }
 
-    // Try to match against registered routes
-    for (auto& route : method_routes->second) {
-        std::smatch matches;
-        if (route.matches(path, matches)) {
-            LOG_DEBUG("Matched route: {}", route.get_pattern());
+    detail::route_captures captures;
+    const auto* found = tree->second.find(path, captures);
+    if (!found) {
+        LOG_DEBUG("No matching route found for {}", path);
+        return nullptr;
+    }
+    LOG_DEBUG("Matched route: {}", found->target->get_pattern());
 
-            // Extract parameters from the match
-            for (size_t i = 0; i < route.get_parameters().size(); ++i) {
-                const auto& param = route.get_parameters()[i];
-                if (i + 1 < matches.size() && matches[i + 1].matched) {
-                    req->set_uri_parameter(param, matches[i + 1].str());
-                }
-            }
-
-            // Set the matched route in request
-            req->set_matched_route(&route);
-
-            return &route;
+    // Path parameters, as captured (raw, not percent-decoded)
+    for (size_t i = 0; i < captures.size() && i < found->names.size(); ++i) {
+        if (!found->names[i].empty() && captures[i].data()) {
+            req->set_uri_parameter(found->names[i], std::string(captures[i]));
         }
     }
 
-    LOG_DEBUG("No matching route found for {}", path);
-    return nullptr;
+    req->set_matched_route(found->target);
+    return found->target;
 }
 
 thinger::awaitable<void> route_handler::handle_unmatched(std::shared_ptr<request> req, response& res) {
