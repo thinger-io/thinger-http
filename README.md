@@ -145,11 +145,17 @@ server.post("/path", handler);
 server.put("/path", handler);
 server.del("/path", handler);
 server.patch("/path", handler);
+server.head("/path", handler);
 server.options("/path", handler);
 
 // Handler signature
 void handler(thinger::http::request& req, thinger::http::response& res);
+
+// Requests matching no route (404/405 by default)
+server.set_not_found_handler(handler);
 ```
+
+Every registration method, `set_not_found_handler()` included, also accepts coroutine handlers (see [Coroutine Handlers](#coroutine-handlers)). A handler that throws is answered with `500`; if it had already started its response, the connection is closed instead.
 
 ### Path Parameters
 
@@ -197,6 +203,14 @@ server.post("/api/data", [](auto& req, auto& res) {
 });
 ```
 
+The server reads the body before calling the handler, decompressing it if it has `Content-Encoding: gzip` or `deflate`. Bodies larger than `set_max_body_size()` (8 MB by default, also once decompressed) are answered with `413 Payload Too Large`; a `Content-Length` over the limit is rejected before reading anything.
+
+Request framing is strict, as a lenient parser could read a request differently than a proxy in front of it (request smuggling). These requests are answered with `400` and the connection is closed:
+
+- `Content-Length` that is not a plain number (`12abc`, `-1`, ` 5`, too large), or repeated with different values.
+- `Transfer-Encoding` other than exactly `chunked` (e.g. `gzip, chunked`, `chunked, chunked`, or repeated), or together with `Content-Length`.
+- Malformed chunked bodies: chunk sizes that are not hexadecimal, empty or overflowing; missing CRLF after a chunk size or its data; bare LF line endings; chunk extensions or trailer sections that are too long. Chunk extensions and trailer fields are accepted and ignored.
+
 ### Coroutine Handlers
 
 Handlers can be coroutines that `co_await` other work (database queries, HTTP calls, timers). Declaring the JSON body in the signature makes the server read it, parse it and validate it against the route schema before the handler runs; invalid JSON or a body that does not match the schema is answered with `400` and the handler is not called:
@@ -238,7 +252,8 @@ server.post("/upload", [](http::request& req, http::response& res) -> thinger::a
 Reads never go past the end of the body. Whatever the handler leaves unread is discarded after it returns, so it is never parsed as the next request on a keep-alive connection; if it exceeds `set_max_body_size()`, the connection is closed instead.
 
 - Do not read the body straight from `req.get_socket()`: use `read()`/`read_some()`, or take over the connection (below).
-- `co_await req.read_body()` loads the remaining body into `req.body()`. Do not mix it with `read()`/`read_some()` on the same request: the stored body would miss the part already read (and fail to decompress if the request is compressed).
+- `co_await req.read_body()` loads the remaining body into `req.body()`, up to `set_max_body_size()` (it fails without reading a larger `Content-Length` body). Do not mix it with `read()`/`read_some()` on the same request: the stored body would miss the part already read (and fail to decompress if the request is compressed).
+- `read()`/`read_some()` return 0 at the end of the body, and also if reading it fails: `req.get_body_error()` tells why (`too_large`, `malformed` framing, `incomplete` if the connection ended first, or `bad_encoding`). A request whose body fails is answered with `400` (`413` if too large) unless the handler responded, and its connection is closed.
 
 ### Taking Over the Connection
 
@@ -341,6 +356,8 @@ server.post("/api/status", [](nlohmann::json& json, auto& res) {
 
 Invalid bodies get `400` with the body `{"error": {"message": "...", "context": [...]}}`, where `context` is the location of the invalid value; the format can be changed with an [error formatter](#error-format).
 
+A schema that cannot be parsed (e.g. a `$ref` to a schema component not registered before the route) is logged as an error when it is set, and the route then answers every request with `500` instead of accepting bodies without validation.
+
 Valijson is enabled by default. Disable with `-DTHINGER_HTTP_ENABLE_VALIJSON=OFF`.
 
 ### Middleware
@@ -418,7 +435,7 @@ devices.get("/:device", get_device).meta("permission", "Device:Read");
 devices.group("/:device/resources").tag("Resources").get("/:resource", get_resource);
 ```
 
-All routes, with their documentation and metadata, are available from `server.router().get_routes()`. See `examples/http_server/route_metadata_example.cpp`.
+All routes, with their documentation and metadata, are available from `server.router().get_routes()`. Registered routes are never moved, so the `route&` returned by a registration method stays valid while more routes are added. See `examples/http_server/route_metadata_example.cpp`.
 
 ### OpenAPI
 
@@ -507,7 +524,7 @@ For HTTPS, the certificate is chosen per domain before any request is read, thro
 
 ### Error Format
 
-Errors sent with `res.error(status, message)`, and the ones the server generates itself (`400` for invalid JSON and schema validation, `401` of basic auth, `404`/`405`, `413`, `500` from middlewares and handlers, and `501`/`504` of in-memory dispatch) go through an error formatter. By default the message is sent as `text/plain`, and errors with details (schema validation) as JSON `{"error": {"message": ..., "context": [...]}}`. A formatter changes it for all of them:
+Errors sent with `res.error(status, message)`, and the ones the server generates itself (`400` for invalid JSON, schema validation and invalid request framing or bodies, `401` of basic auth, `404`/`405`, `413`, `500` from middlewares, handlers and invalid route schemas, and `501`/`504` of in-memory dispatch) go through an error formatter. By default the message is sent as `text/plain`, and errors with details (schema validation) as JSON `{"error": {"message": ..., "context": [...]}}`. A formatter changes it for all of them:
 
 ```cpp
 server.set_error_formatter([](const http::http_error& error, http::http_response& response) {
