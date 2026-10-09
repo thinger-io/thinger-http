@@ -53,12 +53,12 @@ namespace {
         return post_headers("Transfer-Encoding: chunked\r\n") + chunked_body;
     }
 
-    // The request is answered with a single 400, the connection is closed, and nothing
-    // sent after it is run as another request
-    void require_rejected(framing_server& fixture, const std::string& request) {
+    // The request is answered with a single 400 (or `status`), the connection is closed,
+    // and nothing sent after it is run as another request
+    void require_rejected(framing_server& fixture, const std::string& request, const std::string& status = "400") {
         auto result = raw_exchange(fixture.port, request + smuggled_request);
         INFO("response: " << result.data);
-        REQUIRE(result.data.starts_with("HTTP/1.1 400"));
+        REQUIRE(result.data.starts_with("HTTP/1.1 " + status));
         REQUIRE(count(result.data, "HTTP/1.1 ") == 1);
         REQUIRE(result.closed);
         REQUIRE(fixture.smuggled == 0);
@@ -297,5 +297,52 @@ TEST_CASE("Folded header lines (obs-fold) are rejected", "[server][framing][smug
     }
     SECTION("Whitespace before the first header") {
         require_rejected(fixture, "GET /health HTTP/1.1\r\n Host: localhost\r\n\r\n");
+    }
+}
+
+namespace {
+    // GET /health with `count` headers in all (Host included)
+    std::string request_with_headers(int count) {
+        std::string request = "GET /health HTTP/1.1\r\nHost: localhost\r\n";
+        for (int i = 1; i < count; i++) request += "X-Header-" + std::to_string(i) + ": value\r\n";
+        return request + "\r\n";
+    }
+
+    // GET /health whose request line and headers take `size` bytes
+    std::string request_of_size(size_t size) {
+        std::string head = "GET /health HTTP/1.1\r\nHost: localhost\r\nX-Big: ";
+        std::string tail = "\r\n\r\n";
+        return head + std::string(size - head.size() - tail.size(), 'a') + tail;
+    }
+}
+
+TEST_CASE("Request header section limits", "[server][framing][limits][integration]") {
+    framing_server fixture;
+    fixture.start();
+
+    SECTION("100 header lines are accepted") {
+        auto result = raw_exchange(fixture.port, request_with_headers(100) + health_close_request);
+        INFO("response: " << result.data);
+        REQUIRE(count(result.data, "HTTP/1.1 200") == 2);
+    }
+    SECTION("More than 100 header lines are rejected with 431") {
+        require_rejected(fixture, request_with_headers(101), "431");
+    }
+    SECTION("Many repeated Content-Length headers are rejected with 431") {
+        std::string request = post_headers("");
+        request.resize(request.size() - 2);
+        for (int i = 0; i < 150; i++) request += "Content-Length: 5\r\n";
+        require_rejected(fixture, request + "\r\nhello", "431");
+    }
+    SECTION("A 16 KB header section is accepted") {
+        auto result = raw_exchange(fixture.port, request_of_size(16 * 1024) + health_close_request);
+        INFO("response: " << result.data.substr(0, 200));
+        REQUIRE(count(result.data, "HTTP/1.1 200") == 2);
+    }
+    SECTION("A header section over 16 KB is rejected with 431") {
+        require_rejected(fixture, request_of_size(16 * 1024 + 1), "431");
+    }
+    SECTION("A request line over 16 KB is rejected with 431") {
+        require_rejected(fixture, "GET /health?q=" + std::string(16 * 1024, 'a') + " HTTP/1.1\r\nHost: localhost\r\n\r\n", "431");
     }
 }

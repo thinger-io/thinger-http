@@ -397,7 +397,7 @@ namespace thinger::http {
             // detect chunked transfer encoding: it must be the only coding, in a single header,
             // as no other is supported (and the body could not be framed safely)
             if(boost::iequals(key, http::header::transfer_encoding)){
-                if(boost::iequals(value, "chunked") && !has_header(http::header::transfer_encoding)){
+                if(boost::iequals(value, "chunked") && !has_transfer_encoding_header()){
                     chunked_transfer_ = true;
                 }else{
                     invalid_transfer_encoding_ = true;

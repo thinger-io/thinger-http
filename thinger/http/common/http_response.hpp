@@ -35,6 +35,7 @@ public:
         timed_out = 408,
         conflict = 409,
         payload_too_large = 413,
+        request_header_fields_too_large = 431,
         upgrade_required = 426,
         too_many_requests = 429,
         internal_server_error = 500,

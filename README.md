@@ -212,6 +212,8 @@ Request framing is strict, as a lenient parser could read a request differently 
 - `Transfer-Encoding` other than exactly `chunked` (e.g. `gzip, chunked`, `chunked, chunked`, or repeated), or together with `Content-Length`.
 - Malformed chunked bodies: chunk sizes that are not hexadecimal, empty or overflowing; missing CRLF after a chunk size or its data; bare LF line endings; chunk extensions or trailer sections that are too long. Chunk extensions and trailer fields are accepted and ignored.
 
+The request line and headers are limited to 16 KB and 100 header lines: larger requests are answered with `431 Request Header Fields Too Large` and the connection is closed.
+
 ### Coroutine Handlers
 
 Handlers can be coroutines that `co_await` other work (database queries, HTTP calls, timers). Declaring the JSON body in the signature makes the server read it, parse it and validate it against the route schema before the handler runs; invalid JSON or a body that does not match the schema is answered with `400` and the handler is not called:

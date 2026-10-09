@@ -10,6 +10,10 @@ namespace thinger::http {
     }
 
     boost::tribool request_factory::consume(char input) {
+        // bound the request line and headers, as they are buffered whole
+        if (state_ != content && ++header_section_size_ > max_header_section_size) {
+            return header_section_exceeded();
+        }
         switch (state_) {
             case method_start:
                 if (!is_char(input) || is_ctl(input) || is_tspecial(input)) {
@@ -148,6 +152,9 @@ namespace thinger::http {
                     return false;
                 }
                 else {
+                    if (++header_lines_ > max_header_lines) {
+                        return header_section_exceeded();
+                    }
                     tempString1_.clear();
                     tempString1_.push_back(input);
                     state_ = header_name;
@@ -256,6 +263,9 @@ namespace thinger::http {
         state_ =  method_start;
         tempString1_.clear();
         tempString2_.clear();
+        header_lines_ = 0;
+        header_section_size_ = 0;
+        header_section_too_large_ = false;
         return request;
     }
 

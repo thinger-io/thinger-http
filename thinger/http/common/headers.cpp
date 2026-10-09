@@ -37,18 +37,36 @@ namespace thinger::http{
             if (ec != std::errc{} || ptr != value.data() + value.size()) {
                 invalid_content_length_ = true;
                 length = 0;
-            } else if (has_header(header::content_length) && length != content_length_) {
+            } else if (content_length_header_ && length != content_length_) {
                 invalid_content_length_ = true;
             }
             content_length_ = length;
         }
 
+        on_header_added(key);
         headers_.emplace_back(std::move(key), std::move(value));
     }
 
     void headers::add_header(std::string key, std::string value){
         if(key.empty()) return;
+        on_header_added(key);
         headers_.emplace_back(std::move(key), std::move(value));
+    }
+
+    void headers::on_header_added(std::string_view key){
+        if(is_header(key, header::content_length)){
+            content_length_header_ = true;
+        }else if(is_header(key, header::transfer_encoding)){
+            transfer_encoding_header_ = true;
+        }
+    }
+
+    void headers::on_header_removed(std::string_view key){
+        if(is_header(key, header::content_length)){
+            content_length_header_ = has_header(header::content_length);
+        }else if(is_header(key, header::transfer_encoding)){
+            transfer_encoding_header_ = has_header(header::transfer_encoding);
+        }
     }
 
     void headers::add_proxy(std::string key, std::string value){
@@ -132,6 +150,7 @@ namespace thinger::http{
         for(auto it=headers_.begin(); it!=headers_.end(); ++it){
             if(is_header(it->first, key)){
                 headers_.erase(it);
+                on_header_removed(key);
                 return true;
             }
         }

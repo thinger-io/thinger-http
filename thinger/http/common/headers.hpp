@@ -91,6 +91,10 @@ public:
     size_t get_content_length() const;
     // Whether a Content-Length header was not a valid number, or repeated with different values
     bool has_invalid_content_length() const { return invalid_content_length_; }
+    // Whether there is a Content-Length / Transfer-Encoding header (tracked as headers are added
+    // and removed, so checking it for every parsed header is not a scan of all the headers)
+    bool has_content_length_header() const { return content_length_header_; }
+    bool has_transfer_encoding_header() const { return transfer_encoding_header_; }
     int get_http_version_major() const;
     int get_http_version_minor() const;
     bool keep_alive() const;
@@ -104,6 +108,10 @@ public:
     virtual void process_header(std::string key, std::string value);
 
 protected:
+    // Keep track of the framing headers present, after adding or removing a `key` header
+    void on_header_added(std::string_view key);
+    void on_header_removed(std::string_view key);
+
     std::vector<http_header> headers_;
     std::vector<http_header> proxy_headers_;
     boost::tribool keep_alive_    = boost::indeterminate;
@@ -111,6 +119,8 @@ protected:
     bool stream_                  = false;
     size_t content_length_        = 0;
     bool invalid_content_length_  = false;
+    bool content_length_header_   = false;
+    bool transfer_encoding_header_ = false;
     uint8_t http_version_major_   = 1;
     uint8_t http_version_minor_   = 1;
 };

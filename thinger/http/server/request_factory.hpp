@@ -13,6 +13,11 @@ namespace thinger::http {
     /// Parser for incoming requests.
     class request_factory {
     public:
+        /// Limits of the header section (request line and header fields): a request over
+        /// them fails to parse, with header_section_too_large() set
+        static constexpr size_t max_header_lines = 100;
+        static constexpr size_t max_header_section_size = 16 * 1024;
+
         /// Construct ready to parse the http_request method.
         request_factory();
 
@@ -38,6 +43,11 @@ namespace thinger::http {
 
         bool get_headers_only() const {
             return headers_only_;
+        }
+
+        /// Whether the last parse failed for exceeding the header section limits
+        bool header_section_too_large() const {
+            return header_section_too_large_;
         }
 
         std::shared_ptr<http_request> consume_request();
@@ -83,6 +93,15 @@ namespace thinger::http {
         std::string tempString2_;
         size_t tempInt_;
         bool headers_only_ = false;
+        size_t header_lines_ = 0;
+        size_t header_section_size_ = 0;
+        bool header_section_too_large_ = false;
+
+        /// Fail the parsing for exceeding the header section limits
+        bool header_section_exceeded() {
+            header_section_too_large_ = true;
+            return false;
+        }
 
         /// The current state of the parser.
         enum state {

@@ -1,6 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <thinger/http.hpp>
 #include <sstream>
+#include <chrono>
+#include <memory>
 
 TEST_CASE("HTTP Headers operations", "[http][headers]") {
     // Use http_request as a concrete implementation of http_headers
@@ -331,4 +333,114 @@ TEST_CASE("Headers log does not crash", "[http][headers]") {
     h.add_header("Host", "example.com");
     h.add_proxy("X-Forwarded-For", "10.0.0.1");
     REQUIRE_NOTHROW(h.log("test", 0));
+}
+// ============================================================================
+// Body framing headers (Content-Length / Transfer-Encoding)
+// ============================================================================
+
+TEST_CASE("Headers framing decisions on repeated headers", "[http][headers][framing]") {
+    using thinger::http::http_request;
+
+    SECTION("Content-Length repeated with the same value is valid") {
+        http_request h;
+        h.process_header("Content-Length", "5");
+        h.process_header("Content-Length", "5");
+        REQUIRE_FALSE(h.has_invalid_content_length());
+        REQUIRE(h.has_valid_framing());
+        REQUIRE(h.get_content_length() == 5);
+    }
+
+    SECTION("Content-Length repeated with a different value is invalid") {
+        http_request h;
+        h.process_header("Content-Length", "5");
+        h.process_header("Content-Length", "6");
+        REQUIRE(h.has_invalid_content_length());
+        REQUIRE_FALSE(h.has_valid_framing());
+    }
+
+    SECTION("Invalid Content-Length followed by a valid one stays invalid") {
+        http_request h;
+        h.process_header("Content-Length", "abc");
+        h.process_header("Content-Length", "5");
+        REQUIRE(h.has_invalid_content_length());
+    }
+
+    SECTION("Content-Length added before a parsed one with another value is invalid") {
+        http_request h;
+        h.add_header("Content-Length", "5");
+        h.process_header("Content-Length", "7");
+        REQUIRE(h.has_invalid_content_length());
+    }
+
+    SECTION("Content-Length parsed again after removing the previous one") {
+        http_request h;
+        h.process_header("Content-Length", "5");
+        REQUIRE(h.remove_header("Content-Length"));
+        h.process_header("Content-Length", "7");
+        REQUIRE_FALSE(h.has_invalid_content_length());
+        REQUIRE(h.get_content_length() == 7);
+    }
+
+    SECTION("Single Transfer-Encoding: chunked is valid") {
+        http_request h;
+        h.process_header("Transfer-Encoding", "chunked");
+        REQUIRE(h.is_chunked_transfer());
+        REQUIRE(h.has_valid_framing());
+    }
+
+    SECTION("Repeated Transfer-Encoding is invalid") {
+        http_request h;
+        h.process_header("Transfer-Encoding", "chunked");
+        h.process_header("transfer-encoding", "chunked");
+        REQUIRE_FALSE(h.has_valid_framing());
+    }
+
+    SECTION("Transfer-Encoding set before a parsed one is invalid") {
+        http_request h;
+        h.set_header("Transfer-Encoding", "chunked");
+        h.process_header("Transfer-Encoding", "chunked");
+        REQUIRE_FALSE(h.has_valid_framing());
+    }
+
+    SECTION("Content-Length together with Transfer-Encoding is invalid, in any order") {
+        http_request a;
+        a.process_header("Content-Length", "5");
+        a.process_header("Transfer-Encoding", "chunked");
+        REQUIRE_FALSE(a.has_valid_framing());
+
+        http_request b;
+        b.process_header("Transfer-Encoding", "chunked");
+        b.process_header("Content-Length", "5");
+        REQUIRE_FALSE(b.has_valid_framing());
+    }
+}
+
+TEST_CASE("Repeated framing headers are processed in linear time", "[http][headers][framing]") {
+    using thinger::http::http_request;
+    // Other headers first: each repeated header used to scan all of them
+    constexpr int repetitions = 20000;
+    auto with_filler = []() {
+        auto h = std::make_unique<http_request>();
+        for (int i = 0; i < repetitions; i++) h->process_header("X-Filler", "value");
+        return h;
+    };
+
+    SECTION("Content-Length") {
+        auto h = with_filler();
+        auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < repetitions; i++) h->process_header("Content-Length", "5");
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        REQUIRE(elapsed < std::chrono::seconds(2));
+        REQUIRE(h->has_valid_framing());
+        REQUIRE(h->get_content_length() == 5);
+    }
+
+    SECTION("Transfer-Encoding") {
+        auto h = with_filler();
+        auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < repetitions; i++) h->process_header("Transfer-Encoding", "chunked");
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        REQUIRE(elapsed < std::chrono::seconds(2));
+        REQUIRE_FALSE(h->has_valid_framing());
+    }
 }

@@ -135,14 +135,20 @@ awaitable<void> server_connection::read_loop() {
                 break;
             }
         } else if (!result) {
-            // Bad request
-            LOG_ERROR("invalid http request");
+            // Bad request, or a header section over the limits
+            auto status = http_response::status::bad_request;
+            if (request_parser_.header_section_too_large()) {
+                LOG_ERROR("http request header section too large");
+                status = http_response::status::request_header_fields_too_large;
+            } else {
+                LOG_ERROR("invalid http request");
+            }
             auto stream = std::make_shared<http_stream>(++request_id_, false);
             {
                 std::lock_guard<std::mutex> lock(queue_mutex_);
                 request_queue_.push(stream);
             }
-            handle_stock_error(stream, http_response::status::bad_request);
+            handle_stock_error(stream, status);
             break;
         } else {
             // Indeterminate — all data consumed by parser, need more

@@ -2,6 +2,8 @@
 #include <thinger/http/server/request_factory.hpp>
 #include <thinger/http/common/http_request.hpp>
 #include <cstring>
+#include <chrono>
+#include <string>
 
 using namespace thinger::http;
 
@@ -148,4 +150,55 @@ TEST_CASE("Request factory rejects folded header lines (obs-fold)", "[request_fa
     REQUIRE(!parse("GET / HTTP/1.1\r\nTransfer-Encodin: chunked\r\n g\r\n\r\n"));
     REQUIRE(!parse("GET / HTTP/1.1\r\nHost: localhost\r\nX-A: 1\r\n\t2\r\n\r\n"));
     REQUIRE(!parse("GET / HTTP/1.1\r\n Host: localhost\r\n\r\n"));
+}
+
+namespace {
+    boost::tribool parse_headers(request_factory& parser, const std::string& raw) {
+        parser.set_headers_only(true);
+        auto* it = reinterpret_cast<const uint8_t*>(raw.data());
+        auto* end = it + raw.size();
+        return parser.parse(it, end);
+    }
+
+    std::string request_with_headers(int count) {
+        std::string raw = "GET / HTTP/1.1\r\nHost: localhost\r\n";
+        for (int i = 1; i < count; i++) raw += "X-Header-" + std::to_string(i) + ": value\r\n";
+        return raw + "\r\n";
+    }
+
+    // Request line and headers taking exactly `size` bytes
+    std::string request_of_size(size_t size) {
+        std::string head = "GET / HTTP/1.1\r\nX-Big: ";
+        std::string tail = "\r\n\r\n";
+        return head + std::string(size - head.size() - tail.size(), 'a') + tail;
+    }
+}
+
+TEST_CASE("Request factory limits the number of header lines", "[request_factory][unit]") {
+    request_factory accepted;
+    REQUIRE(bool(parse_headers(accepted, request_with_headers(100))));
+
+    request_factory rejected;
+    REQUIRE(!parse_headers(rejected, request_with_headers(101)));
+}
+
+TEST_CASE("Request factory limits the size of the header section", "[request_factory][unit]") {
+    request_factory accepted;
+    REQUIRE(bool(parse_headers(accepted, request_of_size(16 * 1024))));
+
+    request_factory rejected;
+    REQUIRE(!parse_headers(rejected, request_of_size(16 * 1024 + 1)));
+}
+
+TEST_CASE("Request factory rejects many repeated Content-Length headers quickly", "[request_factory][unit]") {
+    std::string raw = "POST / HTTP/1.1\r\nHost: localhost\r\n";
+    for (int i = 0; i < 20000; i++) raw += "Content-Length: 5\r\n";
+    raw += "\r\nhello";
+
+    request_factory parser;
+    auto start = std::chrono::steady_clock::now();
+    auto result = parse_headers(parser, raw);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    REQUIRE(!result);
+    REQUIRE(elapsed < std::chrono::seconds(2));
 }

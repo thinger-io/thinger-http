@@ -135,7 +135,7 @@ public:
     // otherwise, and close the connection, as it cannot tell where the next request starts.
     bool has_valid_framing() const {
         return !has_invalid_content_length() && !invalid_transfer_encoding_
-            && !(chunked_transfer_ && has_header(http::header::content_length));
+            && !(chunked_transfer_ && has_content_length_header());
     }
 
     // other
