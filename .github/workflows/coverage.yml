@@ -15,6 +15,13 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+# Authenticate dependency downloads (CMake FetchContent clones) with the job token:
+# anonymous clones hit GitHub rate limits when several jobs run at once
+env:
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: url.https://x-access-token:${{ github.token }}@github.com/.insteadOf
+  GIT_CONFIG_VALUE_0: https://github.com/
+
 jobs:
   coverage:
     runs-on: self-hosted
