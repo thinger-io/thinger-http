@@ -274,13 +274,18 @@ route& route::schema(const nlohmann::json& json_schema) {
         root["components"]["schemas"] = *schema_components_;
     }
     schema_ = std::make_shared<valijson::Schema>();
+    schema_error_.clear();
     valijson::SchemaParser parser;
     valijson::adapters::NlohmannJsonAdapter adapter(root);
     try {
         parser.populateSchema(adapter, *schema_);
     } catch (const std::exception& e) {
-        LOG_ERROR("Failed to parse JSON Schema: {}", e.what());
+        // Fail closed: requests to the route are rejected rather than accepted unvalidated
+        schema_error_ = e.what();
         schema_.reset();
+        LOG_ERROR("Invalid JSON Schema for route {}: {}. Its requests will be rejected with 500 "
+                  "(are the schema components it references registered before the route?)",
+                  pattern_, schema_error_);
     }
 #else
     LOG_WARNING("JSON Schema validation requested but Valijson is not enabled");
@@ -290,6 +295,11 @@ route& route::schema(const nlohmann::json& json_schema) {
 
 #ifdef THINGER_HTTP_VALIJSON_ENABLED
 bool route::validate_json(const nlohmann::json& json, response& res) const {
+    if (!schema_error_.empty()) {
+        LOG_ERROR("Rejecting request to route {}: its JSON Schema is invalid ({})", pattern_, schema_error_);
+        res.error(http_response::status::internal_server_error, "Invalid route schema");
+        return false;
+    }
     if (!schema_) return true;
 
     valijson::Validator validator;

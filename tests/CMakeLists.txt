@@ -210,6 +210,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/handler_exceptions_test.cpp)
     add_thinger_test(test_integration_handler_exceptions integration/handler_exceptions_test.cpp)
 endif()
 
+# Integration tests - Route hardening (schemas, coroutine handlers, route storage, responses)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/route_hardening_test.cpp)
+    add_thinger_test(test_integration_route_hardening integration/route_hardening_test.cpp)
+endif()
 
 # ==================== ALL TESTS RUNNER ====================
 

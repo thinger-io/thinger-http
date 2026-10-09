@@ -135,7 +135,8 @@ public:
     route& deferred_body(bool enabled = true);
     bool is_deferred_body() const { return deferred_body_ && !takes_json_body(); }
 
-    // Set JSON Schema for request body validation
+    // Set JSON Schema for request body validation. If it cannot be parsed (e.g. a $ref to
+    // a schema component not registered yet), requests to the route are answered with 500.
     route& schema(const nlohmann::json& json_schema);
 
     // --- API documentation (read by tools such as OpenAPI generators) ---
@@ -234,6 +235,7 @@ private:
 
 #ifdef THINGER_HTTP_VALIJSON_ENABLED
     std::shared_ptr<valijson::Schema> schema_;
+    std::string schema_error_;  // why the schema could not be parsed (requests are rejected)
 
     bool validate_json(const nlohmann::json& json, response& res) const;
 #endif
