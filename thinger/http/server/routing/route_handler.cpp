@@ -43,8 +43,7 @@ void route_handler::send_error_response(std::shared_ptr<request> req, http_respo
     
     if (connection && stream && http_request) {
         response res(connection, stream, http_request, cors_enabled_);
-        res.status(status);
-        res.send("");
+        res.error(status);
     }
 }
 
@@ -106,8 +105,7 @@ void route_handler::handle_unmatched(std::shared_ptr<request> req, response& res
     const auto& request_method = req->get_http_request()->get_method();
     auto status = routes_.contains(request_method) ? http_response::status::not_found
                                                    : http_response::status::not_allowed;
-    res.status(status);
-    res.send("");
+    res.error(status);
 }
 
 bool route_handler::handle_request(std::shared_ptr<request> request) {

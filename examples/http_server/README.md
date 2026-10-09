@@ -130,6 +130,23 @@ Graceful server shutdown handling.
 ./server_shutdown_example [port]
 ```
 
+### virtual_hosts_example
+
+Several sites on one listener, chosen by the `Host` header: an API host with its own OpenAPI document, a static site, dynamic device subdomains (`*.devices.localhost`) and the default host. Also shows a JSON error format and the client IP behind a trusted local proxy.
+
+```bash
+./virtual_hosts_example [static_dir]
+curl -H "Host: api.localhost" localhost:8095/v1/status
+curl -H "Host: sensor1.devices.localhost" localhost:8095/some/path
+```
+
+```cpp
+server.host("api.example.com").get("/v1/status", handler);
+server.host("*.devices.example.com").get("/:path(.*)", [](http::request& req, http::response& res) {
+    auto device = req.get_host_matches()[1];
+});
+```
+
 ### advanced_http_server
 
 Complete example with multiple features.
@@ -167,7 +184,8 @@ void handler(http::request& req, http::response& res) {
     req.header("name");     // Request header
     req.body();             // Request body
     req.json();             // Parse body as JSON
-    req.get_request_ip();   // Client IP
+    req.get_request_ip();   // Client IP (forwarded by a trusted proxy, if any)
+    req.get_peer_ip();      // IP of the direct peer
 }
 ```
 

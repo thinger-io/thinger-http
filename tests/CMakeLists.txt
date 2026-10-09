@@ -57,6 +57,14 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/openapi_test.cpp)
     add_thinger_test(test_openapi unit/http/server/openapi_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/virtual_host_test.cpp)
+    add_thinger_test(test_virtual_host unit/http/server/virtual_host_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/trusted_proxies_test.cpp)
+    add_thinger_test(test_trusted_proxies unit/http/server/trusted_proxies_test.cpp)
+endif()
+
 # Unit tests - HTTP Common
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/common/headers_test.cpp)
     add_thinger_test(test_headers unit/http/common/headers_test.cpp)
@@ -166,6 +174,21 @@ endif()
 # Integration tests - Schema validation
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/schema_validation_test.cpp)
     add_thinger_test(test_integration_schema_validation integration/schema_validation_test.cpp)
+endif()
+
+# Integration tests - Virtual hosts
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/virtual_host_test.cpp)
+    add_thinger_test(test_integration_virtual_host integration/virtual_host_test.cpp)
+endif()
+
+# Integration tests - Error format
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/error_format_test.cpp)
+    add_thinger_test(test_integration_error_format integration/error_format_test.cpp)
+endif()
+
+# Integration tests - Trusted proxies
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/trusted_proxies_test.cpp)
+    add_thinger_test(test_integration_trusted_proxies integration/trusted_proxies_test.cpp)
 endif()
 
 # ==================== ALL TESTS RUNNER ====================

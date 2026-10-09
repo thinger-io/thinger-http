@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "request.hpp"
+#include "trusted_proxies.hpp"
 #include "routing/route.hpp"
 
 namespace thinger::http{
@@ -114,10 +115,16 @@ namespace thinger::http{
         return str.str();
     }
 
-    std::string request::get_request_ip() const{
-        if (!request_ip_.empty()) return request_ip_;
+    std::string request::get_peer_ip() const{
+        if (!peer_ip_.empty()) return peer_ip_;
         auto http_connection = http_connection_.lock();
         return http_connection ? http_connection->get_socket()->get_remote_ip() : "";
+    }
+
+    std::string request::get_request_ip() const{
+        auto peer = get_peer_ip();
+        if (!trusted_proxies_ || trusted_proxies_->empty() || !http_request_) return peer;
+        return trusted_proxies_->client_ip(peer, http_request_->get_headers_with_key(trusted_proxies_->header_name()));
     }
 
     /*

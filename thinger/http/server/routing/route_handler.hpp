@@ -24,7 +24,7 @@ public:
     // Find the matching route for a request (without executing the handler)
     const route* find_route(std::shared_ptr<request> req);
 
-    // Handle an unmatched request (404/fallback)
+    // Handle an unmatched request (404/fallback), in the default error format
     void handle_unmatched(std::shared_ptr<request> req);
 
     // Same, answering through an existing response (e.g. one shared with middlewares)

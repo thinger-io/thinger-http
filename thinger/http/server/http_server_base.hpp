@@ -3,6 +3,9 @@
 
 #include "routing/route_handler.hpp"
 #include "routing/route.hpp"
+#include "virtual_host.hpp"
+#include "error_format.hpp"
+#include "trusted_proxies.hpp"
 #include "openapi.hpp"
 #include "http_stream.hpp"
 #include "../../asio/socket_server.hpp"
@@ -13,18 +16,20 @@
 #include <string>
 #include <functional>
 #include <chrono>
+#include <map>
+#include <vector>
 
 namespace thinger::http {
 
 // Forward declarations
 class request;
 class response;
-class route_group;
 
 // Options for requests dispatched in memory (see http_server_base::dispatch)
 struct dispatch_options {
-    // Client IP reported by request::get_request_ip() (empty by default: never assume a
-    // trusted address such as 127.0.0.1 for internal calls)
+    // Address of the peer, reported by request::get_peer_ip() and, unless it is a trusted
+    // proxy (see set_trusted_proxies), by request::get_request_ip(). Empty by default:
+    // never assume a trusted address such as 127.0.0.1 for internal calls.
     std::string remote_ip;
 
     // Maximum time to wait for the response, handler execution included; 504 Gateway
@@ -44,9 +49,10 @@ using async_middleware_function = std::function<thinger::awaitable<bool>(request
 // respond through the response to stop it. next() must not be called asynchronously.
 using middleware_function = std::function<void(request&, response&, std::function<void()>)>;
 
-class http_server_base {
+// The server is the default virtual host: the routes registered on it (see virtual_host
+// for the registration methods) answer every host without a virtual host of its own.
+class http_server_base : public virtual_host {
 protected:
-    route_handler router_;
     openapi_generator openapi_{router_};
     std::unique_ptr<asio::socket_server_base> socket_server_;
     std::vector<async_middleware_function> middlewares_;
@@ -65,80 +71,34 @@ protected:
     
     // Listening attempts (-1 = infinite)
     int max_listening_attempts_ = -1;
+
+    // Virtual hosts by exact name, and by pattern (in registration order)
+    std::map<std::string, std::unique_ptr<virtual_host>> exact_hosts_;
+    std::vector<std::unique_ptr<virtual_host>> pattern_hosts_;
+
+    // Body of error responses (default format if null)
+    std::shared_ptr<const error_formatter> error_formatter_;
+
+    // Proxies allowed to report the client address (none if null)
+    std::shared_ptr<const trusted_proxies> trusted_proxies_;
     
 public:
     http_server_base() = default;
     virtual ~http_server_base() = default;
     
-    // Route registration methods - all return route& for chaining
-    route& get(const std::string& path, route_callback_response_only handler);
-    route& get(const std::string& path, route_callback_json_response handler);
-    route& get(const std::string& path, route_callback_request_response handler);
-    route& get(const std::string& path, route_callback_request_json_response handler);
-    
-    route& post(const std::string& path, route_callback_response_only handler);
-    route& post(const std::string& path, route_callback_json_response handler);
-    route& post(const std::string& path, route_callback_request_response handler);
-    route& post(const std::string& path, route_callback_request_json_response handler);
-    
-    route& put(const std::string& path, route_callback_response_only handler);
-    route& put(const std::string& path, route_callback_json_response handler);
-    route& put(const std::string& path, route_callback_request_response handler);
-    route& put(const std::string& path, route_callback_request_json_response handler);
-    
-    route& del(const std::string& path, route_callback_response_only handler);  // delete is keyword
-    route& del(const std::string& path, route_callback_json_response handler);
-    route& del(const std::string& path, route_callback_request_response handler);
-    route& del(const std::string& path, route_callback_request_json_response handler);
-    
-    route& patch(const std::string& path, route_callback_response_only handler);
-    route& patch(const std::string& path, route_callback_json_response handler);
-    route& patch(const std::string& path, route_callback_request_response handler);
-    route& patch(const std::string& path, route_callback_request_json_response handler);
-    
-    route& head(const std::string& path, route_callback_response_only handler);
-    route& head(const std::string& path, route_callback_request_response handler);
-    
-    route& options(const std::string& path, route_callback_response_only handler);
-    route& options(const std::string& path, route_callback_request_response handler);
+    // Virtual hosts: the routes registered on the server itself answer any host, unless
+    // the Host header (case-insensitive, port ignored) matches a host registered here:
+    // exact names first, then patterns in registration order. Register before listen().
+    // name: exact ("api.example.com"), "*" (this default host), or a pattern where "*" is
+    // one label and ":name" a label available as a request parameter (see virtual_host)
+    virtual_host& host(const std::string& name);
 
-    // Coroutine route registration. See coroutine_handler (route.hpp) for the signatures:
-    // handlers taking a JSON body get it read, parsed and validated first; (request&, response&)
-    // handlers read the body themselves unless deferred_body(false) is set on the route.
-    // Templates avoid ambiguity with the std::function<void(...)> overloads above.
-    template<coroutine_handler F>
-    route& get(const std::string& path, F&& handler) {
-        return router_[method::GET][path] = std::forward<F>(handler);
-    }
+    // Host matched by a regular expression on the whole host name (case-insensitive);
+    // its capture groups are available through request::get_host_matches()
+    virtual_host& host_regex(const std::string& pattern);
 
-    template<coroutine_handler F>
-    route& post(const std::string& path, F&& handler) {
-        return router_[method::POST][path] = std::forward<F>(handler);
-    }
-
-    template<coroutine_handler F>
-    route& put(const std::string& path, F&& handler) {
-        return router_[method::PUT][path] = std::forward<F>(handler);
-    }
-
-    template<coroutine_handler F>
-    route& del(const std::string& path, F&& handler) {
-        return router_[method::DELETE][path] = std::forward<F>(handler);
-    }
-
-    template<coroutine_handler F>
-    route& patch(const std::string& path, F&& handler) {
-        return router_[method::PATCH][path] = std::forward<F>(handler);
-    }
-
-    // Group of routes sharing a path prefix, tags and metadata (see route_group)
-    route_group group(const std::string& prefix);
-
-    // Shared JSON schema (OpenAPI component) that route schemas can reference with
-    // {"$ref": "#/components/schemas/<name>"}. Register it before the routes using it.
-    void schema_component(const std::string& name, nlohmann::json schema);
-
-    // OpenAPI document generated from the routes (configure title, hooks... here)
+    // OpenAPI document generated from the routes of the default host (configure title,
+    // hooks... here). For another host: openapi_generator(server.host(name).router()).
     openapi_generator& openapi() { return openapi_; }
 
     // Serve the OpenAPI document as JSON at `path` (not served unless called)
@@ -181,21 +141,27 @@ public:
                        const std::string& realm,
                        const std::map<std::string, std::string>& users);
     
-    // Fallback handler
-    void set_not_found_handler(route_callback_response_only handler);
-    void set_not_found_handler(route_callback_request_response handler);
-    
     // Configuration
     void enable_cors(bool enabled = true);
     void enable_ssl(bool enabled = true);
     void set_connection_timeout(std::chrono::seconds timeout);
     void set_max_body_size(size_t size);
     void set_max_listening_attempts(int attempts);
-    
-    // Static file serving
-    void serve_static(const std::string& url_prefix,
-                     const std::string& directory,
-                     const std::string& fallback = "index.html");
+
+    // Format of the error responses: those sent with response::error() and the ones the
+    // server generates (400 invalid JSON or schema validation, 404, 405, 413, 500...).
+    // By default the message is sent as text/plain, and errors with details (schema
+    // validation) as JSON {"error": {"message": ..., "context": [...]}}. Set it before
+    // listen(); it may be called concurrently from the worker threads.
+    void set_error_formatter(error_formatter formatter);
+
+    // Proxies (IPs or CIDR ranges: "10.0.0.1", "10.0.0.0/8", "fd00::/8") whose forwarding
+    // header gives the client address reported by request::get_request_ip(). The header
+    // is ignored for any other peer, so only list proxies that overwrite or append to it.
+    // None by default; set before listen(). Returns false if an entry is invalid (then no
+    // proxy is trusted).
+    bool set_trusted_proxies(const std::vector<std::string>& proxies,
+                             forwarded_header header = forwarded_header::x_forwarded_for);
     
     // Server control
     virtual bool listen(const std::string& host, uint16_t port);
@@ -219,10 +185,6 @@ public:
     // Get the port assigned by the OS after listen()
     uint16_t local_port() const;
     
-    // Access to router for advanced use cases
-    route_handler& router() { return router_; }
-    const route_handler& router() const { return router_; }
-    
     // Abstract methods that derived classes must implement
     virtual void wait() = 0;
     
@@ -237,77 +199,12 @@ protected:
     
 private:
     void setup_connection_handler();
+    virtual_host& resolve_host(request& req);
+    std::shared_ptr<http_response> make_error_response(http_response::status status, const std::string& message) const;
     awaitable<void> process_request(std::shared_ptr<request> req, response& res);
     awaitable<bool> run_middlewares(request& req, response& res);
     awaitable<void> discard_unread_body(request& req);
 };
-
-// Routes registered through a group get its path prefix, and inherit its tags and
-// metadata (a route can still override a metadata key with its own meta()).
-class route_group {
-public:
-    route_group(http_server_base& server, std::string prefix)
-        : server_(server), prefix_(std::move(prefix)) {}
-
-    route_group& tag(const std::string& name) {
-        tags_.push_back(name);
-        return *this;
-    }
-
-    route_group& meta(const std::string& key, nlohmann::json value) {
-        metadata_[key] = std::move(value);
-        return *this;
-    }
-
-    // Nested group: prefix appended, tags and metadata inherited
-    route_group group(const std::string& prefix) const {
-        route_group nested(*this);
-        nested.prefix_ += prefix;
-        return nested;
-    }
-
-    const std::string& prefix() const { return prefix_; }
-
-    template<typename F> route& get(const std::string& path, F&& handler) {
-        return apply(server_.get(prefix_ + path, std::forward<F>(handler)));
-    }
-    template<typename F> route& post(const std::string& path, F&& handler) {
-        return apply(server_.post(prefix_ + path, std::forward<F>(handler)));
-    }
-    template<typename F> route& put(const std::string& path, F&& handler) {
-        return apply(server_.put(prefix_ + path, std::forward<F>(handler)));
-    }
-    template<typename F> route& del(const std::string& path, F&& handler) {
-        return apply(server_.del(prefix_ + path, std::forward<F>(handler)));
-    }
-    template<typename F> route& patch(const std::string& path, F&& handler) {
-        return apply(server_.patch(prefix_ + path, std::forward<F>(handler)));
-    }
-    template<typename F> route& head(const std::string& path, F&& handler) {
-        return apply(server_.head(prefix_ + path, std::forward<F>(handler)));
-    }
-    template<typename F> route& options(const std::string& path, F&& handler) {
-        return apply(server_.options(prefix_ + path, std::forward<F>(handler)));
-    }
-
-private:
-    route& apply(route& r) const {
-        r.tags(tags_);
-        for (const auto& [key, value] : metadata_.items()) {
-            r.meta(key, value);
-        }
-        return r;
-    }
-
-    http_server_base& server_;
-    std::string prefix_;
-    std::vector<std::string> tags_;
-    nlohmann::json metadata_ = nlohmann::json::object();
-};
-
-inline route_group http_server_base::group(const std::string& prefix) {
-    return route_group(*this, prefix);
-}
 
 } // namespace thinger::http
 

@@ -28,7 +28,8 @@ Benchmarked with [bombardier](https://github.com/codesenberg/bombardier) — 100
 - **HTTP Server & Client** - Full HTTP/1.1 support with connection pooling
 - **WebSocket** - Server and client support with text/binary messages
 - **Server-Sent Events (SSE)** - Real-time server push
-- **SSL/TLS** - HTTPS and WSS support via OpenSSL
+- **SSL/TLS** - HTTPS and WSS support via OpenSSL, with per-domain certificates (SNI)
+- **Virtual Hosts** - Routes per host name, exact or by pattern, on the same listener
 - **C++20 Coroutines** - Async-first API with sync wrappers
 - **Lightweight** - Minimal dependencies, suitable for embedded systems
 
@@ -338,6 +339,8 @@ server.post("/api/status", [](nlohmann::json& json, auto& res) {
 });
 ```
 
+Invalid bodies get `400` with the body `{"error": {"message": "...", "context": [...]}}`, where `context` is the location of the invalid value; the format can be changed with an [error formatter](#error-format).
+
 Valijson is enabled by default. Disable with `-DTHINGER_HTTP_ENABLE_VALIJSON=OFF`.
 
 ### Middleware
@@ -468,7 +471,71 @@ auto response = co_await server.dispatch(request, {.remote_ip = "10.0.0.7", .tim
 server.dispatch(executor, request, [](std::shared_ptr<http::http_response> response) { /* ... */ });
 ```
 
-The server does not need to be listening. Chunked responses are collected whole. Handlers can keep a copy of the response and answer later. The timeout covers the whole request, handler included: if it expires the result is `504` and the handler is cancelled (its pending awaits are aborted). WebSockets, SSE and `take_over()` answer `501`, as there is no connection. `get_request_ip()` returns `remote_ip`, which is empty unless set: internal calls never pass as a trusted local address by default.
+The server does not need to be listening. Chunked responses are collected whole. Handlers can keep a copy of the response and answer later. The timeout covers the whole request, handler included: if it expires the result is `504` and the handler is cancelled (its pending awaits are aborted). WebSockets, SSE and `take_over()` answer `501`, as there is no connection. The request is served by the [virtual host](#virtual-hosts) of its URL (or `Host` header). `remote_ip` is the peer address: `get_request_ip()` returns it (or the forwarded client address, if it is a [trusted proxy](#client-ip-behind-proxies)), and it is empty unless set: internal calls never pass as a trusted local address by default.
+
+### Virtual Hosts
+
+One server can serve several sites on the same listener, chosen by the `Host` header (case-insensitive, port ignored). Each virtual host has its own routes, with the same registration API as the server: every `get`/`post`/... overload (coroutine and JSON body handlers included), route documentation and metadata, `group()`, `schema_component()`, `serve_static()` and `set_not_found_handler()`. The routes registered on the server itself are the default host, which answers any host without a virtual host of its own, so existing code keeps working.
+
+```cpp
+// Exact host names
+auto& api = server.host("api.example.com");
+api.get("/v1/status", [](http::response& res) { res.json({{"status", "ok"}}); });
+api.group("/v1/devices").tag("Devices").post("/", create_device).schema(device_schema);
+
+server.host("www.example.com").serve_static("/", "/var/www/site");
+
+// Patterns: "*" matches one label, ":name" a label available as a request parameter
+server.host("*.devices.example.com").get("/:path(.*)", [](http::request& req, http::response& res) {
+    auto device = req.get_host_matches()[1];   // [0] is the whole host name
+    // ... forward the request to the device
+});
+server.host(":tenant.example.com").get("/", [](http::request& req, http::response& res) {
+    res.send("Welcome " + req["tenant"]);
+});
+
+// Regular expression on the whole host name (any depth of subdomains here)
+server.host_regex("(.+)\\.proxy\\.example\\.com").get("/:path(.*)", proxy_handler);
+
+// Default host: any other name
+server.get("/", [](http::response& res) { res.send("default site"); });
+```
+
+Hosts are matched in order: exact names, then patterns in registration order, then the default host (`server.host("*")` returns the server itself). Register them before `listen()`. Once the host is chosen, everything works as for a single host: routes and `404`/`405` come from that host only, and the global middlewares (`server.use()`) run for every host after route matching, with `req.get_matched_route()` set to the route of the matched host and `req.get_virtual_host()` to the host. `server.openapi()` documents the default host; for another one build a generator over its router: `http::openapi_generator(server.host("api.example.com").router())`.
+
+For HTTPS, the certificate is chosen per domain before any request is read, through SNI: register one per host name (wildcards such as `*.devices.example.com` included) with `thinger::asio::certificate_manager::instance().set_certificate(hostname, certificate, private_key)`. Virtual hosts then pick the routes for the same name from the `Host` header. See `examples/http_server/virtual_hosts_example.cpp`.
+
+### Error Format
+
+Errors sent with `res.error(status, message)`, and the ones the server generates itself (`400` for invalid JSON and schema validation, `401` of basic auth, `404`/`405`, `413`, `500` from middlewares and handlers, and `501`/`504` of in-memory dispatch) go through an error formatter. By default the message is sent as `text/plain`, and errors with details (schema validation) as JSON `{"error": {"message": ..., "context": [...]}}`. A formatter changes it for all of them:
+
+```cpp
+server.set_error_formatter([](const http::http_error& error, http::http_response& response) {
+    // error.status, error.message (may be empty), error.details (null, or {"context": [...]})
+    nlohmann::json body = {{"error", {{"message", error.message.empty()
+        ? http::http_response::get_reason_phrase(error.status) : error.message}}}};
+    if (error.details.is_object()) body["error"].update(error.details);
+    response.set_content(body.dump(), "application/json");
+});
+
+res.error(http::http_response::status::forbidden, "Not allowed");   // {"error":{"message":"Not allowed"}}
+```
+
+The formatter sets the body (and any header) of the response, whose status is already set. If it throws, the default format is used.
+
+### Client IP Behind Proxies
+
+`req.get_request_ip()` is the address of the peer (`req.get_peer_ip()`) unless the peer is a trusted proxy. Then the client address is taken from the forwarding header: it is walked from right to left, skipping trusted proxies, and the first untrusted address is returned (the leftmost one if all of them are trusted).
+
+```cpp
+// IPs and CIDR ranges, IPv4 and IPv6; X-Forwarded-For by default
+server.set_trusted_proxies({"10.0.0.0/8", "127.0.0.1", "fd00::/8"});
+
+// Or the standard Forwarded header (RFC 7239): for=192.0.2.60;proto=https
+server.set_trusted_proxies({"10.0.0.1"}, http::forwarded_header::forwarded);
+```
+
+No proxy is trusted by default, and the header of any other peer is ignored, so a client cannot change its address by sending it: code that trusts a local address (e.g. `127.0.0.1` to skip checks) stays safe. List only proxies that append to (or overwrite) the header, and only the header they set: the other one reaches the server as the client sent it.
 
 ### CORS
 

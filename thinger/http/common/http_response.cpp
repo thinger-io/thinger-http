@@ -355,6 +355,13 @@ namespace thinger::http{
         return response;
     }
 
+    std::string http_response::get_reason_phrase(http_response::status status){
+        // status lines are "HTTP/1.1 <code> <reason>"
+        const auto& line = status_strings::get_status_string(status);
+        auto position = line.find(' ', line.find(' ') + 1);
+        return position == std::string::npos ? std::string{} : line.substr(position + 1);
+    }
+
     http_response::http_response()= default;
 
     bool http_response::is_redirect_response() const{

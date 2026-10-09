@@ -17,6 +17,8 @@ namespace thinger::http{
 
     // Forward declarations
     class route;
+    class virtual_host;
+    class trusted_proxies;
 
     /**
      * Class that represents a single HTTP request over the API. It means, that the HTTP request
@@ -45,10 +47,28 @@ namespace thinger::http{
 
         std::shared_ptr<http_request> get_http_request();
 
+        /// Client IP: the peer address or, if the peer is a trusted proxy (see
+        /// http_server_base::set_trusted_proxies), the client address it forwarded
         std::string get_request_ip() const;
 
-        /// Client IP to report for requests without a connection (in-memory dispatch)
-        void set_request_ip(std::string ip) { request_ip_ = std::move(ip); }
+        /// Address of the direct peer (the connection's remote IP), whatever it forwards
+        std::string get_peer_ip() const;
+
+        /// Peer address of requests without a connection (in-memory dispatch)
+        void set_peer_ip(std::string ip) { peer_ip_ = std::move(ip); }
+
+        /// Proxies whose forwarding header get_request_ip() accepts (set by the server)
+        void set_trusted_proxies(std::shared_ptr<const trusted_proxies> proxies) { trusted_proxies_ = std::move(proxies); }
+
+        /// Virtual host serving the request (the server itself for the default host)
+        const virtual_host* get_virtual_host() const { return virtual_host_; }
+        void set_virtual_host(const virtual_host* host) { virtual_host_ = host; }
+
+        /// Captures of the host pattern that matched: [0] is the host name and [1..] the
+        /// groups, e.g. the subdomain matched by "*" in "*.example.com" (the labels named
+        /// with ":name" are also request parameters). Empty for exact and default hosts.
+        const std::vector<std::string>& get_host_matches() const { return host_matches_; }
+        void set_host_matches(std::vector<std::string> matches) { host_matches_ = std::move(matches); }
 
         // Convenience methods for accessing request data
 
@@ -167,7 +187,13 @@ namespace thinger::http{
 
         std::string auth_user_;
 
-        std::string request_ip_;
+        std::string peer_ip_;
+
+        std::shared_ptr<const trusted_proxies> trusted_proxies_;
+
+        const virtual_host* virtual_host_ = nullptr;
+
+        std::vector<std::string> host_matches_;
 
         std::set<std::string> groups_;
         

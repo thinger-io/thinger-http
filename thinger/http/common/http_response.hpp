@@ -80,6 +80,9 @@ public:
     // factory methods
     static std::shared_ptr<http_response> stock_http_reply(http_response::status status);
 
+    // Standard reason phrase of a status ("Not Found" for 404)
+    static std::string get_reason_phrase(http_response::status status);
+
 private:
     std::string content_;
     status status_ = status::ok;

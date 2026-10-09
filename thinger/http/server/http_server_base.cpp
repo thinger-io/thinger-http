@@ -4,112 +4,9 @@
 #include "response.hpp"
 #include "../../util/logger.hpp"
 #include "../../util/base64.hpp"
-#include <filesystem>
+#include <boost/algorithm/string.hpp>
 
 namespace thinger::http {
-
-// Route registration methods - GET
-route& http_server_base::get(const std::string& path, route_callback_response_only handler) {
-    return router_[method::GET][path] = handler;
-}
-
-route& http_server_base::get(const std::string& path, route_callback_json_response handler) {
-    return router_[method::GET][path] = handler;
-}
-
-route& http_server_base::get(const std::string& path, route_callback_request_response handler) {
-    return router_[method::GET][path] = handler;
-}
-
-route& http_server_base::get(const std::string& path, route_callback_request_json_response handler) {
-    return router_[method::GET][path] = handler;
-}
-
-// Route registration methods - POST
-route& http_server_base::post(const std::string& path, route_callback_response_only handler) {
-    return router_[method::POST][path] = handler;
-}
-
-route& http_server_base::post(const std::string& path, route_callback_json_response handler) {
-    return router_[method::POST][path] = handler;
-}
-
-route& http_server_base::post(const std::string& path, route_callback_request_response handler) {
-    return router_[method::POST][path] = handler;
-}
-
-route& http_server_base::post(const std::string& path, route_callback_request_json_response handler) {
-    return router_[method::POST][path] = handler;
-}
-
-// Route registration methods - PUT
-route& http_server_base::put(const std::string& path, route_callback_response_only handler) {
-    return router_[method::PUT][path] = handler;
-}
-
-route& http_server_base::put(const std::string& path, route_callback_json_response handler) {
-    return router_[method::PUT][path] = handler;
-}
-
-route& http_server_base::put(const std::string& path, route_callback_request_response handler) {
-    return router_[method::PUT][path] = handler;
-}
-
-route& http_server_base::put(const std::string& path, route_callback_request_json_response handler) {
-    return router_[method::PUT][path] = handler;
-}
-
-// Route registration methods - DELETE
-route& http_server_base::del(const std::string& path, route_callback_response_only handler) {
-    return router_[method::DELETE][path] = handler;
-}
-
-route& http_server_base::del(const std::string& path, route_callback_json_response handler) {
-    return router_[method::DELETE][path] = handler;
-}
-
-route& http_server_base::del(const std::string& path, route_callback_request_response handler) {
-    return router_[method::DELETE][path] = handler;
-}
-
-route& http_server_base::del(const std::string& path, route_callback_request_json_response handler) {
-    return router_[method::DELETE][path] = handler;
-}
-
-// Route registration methods - PATCH
-route& http_server_base::patch(const std::string& path, route_callback_response_only handler) {
-    return router_[method::PATCH][path] = handler;
-}
-
-route& http_server_base::patch(const std::string& path, route_callback_json_response handler) {
-    return router_[method::PATCH][path] = handler;
-}
-
-route& http_server_base::patch(const std::string& path, route_callback_request_response handler) {
-    return router_[method::PATCH][path] = handler;
-}
-
-route& http_server_base::patch(const std::string& path, route_callback_request_json_response handler) {
-    return router_[method::PATCH][path] = handler;
-}
-
-// Route registration methods - HEAD
-route& http_server_base::head(const std::string& path, route_callback_response_only handler) {
-    return router_[method::HEAD][path] = handler;
-}
-
-route& http_server_base::head(const std::string& path, route_callback_request_response handler) {
-    return router_[method::HEAD][path] = handler;
-}
-
-// Route registration methods - OPTIONS
-route& http_server_base::options(const std::string& path, route_callback_response_only handler) {
-    return router_[method::OPTIONS][path] = handler;
-}
-
-route& http_server_base::options(const std::string& path, route_callback_request_response handler) {
-    return router_[method::OPTIONS][path] = handler;
-}
 
 // Middleware
 void http_server_base::use(async_middleware_function middleware) {
@@ -141,17 +38,15 @@ void http_server_base::set_basic_auth(const std::string& path_prefix,
         
         // Check for Authorization header
         if (!http_request->has_header("Authorization")) {
-            res.status(http_response::status::unauthorized);
             res.header("WWW-Authenticate", "Basic realm=\"" + realm + "\"");
-            res.send("Authentication required");
+            res.error(http_response::status::unauthorized, "Authentication required");
             co_return false;
         }
         
         auto auth_header = http_request->get_header("Authorization");
         if (!auth_header.starts_with("Basic ")) {
-            res.status(http_response::status::unauthorized);
             res.header("WWW-Authenticate", "Basic realm=\"" + realm + "\"");
-            res.send("Invalid authentication");
+            res.error(http_response::status::unauthorized, "Invalid authentication");
             co_return false;
         }
         
@@ -161,16 +56,14 @@ void http_server_base::set_basic_auth(const std::string& path_prefix,
         try {
             decoded = ::thinger::util::base64::decode(encoded);
         } catch (...) {
-            res.status(http_response::status::unauthorized);
-            res.send("Invalid credentials format");
+            res.error(http_response::status::unauthorized, "Invalid credentials format");
             co_return false;
         }
         
         // Parse username:password
         auto colon_pos = decoded.find(':');
         if (colon_pos == std::string::npos) {
-            res.status(http_response::status::unauthorized);
-            res.send("Invalid credentials format");
+            res.error(http_response::status::unauthorized, "Invalid credentials format");
             co_return false;
         }
         
@@ -183,9 +76,8 @@ void http_server_base::set_basic_auth(const std::string& path_prefix,
             co_return true;
         }
 
-        res.status(http_response::status::unauthorized);
         res.header("WWW-Authenticate", "Basic realm=\"" + realm + "\"");
-        res.send("Invalid username or password");
+        res.error(http_response::status::unauthorized, "Invalid username or password");
         co_return false;
     });
 }
@@ -210,26 +102,93 @@ void http_server_base::set_basic_auth(const std::string& path_prefix,
         });
 }
 
-// OpenAPI
-void http_server_base::schema_component(const std::string& name, nlohmann::json schema) {
-    router_.add_schema_component(name, std::move(schema));
+// Virtual hosts
+virtual_host& http_server_base::host(const std::string& name) {
+    if (name.empty() || name == "*") return *this;
+
+    if (!virtual_host::is_host_pattern(name)) {
+        auto key = virtual_host::normalize_host(name);
+        auto& host = exact_hosts_[key];
+        if (!host) host = std::make_unique<virtual_host>(key);
+        return *host;
+    }
+
+    // Registering the same pattern again returns the existing host
+    auto pattern = boost::algorithm::to_lower_copy(name);
+    for (const auto& host : pattern_hosts_) {
+        if (host->name() == pattern) return *host;
+    }
+    return *pattern_hosts_.emplace_back(std::make_unique<virtual_host>(pattern));
 }
 
+virtual_host& http_server_base::host_regex(const std::string& pattern) {
+    return *pattern_hosts_.emplace_back(
+        std::make_unique<virtual_host>(pattern, std::regex(pattern, std::regex::icase)));
+}
+
+virtual_host& http_server_base::resolve_host(request& req) {
+    auto http_request = req.get_http_request();
+    const auto& host_header = http_request->get_header(header::host);
+    auto name = virtual_host::normalize_host(host_header.empty() ? http_request->get_host() : host_header);
+
+    virtual_host* host = this;
+    if (auto it = exact_hosts_.find(name); it != exact_hosts_.end()) {
+        host = it->second.get();
+    } else {
+        for (const auto& candidate : pattern_hosts_) {
+            std::smatch matches;
+            if (!candidate->matches(name, matches)) continue;
+
+            std::vector<std::string> captures;
+            for (size_t i = 0; i < matches.size(); ++i) {
+                captures.push_back(matches[i].str());
+                const auto& parameters = candidate->get_parameters();
+                if (i > 0 && i <= parameters.size() && !parameters[i - 1].empty() && matches[i].matched) {
+                    req.set_uri_parameter(parameters[i - 1], matches[i].str());
+                }
+            }
+            req.set_host_matches(std::move(captures));
+            host = candidate.get();
+            break;
+        }
+    }
+
+    req.set_virtual_host(host);
+    return *host;
+}
+
+// Error format
+void http_server_base::set_error_formatter(error_formatter formatter) {
+    error_formatter_ = formatter ? std::make_shared<const error_formatter>(std::move(formatter)) : nullptr;
+}
+
+std::shared_ptr<http_response> http_server_base::make_error_response(http_response::status status,
+                                                                     const std::string& message) const {
+    auto result = std::make_shared<http_response>();
+    result->set_status(status);
+    format_error(error_formatter_.get(), {status, message, nullptr}, *result);
+    return result;
+}
+
+// Trusted proxies
+bool http_server_base::set_trusted_proxies(const std::vector<std::string>& proxies, forwarded_header header) {
+    auto trusted = std::make_shared<trusted_proxies>(header);
+    for (const auto& proxy : proxies) {
+        if (!trusted->add(proxy)) {
+            LOG_ERROR("Invalid trusted proxy: '{}'", proxy);
+            trusted_proxies_.reset();
+            return false;
+        }
+    }
+    trusted_proxies_ = trusted->empty() ? nullptr : std::move(trusted);
+    return true;
+}
+
+// OpenAPI
 route& http_server_base::serve_openapi(const std::string& path) {
     return get(path, [this](response& res) {
         res.json(openapi_.generate());
     }).hidden();
-}
-
-// Fallback handlers
-void http_server_base::set_not_found_handler(route_callback_response_only handler) {
-    router_.set_fallback_handler([handler](request& req, response& res) {
-        handler(res);
-    });
-}
-
-void http_server_base::set_not_found_handler(route_callback_request_response handler) {
-    router_.set_fallback_handler(handler);
 }
 
 // Configuration
@@ -251,78 +210,6 @@ void http_server_base::set_max_body_size(size_t size) {
 
 void http_server_base::set_max_listening_attempts(int attempts) {
     max_listening_attempts_ = attempts;
-}
-
-// Static file serving
-void http_server_base::serve_static(const std::string& url_prefix,
-                               const std::string& directory,
-                               const std::string& fallback) {
-    namespace fs = std::filesystem;
-
-    // Normalize route: avoid double slash when prefix is "/"
-    std::string route = url_prefix;
-    if (!route.empty() && route.back() == '/') route.pop_back();
-    route += "/:path(.*)";
-
-    auto& static_route = get(route, [directory, fallback](request& req, response& res) {
-        std::string path = req["path"];
-
-        auto canonical_dir = fs::canonical(directory);
-        bool has_fallback = !fallback.empty();
-
-        // Empty path means root request — try fallback file directly
-        if (path.empty()) {
-            if (has_fallback) {
-                auto fallback_file = canonical_dir / fallback;
-                if (fs::exists(fallback_file) && fs::is_regular_file(fallback_file)) {
-                    res.send_file(fallback_file);
-                    return;
-                }
-            }
-            res.status(http_response::status::not_found);
-            res.send("Not found");
-            return;
-        }
-
-        // Construct full file path
-        fs::path file_path = fs::path(directory) / path;
-        auto canonical_file = fs::weakly_canonical(file_path);
-
-        // Security: ensure the resolved path is within the directory
-        if (!canonical_file.string().starts_with(canonical_dir.string())) {
-            res.status(http_response::status::forbidden);
-            res.send("Access denied");
-            return;
-        }
-
-        // Serve file if it exists
-        if (fs::exists(canonical_file)) {
-            if (fs::is_regular_file(canonical_file)) {
-                res.send_file(canonical_file);
-                return;
-            }
-            if (fs::is_directory(canonical_file) && has_fallback) {
-                auto fallback_file = canonical_file / fallback;
-                if (fs::exists(fallback_file) && fs::is_regular_file(fallback_file)) {
-                    res.send_file(fallback_file);
-                    return;
-                }
-            }
-        }
-
-        // SPA fallback: serve root fallback file for non-existent paths
-        if (has_fallback) {
-            auto fallback_file = canonical_dir / fallback;
-            if (fs::exists(fallback_file) && fs::is_regular_file(fallback_file)) {
-                res.send_file(fallback_file);
-                return;
-            }
-        }
-
-        res.status(http_response::status::not_found);
-        res.send("Not found");
-    });
-    static_route.hidden();
 }
 
 // Server control
@@ -458,8 +345,13 @@ awaitable<void> http_server_base::process_request(std::shared_ptr<request> req, 
         if (auto stream = req->get_http_stream()) stream->set_keep_alive(false);
     };
 
-    // 1. Match route
-    auto* matched_route = router_.find_route(req);
+    // Server settings the request and its response depend on
+    res.set_error_formatter(error_formatter_);
+    req->set_trusted_proxies(trusted_proxies_);
+
+    // 1. Match the virtual host (by the Host header), then the route among its routes
+    auto& host = resolve_host(*req);
+    auto* matched_route = host.router().find_route(req);
 
     // 2. Run middlewares (before reading the body), sharing the handler response
     if (!co_await run_middlewares(*req, res)) {
@@ -470,7 +362,7 @@ awaitable<void> http_server_base::process_request(std::shared_ptr<request> req, 
     // 3. Three-way dispatch
     if (!matched_route) {
         // No route matched → fallback / 404
-        router_.handle_unmatched(req, res);
+        host.router().handle_unmatched(req, res);
     } else if (matched_route->is_deferred_body()) {
         // DEFERRED: handler reads body at its discretion
         co_await matched_route->handle_request_coro(*req, res);
@@ -502,16 +394,9 @@ awaitable<void> http_server_base::process_request(std::shared_ptr<request> req, 
 // In-memory dispatch
 awaitable<std::shared_ptr<http_response>> http_server_base::dispatch(std::shared_ptr<http_request> http_request,
                                                                      dispatch_options options) {
-    auto error_response = [](http_response::status status, const std::string& message) {
-        auto result = std::make_shared<http_response>();
-        result->set_status(status);
-        result->set_content(message, "text/plain");
-        return result;
-    };
-
-    if (!http_request) co_return error_response(http_response::status::bad_request, "Missing request");
+    if (!http_request) co_return make_error_response(http_response::status::bad_request, "Missing request");
     if (http_request->is_chunked_transfer()) {
-        co_return error_response(http_response::status::bad_request, "Chunked requests cannot be dispatched in memory");
+        co_return make_error_response(http_response::status::bad_request, "Chunked requests cannot be dispatched in memory");
     }
 
     // Serve the body from memory, as if just received from the client: handlers read it
@@ -522,7 +407,7 @@ awaitable<std::shared_ptr<http_response>> http_server_base::dispatch(std::shared
     http_request->process_header(header::content_length, std::to_string(body.size()));
 
     auto req = std::make_shared<request>(nullptr, nullptr, http_request);
-    req->set_request_ip(options.remote_ip);
+    req->set_peer_ip(options.remote_ip);
     if (!body.empty()) {
         req->set_read_ahead(reinterpret_cast<const uint8_t*>(body.data()), body.size());
     }
@@ -551,7 +436,7 @@ awaitable<std::shared_ptr<http_response>> http_server_base::dispatch(std::shared
     if (!result) {
         // Abort what the handler is waiting for (timers, sockets...)
         boost::asio::post(strand, [cancel]() { cancel->emit(boost::asio::cancellation_type::terminal); });
-        co_return error_response(http_response::status::gateway_timeout, "No response within the timeout");
+        co_return make_error_response(http_response::status::gateway_timeout, "No response within the timeout");
     }
     co_return result;
 }
@@ -561,10 +446,9 @@ void http_server_base::dispatch(const boost::asio::any_io_executor& executor,
                                 std::function<void(std::shared_ptr<http_response>)> callback,
                                 dispatch_options options) {
     co_spawn(executor, dispatch(std::move(request), std::move(options)),
-        [callback = std::move(callback)](std::exception_ptr error, std::shared_ptr<http_response> result) {
+        [this, callback = std::move(callback)](std::exception_ptr error, std::shared_ptr<http_response> result) {
             if (error || !result) {
-                result = std::make_shared<http_response>();
-                result->set_status(http_response::status::internal_server_error);
+                result = make_error_response(http_response::status::internal_server_error, "");
             }
             callback(std::move(result));
         });

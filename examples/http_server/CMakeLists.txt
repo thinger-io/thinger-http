@@ -63,3 +63,7 @@ target_link_libraries(route_metadata_example PRIVATE thinger::http)
 # OpenAPI example (document generated from the routes, Swagger UI)
 add_executable(openapi_example openapi_example.cpp)
 target_link_libraries(openapi_example PRIVATE thinger::http)
+
+# Virtual hosts example (sites per Host header, error format, trusted proxies)
+add_executable(virtual_hosts_example virtual_hosts_example.cpp)
+target_link_libraries(virtual_hosts_example PRIVATE thinger::http)

@@ -8,6 +8,7 @@
 #include "websocket_connection.hpp"
 #include "sse_connection.hpp"
 #include "memory_response.hpp"
+#include "error_format.hpp"
 #include "../../util/compression.hpp"
 #include <nlohmann/json.hpp>
 #include <memory>
@@ -28,6 +29,7 @@ private:
     std::shared_ptr<http::http_request> http_request_;
     std::shared_ptr<http_response> response_;
     std::shared_ptr<memory_response> memory_;   // set for requests dispatched in memory
+    std::shared_ptr<const error_formatter> error_formatter_;    // default format if null
     bool responded_ = false;
     bool cors_enabled_ = false;
 
@@ -157,14 +159,21 @@ public:
         send(html, "text/html");
     }
 
-    // Error response
-    void error(http::http_response::status status, const std::string& message = "") {
+    // Error response, with the body produced by the error formatter (see
+    // http_server_base::set_error_formatter): by default the message as text/plain, or a
+    // JSON object for errors with details
+    void error(http::http_response::status status, const std::string& message = "",
+               const nlohmann::json& details = nullptr) {
+        if (!ensure_not_responded()) return;
         prepare_response();
         response_->set_status(status);
-        if (!message.empty()) {
-            response_->set_content(message, "text/plain");
-        }
+        format_error(error_formatter_.get(), {status, message, details}, *response_);
         send_prepared_response();
+    }
+
+    // Formatter used by error() (set by the server)
+    void set_error_formatter(std::shared_ptr<const error_formatter> formatter) {
+        error_formatter_ = std::move(formatter);
     }
 
     // Set status code (for building custom responses)

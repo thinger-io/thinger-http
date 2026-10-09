@@ -300,21 +300,23 @@ bool route::validate_json(const nlohmann::json& json, response& res) const {
         return true;
     }
 
-    // Build error response with first validation error
+    // Answer the first validation error, with the location of the invalid value as details
+    // (by default: {"error": {"message": ..., "context": [...]}})
     valijson::ValidationResults::Error error;
-    nlohmann::json error_response = {{"error", {{"message", "Schema validation failed"}}}};
+    std::string message = "Schema validation failed";
+    nlohmann::json details = nlohmann::json::object();
     if (results.popError(error)) {
-        error_response["error"]["message"] = error.description;
+        message = error.description;
         nlohmann::json context = nlohmann::json::array();
         for (const auto& c : error.context) {
             context.push_back(c);
         }
         if (!context.empty()) {
-            error_response["error"]["context"] = std::move(context);
+            details["context"] = std::move(context);
         }
     }
 
-    res.json(error_response, http_response::status::bad_request);
+    res.error(http_response::status::bad_request, message, details);
     return false;
 }
 #endif
