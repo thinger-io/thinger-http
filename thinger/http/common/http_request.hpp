@@ -131,11 +131,15 @@ public:
     bool is_chunked_transfer() const { return chunked_transfer_; }
 
     // Whether the body framing is unambiguous (RFC 9112, section 6.3): a valid Content-Length,
-    // or "Transfer-Encoding: chunked" alone, but not both. A server must reject the request
-    // otherwise, and close the connection, as it cannot tell where the next request starts.
+    // or "Transfer-Encoding: chunked" alone, but not both, and Transfer-Encoding only from
+    // HTTP/1.1 on (section 6.1: in an HTTP/1.0 message, its framing is faulty). A server must
+    // reject the request otherwise, and close the connection, as it cannot tell where the
+    // next request starts.
     bool has_valid_framing() const {
+        bool before_http_1_1 = http_version_major_ < 1 || (http_version_major_ == 1 && http_version_minor_ < 1);
         return !has_invalid_content_length() && !invalid_transfer_encoding_
-            && !(chunked_transfer_ && has_content_length_header());
+            && !(chunked_transfer_ && has_content_length_header())
+            && !(before_http_1_1 && has_transfer_encoding_header());
     }
 
     // other

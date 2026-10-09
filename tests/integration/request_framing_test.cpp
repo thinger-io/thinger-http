@@ -87,6 +87,19 @@ TEST_CASE("Transfer-Encoding other than chunked is rejected", "[server][framing]
     }
 }
 
+TEST_CASE("Transfer-Encoding in an HTTP/1.0 request is rejected", "[server][framing][smuggling][integration]") {
+    framing_server fixture;
+    fixture.start();
+
+    // RFC 9112 section 6.1: an HTTP/1.0 message with Transfer-Encoding has faulty framing
+    SECTION("Chunked") {
+        require_rejected(fixture, "POST /echo HTTP/1.0\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+    }
+    SECTION("Chunked on a keep-alive connection") {
+        require_rejected(fixture, "POST /echo HTTP/1.0\r\nHost: localhost\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+    }
+}
+
 TEST_CASE("Content-Length together with Transfer-Encoding is rejected", "[server][framing][smuggling][integration]") {
     framing_server fixture;
     fixture.start();

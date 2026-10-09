@@ -402,6 +402,20 @@ TEST_CASE("Headers framing decisions on repeated headers", "[http][headers][fram
         REQUIRE_FALSE(h.has_valid_framing());
     }
 
+    SECTION("Transfer-Encoding in HTTP/1.0 is invalid") {
+        http_request h;
+        h.set_http_version_major(1);
+        h.set_http_version_minor(0);
+        h.process_header("Transfer-Encoding", "chunked");
+        REQUIRE_FALSE(h.has_valid_framing());
+
+        http_request h11;
+        h11.set_http_version_major(1);
+        h11.set_http_version_minor(1);
+        h11.process_header("Transfer-Encoding", "chunked");
+        REQUIRE(h11.has_valid_framing());
+    }
+
     SECTION("Content-Length together with Transfer-Encoding is invalid, in any order") {
         http_request a;
         a.process_header("Content-Length", "5");

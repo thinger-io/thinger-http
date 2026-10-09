@@ -209,7 +209,7 @@ Request framing is strict, as a lenient parser could read a request differently 
 
 - Header lines starting with a space or tab (obsolete line folding), which are never joined to the previous line.
 - `Content-Length` that is not a plain number (`12abc`, `-1`, ` 5`, too large), or repeated with different values.
-- `Transfer-Encoding` other than exactly `chunked` (e.g. `gzip, chunked`, `chunked, chunked`, or repeated), or together with `Content-Length`.
+- `Transfer-Encoding` other than exactly `chunked` (e.g. `gzip, chunked`, `chunked, chunked`, or repeated), together with `Content-Length`, or in an HTTP/1.0 request.
 - Malformed chunked bodies: chunk sizes that are not hexadecimal, empty or overflowing; missing CRLF after a chunk size or its data; bare LF line endings; chunk extensions or trailer sections that are too long. Chunk extensions and trailer fields are accepted and ignored.
 
 The request line and headers are limited to 16 KB and 100 header lines: larger requests are answered with `431 Request Header Fields Too Large` and the connection is closed.
