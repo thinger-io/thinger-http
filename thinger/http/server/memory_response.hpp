@@ -12,7 +12,7 @@
 
 namespace thinger::http {
 
-// Collects the response of a request dispatched in memory (see http_server_base::dispatch).
+// Collects the response of a request dispatched in memory (see http_application::dispatch).
 // It is shared by every copy of the response object, so a handler may keep a copy and
 // answer later, from any thread.
 class memory_response : public response_sink {

@@ -49,7 +49,7 @@ namespace thinger::http{
         std::shared_ptr<http_request> get_http_request();
 
         /// Client IP: the peer address or, if the peer is a trusted proxy (see
-        /// http_server_base::set_trusted_proxies), the client address it forwarded
+        /// http_application::set_trusted_proxies), the client address it forwarded
         std::string get_request_ip() const;
 
         /// Address of the direct peer (the connection's remote IP), whatever it forwards
@@ -61,7 +61,7 @@ namespace thinger::http{
         /// Proxies whose forwarding header get_request_ip() accepts (set by the server)
         void set_trusted_proxies(std::shared_ptr<const trusted_proxies> proxies) { trusted_proxies_ = std::move(proxies); }
 
-        /// Virtual host serving the request (the server itself for the default host)
+        /// Virtual host serving the request (the application itself for the default host)
         const virtual_host* get_virtual_host() const { return virtual_host_; }
         void set_virtual_host(const virtual_host* host) { virtual_host_ = host; }
 

@@ -4,6 +4,7 @@
 // HTTP Server functionality
 #include <thinger/http/server/server_standalone.hpp>  // server class (standalone)
 #include <thinger/http/server/pool_server.hpp>       // pool_server class (for worker threads)
+#include <thinger/http/server/http_application.hpp>  // routes, hosts and middlewares a server serves
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/request_handler.hpp>

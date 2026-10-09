@@ -49,7 +49,7 @@ public:
     }
 
     // Error response, with the body produced by the error formatter (see
-    // http_server_base::set_error_formatter): by default the message as text/plain, or a
+    // http_application::set_error_formatter): by default the message as text/plain, or a
     // JSON object for errors with details
     void error(http::http_response::status status, const std::string& message = "",
                const nlohmann::json& details = nullptr);

@@ -2336,6 +2336,117 @@ TEST_CASE("Connection takeover hands the socket and buffered bytes to the new ow
     }
 }
 
+namespace {
+    // Same as read_until_contains, giving up after `timeout` (false if `needle` did not show up)
+    bool read_until_contains_within(boost::asio::ip::tcp::socket& sock, std::string& pending,
+                                    const std::string& needle, std::chrono::milliseconds timeout) {
+        auto& ioc = static_cast<boost::asio::io_context&>(sock.get_executor().context());
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        char tmp[1024];
+        while (pending.find(needle) == std::string::npos) {
+            boost::system::error_code ec;
+            size_t bytes = 0;
+            bool done = false;
+            sock.async_read_some(boost::asio::buffer(tmp), [&](boost::system::error_code e, size_t n) {
+                ec = e;
+                bytes = n;
+                done = true;
+            });
+            ioc.restart();
+            ioc.run_until(deadline);
+            if (!done) {
+                sock.cancel();
+                ioc.restart();
+                ioc.run();
+                return false;
+            }
+            if (ec) return false;
+            pending.append(tmp, bytes);
+        }
+        return true;
+    }
+
+    // Answers 101 and takes the connection over with an echo session
+    void take_over_with_echo(http::response& res) {
+        res.status(http::http_response::status::switching_protocols);
+        res.header("Upgrade", "echo");
+        res.header("Connection", "Upgrade");
+        res.take_over([](std::shared_ptr<thinger::asio::socket> socket, std::string buffered) {
+            thinger::co_spawn(socket->get_io_context(), echo_session(socket, std::move(buffered)), thinger::detached);
+        });
+    }
+}
+
+TEST_CASE("Connection takeover after a pipelined request answered later", "[server][takeover][pipelining][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    server.get("/later", [](http::response& res) {
+        std::thread([res]() mutable {
+            std::this_thread::sleep_for(50ms);
+            res.send("later-ok");
+        }).detach();
+    });
+    server.get("/echo", [](http::response& res) { take_over_with_echo(res); });
+
+    fixture.start_server();
+
+    boost::asio::io_context ioc;
+    boost::asio::ip::tcp::socket sock(ioc);
+    boost::asio::ip::tcp::resolver resolver(ioc);
+    boost::asio::connect(sock, resolver.resolve("127.0.0.1", std::to_string(fixture.port)));
+
+    // The takeover belongs to the second request: the first one is answered as usual
+    boost::asio::write(sock, boost::asio::buffer(std::string(
+        "GET /later HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        "GET /echo HTTP/1.1\r\nHost: localhost\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n")));
+
+    std::string received;
+    REQUIRE(read_until_contains_within(sock, received, "]\n", 5s));
+    auto first = received.find("later-ok");
+    auto upgrade = received.find("HTTP/1.1 101");
+    REQUIRE(first != std::string::npos);
+    REQUIRE(upgrade != std::string::npos);
+    REQUIRE(first < upgrade);
+    REQUIRE(received.find("buffered:[]") != std::string::npos);
+
+    received.clear();
+    boost::asio::write(sock, boost::asio::buffer(std::string("ping")));
+    REQUIRE(read_until_contains_within(sock, received, "ping", 5s));
+}
+
+TEST_CASE("Connection takeover from a copy of the response after the handler returned", "[server][takeover][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    server.get("/echo-later", [](http::response& res) {
+        std::thread([res]() mutable {
+            std::this_thread::sleep_for(50ms);
+            take_over_with_echo(res);
+        }).detach();
+    });
+
+    fixture.start_server();
+
+    boost::asio::io_context ioc;
+    boost::asio::ip::tcp::socket sock(ioc);
+    boost::asio::ip::tcp::resolver resolver(ioc);
+    boost::asio::connect(sock, resolver.resolve("127.0.0.1", std::to_string(fixture.port)));
+
+    // Bytes sent right after the request still belong to the new owner
+    boost::asio::write(sock, boost::asio::buffer(std::string(
+        "GET /echo-later HTTP/1.1\r\nHost: localhost\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\nEARLY")));
+
+    std::string received;
+    REQUIRE(read_until_contains_within(sock, received, "]\n", 5s));
+    REQUIRE(received.starts_with("HTTP/1.1 101"));
+    REQUIRE(received.find("buffered:[EARLY]") != std::string::npos);
+
+    received.clear();
+    boost::asio::write(sock, boost::asio::buffer(std::string("ping")));
+    REQUIRE(read_until_contains_within(sock, received, "ping", 5s));
+}
+
 TEST_CASE("WebSocket client sending data before the handshake is closed", "[server][takeover][websocket][integration]") {
     ServerBaseTestFixture fixture;
     auto& server = fixture.server;

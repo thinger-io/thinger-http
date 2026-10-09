@@ -13,8 +13,8 @@ namespace thinger::http {
 
 class route_group;
 
-// Set of routes served for a host name (see http_server_base::host). The server itself is
-// the default virtual host: its routes answer the requests for hosts not registered.
+// Set of routes served for a host name (see http_application::host). The application
+// itself is the default virtual host: its routes answer the requests for hosts not registered.
 class virtual_host : public route_registrar<virtual_host> {
 public:
     // Default host ("*")

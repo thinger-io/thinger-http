@@ -20,21 +20,11 @@ namespace thinger::http {
 
     void http_stream::add_frame(std::shared_ptr<http_frame> frame) {
         queue_.push(frame);
+        responded_ = true;
     }
 
     size_t http_stream::get_queued_frames() const {
         return queue_.size();
-    }
-
-    void http_stream::on_completed(std::function<void()> callback) {
-        stream_callback_ = callback;
-    }
-
-    void http_stream::completed() {
-        if (stream_callback_) {
-            stream_callback_();
-            stream_callback_ = nullptr;
-        }
     }
 
     stream_id http_stream::id() const {

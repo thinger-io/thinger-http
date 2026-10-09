@@ -48,13 +48,9 @@ void connection_sink::take_over(std::shared_ptr<http_response> response, takeove
         return;
     }
 
-    // Stop the connection from reading further requests, then hand the socket over
+    // The connection stops reading requests after this one, and hands the socket over
     // once this response has been written
-    connection->begin_takeover(std::move(handler));
-    stream->on_completed([connection]() {
-        connection->takeover_response_sent();
-    });
-    connection->handle_stream(stream, std::move(response));
+    connection->take_over(stream, std::move(response), std::move(handler));
 }
 
 } // namespace thinger::http

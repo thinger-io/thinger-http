@@ -4,11 +4,21 @@
 #include <queue>
 #include <memory>
 #include <functional>
+#include <string>
+#include <utility>
 #include "../common/http_frame.hpp"
+
+namespace thinger::asio {
+    class socket;
+}
 
 namespace thinger::http {
 
     typedef uint32_t stream_id;
+
+    // Receives a connection taken over from the HTTP server: the socket, and any bytes the
+    // server had already read past the request that took it over
+    using takeover_handler = std::function<void(std::shared_ptr<asio::socket>, std::string buffered)>;
 
     /**
      * A HTTP stream represents a communication channel inside a single HTTP connection. As a
@@ -33,10 +43,15 @@ namespace thinger::http {
         std::queue<std::shared_ptr<http_frame>> queue_;
 
         /**
-         * Callback to be able to register a function when the stream was completed, i.e., completed a
-         * response to a given query.
+         * Set when the response takes over the connection: receives the socket once the
+         * response is written
          */
-        std::function<void()> stream_callback_;
+        takeover_handler takeover_;
+
+        /**
+         * Whether the response has started: a frame was queued, or a takeover requested
+         */
+        bool responded_ = false;
 
         bool keep_alive_;
 
@@ -59,9 +74,25 @@ namespace thinger::http {
 
         size_t get_queued_frames() const;
 
-        void on_completed(std::function<void()> callback);
+        bool responded() const {
+            return responded_;
+        }
 
-        void completed();
+        /**
+         * Take over the connection once the response of this stream is written
+         */
+        void set_takeover(takeover_handler handler) {
+            takeover_ = std::move(handler);
+            responded_ = true;
+        }
+
+        bool takes_over() const {
+            return static_cast<bool>(takeover_);
+        }
+
+        takeover_handler release_takeover() {
+            return std::exchange(takeover_, nullptr);
+        }
 
         stream_id id() const;
 

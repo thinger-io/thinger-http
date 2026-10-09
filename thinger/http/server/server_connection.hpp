@@ -15,10 +15,6 @@ namespace thinger::http {
 
 class request;
 
-// Receives a connection taken over from the HTTP server: the socket, and any bytes the
-// server had already read past the request that took it over
-using takeover_handler = std::function<void(std::shared_ptr<asio::socket>, std::string buffered)>;
-
 class server_connection : public std::enable_shared_from_this<server_connection>, public boost::noncopyable {
 
     static constexpr size_t MAX_BUFFER_SIZE = 4096;
@@ -36,15 +32,11 @@ public:
     // Release the socket for upgrades (WebSocket, etc.)
     std::shared_ptr<asio::socket> release_socket();
 
-    // Take over the connection: once the current request has been handled and its
-    // response written, stop serving HTTP and hand the socket to `handler`
-    void begin_takeover(takeover_handler handler);
-
-    // Called when the response of the request taking over the connection is written
-    void takeover_response_sent();
-
-    // Whether the connection is being (or has been) taken over
-    bool is_taken_over() const { return takeover_requested_; }
+    // Take over the connection from a stream: send `response`, then, once its request
+    // has been handled, stop serving HTTP and hand the socket to `handler` (can be called
+    // from any thread)
+    void take_over(std::shared_ptr<http_stream> stream, std::shared_ptr<http_frame> response,
+                   takeover_handler handler);
 
     // Release this instance without touching the socket
     void release();
@@ -67,6 +59,12 @@ private:
     // Main read loop coroutine
     awaitable<void> read_loop();
 
+    // Wait until the response of a stream has started, or the connection is closed
+    awaitable<void> wait_response(const http_stream& stream);
+
+    // Queue a response frame (on the connection executor)
+    void queue_frame(const std::shared_ptr<http_stream>& stream, std::shared_ptr<http_frame> frame);
+
     // Write output queue
     awaitable<void> write_frame(std::shared_ptr<http_stream> stream, std::shared_ptr<http_frame> frame);
 
@@ -83,11 +81,14 @@ private:
     void close();
 
     // Hand the socket over once the response is written and the read loop has stopped
-    void complete_takeover();
+    void complete_takeover(http_stream& stream);
 
 private:
     std::shared_ptr<asio::socket> socket_;
     boost::asio::steady_timer timeout_timer_;
+
+    // Cancelled when a response starts, waking the read loop waiting for it
+    boost::asio::steady_timer response_started_;
     std::chrono::seconds timeout_{DEFAULT_TIMEOUT};
 
     uint8_t buffer_[MAX_BUFFER_SIZE];
@@ -105,10 +106,8 @@ private:
     bool running_{false};
     stream_id request_id_{0};
 
-    // Connection takeover
-    takeover_handler takeover_handler_;
+    // Connection takeover (the handler belongs to the stream taking it over)
     std::string takeover_buffer_;
-    bool takeover_requested_{false};
     bool takeover_response_sent_{false};
     bool takeover_reader_stopped_{false};
 };
