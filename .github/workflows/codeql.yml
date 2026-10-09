@@ -14,6 +14,7 @@ jobs:
     runs-on: self-hosted
     container:
       image: thinger/compiler:mold-latest
+      options: --memory=36g --memory-swap=36g
 
     permissions:
       security-events: write
@@ -33,7 +34,7 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build -j$(nproc)
+        run: cmake --build build -j$(( $(nproc) / 4 ))
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4

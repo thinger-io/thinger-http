@@ -11,6 +11,7 @@ jobs:
     runs-on: self-hosted
     container:
       image: thinger/compiler:mold-latest
+      options: --memory=36g --memory-swap=36g
 
     steps:
       - uses: actions/checkout@v4
@@ -19,4 +20,4 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DTHINGER_HTTP_BUILD_TESTS=OFF -DTHINGER_HTTP_BUILD_EXAMPLES=ON
 
       - name: Build examples
-        run: cmake --build build -j$(nproc)
+        run: cmake --build build -j$(( $(nproc) / 4 ))

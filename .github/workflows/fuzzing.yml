@@ -11,6 +11,7 @@ jobs:
     runs-on: self-hosted
     container:
       image: thinger/compiler:mold-latest
+      options: --memory=36g --memory-swap=36g
 
     env:
       CC: clang
@@ -32,7 +33,7 @@ jobs:
         run: cmake -B build-fuzz -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTHINGER_HTTP_ENABLE_FUZZING=ON -DTHINGER_HTTP_BUILD_TESTS=OFF -DTHINGER_HTTP_ENABLE_LOGGING=OFF
 
       - name: Build
-        run: cmake --build build-fuzz -j$(nproc)
+        run: cmake --build build-fuzz -j$(( $(nproc) / 4 ))
 
       - name: Prepare corpus directories
         run: |
