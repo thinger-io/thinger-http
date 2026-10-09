@@ -1031,6 +1031,7 @@ See the [examples](examples/) directory for complete working examples:
 ## Thread Safety
 
 - `http::server` - Thread-safe, can handle concurrent requests
+- `http::response` - Copies share the response and can answer from any thread, even at the same time: only the first answer is sent. Chunks (`write_chunk()`, `end_chunked()`) are written in call order once `start_chunked()` returned `true`. Set the status and headers (`status()`, `header()`) from one thread, before answering
 - `http::client` - Single-threaded, create one per thread or use `async_client`
 - `http::async_client` - Thread-safe, uses internal worker threads
 - `http::websocket_client` - Single connection, thread-safe send operations
