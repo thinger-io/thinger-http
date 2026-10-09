@@ -71,6 +71,8 @@ public:
     bool stream() const;
     bool has_header(std::string_view key) const;
     bool remove_header(std::string_view key);
+    // Remove every `key` header, returning how many there were
+    size_t remove_headers(std::string_view key);
     void set_http_version_major(uint8_t http_version_major);
     void set_http_version_minor(uint8_t http_version_minor);
     void set_keep_alive(bool keep_alive);

@@ -157,6 +157,15 @@ namespace thinger::http{
         return false;
     }
 
+    size_t headers::remove_headers(std::string_view key)
+    {
+        auto removed = std::erase_if(headers_, [&](const http_header& header){
+            return is_header(header.first, key);
+        });
+        if(removed) on_header_removed(key);
+        return removed;
+    }
+
     const std::string& headers::get_authorization() const
     {
         return get_header(header::authorization);

@@ -223,3 +223,29 @@ TEST_CASE("In-memory dispatch of handlers answering later", "[server][dispatch][
         REQUIRE(result->get_content() == "late answer");
     }
 }
+
+TEST_CASE("In-memory dispatch replaces every Content-Length header", "[server][dispatch][integration]") {
+    http::server server;
+    server.post("/echo", [](http::request& req, http::response& res) {
+        res.send("body=[" + req.body() + "]");
+    });
+
+    // The body length is computed again: stale or repeated Content-Length headers of the
+    // request (added by hand) do not make it look ambiguous
+    SECTION("Repeated with the body length") {
+        auto request = make_request(http::method::POST, "/echo", "hello");
+        request->add_header("Content-Length", "5");
+        auto response = run_dispatch(server, request);
+        REQUIRE(response->get_status() == http::http_response::status::ok);
+        REQUIRE(response->get_content() == "body=[hello]");
+    }
+    SECTION("Repeated with other values") {
+        auto request = make_request(http::method::POST, "/echo", "hello");
+        request->add_header("Content-Length", "1");
+        request->add_header("Content-Length", "2");
+        auto response = run_dispatch(server, request);
+        REQUIRE(response->get_status() == http::http_response::status::ok);
+        REQUIRE(response->get_content() == "body=[hello]");
+        REQUIRE(request->get_headers_with_key("Content-Length") == std::vector<std::string>{"5"});
+    }
+}

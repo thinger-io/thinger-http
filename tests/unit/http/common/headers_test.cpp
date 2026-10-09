@@ -381,6 +381,20 @@ TEST_CASE("Headers framing decisions on repeated headers", "[http][headers][fram
         REQUIRE(h.get_content_length() == 7);
     }
 
+    SECTION("remove_headers removes every instance") {
+        http_request h;
+        h.add_header("Content-Length", "1");
+        h.add_header("X-Other", "x");
+        h.add_header("content-length", "2");
+        REQUIRE(h.remove_headers("Content-Length") == 2);
+        REQUIRE_FALSE(h.has_header("Content-Length"));
+        REQUIRE_FALSE(h.has_content_length_header());
+        REQUIRE(h.has_header("X-Other"));
+        REQUIRE(h.remove_headers("Content-Length") == 0);
+        h.process_header("Content-Length", "7");
+        REQUIRE_FALSE(h.has_invalid_content_length());
+    }
+
     SECTION("Single Transfer-Encoding: chunked is valid") {
         http_request h;
         h.process_header("Transfer-Encoding", "chunked");

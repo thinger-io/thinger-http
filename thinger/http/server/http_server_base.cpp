@@ -437,7 +437,7 @@ awaitable<std::shared_ptr<http_response>> http_server_base::dispatch(std::shared
     // like on a connection (read_body(), or read()/read_some() on deferred routes)
     std::string body = std::move(http_request->get_body());
     http_request->get_body().clear();
-    http_request->remove_header(header::content_length);
+    http_request->remove_headers(header::content_length);
     http_request->process_header(header::content_length, std::to_string(body.size()));
 
     auto req = std::make_shared<request>(nullptr, nullptr, http_request);
@@ -453,16 +453,12 @@ awaitable<std::shared_ptr<http_response>> http_server_base::dispatch(std::shared
     // Run the request on its own coroutine (in a strand, so it can be cancelled safely),
     // and wait for the response from the start: the timeout also covers a handler that
     // never finishes. Handlers may also answer later, from a copy of the response.
+    // process_request() answers whatever the middlewares, body reading or handler throw.
     auto strand = boost::asio::make_strand(executor);
     auto cancel = std::make_shared<boost::asio::cancellation_signal>();
     co_spawn(strand,
         [this, req, res, cancel]() -> awaitable<void> {
-            try {
-                co_await process_request(req, *res);
-            } catch (const std::exception& e) {
-                LOG_ERROR("Exception dispatching in-memory request: {}", e.what());
-                if (!res->has_responded()) res->error(http_response::status::internal_server_error);
-            }
+            co_await process_request(req, *res);
         },
         boost::asio::bind_cancellation_slot(cancel->slot(), boost::asio::detached));
 
