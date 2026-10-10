@@ -4,6 +4,7 @@
 #include "sockets/socket.hpp"
 #include "../util/logger.hpp"
 
+#include <atomic>
 #include <memory>
 #include <set>
 #include <functional>
@@ -53,7 +54,8 @@ protected:
     std::set<std::string> allowed_remotes_;
     std::set<std::string> forbidden_remotes_;
     int max_listening_attempts_;
-    bool running_ = false;
+    // Read by the accept handlers, possibly on a thread of their own
+    std::atomic<bool> running_{false};
     
     // io_context providers
     io_context_provider acceptor_context_provider_;

@@ -1,8 +1,14 @@
 #include "tcp_socket_server.hpp"
 #include "workers.hpp"
+#include "worker_thread.hpp"
 #include "../util/logger.hpp"
 #include "../util/types.hpp"
 #include <boost/asio/ssl.hpp>
+#include <cerrno>
+#include <system_error>
+#include <utility>
+#include <sys/socket.h>
+#include <unistd.h>
 
 namespace thinger::asio {
 
@@ -33,9 +39,11 @@ tcp_socket_server::tcp_socket_server(std::string host,
                        std::move(allowed_remotes), 
                        std::move(forbidden_remotes))
 {
+    own_acceptor_thread_ = true;
 }
 
 tcp_socket_server::~tcp_socket_server() {
+    stop_acceptor_thread();
     close_acceptor();
 }
 
@@ -43,10 +51,16 @@ bool tcp_socket_server::stop() {
     // First call base class to set running_ = false
     socket_server_base::stop();
     
-    // Now close the acceptor
+    // Now close the acceptor, once its own thread (if any) is not using it
+    stop_acceptor_thread();
     close_acceptor();
     
     return true;
+}
+
+void tcp_socket_server::stop_acceptor_thread() {
+    // The thread object is kept while the acceptor uses its io_context
+    if (acceptor_thread_) acceptor_thread_->stop();
 }
 
 void tcp_socket_server::close_acceptor() {
@@ -91,10 +105,19 @@ uint16_t tcp_socket_server::local_port() const {
 }
 
 bool tcp_socket_server::create_acceptor() {
+    if (own_acceptor_thread_) {
+        acceptor_.reset(); // it uses the io_context of the previous thread, if any
+        acceptor_thread_ = std::make_unique<worker_thread>("tcp acceptor " + host_ + ":" + port_);
+        acceptor_thread_->start();
+        if (listen(acceptor_thread_->get_io_context())) return true;
+        stop_acceptor_thread();
+        return false;
+    }
+    return listen(acceptor_context_provider_());
+}
+
+bool tcp_socket_server::listen(boost::asio::io_context& io_context) {
     int num_attempts = 0;
-    
-    // Get io_context from provider
-    boost::asio::io_context& io_context = acceptor_context_provider_();
     
     // Resolve endpoint
     boost::asio::ip::tcp::endpoint endpoint;
@@ -120,6 +143,7 @@ bool tcp_socket_server::create_acceptor() {
             std::this_thread::sleep_for(std::chrono::seconds(5));
         }
         
+        protocol_ = endpoint.protocol();
         acceptor_ = std::make_unique<boost::asio::ip::tcp::acceptor>(io_context);
         acceptor_->open(endpoint.protocol());
         acceptor_->set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
@@ -149,26 +173,91 @@ bool tcp_socket_server::create_acceptor() {
     return success;
 }
 
-void tcp_socket_server::accept_connection() {
-    // Get next io_context from provider
-    boost::asio::io_context& io_context = connection_context_provider_();
-    
-    // Create socket based on SSL configuration
-    std::shared_ptr<tcp_socket> sock;
-    if (ssl_enabled_) {
-        if (!ssl_context_) {
-            LOG_ERROR("SSL enabled but no SSL context configured");
-            return;
-        }
-        sock = std::make_shared<ssl_socket>("ssl_socket_server", io_context, ssl_context_);
-    } else {
-        sock = std::make_shared<tcp_socket>("tcp_socket_server", io_context);
+namespace {
+
+// What an accepted connection needs to be set up, copied: the server may be stopped and gone
+// by then
+struct connection_setup {
+    std::shared_ptr<boost::asio::ssl::context> ssl_context; // none without TLS
+    bool tcp_no_delay;
+    std::function<void(std::shared_ptr<socket>)> handler;
+};
+
+// An accepted descriptor on its way to the io_context serving it, closed if it never gets there
+class accepted_descriptor {
+public:
+    explicit accepted_descriptor(int descriptor) : descriptor_(descriptor) {}
+    accepted_descriptor(accepted_descriptor&& other) noexcept : descriptor_(std::exchange(other.descriptor_, -1)) {}
+    accepted_descriptor& operator=(accepted_descriptor&&) = delete;
+    ~accepted_descriptor() { if (descriptor_ >= 0) ::close(descriptor_); }
+
+    int get() const { return descriptor_; }
+    int release() { return std::exchange(descriptor_, -1); }
+
+private:
+    int descriptor_;
+};
+
+std::shared_ptr<tcp_socket> make_socket(boost::asio::io_context& io_context, const connection_setup& setup) {
+    if (setup.ssl_context) return std::make_shared<ssl_socket>("ssl_socket_server", io_context, setup.ssl_context);
+    return std::make_shared<tcp_socket>("tcp_socket_server", io_context);
+}
+
+// Set an accepted connection up and hand it to the handler
+void serve_connection(std::shared_ptr<tcp_socket> sock, connection_setup setup) {
+    LOG_INFO("received connection from: ip: {}, port: {}, secure: {}",
+            sock->get_remote_ip(), sock->get_local_port(), sock->is_secure());
+
+    if (setup.tcp_no_delay) {
+        sock->enable_tcp_no_delay();
     }
 
+    if (sock->requires_handshake()) {
+        // Use co_spawn to run the coroutine-based handshake
+        co_spawn(sock->get_io_context(),
+            [sock, handler = std::move(setup.handler)]() -> awaitable<void> {
+                auto ec = co_await sock->handshake();
+                if (ec) {
+                    LOG_ERROR("error while handling SSL handshake: {}, remote ip: {}",
+                             ec.message(), sock->get_remote_ip());
+                    co_return;
+                }
+                if (handler) handler(sock);
+            },
+            detached);
+    } else {
+        if (setup.handler) setup.handler(std::move(sock));
+    }
+}
+
+} // namespace
+
+void tcp_socket_server::accept_connection() {
+    if (ssl_enabled_ && !ssl_context_) {
+        LOG_ERROR("SSL enabled but no SSL context configured");
+        return;
+    }
+
+    // On a thread of its own, every pending connection is accepted at once, without waiting
+    if (acceptor_thread_) {
+        boost::system::error_code ec;
+        acceptor_->non_blocking(true, ec);
+        if (ec) {
+            LOG_ERROR("cannot accept connections: {}", ec.message());
+            return;
+        }
+        boost::asio::post(acceptor_thread_->get_io_context(), [this] { accept_pending(); });
+        return;
+    }
+
+    // Get next io_context from provider
+    boost::asio::io_context& io_context = connection_context_provider_();
+    connection_setup setup{ssl_enabled_ ? ssl_context_ : nullptr, tcp_no_delay_, handler_};
+    auto sock = make_socket(io_context, setup);
     auto& socket = sock->get_socket();
     
     // Start accepting a connection
-    acceptor_->async_accept(socket, [sock = std::move(sock), this](const boost::system::error_code& e) mutable {
+    acceptor_->async_accept(socket, [sock = std::move(sock), setup = std::move(setup), this](const boost::system::error_code& e) mutable {
         if (!e) {
             // Check if IP is allowed (the remote address is only looked up to filter it)
             if (filters_remotes()) {
@@ -182,51 +271,101 @@ void tcp_socket_server::accept_connection() {
                 }
             }
 
-            LOG_INFO("received connection from: ip: {}, port: {}, secure: {}", 
-                    sock->get_remote_ip(), sock->get_local_port(), sock->is_secure());
-
-            if (tcp_no_delay_) {
-                sock->enable_tcp_no_delay();
-            }
-
-            if (sock->requires_handshake()) {
-                // Use co_spawn to run the coroutine-based handshake
-                co_spawn(sock->get_io_context(),
-                    [this, sock]() -> awaitable<void> {
-                        auto ec = co_await sock->handshake();
-                        if (ec) {
-                            LOG_ERROR("error while handling SSL handshake: {}, remote ip: {}",
-                                     ec.message(), sock->get_remote_ip());
-                            co_return;
-                        }
-                        if (handler_) handler_(sock);
-                    },
-                    detached);
-            } else {
-                if (handler_) handler_(std::move(sock));
-            }
+            serve_connection(std::move(sock), std::move(setup));
 
             // Continue accepting connections
             if (running_) accept_connection();
+        } else if (e != boost::asio::error::operation_aborted) {
+            LOG_ERROR("cannot accept more connections: {}", e.message());
+            retry_accept();
         } else {
-            if (e != boost::asio::error::operation_aborted) {
-                LOG_ERROR("cannot accept more connections: {}", e.message());
-                if (running_) {
-                    // Retry after a delay to avoid tight loop on persistent errors
-                    auto timer = std::make_shared<boost::asio::steady_timer>(
-                        acceptor_context_provider_(),
-                        std::chrono::seconds(1)
-                    );
-                    timer->async_wait([this, timer](const boost::system::error_code& e) {
-                        if (e != boost::asio::error::operation_aborted) {
-                            accept_connection();
-                        }
-                    });
-                }
-            } else {
-                LOG_INFO("stop accepting connections");
-            }
+            LOG_INFO("stop accepting connections");
         }
+    });
+}
+
+void tcp_socket_server::wait_connections() {
+    acceptor_->async_wait(boost::asio::socket_base::wait_read, [this](const boost::system::error_code& e) {
+        if (!e) {
+            accept_pending();
+        } else if (e != boost::asio::error::operation_aborted) {
+            LOG_ERROR("cannot accept more connections: {}", e.message());
+            retry_accept();
+        } else {
+            LOG_INFO("stop accepting connections");
+        }
+    });
+}
+
+void tcp_socket_server::accept_pending() {
+    // Only this thread uses the acceptor (it is closed once the thread stops), and it is the
+    // only one running its io_context, so no other thread takes its readiness meanwhile
+    while (running_) {
+        int descriptor = ::accept(acceptor_->native_handle(), nullptr, nullptr);
+        if (descriptor >= 0) {
+#if defined(SO_NOSIGPIPE)
+            int enabled = 1;
+            ::setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+#endif
+            hand_over(descriptor);
+            continue;
+        }
+        int error = errno;
+        if (error == EINTR || error == ECONNABORTED || error == EPROTO) continue;
+        if (error == EAGAIN || error == EWOULDBLOCK) {
+            wait_connections();
+        } else {
+            LOG_ERROR("cannot accept more connections: {}", std::error_code(error, std::system_category()).message());
+            retry_accept();
+        }
+        return;
+    }
+}
+
+void tcp_socket_server::hand_over(int accepted) {
+    accepted_descriptor descriptor(accepted);
+
+    // Check if IP is allowed (the remote address is only looked up to filter it)
+    if (filters_remotes()) {
+        boost::asio::ip::tcp::endpoint remote;
+        auto size = static_cast<socklen_t>(remote.capacity());
+        std::string remote_ip = "0.0.0.0";
+        if (::getpeername(descriptor.get(), remote.data(), &size) == 0) {
+            remote.resize(size);
+            remote_ip = remote.address().to_string();
+        }
+        if (!is_remote_allowed(remote_ip)) {
+            LOG_WARNING("rejecting connection from: ip: {}, port: {}, secure: {}",
+                       remote_ip, local_port(), ssl_enabled_);
+            return;
+        }
+    }
+
+    // The connection is registered and set up on the worker serving it, waking it up once
+    boost::asio::io_context& io_context = connection_context_provider_();
+    boost::asio::post(io_context,
+        [&io_context, descriptor = std::move(descriptor), protocol = protocol_,
+         setup = connection_setup{ssl_enabled_ ? ssl_context_ : nullptr, tcp_no_delay_, handler_}]() mutable {
+            auto sock = make_socket(io_context, setup);
+            boost::system::error_code ec;
+            sock->get_socket().assign(protocol, descriptor.get(), ec);
+            if (ec) {
+                LOG_ERROR("cannot serve an accepted connection: {}", ec.message());
+                return;
+            }
+            descriptor.release();
+            serve_connection(std::move(sock), std::move(setup));
+        });
+}
+
+void tcp_socket_server::retry_accept() {
+    if (!running_) return;
+    // Retry after a delay to avoid tight loop on persistent errors
+    auto timer = std::make_shared<boost::asio::steady_timer>(acceptor_->get_executor(), std::chrono::seconds(1));
+    timer->async_wait([this, timer](const boost::system::error_code& e) {
+        if (e == boost::asio::error::operation_aborted) return;
+        if (acceptor_thread_) accept_pending();
+        else accept_connection();
     });
 }
 
