@@ -2,6 +2,7 @@
 #include "../server/mime_types.hpp"
 #include "../data/out_string.hpp"
 
+#include <algorithm>
 #include <memory>
 #include "../../util/logger.hpp"
 
@@ -129,7 +130,20 @@ namespace thinger::http{
     }
 
     void http_response::to_buffer(std::vector<boost::asio::const_buffer>& buffer) const{
-        buffer.emplace_back(boost::asio::buffer(status_strings::get_status_string(status_)));
+        const auto& status_line = status_strings::get_status_string(status_);
+        auto code = get_status_code();
+        if (&status_line == &status_strings::unknown && code >= 100 && code <= 599) {
+            // any other valid status (e.g. relayed from another server): its code, and its
+            // reason phrase if it only has printable characters (it ends the line)
+            status_line_ = "HTTP/1.1 " + std::to_string(code) + " ";
+            bool printable = std::all_of(reason_phrase_.begin(), reason_phrase_.end(), [](unsigned char c) {
+                return c == '\t' || (c >= 0x20 && c != 0x7f);
+            });
+            if (printable) status_line_ += reason_phrase_;
+            buffer.emplace_back(boost::asio::buffer(status_line_));
+        } else {
+            buffer.emplace_back(boost::asio::buffer(status_line));
+        }
         buffer.emplace_back(boost::asio::buffer(misc_strings::crlf));
         for(const auto& t: headers_){
             buffer.emplace_back(boost::asio::buffer(t.first));

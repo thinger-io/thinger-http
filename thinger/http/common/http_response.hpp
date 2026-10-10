@@ -63,6 +63,8 @@ public:
 
     void set_status(uint16_t status_code);
     void set_status(status status_code);
+    // Reason phrase of the status line, for statuses without a standard one (e.g. those
+    // received from another server); only printable characters are sent
     void set_reason_phrase(const std::string& reason);
 
     // some getters
@@ -72,6 +74,7 @@ public:
     size_t get_size() override;
     status get_status() const;
     int get_status_code() const;
+    const std::string& get_reason() const { return reason_phrase_; }
     bool is_ok() const;
     bool is_redirect_response() const;
 
@@ -88,6 +91,8 @@ private:
     std::string content_;
     status status_ = status::ok;
     std::string reason_phrase_;
+    // Status line of a status without a standard reason phrase, built when sent
+    mutable std::string status_line_;
 };
 
 }

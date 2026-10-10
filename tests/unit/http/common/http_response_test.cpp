@@ -260,6 +260,27 @@ TEST_CASE("HTTP Response status line formatting", "[http][response][unit]") {
         std::string status_line = full_response.substr(0, full_response.find("\r\n"));
         REQUIRE(status_line == "HTTP/1.1 000 Unknown Status");
     }
+
+    SECTION("Other valid status codes keep their code and reason phrase") {
+        auto status_line = [](uint16_t code, const std::string& reason) {
+            http_response res;
+            res.set_status(code);
+            res.set_reason_phrase(reason);
+            std::vector<boost::asio::const_buffer> buffers;
+            res.to_buffer(buffers);
+            std::string full_response;
+            for (const auto& buffer : buffers) {
+                full_response.append(static_cast<const char*>(buffer.data()), buffer.size());
+            }
+            return full_response.substr(0, full_response.find("\r\n"));
+        };
+        REQUIRE(status_line(418, "I'm a teapot") == "HTTP/1.1 418 I'm a teapot");
+        REQUIRE(status_line(206, "") == "HTTP/1.1 206 ");
+        // a reason that could end the line is not sent
+        REQUIRE(status_line(299, "Bad\r\nX-Injected: 1") == "HTTP/1.1 299 ");
+        // standard statuses keep their standard reason
+        REQUIRE(status_line(404, "Gone Away") == "HTTP/1.1 404 Not Found");
+    }
 }
 
 TEST_CASE("HTTP Response edge cases", "[http][response][unit]") {
