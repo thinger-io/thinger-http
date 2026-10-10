@@ -80,10 +80,14 @@ awaitable<std::shared_ptr<http_response>> client_connection::read_response(bool 
             co_return nullptr;
         }
 
-        boost::tribool result = response_parser_.parse(buffer_, buffer_ + bytes, head_request);
+        uint8_t* begin = buffer_;
+        uint8_t* end = buffer_ + bytes;
+        boost::tribool result = response_parser_.parse_some(begin, end, head_request);
 
         if (result) {
-            // Successfully parsed response
+            // Successfully parsed response; keep what followed it (e.g. data sent right
+            // after a protocol upgrade)
+            buffered_.assign(reinterpret_cast<const char*>(begin), static_cast<size_t>(end - begin));
             auto response = response_parser_.consume_response();
 
             // Decompress if needed
@@ -247,6 +251,10 @@ void client_connection::close() {
         socket_->close();
     }
     response_parser_.reset();
+}
+
+std::string client_connection::take_buffered() {
+    return std::exchange(buffered_, {});
 }
 
 std::shared_ptr<thinger::asio::socket> client_connection::release_socket() {

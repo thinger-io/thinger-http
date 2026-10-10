@@ -8,6 +8,8 @@
 #include <thread>
 #include <chrono>
 #include <future>
+#include <thinger/util/base64.hpp>
+#include <thinger/util/sha1.hpp>
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -307,4 +309,53 @@ TEST_CASE("Async Client WebSocket Integration", "[websocket][client][integration
         REQUIRE(callback_called);
         REQUIRE_FALSE(received_ws);  // Should be nullptr
     }
+}
+
+TEST_CASE("WebSocket client keeps the frames received along with the handshake response",
+          "[websocket][client][integration]") {
+    // A server that sends a frame right after its 101 response, in the same write: the
+    // client reads both at once
+    boost::asio::io_context server_context;
+    boost::asio::ip::tcp::acceptor acceptor(server_context,
+        {boost::asio::ip::make_address("127.0.0.1"), 0});
+    auto port = acceptor.local_endpoint().port();
+
+    std::thread server_thread([&acceptor, &server_context]() {
+        boost::asio::ip::tcp::socket socket(server_context);
+        acceptor.accept(socket);
+
+        boost::asio::streambuf request;
+        boost::asio::read_until(socket, request, "\r\n\r\n");
+        std::string text(boost::asio::buffers_begin(request.data()), boost::asio::buffers_end(request.data()));
+        const std::string key_header = "Sec-WebSocket-Key: ";
+        auto key_start = text.find(key_header) + key_header.size();
+        auto key = text.substr(key_start, text.find("\r\n", key_start) - key_start);
+        auto accept = util::base64::encode(util::sha1::hash(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
+
+        std::string response = "HTTP/1.1 101 Switching Protocols\r\n"
+                               "Upgrade: websocket\r\n"
+                               "Connection: Upgrade\r\n"
+                               "Sec-WebSocket-Accept: " + accept + "\r\n\r\n";
+        response += std::string("\x81\x07" "welcome", 9);   // final text frame, unmasked
+        boost::asio::write(socket, boost::asio::buffer(response));
+
+        // Wait for the close frame of the client, then close
+        uint8_t data[64];
+        boost::system::error_code ec;
+        socket.read_some(boost::asio::buffer(data), ec);
+        socket.close();
+    });
+
+    {
+        http::client client;
+        auto ws = client.websocket("ws://127.0.0.1:" + std::to_string(port) + "/");
+        REQUIRE(ws.has_value());
+
+        auto [message, binary] = ws->receive();
+        REQUIRE(message == "welcome");
+        REQUIRE_FALSE(binary);
+
+        ws->close();
+    }
+    server_thread.join();
 }

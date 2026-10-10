@@ -2,6 +2,7 @@
 #include "../../util/logger.hpp"
 #include "tcp_socket.hpp"
 
+#include <cstring>
 #include <random>
 
 namespace thinger::asio {
@@ -111,7 +112,7 @@ awaitable<size_t> websocket::read_frame(uint8_t buffer[], size_t max_size, boost
     // If there's remaining data in current frame, read it
     if (frame_remaining_ > 0) {
         auto read_size = std::min(frame_remaining_, max_size);
-        auto [read_ec, bytes] = co_await socket_->read(buffer, read_size);
+        auto [read_ec, bytes] = co_await read_exact(buffer, read_size);
 
         if (read_ec) {
             ec = read_ec;
@@ -126,7 +127,7 @@ awaitable<size_t> websocket::read_frame(uint8_t buffer[], size_t max_size, boost
 
     // Read frame header (2 bytes minimum)
     {
-        auto [read_ec, bytes] = co_await socket_->read(buffer_, 2);
+        auto [read_ec, bytes] = co_await read_exact(buffer_, 2);
         if (read_ec) {
             ec = read_ec;
             co_return 0;
@@ -197,14 +198,14 @@ awaitable<size_t> websocket::read_frame(uint8_t buffer[], size_t max_size, boost
     // Determine payload length
     uint64_t payload_size = data_size;
     if (data_size == 126) {
-        auto [read_ec, bytes] = co_await socket_->read(buffer_, 2);
+        auto [read_ec, bytes] = co_await read_exact(buffer_, 2);
         if (read_ec) {
             ec = read_ec;
             co_return 0;
         }
         payload_size = (buffer_[0] << 8) | buffer_[1];
     } else if (data_size == 127) {
-        auto [read_ec, bytes] = co_await socket_->read(buffer_, 8);
+        auto [read_ec, bytes] = co_await read_exact(buffer_, 8);
         if (read_ec) {
             ec = read_ec;
             co_return 0;
@@ -219,7 +220,7 @@ awaitable<size_t> websocket::read_frame(uint8_t buffer[], size_t max_size, boost
 
     // Read mask if present
     if (masked_) {
-        auto [read_ec, bytes] = co_await socket_->read(mask_, MASK_SIZE_BYTES);
+        auto [read_ec, bytes] = co_await read_exact(mask_, MASK_SIZE_BYTES);
         if (read_ec) {
             ec = read_ec;
             co_return 0;
@@ -232,7 +233,7 @@ awaitable<size_t> websocket::read_frame(uint8_t buffer[], size_t max_size, boost
         uint8_t control_buffer[125];
         size_t control_size = std::min(static_cast<size_t>(payload_size), size_t(125));
         if (control_size > 0) {
-            auto [read_ec, bytes] = co_await socket_->read(control_buffer, control_size);
+            auto [read_ec, bytes] = co_await read_exact(control_buffer, control_size);
             if (read_ec) {
                 ec = read_ec;
                 co_return 0;
@@ -269,7 +270,7 @@ awaitable<size_t> websocket::read_frame(uint8_t buffer[], size_t max_size, boost
     }
 
     auto read_size = std::min(frame_remaining_, max_size);
-    auto [read_ec, bytes] = co_await socket_->read(buffer, read_size);
+    auto [read_ec, bytes] = co_await read_exact(buffer, read_size);
 
     if (read_ec) {
         ec = read_ec;
@@ -346,6 +347,21 @@ awaitable<io_result> websocket::send_message(uint8_t opcode, const uint8_t buffe
         co_return io_result{ec, 0};
     }
     co_return io_result{ec, bytes - header_size};
+}
+
+awaitable<io_result> websocket::read_exact(uint8_t buffer[], size_t size) {
+    size_t buffered = std::min(size, read_ahead_.size() - read_ahead_offset_);
+    if (buffered > 0) {
+        std::memcpy(buffer, read_ahead_.data() + read_ahead_offset_, buffered);
+        read_ahead_offset_ += buffered;
+        if (read_ahead_offset_ == read_ahead_.size()) {
+            read_ahead_.clear();
+            read_ahead_offset_ = 0;
+        }
+        if (buffered == size) co_return io_result{boost::system::error_code{}, size};
+    }
+    auto [ec, bytes] = co_await socket_->read(buffer + buffered, size - buffered);
+    co_return io_result{ec, buffered + bytes};
 }
 
 awaitable<io_result> websocket::read_some(uint8_t buffer[], size_t max_size) {

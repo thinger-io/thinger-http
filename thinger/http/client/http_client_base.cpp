@@ -364,6 +364,8 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
     // Upgrade to WebSocket
     auto raw_socket = connection->release_socket();
     auto ws = std::make_shared<asio::websocket>(raw_socket, false, false);
+    // Frames the server sent right after its response, read along with it
+    ws->set_read_ahead(connection->take_buffered());
 
     LOG_INFO("WebSocket connected to {}", url);
 

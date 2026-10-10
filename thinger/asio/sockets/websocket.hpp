@@ -63,10 +63,19 @@ public:
     // Timeout management
     void start_timeout();
 
+    // Bytes already read from the socket, read before anything else from it (e.g. frames
+    // received along with the handshake response)
+    void set_read_ahead(std::string data) {
+        read_ahead_ = std::move(data);
+        read_ahead_offset_ = 0;
+    }
+
 private:
     // Internal helpers
     void unmask(uint8_t buffer[], size_t size);
     awaitable<size_t> read_frame(uint8_t buffer[], size_t max_size, boost::system::error_code& ec);
+    // Read exactly `size` bytes: from the read-ahead first, then from the socket
+    awaitable<io_result> read_exact(uint8_t buffer[], size_t size);
     awaitable<io_result> send_message(uint8_t opcode, const uint8_t buffer[], size_t size);
     awaitable<void> send_close(uint8_t buffer[] = nullptr, size_t size = 0);
 
@@ -98,6 +107,8 @@ private:
 
     // Write synchronization (for write ordering)
     std::mutex write_mutex_;
+    std::string read_ahead_;
+    size_t read_ahead_offset_ = 0;
 };
 
 }

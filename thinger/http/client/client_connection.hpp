@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <mutex>
+#include <string>
 #include <boost/noncopyable.hpp>
 
 #include "../common/http_request.hpp"
@@ -46,6 +47,11 @@ public:
     // Connection management
     void close();
     std::shared_ptr<thinger::asio::socket> release_socket();
+
+    // Bytes received after the last response, read along with it (e.g. data the server
+    // sent right after a protocol upgrade response): they come before anything read from
+    // the released socket
+    std::string take_buffered();
     std::shared_ptr<thinger::asio::socket> get_socket() const { return socket_; }
     bool is_open() const { return socket_ && socket_->is_open(); }
 
@@ -61,6 +67,7 @@ private:
     std::string socket_path_;
     std::chrono::seconds timeout_;
     uint8_t buffer_[MAX_BUFFER_SIZE];
+    std::string buffered_;
     response_factory response_parser_;
     std::mutex connection_mutex_;
 };

@@ -28,6 +28,13 @@ namespace thinger::http {
         /// input has been consumed.
         template<typename InputIterator>
         boost::tribool parse(InputIterator begin, InputIterator end, bool head_request = false) {
+            return parse_some(begin, end, head_request);
+        }
+
+        /// Same as parse(), leaving `begin` where parsing stopped: past the end of the
+        /// response when it is complete, so what follows it is in [begin, end)
+        template<typename InputIterator>
+        boost::tribool parse_some(InputIterator& begin, InputIterator end, bool head_request = false) {
             // iterate over all input chars
             while (begin != end) {
                 // Optimization: batch process content in streaming mode
