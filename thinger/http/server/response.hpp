@@ -14,6 +14,7 @@
 #include <memory>
 #include <functional>
 #include <filesystem>
+#include <optional>
 #include <set>
 #include <string>
 
@@ -99,6 +100,25 @@ public:
     bool start_chunked(const std::string& content_type, http::http_response::status status = http::http_response::status::ok);
     bool write_chunk(const std::string& data);
     bool end_chunked();
+
+    // Streamed response, with flow control (e.g. to relay a body as it arrives from
+    // elsewhere). start_stream() sends the head: the headers set so far (header()) and those
+    // of `head`, with the status of `head`. Its framing is set here (Content-Length,
+    // Transfer-Encoding and Connection headers in `head` are ignored): with `content_length`
+    // the body has that length; without it, it is chunked, or, for HTTP/1.0 clients, ended
+    // by closing the connection. Responses to HEAD requests, and with status 1xx, 204 or
+    // 304, have no body (`content_length` is only advertised, except for 1xx and 204).
+    // Then write_stream() each part of the body: it completes once the part is written to
+    // the connection, so the body goes at the pace of the client. end_stream() completes
+    // the response (false if the body is shorter than its Content-Length, then closing the
+    // connection), or abort_stream() leaves it incomplete for the client (closing the
+    // connection) if the body cannot be produced. They return false if the response cannot
+    // be written: another answer was sent first, the connection is gone, more data than
+    // its Content-Length or data for a response without body. Use one writer at a time.
+    bool start_stream(const http_response& head, std::optional<size_t> content_length = std::nullopt);
+    awaitable<bool> write_stream(std::string data);
+    awaitable<bool> end_stream();
+    void abort_stream();
 
     // Check if response has been sent
     bool has_responded() const;

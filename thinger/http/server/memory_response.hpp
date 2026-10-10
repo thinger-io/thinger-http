@@ -51,6 +51,12 @@ public:
         return true;
     }
 
+    // A streamed response that could not be completed: its body is incomplete, so the
+    // result is a 502 instead
+    void abort_stream() override {
+        send(http_response::stock_http_reply(http_response::status::bad_gateway));
+    }
+
     bool is_complete() const {
         std::lock_guard lock(mutex_);
         return complete_;

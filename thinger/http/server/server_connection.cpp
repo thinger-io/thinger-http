@@ -222,7 +222,10 @@ awaitable<bool> server_connection::wait_peer_closed() {
     co_return co_await socket_->peer_closed();
 }
 
-void server_connection::frame_written(http_stream& stream, const std::shared_ptr<http_frame>& frame) {
+void server_connection::frame_written(http_stream& stream, const std::shared_ptr<http_frame>& frame, bool written) {
+    // Whoever waits for the frame (a streamed response) may write the next one
+    frame->notify_written(written);
+
     // Reset timeout on activity. The timer holds a weak reference: once the read loop stopped
     // (the connection closes after this response), only a pending write keeps the connection,
     // so a response still unfinished when its queued frames are written (e.g. chunks written
@@ -270,9 +273,12 @@ void server_connection::process_output_queue() {
         // A write error is left to the read loop, as for a write that waited
         boost::system::error_code ec;
         size_t written = socket_->write_now(buffers, ec);
-        if (written == boost::asio::buffer_size(buffers) ||
-            (ec && ec != boost::asio::error::would_block && ec != boost::asio::error::operation_not_supported)) {
-            frame_written(*stream, frame);
+        if (written == boost::asio::buffer_size(buffers)) {
+            frame_written(*stream, frame, true);
+            continue;
+        }
+        if (ec && ec != boost::asio::error::would_block && ec != boost::asio::error::operation_not_supported) {
+            frame_written(*stream, frame, false);
             continue;
         }
 
@@ -289,8 +295,8 @@ void server_connection::process_output_queue() {
         co_spawn(socket_->get_io_context(),
             [this, self = shared_from_this(), stream = std::move(stream), frame = std::move(frame),
              buffers = std::move(buffers)]() -> awaitable<void> {
-                co_await socket_->write(buffers);
-                frame_written(*stream, frame);
+                auto [ec, bytes] = co_await socket_->write(buffers);
+                frame_written(*stream, frame, !ec);
                 writing_ = false;
 
                 // Process more frames if available

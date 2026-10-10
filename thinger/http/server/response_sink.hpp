@@ -2,6 +2,7 @@
 #define THINGER_HTTP_SERVER_RESPONSE_SINK_HPP
 
 #include "../common/http_response.hpp"
+#include "../../util/types.hpp"
 #include "server_connection.hpp"
 #include "http_stream.hpp"
 #include <memory>
@@ -9,9 +10,18 @@
 
 namespace thinger::http {
 
+// How the body of a streamed response is delimited (see response::start_stream)
+enum class body_framing {
+    none,       // no body (a response to HEAD, 1xx, 204, 304): the head alone
+    length,     // Content-Length, already set in the head
+    chunked,    // chunked transfer coding
+    close       // closing the connection at its end (HTTP/1.0 clients)
+};
+
 // Where a response is written: a connection, or memory for requests dispatched in memory.
 // Shared by every copy of a response, which writes it once: whole (send), in chunks
-// (begin, append..., finish), or followed by a connection takeover (take_over).
+// (begin, append..., finish), streamed with flow control (begin_stream, write_stream...,
+// end_stream or abort_stream), or followed by a connection takeover (take_over).
 class response_sink {
 public:
     virtual ~response_sink() = default;
@@ -24,6 +34,23 @@ public:
     virtual bool begin(std::shared_ptr<http_response> headers) = 0;
     virtual bool append(const std::string& data) = 0;
     virtual bool finish() = 0;
+
+    // Streamed response: the head (its framing headers are set by the sink), then the
+    // body, each write completing once its data is written (false if it could not be),
+    // then the end; or an abort, ending the response so the client sees it incomplete.
+    // By default they are the chunked response above, collected at once.
+    virtual bool begin_stream(std::shared_ptr<http_response> head, body_framing /*framing*/) {
+        return begin(std::move(head));
+    }
+    virtual awaitable<bool> write_stream(std::string data) {
+        co_return append(data);
+    }
+    virtual awaitable<bool> end_stream() {
+        co_return finish();
+    }
+    virtual void abort_stream() {
+        finish();
+    }
 
     // Whether the connection can be taken over (WebSocket, SSE, response::take_over)
     virtual bool can_take_over() const { return false; }
@@ -45,6 +72,10 @@ public:
     bool begin(std::shared_ptr<http_response> headers) override;
     bool append(const std::string& data) override;
     bool finish() override;
+    bool begin_stream(std::shared_ptr<http_response> head, body_framing framing) override;
+    awaitable<bool> write_stream(std::string data) override;
+    awaitable<bool> end_stream() override;
+    void abort_stream() override;
     bool can_take_over() const override { return true; }
     void take_over(std::shared_ptr<http_response> response, takeover_handler handler) override;
     std::shared_ptr<server_connection> connection() const override { return connection_.lock(); }
@@ -53,8 +84,17 @@ private:
     // Queue a frame on the stream; false if the connection is gone
     bool write(std::shared_ptr<http_frame> frame);
 
+    // Queue a frame and wait until it is written; false if it could not be
+    awaitable<bool> write_and_wait(std::shared_ptr<http_frame> frame);
+
+    // Close the connection once this response is written
+    void close_after_response();
+
     std::weak_ptr<server_connection> connection_;
     std::weak_ptr<http_stream> stream_;
+
+    // Framing of a streamed response
+    body_framing framing_ = body_framing::none;
 };
 
 } // namespace thinger::http

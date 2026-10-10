@@ -10,7 +10,7 @@ namespace thinger::http::data{
 class out_chunk : public out_data{
 
 public:
-    explicit out_chunk(const std::string& str) : str_(str){
+    explicit out_chunk(std::string str) : str_(std::move(str)){
         std::ostringstream ss;
         ss << std::hex << str_.size();
         size_ = ss.str();

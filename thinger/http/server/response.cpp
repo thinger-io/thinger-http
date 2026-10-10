@@ -28,6 +28,12 @@ struct response::state {
     enum class chunked_phase { none, open, ended };
     std::mutex chunked_mutex;
     chunked_phase chunked = chunked_phase::none;
+
+    // Streamed response (under chunked_mutex too): its phase, framing, and the bytes left
+    // of a body with Content-Length
+    chunked_phase stream = chunked_phase::none;
+    body_framing stream_framing = body_framing::none;
+    size_t stream_remaining = 0;
 };
 
 namespace {
@@ -400,4 +406,108 @@ bool response::end_chunked() {
     return state_->sink->finish();
 }
 
+
+// Streamed response: the sink writes the head, then each part of the body once the previous
+// one is written. The response checks the body against its framing, so a writer can never
+// put more on the connection than the head announced (it would be read as what follows)
+bool response::start_stream(const http_response& head, std::optional<size_t> content_length) {
+    if (!ensure_not_responded()) return false;
+    auto message = new_response();
+    message->set_status(head.get_status());
+    message->set_reason_phrase(head.get_reason());
+    // the headers of `head` replace those with the same name set before (e.g. CORS)
+    auto is_framing = [](const std::string& key) {
+        return headers::is_header(key, header::content_length) || headers::is_header(key, header::transfer_encoding) ||
+               headers::is_header(key, header::connection);
+    };
+    for (const auto& [key, value] : head.get_headers()) {
+        if (!is_framing(key)) message->remove_headers(key);
+    }
+    for (const auto& [key, value] : head.get_headers()) {
+        if (!is_framing(key)) message->add_header(key, value);
+    }
+    // headers set before (header()) may carry framing too
+    message->remove_headers(header::content_length);
+    message->remove_headers(header::transfer_encoding);
+
+    const auto& request = *state_->request;
+    int code = message->get_status_code();
+    bool no_body = request.get_method() == method::HEAD || (code >= 100 && code < 200) || code == 204 || code == 304;
+    bool http_1_1 = request.get_http_version_major() > 1 ||
+                    (request.get_http_version_major() == 1 && request.get_http_version_minor() >= 1);
+
+    body_framing framing;
+    if (no_body) {
+        framing = body_framing::none;
+        // the length of the resource (HEAD, 304), but never for 1xx and 204
+        if (content_length && code >= 200 && code != 204) message->set_content_length(*content_length);
+    } else if (content_length) {
+        framing = body_framing::length;
+        message->set_content_length(*content_length);
+    } else if (http_1_1) {
+        framing = body_framing::chunked;
+    } else {
+        framing = body_framing::close;
+    }
+
+    if (!mark_responded()) return false;
+
+    std::lock_guard lock(state_->chunked_mutex);
+    if (!state_->sink->begin_stream(std::move(message), framing)) return false;
+    state_->stream = state::chunked_phase::open;
+    state_->stream_framing = framing;
+    state_->stream_remaining = framing == body_framing::length ? *content_length : 0;
+    return true;
+}
+
+awaitable<bool> response::write_stream(std::string data) {
+    {
+        std::lock_guard lock(state_->chunked_mutex);
+        if (state_->stream != state::chunked_phase::open) {
+            LOG_ERROR("Stream data can only be written between start_stream() and end_stream()");
+            co_return false;
+        }
+        if (state_->stream_framing == body_framing::none) {
+            if (!data.empty()) LOG_ERROR("Response without body: stream data dropped");
+            co_return data.empty();
+        }
+        if (state_->stream_framing == body_framing::length) {
+            if (data.size() > state_->stream_remaining) {
+                LOG_ERROR("Stream data exceeds the Content-Length of the response: dropped");
+                co_return false;
+            }
+            state_->stream_remaining -= data.size();
+        }
+    }
+    // (an empty chunk would end a chunked body)
+    if (data.empty()) co_return true;
+    co_return co_await state_->sink->write_stream(std::move(data));
+}
+
+awaitable<bool> response::end_stream() {
+    {
+        std::lock_guard lock(state_->chunked_mutex);
+        if (state_->stream != state::chunked_phase::open) {
+            LOG_ERROR("Only a response started with start_stream() can be ended, once");
+            co_return false;
+        }
+        state_->stream = state::chunked_phase::ended;
+        if (state_->stream_framing == body_framing::length && state_->stream_remaining > 0) {
+            LOG_ERROR("Stream ended {} bytes before its Content-Length: closing the connection",
+                      state_->stream_remaining);
+            state_->sink->abort_stream();
+            co_return false;
+        }
+    }
+    co_return co_await state_->sink->end_stream();
+}
+
+void response::abort_stream() {
+    std::lock_guard lock(state_->chunked_mutex);
+    if (state_->stream != state::chunked_phase::open) return;
+    state_->stream = state::chunked_phase::ended;
+    state_->sink->abort_stream();
+}
+
 } // namespace thinger::http
+

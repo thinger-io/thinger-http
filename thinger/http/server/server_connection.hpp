@@ -73,9 +73,9 @@ private:
     // Queue a response frame (on the connection executor)
     void queue_frame(const std::shared_ptr<http_stream>& stream, std::shared_ptr<http_frame> frame);
 
-    // Once a frame of `stream` is written: close the connection or hand it over when its
-    // response ends, as required
-    void frame_written(http_stream& stream, const std::shared_ptr<http_frame>& frame);
+    // Once a frame of `stream` is written (or its write failed): close the connection or
+    // hand it over when its response ends, as required
+    void frame_written(http_stream& stream, const std::shared_ptr<http_frame>& frame, bool written);
 
     // Write the queued frames, in order
     void process_output_queue();
