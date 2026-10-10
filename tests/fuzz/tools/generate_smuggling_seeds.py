@@ -89,6 +89,7 @@ def quirks():
         ("rl_query_with_hash", b"GET /a?b=c#d HTTP/1.1"),
         ("rl_percent_00", b"GET /a%00b HTTP/1.1"),
         ("rl_percent_short", b"GET /a%2 HTTP/1.1"),
+        ("rl_encoded_leading_slash", b"GET %2Fa HTTP/1.1"),
         ("rl_authority_form", b"CONNECT localhost:443 HTTP/1.1"),
         ("rl_absolute_form", b"GET http://localhost/a HTTP/1.1"),
         ("rl_asterisk_options", b"OPTIONS * HTTP/1.1"),
@@ -111,6 +112,7 @@ def quirks():
     ):
         add(name, line + b"\r\nHost: localhost\r\n\r\n")
     add("rl_h2_preface", b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+    add("rl_pri_http11_preface_body", b"PRI / HTTP/1.1\r\n\r\nSM\r\n\r\n")
     add("rl_http09_simple", b"GET /\r\n")
 
     # Field names

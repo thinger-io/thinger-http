@@ -209,21 +209,25 @@ namespace {
     }
 
     /**
-     * Discrepancies known to be acceptable, where we accept a request llhttp rejects (see
-     * README.md). If it is one of them, `input` is rewritten so that llhttp no longer
-     * rejects it for that reason, and the reason returned; comparing again then checks the
+     * Discrepancies known to be acceptable, where we accept a request llhttp rejects or still
+     * needs data for (see README.md). If it is one of them, `input` is rewritten so that
+     * llhttp no longer does it for that reason, and the reason returned; comparing again then checks the
      * rest of the request. The rewrite keeps the framing; when it changes the size, it is
      * only within the request. nullptr if it is not one.
      */
     const char* normalize_known_discrepancy(const fuzz::server_result& ours, const llhttp_result& theirs, std::string& input) {
         auto& req = *ours.request;
 
-        // A method llhttp does not know, or not for HTTP (RTSP methods, PRI for the HTTP/2
-        // preface), or in lowercase: any token is a method (RFC 9110 section 9.1), which we
-        // keep as UNKNOWN for the application to answer; it does not frame the message.
-        // Replaced by GET
-        bool method_error = theirs.error == HPE_INVALID_METHOD || theirs.reason.find("method") != std::string::npos ||
-                            theirs.reason.find("HTTP/2 Connection Preface") != std::string::npos;
+        // A method llhttp does not know, or not for HTTP (RTSP methods), or in lowercase: any
+        // token is a method (RFC 9110 section 9.1), which we keep as UNKNOWN for the
+        // application to answer; it does not frame the message. Also PRI, which llhttp always
+        // reads as the start of the HTTP/2 connection preface (waiting for the rest of it, or
+        // stopping there): an HTTP/1.1 server sees a request with an unknown method, as the
+        // preface intends (RFC 9113 section 3.4). Replaced by GET
+        bool method_error = theirs.error == HPE_INVALID_METHOD || theirs.error == HPE_PAUSED_H2_UPGRADE ||
+                            theirs.reason.find("method") != std::string::npos ||
+                            theirs.reason.find("HTTP/2 Connection Preface") != std::string::npos ||
+                            (theirs.result == outcome::incomplete && input.starts_with("PRI "));
         if (method_error && req.get_method() == thinger::http::method::UNKNOWN) {
             input.replace(0, input.find(' '), "GET");
             return "method unknown to llhttp";
@@ -292,8 +296,7 @@ namespace {
         // We accept the request
         if (theirs.result != outcome::accepted) {
             std::string normalized(input);
-            const char* known = normalizations < 4 && theirs.result == outcome::rejected
-                                    ? normalize_known_discrepancy(ours, theirs, normalized) : nullptr;
+            const char* known = normalizations < 4 ? normalize_known_discrepancy(ours, theirs, normalized) : nullptr;
             if (known) {
                 known_discrepancies.add(known, describe_all(input, ours, theirs, beast));
                 if (trace) std::fprintf(stderr, "normalized (%s): %s\n", known, fuzz::escape(normalized, 2048).c_str());

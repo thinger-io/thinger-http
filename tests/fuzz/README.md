@@ -119,6 +119,11 @@ normalizes.
   section 3 asks to reject rather than autocorrect an invalid request line, as it may be
   crafted to bypass filters along the request chain. They are now rejected, as llhttp does.
   Regression tests in `request_factory_test.cpp` and `request_framing_test.cpp`.
+- **A target starting with an encoded slash was accepted.** The origin form (a target
+  starting with `/`) was checked on the percent-decoded target, so `GET %2Fhealth` was served
+  as `/health`, though it is not in origin form (RFC 9112 section 3.2.1) and any other parser
+  reads it differently (llhttp rejects it). The raw target must now start with `/`.
+  Regression tests in `request_factory_test.cpp` and `request_framing_test.cpp`.
 
 ## Known discrepancies
 
@@ -141,10 +146,12 @@ overflow, chunk data longer than its size...) are not listed.
 | Empty `Transfer-Encoding` | rejected | accepted | rejected |
 | `Transfer-Encoding` in an HTTP/1.0 request | rejected (RFC 9112 section 6.1) | accepted | accepted |
 | Request target other than origin form (absolute form, authority form, `*`) | rejected | accepted | accepted |
+| Request target starting with an encoded slash (`%2Fa`) | rejected (fixed, see above) | accepted | rejected |
 | Request target with invalid percent-encoding or `..` | rejected | accepted | accepted |
 | Request target with bytes above 0x7F | rejected (fixed, see above) | accepted | rejected |
 | `CONNECT` | rejected (fixed, see above) | parsed as any other request (body read) | no content: what follows is tunnel data |
-| Methods llhttp does not know (any token, lowercase, RTSP methods like `DESCRIBE` in HTTP, `PRI` outside the HTTP/2 preface) | accepted as `UNKNOWN` (RFC 9110 section 9.1), for the application to answer | accepted | rejected, **normalized** (replaced by `GET`) |
+| Methods llhttp does not know (any token, lowercase, RTSP methods like `DESCRIBE` in HTTP) | accepted as `UNKNOWN` (RFC 9110 section 9.1), for the application to answer | accepted | rejected, **normalized** (replaced by `GET`) |
+| `PRI` method | accepted as `UNKNOWN`, as the HTTP/2 preface intends for an HTTP/1.1 server (RFC 9113 section 3.4) | accepted | always the HTTP/2 preface: waits for the rest of it, stops at it or rejects what does not follow it, **normalized** (replaced by `GET`) |
 | `HTTP/1.2` to `HTTP/1.9` | accepted, handled as HTTP/1.1 (RFC 9110 section 2.5) | rejected, **normalized** | rejected, **normalized** |
 | `HTTP/0.9` and `HTTP/2.0` request lines, request line without a version | rejected | rejected | accepted |
 | Empty lines (CRLF) before the request line | rejected | rejected | skipped |
