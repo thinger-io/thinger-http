@@ -36,23 +36,45 @@ void server_connection::start(std::chrono::seconds timeout) {
 }
 
 void server_connection::reset_timeout() {
-    timeout_timer_.expires_after(timeout_);
+    deadline_ = std::chrono::steady_clock::now() + timeout_;
+    // A running timer checks the new deadline when it expires, unless it is earlier (the
+    // timeout was shortened)
+    if (!timeout_armed_ || deadline_ < timeout_timer_.expiry()) {
+        arm_timeout();
+    }
+}
+
+void server_connection::arm_timeout() {
+    timeout_armed_ = true;
+    timeout_timer_.expires_at(deadline_);
     // The timer does not keep the connection alive: once neither the read loop nor a write
     // holds it (e.g. the read loop stopped with a response left unfinished), it is released
     // and the socket closed
     timeout_timer_.async_wait([weak = weak_from_this()](const boost::system::error_code& ec) {
-        if (ec) return; // Timer was cancelled
+        if (ec) return; // Timer was cancelled or re-armed
         auto self = weak.lock();
-        if (!self) return;
+        if (!self || !self->timeout_armed_) return; // Expired as it was cancelled
 
+        // Some activity moved the deadline meanwhile
+        if (std::chrono::steady_clock::now() < self->deadline_) {
+            self->arm_timeout();
+            return;
+        }
+
+        self->timeout_armed_ = false;
         LOG_DEBUG("http server connection timed out after {} seconds", self->timeout_.count());
         self->close();
     });
 }
 
+void server_connection::cancel_timeout() {
+    timeout_armed_ = false;
+    timeout_timer_.cancel();
+}
+
 void server_connection::close() {
     running_ = false;
-    timeout_timer_.cancel();
+    cancel_timeout();
     response_started_.cancel();
     socket_->close();
 }
@@ -167,7 +189,7 @@ awaitable<void> server_connection::read_loop() {
     // Connection ended, without being taken over
     running_ = false;
     reader_stopped_ = true;
-    timeout_timer_.cancel();
+    cancel_timeout();
 }
 
 awaitable<void> server_connection::wait_response(const http_stream& stream) {
@@ -176,6 +198,7 @@ awaitable<void> server_connection::wait_response(const http_stream& stream) {
     // connection timeout. Nothing the client sends is lost: it stays readable from the
     // socket for the next request or a takeover
     bool watch_peer = true;
+    waiting_response_ = true;
     while (!stream.responded() && running_ && socket_->is_open()) {
         response_started_.expires_at(boost::asio::steady_timer::time_point::max());
         if (!watch_peer) {
@@ -187,6 +210,7 @@ awaitable<void> server_connection::wait_response(const http_stream& stream) {
 
         if (std::get<1>(result)) {
             LOG_DEBUG("http client left while waiting for a response");
+            waiting_response_ = false;
             close();
             co_return;
         }
@@ -194,6 +218,7 @@ awaitable<void> server_connection::wait_response(const http_stream& stream) {
         // A pipelined request (or data for a takeover) is waiting: leave it for later
         watch_peer = false;
     }
+    waiting_response_ = false;
 }
 
 awaitable<bool> server_connection::wait_peer_closed() {
@@ -269,7 +294,7 @@ void server_connection::process_output_queue() {
 
 void server_connection::queue_frame(const std::shared_ptr<http_stream>& stream, std::shared_ptr<http_frame> frame) {
     stream->add_frame(std::move(frame));
-    response_started_.cancel();
+    if (waiting_response_) response_started_.cancel();
 
     std::shared_ptr<http_stream> front_stream;
     {
@@ -331,7 +356,7 @@ void server_connection::handle_stock_error(std::shared_ptr<http_stream> stream,
 std::shared_ptr<asio::socket> server_connection::release_socket() {
     running_ = false;
     socket_->cancel();
-    timeout_timer_.cancel();
+    cancel_timeout();
     return socket_;
 }
 

@@ -79,8 +79,14 @@ private:
     // Handle stock error responses
     void handle_stock_error(std::shared_ptr<http_stream> stream, http_response::status status);
 
-    // Reset timeout timer
+    // Extend the connection deadline after some activity
     void reset_timeout();
+
+    // Wait for the timer up to the deadline (it is re-armed there if the deadline moved)
+    void arm_timeout();
+
+    // Stop the timer (the next reset_timeout() arms it again)
+    void cancel_timeout();
 
     // Close connection
     void close();
@@ -90,10 +96,16 @@ private:
 
 private:
     std::shared_ptr<asio::socket> socket_;
+
+    // The connection is closed when its deadline passes. Activity just moves the deadline:
+    // the timer is not touched on every request, it only checks the deadline on expiry
     boost::asio::steady_timer timeout_timer_;
+    std::chrono::steady_clock::time_point deadline_;
+    bool timeout_armed_{false};
 
     // Cancelled when a response starts, waking the read loop waiting for it
     boost::asio::steady_timer response_started_;
+    bool waiting_response_{false};
     std::chrono::seconds timeout_{DEFAULT_TIMEOUT};
 
     uint8_t buffer_[MAX_BUFFER_SIZE];
