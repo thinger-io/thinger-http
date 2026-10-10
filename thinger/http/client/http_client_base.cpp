@@ -5,6 +5,9 @@
 #include "../../asio/sockets/unix_socket.hpp"
 #include "../../asio/sockets/websocket.hpp"
 
+#include <algorithm>
+#include <boost/algorithm/string.hpp>
+
 namespace thinger::http {
 
 http_client_base::~http_client_base() {
@@ -364,10 +367,22 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
         co_return std::nullopt;
     }
 
+    // The subprotocol accepted must be one offered (RFC 6455, 4.1)
+    auto accepted_protocol = response->get_header("Sec-WebSocket-Protocol");
+    if (!accepted_protocol.empty()) {
+        std::vector<std::string> offered;
+        boost::split(offered, subprotocol, boost::is_any_of(","));
+        for (auto& protocol : offered) boost::trim(protocol);
+        if (std::find(offered.begin(), offered.end(), accepted_protocol) == offered.end()) {
+            LOG_ERROR("WebSocket server accepted a subprotocol not offered: {}", accepted_protocol);
+            co_return std::nullopt;
+        }
+    }
+
     // Upgrade to WebSocket
     auto raw_socket = connection->release_socket();
     auto ws = std::make_shared<asio::websocket>(raw_socket, false, false);
-    ws->set_protocol(response->get_header("Sec-WebSocket-Protocol"));
+    ws->set_protocol(accepted_protocol);
     // Frames the server sent right after its response, read along with it
     ws->set_read_ahead(connection->take_buffered());
 
