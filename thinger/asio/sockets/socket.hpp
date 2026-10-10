@@ -67,6 +67,13 @@ public:
     boost::asio::io_context &get_io_context() const;
 
 protected:
+    using native_handle_type = boost::asio::ip::tcp::socket::native_handle_type;
+
+    // write_now() of a plain stream socket: a single non-blocking gathered send (the
+    // buffers past the first 64 are left, as if the socket accepted no more)
+    static size_t send_now(native_handle_type descriptor, const std::vector<boost::asio::const_buffer>& buffers,
+                           boost::system::error_code& ec);
+
     std::string context_;
     boost::asio::io_context &io_context_;
     static std::atomic<unsigned long> connections;

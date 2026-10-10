@@ -1,10 +1,5 @@
-#include <array>
 #include <iostream>
 #include "tcp_socket.hpp"
-#if !defined(BOOST_ASIO_WINDOWS)
-#include <sys/socket.h>
-#include <sys/uio.h>
-#endif
 
 namespace thinger::asio {
 
@@ -184,36 +179,7 @@ awaitable<io_result> tcp_socket::write(const std::vector<boost::asio::const_buff
 }
 
 size_t tcp_socket::write_now(const std::vector<boost::asio::const_buffer>& buffers, boost::system::error_code& ec) {
-#if defined(MSG_DONTWAIT) && !defined(BOOST_ASIO_WINDOWS)
-    // A single non-blocking gathered send (the remaining buffers, if too many, are left
-    // for later, as if the socket accepted no more)
-    std::array<iovec, 64> iov;
-    size_t count = std::min(buffers.size(), iov.size());
-    for (size_t i = 0; i < count; ++i) {
-        iov[i].iov_base = const_cast<void*>(buffers[i].data());
-        iov[i].iov_len = buffers[i].size();
-    }
-    msghdr message{};
-    message.msg_iov = iov.data();
-    message.msg_iovlen = count;
-    int flags = MSG_DONTWAIT;
-#if defined(MSG_NOSIGNAL)
-    flags |= MSG_NOSIGNAL;
-#endif
-    ssize_t bytes;
-    do {
-        bytes = ::sendmsg(socket_.native_handle(), &message, flags);
-    } while (bytes < 0 && errno == EINTR);
-    if (bytes < 0) {
-        ec = boost::system::error_code(errno, boost::asio::error::get_system_category());
-        if (ec == boost::asio::error::try_again) ec = boost::asio::error::would_block;
-        return 0;
-    }
-    ec = {};
-    return static_cast<size_t>(bytes);
-#else
-    return socket::write_now(buffers, ec);
-#endif
+    return send_now(socket_.native_handle(), buffers, ec);
 }
 
 awaitable<boost::system::error_code> tcp_socket::wait(boost::asio::socket_base::wait_type type) {
