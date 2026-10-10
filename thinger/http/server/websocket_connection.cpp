@@ -105,7 +105,7 @@ namespace thinger::http{
                 }
 
                 // next iteration will prepare enough space for remaining frame data
-                next_read_size = remaining;
+                next_read_size = static_cast<size_t>(remaining);
             }
         }
     }
@@ -135,7 +135,11 @@ namespace thinger::http{
     }
 
     std::shared_ptr<asio::socket> websocket_connection::release_socket(){
-        // cancel pending async i/io requests on this socket
+        // the new owner decides about the keepalive started by start()
+        ws_->set_keepalive(std::chrono::milliseconds{0}, std::chrono::milliseconds{0});
+
+        // cancel pending async i/io requests on this socket (a frame being written is
+        // completed by the next write)
         ws_->cancel();
 
         // return socket

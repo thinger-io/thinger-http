@@ -7,6 +7,7 @@
 #include <chrono>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,22 +24,31 @@ namespace thinger::asio {
 //   returns data from one frame at most, and never 0 bytes (empty frames are skipped).
 // - Each write sends one message (unfragmented), binary by default (see set_binary()). Writes
 //   may be called while another one is pending, from several coroutines: they are sent one
-//   after another, in call order. Writing 0 bytes sends nothing.
+//   after another, in call order. Writing 0 bytes sends nothing. A write interrupted in the
+//   middle of its frame (cancel(), or the cancellation of the operation) leaves the rest of
+//   the frame to be sent before anything else, so the framing is never broken.
 // - Pings are answered, pongs and unexpected control frames handled, while reading: some
-//   read must be pending for them to be answered (as with a protocol reading its socket).
+//   read must be pending for them to be answered (as with a protocol reading its socket). The
+//   pong is sent as soon as no frame is being written, without holding the reads.
 // - A close frame received is answered, the connection closed, and reads end with
 //   boost::asio::error::eof (as a TCP socket closed by its peer). Writes then fail.
-// - close() sends a close frame (code 1000) unless a write is in progress, and closes the
-//   connection once the peer answers it or after CLOSE_TIMEOUT, without waiting: the socket is
-//   closed for its user right away. close_graceful() does the same, waiting.
-// - An optional keepalive pings the peer and closes the connection when it is idle (see
-//   set_keepalive()).
+// - close(), on the io_context of the socket, ends the pending operations and closes the
+//   socket for its user right away; the closing handshake goes on by itself: the rest of a
+//   frame being written, a close frame (code 1000), and the connection closed once the peer
+//   answers or after CLOSE_TIMEOUT. Called while nothing runs the io_context (e.g. by a
+//   synchronous client), it closes the connection at once instead. close_graceful() does
+//   the handshake, waiting. A websocket destroyed open on its io_context closes with 1001.
+// - An optional keepalive pings the peer (one ping at a time) and closes the connection
+//   when it is idle (see set_keepalive()).
+// - Text is not validated as UTF-8 here, neither in text messages nor in close reasons:
+//   the stream may cut a character anywhere (http::websocket_connection validates whole
+//   messages).
 //
 // The message interface (read_message_some(), is_message_complete(), is_binary()) is for
 // message-oriented users, such as http::websocket_connection and http::websocket_client.
 //
-// It must be owned by a std::shared_ptr for the keepalive. Not thread-safe, as any socket
-// (see socket.hpp).
+// It must be owned by a std::shared_ptr for the keepalive and to answer pings without
+// holding the reads. Not thread-safe, as any socket (see socket.hpp).
 class websocket : public socket, public std::enable_shared_from_this<websocket> {
 
 public:
@@ -86,11 +96,12 @@ public:
     // empty (0 bytes for an empty frame, without error). The message is complete when
     // is_message_complete() and remaining_in_frame() is 0; is_binary() tells its type.
     awaitable<io_result> read_message_some(uint8_t buffer[], size_t max_size);
-    std::size_t remaining_in_frame() const;
+    uint64_t remaining_in_frame() const;
     bool is_message_complete() const;
     bool is_binary() const { return message_opcode_ == 0x2; }
 
-    // Control frames, sent before the writes waiting (after the one in progress)
+    // Control frames, sent before the writes waiting (after the one in progress), waiting
+    // until sent
     awaitable<void> send_ping(uint8_t buffer[] = nullptr, size_t size = 0);
     awaitable<void> send_pong(uint8_t buffer[] = nullptr, size_t size = 0);
 
@@ -153,23 +164,38 @@ private:
     awaitable<boost::system::error_code> handle_control(const frame_header& header);
     awaitable<io_result> read_frame_data(uint8_t buffer[], size_t max_size, bool skip_empty);
     void unmask(uint8_t buffer[], size_t size);
+    // XOR `data` with the mask key, starting at byte `offset` of the key
+    static void apply_mask(uint8_t* data, size_t size, const uint8_t mask[MASK_SIZE_BYTES], size_t offset);
     // Fail the connection on a protocol error: close frame (1002, best effort) and close
     boost::system::error_code fail(const char* reason);
 
-    // Write side: one message or control frame at a time, in order (control frames first)
+    // Write side: one frame at a time (the writer holding the turn), in order: the rest of an
+    // interrupted frame first, then the pong and ping queued, then the writes waiting
     awaitable<bool> acquire_write(bool control);
+    // Pass the turn on: to the closing handshake once closed, to the control frames queued,
+    // or to the next writer waiting
     void release_write();
     void wake_writers();
     awaitable<io_result> send_frame(uint8_t opcode, const std::vector<boost::asio::const_buffer>& payload,
                                     bool control);
+    // Write a frame, holding the turn: the rest of an interrupted frame first, and what this
+    // one leaves if interrupted
+    awaitable<boost::system::error_code> write_frame(uint8_t opcode, const std::vector<boost::asio::const_buffer>& payload);
     awaitable<boost::system::error_code> send_close(uint16_t code);
+    // Queue a pong (answering the last ping) or a ping, sent without waiting for it
+    void queue_control();
+    // Send the control frames queued, holding the turn
+    awaitable<void> flush_control();
 
-    // Close the connection: with a close frame when it can be sent now
-    void close(uint16_t code);
-    // Close frame (code), the bytes still buffered and the payload remaining of the frame in
-    // progress: what the closing handshake needs once this websocket is closed
-    static awaitable<void> linger(std::shared_ptr<socket> socket, std::vector<uint8_t> close_frame,
-                                  std::string input, uint64_t skip);
+    // Close the connection: the closing handshake on its own when called on the io_context,
+    // waiting for the close frame of the peer if `expect_reply`
+    void close(uint16_t code, bool expect_reply = true);
+    void start_linger();
+    // The rest of a frame and a close frame, the bytes still buffered and the payload
+    // remaining of the frame being received: what the closing handshake needs once this
+    // websocket is closed
+    static awaitable<void> linger(std::shared_ptr<socket> socket, std::vector<uint8_t> output,
+                                  std::string input, uint64_t skip, bool expect_reply);
 
     std::shared_ptr<socket> socket_;
     bool binary_;
@@ -184,7 +210,7 @@ private:
     // Frame being received
     bool new_message_ = true;
     uint8_t message_opcode_ = 0;
-    std::size_t frame_remaining_ = 0;
+    uint64_t frame_remaining_ = 0;
     bool frame_fin_ = false;
     bool frame_masked_ = false;
     uint8_t mask_[MASK_SIZE_BYTES]{};
@@ -200,11 +226,23 @@ private:
     };
     bool writing_ = false;
     std::deque<std::shared_ptr<write_waiter>> write_waiters_;
+    // Rest of a frame whose write was interrupted, sent before anything else
+    std::vector<uint8_t> tail_;
+    // Error that broke the connection while writing
+    boost::system::error_code write_error_;
+    // Control frames queued: the payload of the last ping received, and a keepalive ping
+    std::optional<std::string> pending_pong_;
+    bool pending_ping_ = false;
+    bool ping_in_flight_ = false;
 
     // Connection state
     bool closed_ = false;
     bool close_received_ = false;
     bool close_sent_ = false;
+    // Closing handshake to start once the write in progress ends
+    bool linger_pending_ = false;
+    bool linger_expect_reply_ = true;
+    uint16_t close_code_ = CLOSE_NORMAL;
     std::shared_ptr<boost::asio::steady_timer> close_timer_;
 
     // Keepalive

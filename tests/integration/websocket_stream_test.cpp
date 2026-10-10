@@ -6,6 +6,9 @@
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
+#include <thinger/http/client/client.hpp>
+#include <thinger/util/base64.hpp>
+#include <thinger/util/sha1.hpp>
 
 #include "server_test_helpers.hpp"
 #include "../fixtures/stream_test_helpers.hpp"
@@ -739,4 +742,272 @@ TEST_CASE("WebSocket stream: the client WebSocket used as a socket", "[websocket
         app.close();
         REQUIRE(client.wait_for(5s));
     }
+}
+
+// ============================================================================
+// Regressions: closing without an io_context, interrupted writes, control frames
+// ============================================================================
+
+namespace {
+
+    constexpr size_t STUCK_SIZE = 32 * 1024 * 1024;   // more than the socket buffers hold
+
+    // Wait on the io_context of the socket
+    awaitable<void> sleep_for(std::shared_ptr<asio::socket> socket, std::chrono::milliseconds duration) {
+        boost::asio::steady_timer timer(socket->get_io_context(), duration);
+        co_await timer.async_wait(use_nothrow_awaitable);
+    }
+
+    std::vector<ws_frame> read_frames(raw_ws_client& client, size_t count) {
+        std::vector<ws_frame> frames;
+        while (frames.size() < count) {
+            auto frame = client.read_frame(10s);
+            if (!frame) break;
+            frames.push_back(std::move(*frame));
+        }
+        return frames;
+    }
+
+}
+
+TEST_CASE("WebSocket stream: a synchronous client closes without running its io_context", "[websocket][stream][client][integration]") {
+    http::server server;
+    result_slot<boost::system::error_code> ended;
+    server.get("/echo", [&](http::request& req, http::response& res) {
+        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+            co_spawn(ws->get_io_context(), [ws, &ended]() -> awaitable<void> {
+                ended.set(co_await length_prefixed_echo(ws));
+            }, detached);
+        });
+    });
+    server.get("/ok", [](http::response& res) { res.send("ok"); });
+    running_server running(server);
+    auto base = "127.0.0.1:" + std::to_string(running.port);
+
+    http::client client;
+    auto ws = client.websocket("ws://" + base + "/echo");
+    REQUIRE(ws);
+    // released without close(): closed now, leaving nothing for the next call of the client
+    ws.reset();
+    REQUIRE(ended.wait(2s));
+
+    auto start = std::chrono::steady_clock::now();
+    auto response = client.get("http://" + base + "/ok");
+    REQUIRE(response.ok());
+    REQUIRE(std::chrono::steady_clock::now() - start < 1s);
+}
+
+TEST_CASE("WebSocket stream: a websocket released on another thread starts no I/O", "[websocket][stream][integration]") {
+    boost::asio::io_context ioc;
+    auto work = boost::asio::make_work_guard(ioc);
+    tcp::acceptor acceptor(ioc, {tcp::v4(), 0});
+    tcp::socket peer(ioc);
+    peer.connect({boost::asio::ip::make_address("127.0.0.1"), acceptor.local_endpoint().port()});
+    auto accepted = acceptor.accept();
+    std::thread io_thread([&ioc] { ioc.run(); });
+
+    // created and used on the io_context (keepalive running), released here
+    std::promise<std::shared_ptr<asio::websocket>> created;
+    boost::asio::post(ioc, [&] {
+        auto tcp_end = std::make_shared<asio::tcp_socket>("ws", std::move(accepted));
+        auto ws = std::make_shared<asio::websocket>(tcp_end, true, true);
+        ws->set_keepalive(std::chrono::hours(1), std::chrono::hours(1));   // waiting on its timer
+        created.set_value(ws);
+    });
+    auto ws = created.get_future().get();
+    std::this_thread::sleep_for(50ms);
+    std::weak_ptr<asio::websocket> weak = ws;
+    ws.reset();
+    // a ping being sent may hold it for a moment
+    auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (!weak.expired() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+    REQUIRE(weak.expired());
+    std::this_thread::sleep_for(50ms);
+
+    std::promise<void> cleaned;
+    boost::asio::post(ioc, [&] {
+        boost::system::error_code ignored;
+        peer.close(ignored);
+        acceptor.close(ignored);
+        cleaned.set_value();
+    });
+    cleaned.get_future().wait();
+    work.reset();
+    ioc.stop();   // its keepalive coroutine ends at its next tick, an hour away
+    io_thread.join();
+}
+
+TEST_CASE("WebSocket stream: interrupted writes keep the framing", "[websocket][stream][integration]") {
+    http::server server;
+    result_slot<boost::system::error_code> first_write;
+    result_slot<std::string> read_result;
+    std::string big = pattern(STUCK_SIZE, 11);
+
+    server.get("/cancel", [&](http::request& req, http::response& res) {
+        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+            co_spawn(ws->get_io_context(), [ws, &first_write, &big]() -> awaitable<void> {
+                co_spawn(ws->get_io_context(), [ws]() -> awaitable<void> {
+                    co_await sleep_for(ws, 100ms);
+                    ws->cancel();   // in the middle of the write: the client is not reading
+                }, detached);
+                auto [ec, bytes] = co_await ws->write(std::string_view(big));
+                first_write.set(ec);
+                co_await ws->write(std::string_view("after"));
+            }, detached);
+        });
+    });
+    server.get("/close", [&](http::request& req, http::response& res) {
+        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+            co_spawn(ws->get_io_context(), [ws, &first_write, &big]() -> awaitable<void> {
+                co_spawn(ws->get_io_context(), [ws]() -> awaitable<void> {
+                    co_await sleep_for(ws, 100ms);
+                    ws->close();
+                }, detached);
+                auto [ec, bytes] = co_await ws->write(std::string_view(big));
+                first_write.set(ec);
+            }, detached);
+        });
+    });
+    server.get("/pong", [&](http::request& req, http::response& res) {
+        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+            co_spawn(ws->get_io_context(), [ws, &big]() -> awaitable<void> {
+                co_await ws->write(std::string_view(big));
+            }, detached);
+            co_spawn(ws->get_io_context(), [ws, &read_result]() -> awaitable<void> {
+                uint8_t data[4];
+                auto [ec, bytes] = co_await ws->read(data, sizeof(data));
+                read_result.set(ec ? ec.message() : std::string(reinterpret_cast<char*>(data), bytes));
+            }, detached);
+        });
+    });
+    server.get("/pings", [&](http::request& req, http::response& res) {
+        res.upgrade_websocket_stream({.ping_interval = 300ms}, [&](std::shared_ptr<asio::websocket> ws, std::string) {
+            co_spawn(ws->get_io_context(), [ws, &big]() -> awaitable<void> {
+                co_await ws->write(std::string_view(big));
+            }, detached);
+            co_spawn(ws->get_io_context(), length_prefixed_echo(ws), detached);
+        });
+    });
+    running_server running(server);
+
+    SECTION("cancel() in the middle of a frame: the next write completes it first") {
+        raw_ws_client client(running.port);
+        REQUIRE(client.handshake("/cancel").starts_with("HTTP/1.1 101"));
+        auto ec = first_write.wait();
+        REQUIRE(ec);
+        REQUIRE(*ec == boost::asio::error::operation_aborted);
+        auto frames = read_frames(client, 2);
+        REQUIRE(frames.size() == 2);
+        REQUIRE(frames[0].opcode == OP_BINARY);
+        REQUIRE(frames[0].payload == big);
+        REQUIRE(frames[1].opcode == OP_BINARY);
+        REQUIRE(frames[1].payload == "after");
+    }
+
+    SECTION("close() in the middle of a frame: completed, then the close frame") {
+        raw_ws_client client(running.port);
+        REQUIRE(client.handshake("/close").starts_with("HTTP/1.1 101"));
+        REQUIRE(first_write.wait());
+        auto frames = read_frames(client, 2);
+        REQUIRE(frames.size() == 2);
+        REQUIRE(frames[0].payload == big);
+        REQUIRE(frames[1].opcode == OP_CLOSE);
+        REQUIRE(frames[1].close_code() == 1000);
+        client.send_frame(OP_CLOSE, close_payload(1000));
+        REQUIRE(client.closed_within(2s));
+    }
+
+    SECTION("A ping does not hold the reads while a write is in progress") {
+        raw_ws_client client(running.port);
+        REQUIRE(client.handshake("/pong").starts_with("HTTP/1.1 101"));
+        std::this_thread::sleep_for(100ms);
+        client.send_frame(OP_PING, "p");
+        client.send_frame(OP_BINARY, "data");
+        // read while the write is still stuck: the client has not read anything yet
+        REQUIRE(read_result.wait(3s) == "data");
+        auto frames = read_frames(client, 2);
+        REQUIRE(frames.size() == 2);
+        REQUIRE(frames[0].payload == big);
+        REQUIRE(frames[1].opcode == OP_PONG);
+        REQUIRE(frames[1].payload == "p");
+    }
+
+    SECTION("Keepalive pings do not pile up behind a write in progress") {
+        raw_ws_client client(running.port);
+        REQUIRE(client.handshake("/pings").starts_with("HTTP/1.1 101"));
+        std::this_thread::sleep_for(4500ms);   // 15 ping intervals
+        auto start = std::chrono::steady_clock::now();
+        auto frames = read_frames(client, 1);
+        REQUIRE(frames.size() == 1);
+        REQUIRE(frames[0].payload == big);
+        int pings = 0;
+        while (auto frame = client.read_frame(100ms)) {
+            REQUIRE(frame->opcode == OP_PING);
+            pings++;
+        }
+        REQUIRE(pings >= 1);
+        // the one queued, and those of the time the client took to read the message
+        auto intervals = (std::chrono::steady_clock::now() - start) / 300ms;
+        REQUIRE(pings <= 2 + intervals);
+    }
+}
+
+TEST_CASE("WebSocket stream: handshake checks", "[websocket][stream][integration]") {
+    http::server server;
+    auto handler = [](http::request& req, http::response& res) {
+        res.upgrade_websocket_stream([](std::shared_ptr<asio::websocket> ws, std::string) {});
+    };
+    server.get("/ws", handler);
+    server.post("/ws", handler);
+    running_server running(server);
+
+    auto exchange = [&](const std::string& method, const std::string& headers) {
+        return server_test::raw_exchange(running.port, method + " /ws HTTP/1.1\r\nHost: localhost\r\n" + headers +
+                                                       "Content-Length: 0\r\n\r\n", 300ms).data;
+    };
+    const std::string upgrade = "Upgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n";
+    const std::string key = "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+    const std::string version = "Sec-WebSocket-Version: 13\r\n";
+
+    REQUIRE(exchange("GET", upgrade + key + version).starts_with("HTTP/1.1 101"));
+    REQUIRE(exchange("POST", upgrade + key + version).starts_with("HTTP/1.1 400"));
+    REQUIRE(exchange("GET", "Upgrade: websocket\r\nConnection: keep-alive\r\n" + key + version).starts_with("HTTP/1.1 400"));
+    auto old_version = exchange("GET", upgrade + key + "Sec-WebSocket-Version: 8\r\n");
+    REQUIRE(old_version.starts_with("HTTP/1.1 426"));
+    REQUIRE(header_value(old_version, "Sec-WebSocket-Version") == "13");
+    REQUIRE(exchange("GET", upgrade + key).starts_with("HTTP/1.1 426"));
+    REQUIRE(exchange("GET", upgrade + "Sec-WebSocket-Key: c2hvcnQ=\r\n" + version).starts_with("HTTP/1.1 400"));
+    REQUIRE(exchange("GET", upgrade + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ!!\r\n" + version).starts_with("HTTP/1.1 400"));
+    REQUIRE(exchange("GET", upgrade + version).starts_with("HTTP/1.1 400"));
+}
+
+TEST_CASE("WebSocket client rejects a subprotocol it did not offer", "[websocket][client][integration]") {
+    boost::asio::io_context server_context;
+    tcp::acceptor acceptor(server_context, {boost::asio::ip::make_address("127.0.0.1"), 0});
+    auto port = acceptor.local_endpoint().port();
+
+    std::thread server_thread([&acceptor, &server_context]() {
+        tcp::socket socket(server_context);
+        acceptor.accept(socket);
+        boost::asio::streambuf request;
+        boost::asio::read_until(socket, request, "\r\n\r\n");
+        std::string text(boost::asio::buffers_begin(request.data()), boost::asio::buffers_end(request.data()));
+        const std::string key_header = "Sec-WebSocket-Key: ";
+        auto key_start = text.find(key_header) + key_header.size();
+        auto key = text.substr(key_start, text.find("\r\n", key_start) - key_start);
+        auto accept = util::base64::encode(util::sha1::hash(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
+        std::string response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                               "Sec-WebSocket-Protocol: other\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n";
+        boost::asio::write(socket, boost::asio::buffer(response));
+        uint8_t data[64];
+        boost::system::error_code ec;
+        socket.read_some(boost::asio::buffer(data), ec);
+    });
+
+    {
+        http::client client;
+        auto ws = client.websocket("ws://127.0.0.1:" + std::to_string(port) + "/", "mqtt, mqttv3.1");
+        REQUIRE_FALSE(ws);
+    }
+    server_thread.join();
 }
