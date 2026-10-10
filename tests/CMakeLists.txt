@@ -159,6 +159,16 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/socket_pipe_test.cpp)
     add_thinger_test(test_integration_socket_pipe integration/socket_pipe_test.cpp)
 endif()
 
+# Integration tests - WebSocket as a byte stream socket
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_stream_test.cpp)
+    add_thinger_test(test_integration_websocket_stream integration/websocket_stream_test.cpp)
+endif()
+
+# Integration tests - Sockets defined by the application
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/custom_socket_test.cpp)
+    add_thinger_test(test_integration_custom_socket integration/custom_socket_test.cpp)
+endif()
+
 # Integration tests - Compression
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/compression_test.cpp)
     add_thinger_test(test_integration_compression integration/compression_test.cpp)

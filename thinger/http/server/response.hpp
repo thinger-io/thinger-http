@@ -14,15 +14,38 @@
 #include <memory>
 #include <functional>
 #include <filesystem>
+#include <chrono>
 #include <optional>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace thinger::http {
 
 // Forward declarations
 class websocket_connection;
 class sse_connection;
+
+// WebSocket upgrade that hands out the WebSocket as a byte stream socket
+// (see response::upgrade_websocket_stream)
+struct websocket_options {
+    // Subprotocols the handler speaks, alternatives included (e.g. "mqtt", "mqttv3.1",
+    // "mqttv3.1.1"). The first one the client offers (Sec-WebSocket-Protocol, in its order of
+    // preference) that is in this list is accepted.
+    std::vector<std::string> protocols;
+    // With protocols: a client offering none of them is rejected with 400. Otherwise it is
+    // accepted without a subprotocol (and the handler gets an empty one)
+    bool protocol_required = true;
+    // Messages written: binary, or text
+    bool binary = true;
+    // Ping the client once nothing was received from it for this long (0: never)
+    std::chrono::milliseconds ping_interval{0};
+    // Close the connection once nothing was received for this long, pongs included (0: never)
+    std::chrono::milliseconds idle_timeout{0};
+};
+
+// Receives the WebSocket and the subprotocol negotiated (empty if none)
+using websocket_stream_handler = std::function<void(std::shared_ptr<asio::websocket> socket, std::string protocol)>;
 
 // Response to a request. It is a handle: copies share the response, so a handler may keep
 // a copy and answer later, from any thread. Only the first answer is sent: the others are
@@ -71,9 +94,23 @@ public:
     // Send raw http_response object (for advanced use cases)
     void send_response(const std::shared_ptr<http_response>& response);
 
-    // WebSocket upgrade
+    // WebSocket upgrade, with a message interface. With supported_protocols, the client must
+    // offer one of them (400 otherwise), and the first one it offers is accepted; without, a
+    // client offering a subprotocol is rejected with 400
     void upgrade_websocket(std::function<void(std::shared_ptr<websocket_connection>)> handler,
                           const std::set<std::string>& supported_protocols = {});
+
+    // WebSocket upgrade handing out the WebSocket as a byte stream socket, for a protocol
+    // running on it (MQTT, a custom one...) or a tunnel (socket_pipe): binary messages by
+    // default, read as one continuous stream (see asio::websocket). The handler is called on
+    // the io_context of the socket once the handshake response is written, with the WebSocket
+    // (holding any frames the client sent right after its request) and the subprotocol
+    // negotiated (see websocket_options). Rejected with 426 if the request is not a
+    // WebSocket upgrade, or 400 if its key is missing or no subprotocol matches.
+    void upgrade_websocket_stream(const websocket_options& options, websocket_stream_handler handler);
+    void upgrade_websocket_stream(websocket_stream_handler handler) {
+        upgrade_websocket_stream(websocket_options{}, std::move(handler));
+    }
 
     // Server-Sent Events
     void start_sse(std::function<void(std::shared_ptr<sse_connection>)> handler);
@@ -144,6 +181,11 @@ private:
     void take_over(std::shared_ptr<http_response> message, takeover_handler handler);
     // Answers 501 if the connection cannot be taken over (in-memory requests)
     bool reject_takeover(const char* feature);
+    // Checks of a WebSocket upgrade request and the subprotocol negotiated: the 101 response
+    // to send, or null if the request was answered with an error
+    std::shared_ptr<http_response> websocket_handshake(const std::vector<std::string>& protocols,
+                                                       bool protocol_required, bool reject_unknown_protocol,
+                                                       std::string& protocol);
 
     std::shared_ptr<state> state_;
 };

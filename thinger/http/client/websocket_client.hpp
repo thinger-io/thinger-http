@@ -89,7 +89,14 @@ public:
     explicit operator bool() const { return is_open(); }
 
     /**
+     * Subprotocol accepted by the server (Sec-WebSocket-Protocol), empty if none.
+     */
+    std::string get_protocol() const { return websocket_ ? websocket_->get_protocol() : std::string{}; }
+
+    /**
      * Release ownership of the underlying WebSocket.
+     * It is a byte stream socket (asio::socket), usable by any protocol or with a
+     * socket_pipe; it writes text messages unless set_binary(true) is called.
      * After calling this method, the websocket_client becomes invalid.
      * Use this to take full control of the raw WebSocket for advanced use cases.
      * @return The underlying WebSocket, or nullptr if already released

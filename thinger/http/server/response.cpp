@@ -6,6 +6,7 @@
 #include "../../util/sha1.hpp"
 #include "../../asio/sockets/websocket.hpp"
 #include <boost/algorithm/string.hpp>
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 #include <atomic>
@@ -263,57 +264,95 @@ void response::send_file(const std::filesystem::path& path, bool force_download)
     send_message(std::move(response));
 }
 
-// WebSocket upgrade implementation
-void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_connection>)> handler,
-                                const std::set<std::string>& supported_protocols) {
-    if (!ensure_not_responded()) return;
-    if (reject_takeover("WebSocket upgrade")) return;
+namespace {
+
+    // Subprotocols offered by the client, in its order of preference: the comma-separated
+    // values of its Sec-WebSocket-Protocol headers
+    std::vector<std::string> offered_protocols(const http_request& request) {
+        std::vector<std::string> offered;
+        for (const auto& value : request.get_headers_with_key("Sec-WebSocket-Protocol")) {
+            std::vector<std::string> tokens;
+            boost::split(tokens, value, boost::is_any_of(","));
+            for (auto& token : tokens) {
+                boost::trim(token);
+                if (!token.empty()) offered.push_back(std::move(token));
+            }
+        }
+        return offered;
+    }
+
+}
+
+std::shared_ptr<http_response> response::websocket_handshake(const std::vector<std::string>& protocols,
+                                                             bool protocol_required, bool reject_unknown_protocol,
+                                                             std::string& protocol) {
     const auto& request = *state_->request;
 
     // Check if this is a WebSocket upgrade request
     if (!boost::iequals(request.get_header(http::header::upgrade), "websocket")) {
         error(http_response::status::upgrade_required, "This service requires use of WebSockets");
-        return;
+        return nullptr;
     }
-    
-    // Check WebSocket protocol if specified
-    auto protocol = request.get_header("Sec-WebSocket-Protocol");
-    if (!protocol.empty()) {
-        LOG_DEBUG("Received WebSocket protocol: {}", protocol);
-        if (!supported_protocols.contains(protocol)) {
-            error(http_response::status::bad_request, "Unsupported WebSocket protocol");
-            return;
+
+    // Subprotocol: the first one offered by the client that is supported
+    auto offered = offered_protocols(request);
+    protocol.clear();
+    for (const auto& candidate : offered) {
+        if (std::find(protocols.begin(), protocols.end(), candidate) != protocols.end()) {
+            protocol = candidate;
+            break;
         }
-    } else if (!supported_protocols.empty()) {
-        error(http_response::status::bad_request, "This method requires specifying a WebSocket protocol");
-        return;
     }
-    
+    if (protocol.empty()) {
+        if (!offered.empty() && (reject_unknown_protocol || (protocol_required && !protocols.empty()))) {
+            LOG_DEBUG("Unsupported WebSocket protocol: {}", request.get_header("Sec-WebSocket-Protocol"));
+            error(http_response::status::bad_request, "Unsupported WebSocket protocol");
+            return nullptr;
+        }
+        if (offered.empty() && protocol_required && !protocols.empty()) {
+            error(http_response::status::bad_request, "This method requires specifying a WebSocket protocol");
+            return nullptr;
+        }
+    }
+
     // Get WebSocket key
     auto ws_key = request.get_header("Sec-WebSocket-Key");
     if (ws_key.empty()) {
         error(http_response::status::bad_request, "Missing Sec-WebSocket-Key header");
-        return;
+        return nullptr;
     }
-    
+
     // Calculate WebSocket accept key
     std::string accept_key = ws_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     std::string hash = ::thinger::util::sha1::hash(accept_key);
     accept_key = ::thinger::util::base64::encode(hash);
-    
+
     // Create upgrade response
     auto response = new_response();
     response->set_status(http_response::status::switching_protocols);
     response->add_header(header::upgrade, "websocket");
     response->add_header(header::connection, "Upgrade");
     response->add_header("Sec-WebSocket-Accept", accept_key);
-    
+
     if (!protocol.empty()) {
         response->add_header("Sec-WebSocket-Protocol", protocol);
     }
-    
+    return response;
+}
+
+// WebSocket upgrade implementation
+void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_connection>)> handler,
+                                const std::set<std::string>& supported_protocols) {
+    if (!ensure_not_responded()) return;
+    if (reject_takeover("WebSocket upgrade")) return;
+
+    std::string protocol;
+    auto response = websocket_handshake({supported_protocols.begin(), supported_protocols.end()},
+                                        true, true, protocol);
+    if (!response) return;
+
     // Send the upgrade response and take over the connection
-    take_over(std::move(response), [handler = std::move(handler)](std::shared_ptr<asio::socket> socket, std::string buffered) {
+    take_over(std::move(response), [handler = std::move(handler), protocol](std::shared_ptr<asio::socket> socket, std::string buffered) {
         // A client must wait for the handshake response before sending frames (RFC 6455)
         if (!buffered.empty()) {
             LOG_WARNING("WebSocket client sent data before the handshake completed, closing");
@@ -323,6 +362,7 @@ void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_co
 
         // Create WebSocket from the socket
         auto websocket = std::make_shared<asio::websocket>(socket, true, true); // binary=true, server=true
+        websocket->set_protocol(protocol);
         auto ws_connection = std::make_shared<websocket_connection>(websocket);
 
         // Call user handler
@@ -330,6 +370,24 @@ void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_co
 
         // Start the WebSocket connection
         ws_connection->start();
+    });
+}
+
+void response::upgrade_websocket_stream(const websocket_options& options, websocket_stream_handler handler) {
+    if (!ensure_not_responded()) return;
+    if (reject_takeover("WebSocket upgrade")) return;
+
+    std::string protocol;
+    auto response = websocket_handshake(options.protocols, options.protocol_required, false, protocol);
+    if (!response) return;
+
+    take_over(std::move(response), [handler = std::move(handler), options, protocol](std::shared_ptr<asio::socket> socket, std::string buffered) {
+        auto websocket = std::make_shared<asio::websocket>(std::move(socket), options.binary, true);
+        websocket->set_protocol(protocol);
+        // Frames the client sent right after its request, without waiting for the response
+        if (!buffered.empty()) websocket->set_read_ahead(std::move(buffered));
+        websocket->set_keepalive(options.ping_interval, options.idle_timeout);
+        handler(std::move(websocket), protocol);
     });
 }
 

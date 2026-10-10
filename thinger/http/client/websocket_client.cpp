@@ -244,7 +244,7 @@ awaitable<std::pair<std::string, bool>> websocket_client::receive_async() {
     }
 
     std::array<uint8_t, 65536> buffer;
-    auto [ec, bytes_read] = co_await websocket_->read_some(buffer.data(), buffer.size());
+    auto [ec, bytes_read] = co_await websocket_->read_message_some(buffer.data(), buffer.size());
 
     if (ec) {
         co_return std::make_pair(std::string{}, false);

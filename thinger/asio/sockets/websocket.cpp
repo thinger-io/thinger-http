@@ -1,22 +1,57 @@
 #include "websocket.hpp"
 #include "../../util/logger.hpp"
-#include "tcp_socket.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <random>
 
 namespace thinger::asio {
 
-using random_bytes_engine = std::independent_bits_engine<std::default_random_engine, CHAR_BIT, unsigned char>;
+namespace {
+
+// Bytes of the input buffer; larger payloads are read straight into the reader's buffer
+constexpr size_t INPUT_BUFFER_SIZE = 4096;
+constexpr size_t DIRECT_READ_SIZE = 1024;
+
+constexpr uint8_t OPCODE_CONTINUATION = 0x0;
+constexpr uint8_t OPCODE_TEXT = 0x1;
+constexpr uint8_t OPCODE_BINARY = 0x2;
+constexpr uint8_t OPCODE_CLOSE = 0x8;
+constexpr uint8_t OPCODE_PING = 0x9;
+constexpr uint8_t OPCODE_PONG = 0xA;
+
+constexpr size_t MAX_CONTROL_PAYLOAD = 125;
+
+// Close codes that may be sent back (RFC 6455, 7.4)
+bool valid_close_code(uint16_t code) {
+    if (code >= 3000 && code <= 4999) return true;
+    return code >= 1000 && code <= 1011 && code != 1004 && code != 1005 && code != 1006;
+}
+
+// Mask keys must be unpredictable (RFC 6455, 5.3): one generator per thread
+void random_mask(uint8_t mask[websocket::MASK_SIZE_BYTES]) {
+    thread_local std::mt19937 engine{std::random_device{}()};
+    uint32_t value = engine();
+    std::memcpy(mask, &value, websocket::MASK_SIZE_BYTES);
+}
+
+boost::system::error_code protocol_error() {
+    return boost::system::errc::make_error_code(boost::system::errc::protocol_error);
+}
+
+}
 
 std::atomic<unsigned long> websocket::connections{0};
 
 websocket::websocket(std::shared_ptr<socket> sock, bool binary, bool server)
     : socket("websocket", sock->get_io_context())
-    , socket_(sock)
-    , timer_(sock->get_io_context())
+    , socket_(std::move(sock))
     , binary_(binary)
-    , server_role_(server) {
+    , server_role_(server)
+    , in_(INPUT_BUFFER_SIZE)
+    , close_timer_(std::make_shared<boost::asio::steady_timer>(io_context_))
+    , keepalive_timer_(std::make_shared<boost::asio::steady_timer>(io_context_))
+    , last_received_(std::chrono::steady_clock::now()) {
     ++connections;
     LOG_DEBUG("websocket created");
 }
@@ -24,395 +59,539 @@ websocket::websocket(std::shared_ptr<socket> sock, bool binary, bool server)
 websocket::~websocket() {
     --connections;
     LOG_DEBUG("releasing websocket");
-    timer_.cancel();
+    // A websocket released while open says goodbye to its peer
+    close(CLOSE_GOING_AWAY);
 }
 
-void websocket::unmask(uint8_t buffer[], std::size_t size) {
-    LOG_DEBUG("unmasking payload. size: {}", size);
+void websocket::set_read_ahead(std::string data) {
+    if (data.size() > in_.size()) in_.resize(data.size());
+    std::memcpy(in_.data(), data.data(), data.size());
+    in_begin_ = 0;
+    in_end_ = data.size();
+}
+
+// ---------------------------------------------------------------------------
+// Frames
+// ---------------------------------------------------------------------------
+
+bool websocket::parse_header(const uint8_t* data, size_t size, frame_header& header) {
+    header.size = 2;
+    if (size < 2) return false;
+    uint8_t length = data[1] & 0x7F;
+    header.masked = data[1] & 0x80;
+    header.size += (length == 126 ? 2 : length == 127 ? 8 : 0) + (header.masked ? MASK_SIZE_BYTES : 0);
+    if (size < header.size) return false;
+
+    header.fin = data[0] & 0x80;
+    header.rsv = data[0] & 0x70;
+    header.opcode = data[0] & 0x0F;
+    size_t offset = 2;
+    if (length == 126) {
+        header.payload_size = (uint64_t(data[2]) << 8) | data[3];
+        offset += 2;
+    } else if (length == 127) {
+        header.payload_size = 0;
+        for (int i = 0; i < 8; ++i) header.payload_size = (header.payload_size << 8) | data[2 + i];
+        offset += 8;
+    } else {
+        header.payload_size = length;
+    }
+    if (header.masked) std::memcpy(header.mask, data + offset, MASK_SIZE_BYTES);
+    return true;
+}
+
+size_t websocket::build_header(uint8_t opcode, uint64_t payload_size, uint8_t header[14],
+                               uint8_t mask[MASK_SIZE_BYTES]) const {
+    size_t size = 2;
+    header[0] = 0x80 | opcode;
+    if (payload_size <= 125) {
+        header[1] = static_cast<uint8_t>(payload_size);
+    } else if (payload_size <= 65535) {
+        header[1] = 126;
+        header[2] = (payload_size >> 8) & 0xFF;
+        header[3] = payload_size & 0xFF;
+        size += 2;
+    } else {
+        header[1] = 127;
+        for (int i = 0; i < 8; ++i) header[2 + i] = (payload_size >> ((7 - i) * 8)) & 0xFF;
+        size += 8;
+    }
+    // Clients mask what they send (RFC 6455, 5.3)
+    if (!server_role_) {
+        header[1] |= 0x80;
+        random_mask(mask);
+        std::memcpy(header + size, mask, MASK_SIZE_BYTES);
+        size += MASK_SIZE_BYTES;
+    }
+    return size;
+}
+
+void websocket::unmask(uint8_t buffer[], size_t size) {
     for (size_t i = 0; i < size; ++i) {
-        buffer[i] ^= mask_[i % MASK_SIZE_BYTES];
+        buffer[i] ^= mask_[(mask_offset_ + i) % MASK_SIZE_BYTES];
     }
+    mask_offset_ = (mask_offset_ + size) % MASK_SIZE_BYTES;
 }
 
-void websocket::start_timeout() {
-    timer_.expires_after(CONNECTION_TIMEOUT_SECONDS);
-    timer_.async_wait([this](const boost::system::error_code& e) {
-        if (e) {
-            if (e != boost::asio::error::operation_aborted) {
-                LOG_ERROR("error on timeout: {}", e.message());
+// ---------------------------------------------------------------------------
+// Read side
+// ---------------------------------------------------------------------------
+
+awaitable<boost::system::error_code> websocket::fill(size_t size) {
+    while (buffered() < size) {
+        if (buffered() == 0) {
+            in_begin_ = in_end_ = 0;
+        } else if (in_.size() - in_begin_ < size) {
+            std::memmove(in_.data(), in_.data() + in_begin_, buffered());
+            in_end_ -= in_begin_;
+            in_begin_ = 0;
+        }
+        auto [ec, bytes] = co_await socket_->read_some(in_.data() + in_end_, in_.size() - in_end_);
+        // closed meanwhile: the socket is not this websocket's anymore
+        if (closed_) co_return boost::asio::error::operation_aborted;
+        if (ec) co_return ec;
+        if (bytes == 0) co_return boost::asio::error::eof;   // a socket breaking its guarantees
+        in_end_ += bytes;
+        last_received_ = std::chrono::steady_clock::now();
+    }
+    co_return boost::system::error_code{};
+}
+
+awaitable<io_result> websocket::read_payload(uint8_t buffer[], size_t max_size) {
+    size_t wanted = std::min(max_size, frame_remaining_);
+    size_t bytes;
+    if (buffered() == 0 && wanted >= DIRECT_READ_SIZE) {
+        // Large reads go straight to the reader's buffer, never past this frame
+        auto [ec, read] = co_await socket_->read_some(buffer, wanted);
+        if (closed_) co_return io_result{boost::asio::error::operation_aborted, 0};
+        if (ec) co_return io_result{ec, 0};
+        last_received_ = std::chrono::steady_clock::now();
+        bytes = read;
+    } else {
+        if (auto ec = co_await fill(1)) co_return io_result{ec, 0};
+        bytes = std::min(wanted, buffered());
+        std::memcpy(buffer, in_.data() + in_begin_, bytes);
+        in_begin_ += bytes;
+    }
+    if (frame_masked_) unmask(buffer, bytes);
+    frame_remaining_ -= bytes;
+    if (frame_remaining_ == 0 && frame_fin_) new_message_ = true;
+    co_return io_result{boost::system::error_code{}, bytes};
+}
+
+boost::system::error_code websocket::fail(const char* reason) {
+    LOG_WARNING("websocket protocol error: {}", reason);
+    close(CLOSE_PROTOCOL_ERROR);
+    return protocol_error();
+}
+
+awaitable<boost::system::error_code> websocket::handle_control(const frame_header& header) {
+    uint8_t payload[MAX_CONTROL_PAYLOAD];
+    size_t size = header.payload_size;
+    std::memcpy(payload, in_.data() + in_begin_ + header.size, size);
+    if (header.masked) {
+        for (size_t i = 0; i < size; ++i) payload[i] ^= header.mask[i % MASK_SIZE_BYTES];
+    }
+    in_begin_ += header.size + size;
+
+    switch (header.opcode) {
+        case OPCODE_PING: {
+            LOG_DEBUG("received ping frame");
+            co_await send_frame(OPCODE_PONG, {boost::asio::buffer(payload, size)}, true);
+            // a write error shows up in the next read
+            if (closed_) co_return boost::asio::error::operation_aborted;
+            co_return boost::system::error_code{};
+        }
+        case OPCODE_PONG:
+            LOG_DEBUG("received pong frame");
+            co_return boost::system::error_code{};
+        case OPCODE_CLOSE: {
+            LOG_DEBUG("received close frame");
+            if (size == 1) co_return fail("invalid close frame payload");
+            close_received_ = true;
+            uint16_t code = size >= 2 ? uint16_t((payload[0] << 8) | payload[1]) : CLOSE_NORMAL;
+            if (!close_sent_ && !closed_) {
+                co_await send_close(valid_close_code(code) ? code : CLOSE_PROTOCOL_ERROR);
             }
-            return;
+            // The closing handshake is done: the server closes the connection first, and a
+            // client does not need to wait for it
+            close(CLOSE_NORMAL);
+            co_return boost::asio::error::eof;
         }
-        if (data_received_) {
-            data_received_ = false;
-            return start_timeout();
-        } else {
-            if (!pending_ping_) {
-                pending_ping_ = true;
-                co_spawn(io_context_, [this]() -> awaitable<void> {
-                    co_await send_ping();
-                    if (socket_->is_open()) {
-                        start_timeout();
-                    }
-                }, detached);
-            } else {
-                LOG_DEBUG("websocket ping timeout... closing connection!");
-                close();
-            }
-        }
-    });
+        default:
+            co_return fail("unknown control frame opcode");
+    }
 }
 
-awaitable<void> websocket::send_close(uint8_t buffer[], size_t size) {
-    LOG_DEBUG("sending close frame");
-    co_await send_message(0x88, buffer, size);
-    close_sent_ = true;
-    LOG_DEBUG("close frame sent");
+awaitable<io_result> websocket::read_frame_data(uint8_t buffer[], size_t max_size, bool skip_empty) {
+    for (;;) {
+        if (close_received_) co_return io_result{boost::asio::error::eof, 0};
+        if (closed_) co_return io_result{boost::asio::error::bad_descriptor, 0};
 
-    if (!close_received_) {
-        // Race: read the close ack vs timeout
-        timer_.cancel();
-        timer_.expires_after(std::chrono::seconds{5});
-
-        auto read_close_ack = [this]() -> awaitable<void> {
-            uint8_t buf[125];
-            boost::system::error_code ec;
-            while (!close_received_ && socket_->is_open()) {
-                co_await read_frame(buf, sizeof(buf), ec);
-                if (ec) break;
-            }
-        };
-
-        auto wait_timeout = [this]() -> awaitable<void> {
-            auto [ec] = co_await timer_.async_wait(use_nothrow_awaitable);
-        };
-
-        co_await (read_close_ack() || wait_timeout());
-
-        if (!close_received_) {
-            LOG_WARNING("timeout while waiting close acknowledgement");
-        }
-    }
-    close();
-}
-
-awaitable<void> websocket::send_ping(uint8_t buffer[], size_t size) {
-    LOG_DEBUG("sending ping frame");
-    co_await send_message(0x09, buffer, size);
-    LOG_DEBUG("ping frame sent");
-}
-
-awaitable<void> websocket::send_pong(uint8_t buffer[], size_t size) {
-    LOG_DEBUG("sending pong frame");
-    co_await send_message(0x0A, buffer, size);
-    LOG_DEBUG("pong frame sent");
-}
-
-awaitable<size_t> websocket::read_frame(uint8_t buffer[], size_t max_size, boost::system::error_code& ec) {
-    // If there's remaining data in current frame, read it
-    if (frame_remaining_ > 0) {
-        auto read_size = std::min(frame_remaining_, max_size);
-        auto [read_ec, bytes] = co_await read_exact(buffer, read_size);
-
-        if (read_ec) {
-            ec = read_ec;
-            co_return 0;
+        // Payload of the data frame being received
+        if (frame_remaining_ > 0) {
+            if (max_size == 0) co_return io_result{boost::system::error_code{}, 0};
+            co_return co_await read_payload(buffer, max_size);
         }
 
-        if (masked_) unmask(buffer, bytes);
-        frame_remaining_ -= bytes;
-
-        co_return bytes;
-    }
-
-    // Read frame header (2 bytes minimum)
-    {
-        auto [read_ec, bytes] = co_await read_exact(buffer_, 2);
-        if (read_ec) {
-            ec = read_ec;
-            co_return 0;
+        // Next frame header
+        frame_header header;
+        while (!parse_header(in_.data() + in_begin_, buffered(), header)) {
+            if (auto ec = co_await fill(header.size)) co_return io_result{ec, 0};
         }
-    }
-    data_received_ = true;
 
-    uint8_t data_type = buffer_[0];
-    uint8_t fin = data_type & 0b10000000;
-    uint8_t rsv = data_type & 0b01110000;
+        if (header.rsv) co_return io_result{fail("reserved bits set without an extension"), 0};
+        if (server_role_ && !header.masked) co_return io_result{fail("unmasked frame from a client"), 0};
+        if (!server_role_ && header.masked) co_return io_result{fail("masked frame from a server"), 0};
+        if (header.payload_size >> 63) co_return io_result{fail("invalid payload length"), 0};
 
-    if (rsv) {
-        LOG_ERROR("invalid RSV parameters");
-        ec = boost::asio::error::invalid_argument;
-        co_return 0;
-    }
+        // Control frames, which may come between the frames of a message
+        if (header.opcode >= 0x8) {
+            if (!header.fin) co_return io_result{fail("fragmented control frame"), 0};
+            if (header.payload_size > MAX_CONTROL_PAYLOAD) co_return io_result{fail("control frame too large"), 0};
+            if (auto ec = co_await fill(header.size + header.payload_size)) co_return io_result{ec, 0};
+            if (auto ec = co_await handle_control(header)) co_return io_result{ec, 0};
+            continue;
+        }
 
-    uint8_t opcode = data_type & 0x0F;
-    uint8_t data_size = buffer_[1] & ~(1 << 7);
-    uint8_t masked = buffer_[1] & 0b10000000;
-
-    LOG_DEBUG("decoded frame header. fin: {}, opcode: 0x{:02X} mask: {} data_size: {}", fin, opcode, masked, data_size);
-
-    if (!masked && server_role_) {
-        LOG_ERROR("client is not masking the information");
-        ec = boost::asio::error::invalid_argument;
-        co_return 0;
-    }
-
-    masked_ = masked;
-    fin_ = fin;
-    opcode_ = opcode;
-
-    // Handle opcodes
-    if (new_message_) {
-        switch (opcode) {
-            case 0x0:
-                LOG_ERROR("received continuation message as the first message!");
-                ec = boost::asio::error::invalid_argument;
-                co_return 0;
-            case 0x1: // text
-            case 0x2: // binary
-                message_opcode_ = opcode;
+        // Data frames: a text or binary frame starts a message, continuation frames go on
+        switch (header.opcode) {
+            case OPCODE_CONTINUATION:
+                if (new_message_) co_return io_result{fail("continuation frame without a message"), 0};
                 break;
-            case 0x8: // close
-            case 0x9: // ping
-            case 0xA: // pong
-                if (!fin) {
-                    LOG_ERROR("control frame messages cannot be fragmented");
-                    ec = boost::asio::error::invalid_argument;
-                    co_return 0;
-                }
+            case OPCODE_TEXT:
+            case OPCODE_BINARY:
+                if (!new_message_) co_return io_result{fail("new message before the previous one ended"), 0};
+                message_opcode_ = header.opcode;
                 break;
             default:
-                LOG_ERROR("received unknown websocket opcode: {}", (int)opcode);
-                ec = boost::asio::error::invalid_argument;
-                co_return 0;
+                co_return io_result{fail("unknown data frame opcode"), 0};
         }
-    } else {
-        // Continuation frame expected
-        if (opcode != 0x0 && opcode < 0x8) {
-            LOG_ERROR("unexpected fragment type. expecting a continuation frame");
-            ec = boost::asio::error::invalid_argument;
-            co_return 0;
-        }
-    }
 
-    // Determine payload length
-    uint64_t payload_size = data_size;
-    if (data_size == 126) {
-        auto [read_ec, bytes] = co_await read_exact(buffer_, 2);
-        if (read_ec) {
-            ec = read_ec;
-            co_return 0;
-        }
-        payload_size = (buffer_[0] << 8) | buffer_[1];
-    } else if (data_size == 127) {
-        auto [read_ec, bytes] = co_await read_exact(buffer_, 8);
-        if (read_ec) {
-            ec = read_ec;
-            co_return 0;
-        }
-        payload_size = 0;
-        for (int i = 0; i < 8; ++i) {
-            payload_size = (payload_size << 8) | buffer_[i];
-        }
-    }
-
-    frame_remaining_ = payload_size;
-
-    // Read mask if present
-    if (masked_) {
-        auto [read_ec, bytes] = co_await read_exact(mask_, MASK_SIZE_BYTES);
-        if (read_ec) {
-            ec = read_ec;
-            co_return 0;
-        }
-    }
-
-    // Handle control frames
-    if (opcode >= 0x8) {
-        // Read control frame payload
-        uint8_t control_buffer[125];
-        size_t control_size = std::min(static_cast<size_t>(payload_size), size_t(125));
-        if (control_size > 0) {
-            auto [read_ec, bytes] = co_await read_exact(control_buffer, control_size);
-            if (read_ec) {
-                ec = read_ec;
-                co_return 0;
-            }
-            if (masked_) unmask(control_buffer, control_size);
-        }
-        frame_remaining_ = 0;
-
-        switch (opcode) {
-            case 0x8: // close
-                LOG_DEBUG("received close frame");
-                close_received_ = true;
-                if (!close_sent_) {
-                    co_await send_close();
-                }
-                ec = boost::asio::error::connection_aborted;
-                co_return 0;
-            case 0x9: // ping
-                LOG_DEBUG("received ping frame");
-                co_await send_pong(control_buffer, control_size);
-                co_return co_await read_frame(buffer, max_size, ec);
-            case 0xA: // pong
-                LOG_DEBUG("received pong frame");
-                pending_ping_ = false;
-                data_received_ = false;
-                co_return co_await read_frame(buffer, max_size, ec);
-        }
-    }
-
-    // Read data frame payload
-    if (frame_remaining_ == 0) {
-        if (fin_) new_message_ = true;
-        co_return 0;
-    }
-
-    auto read_size = std::min(frame_remaining_, max_size);
-    auto [read_ec, bytes] = co_await read_exact(buffer, read_size);
-
-    if (read_ec) {
-        ec = read_ec;
-        co_return 0;
-    }
-
-    if (masked_) unmask(buffer, bytes);
-    frame_remaining_ -= bytes;
-
-    if (frame_remaining_ == 0 && fin_) {
-        new_message_ = true;
-    } else if (frame_remaining_ == 0) {
+        in_begin_ += header.size;
+        frame_remaining_ = header.payload_size;
+        frame_fin_ = header.fin;
+        frame_masked_ = header.masked;
+        std::memcpy(mask_, header.mask, MASK_SIZE_BYTES);
+        mask_offset_ = 0;
         new_message_ = false;
-    }
 
-    co_return bytes;
-}
-
-awaitable<io_result> websocket::send_message(uint8_t opcode, const uint8_t buffer[], size_t size) {
-    std::lock_guard<std::mutex> lock(write_mutex_);
-
-    uint8_t header_size = 2;
-    output_[0] = 0x80 | opcode;
-
-    if (size <= 125) {
-        output_[1] = size;
-    } else if (size <= 65535) {
-        output_[1] = 126;
-        output_[2] = (size >> 8) & 0xff;
-        output_[3] = size & 0xff;
-        header_size += 2;
-    } else {
-        output_[1] = 127;
-        for (int i = 0; i < 8; ++i) {
-            output_[2 + i] = (size >> ((7 - i) * 8)) & 0xff;
+        if (frame_remaining_ == 0) {
+            if (frame_fin_) new_message_ = true;
+            if (!skip_empty) co_return io_result{boost::system::error_code{}, 0};
         }
-        header_size += 8;
     }
-
-    // Create output buffers
-    std::vector<boost::asio::const_buffer> output_buffers;
-    output_buffers.push_back(boost::asio::buffer(output_, header_size));
-
-    // Handle masking for client role
-    std::vector<uint8_t> masked_data;
-    if (!server_role_) {
-        output_[1] |= 0b10000000;
-
-        static random_bytes_engine rbe;
-        uint8_t mask[MASK_SIZE_BYTES];
-        for (int i = 0; i < MASK_SIZE_BYTES; ++i) {
-            mask[i] = rbe();
-            output_[header_size + i] = mask[i];
-        }
-        header_size += MASK_SIZE_BYTES;
-
-        // Mask the data
-        masked_data.resize(size);
-        for (size_t i = 0; i < size; ++i) {
-            masked_data[i] = buffer[i] ^ mask[i % MASK_SIZE_BYTES];
-        }
-
-        output_buffers.clear();
-        output_buffers.push_back(boost::asio::buffer(output_, header_size));
-        output_buffers.push_back(boost::asio::buffer(masked_data));
-    } else {
-        output_buffers.push_back(boost::asio::buffer(buffer, size));
-    }
-
-    LOG_DEBUG("sending websocket data. header: {}, payload: {}", header_size, size);
-
-    auto [ec, bytes] = co_await socket_->write(output_buffers);
-    if (ec) {
-        co_return io_result{ec, 0};
-    }
-    co_return io_result{ec, bytes - header_size};
-}
-
-awaitable<io_result> websocket::read_exact(uint8_t buffer[], size_t size) {
-    size_t buffered = std::min(size, read_ahead_.size() - read_ahead_offset_);
-    if (buffered > 0) {
-        std::memcpy(buffer, read_ahead_.data() + read_ahead_offset_, buffered);
-        read_ahead_offset_ += buffered;
-        if (read_ahead_offset_ == read_ahead_.size()) {
-            read_ahead_.clear();
-            read_ahead_offset_ = 0;
-        }
-        if (buffered == size) co_return io_result{boost::system::error_code{}, size};
-    }
-    auto [ec, bytes] = co_await socket_->read(buffer + buffered, size - buffered);
-    co_return io_result{ec, buffered + bytes};
 }
 
 awaitable<io_result> websocket::read_some(uint8_t buffer[], size_t max_size) {
-    boost::system::error_code ec;
-    auto bytes = co_await read_frame(buffer, max_size, ec);
-    if (ec) {
-        if (ec != boost::asio::error::connection_aborted) {
-            LOG_ERROR("websocket read_some error: {}", ec.message());
-        }
-        co_return io_result{ec, 0};
+    if (max_size == 0) co_return io_result{closed_ ? boost::asio::error::bad_descriptor : boost::system::error_code{}, 0};
+    reading_ = true;
+    auto result = co_await read_frame_data(buffer, max_size, true);
+    reading_ = false;
+    co_return result;
+}
+
+awaitable<io_result> websocket::read_message_some(uint8_t buffer[], size_t max_size) {
+    reading_ = true;
+    auto result = co_await read_frame_data(buffer, max_size, false);
+    reading_ = false;
+    co_return result;
+}
+
+// ---------------------------------------------------------------------------
+// Write side
+// ---------------------------------------------------------------------------
+
+awaitable<bool> websocket::acquire_write(bool control) {
+    if (closed_) co_return false;
+    if (!writing_) {
+        writing_ = true;
+        co_return true;
     }
-    co_return io_result{boost::system::error_code{}, bytes};
-}
-
-awaitable<io_result> websocket::read(uint8_t buffer[], size_t size) {
-    boost::system::error_code ec;
-    auto bytes = co_await read_frame(buffer, size, ec);
-    if (ec) {
-        if (ec != boost::asio::error::connection_aborted) {
-            LOG_ERROR("websocket read error: {}", ec.message());
-        }
-        co_return io_result{ec, 0};
+    // Wait for the turn: control frames go before the data waiting, after other control frames
+    auto waiter = std::make_shared<write_waiter>(io_context_);
+    waiter->timer.expires_at(std::chrono::steady_clock::time_point::max());
+    if (control) {
+        auto position = std::find_if(write_waiters_.begin(), write_waiters_.end(),
+                                     [](const auto& other) { return !other->control; });
+        waiter->control = true;
+        write_waiters_.insert(position, waiter);
+    } else {
+        write_waiters_.push_back(waiter);
     }
-    co_return io_result{boost::system::error_code{}, bytes};
+    co_await waiter->timer.async_wait(use_nothrow_awaitable);
+    if (waiter->granted) co_return true;
+    // closed, cancelled, or the wait itself cancelled
+    auto it = std::find(write_waiters_.begin(), write_waiters_.end(), waiter);
+    if (it != write_waiters_.end()) write_waiters_.erase(it);
+    co_return false;
 }
 
-awaitable<io_result> websocket::read(boost::asio::streambuf& buffer, size_t size) {
-    // Not supported for websocket
-    co_return io_result{boost::asio::error::operation_not_supported, 0};
+void websocket::release_write() {
+    if (!write_waiters_.empty()) {
+        // the turn passes to the next writer: writing_ stays set
+        auto next = std::move(write_waiters_.front());
+        write_waiters_.pop_front();
+        next->granted = true;
+        next->timer.cancel();
+        return;
+    }
+    writing_ = false;
 }
 
-awaitable<io_result> websocket::read_until(boost::asio::streambuf& buffer, std::string_view delim) {
-    // Not supported for websocket
-    co_return io_result{boost::asio::error::operation_not_supported, 0};
+void websocket::wake_writers() {
+    auto waiters = std::move(write_waiters_);
+    write_waiters_.clear();
+    for (auto& waiter : waiters) waiter->timer.cancel();
+}
+
+awaitable<io_result> websocket::send_frame(uint8_t opcode, const std::vector<boost::asio::const_buffer>& payload,
+                                           bool control) {
+    if (!co_await acquire_write(control)) {
+        co_return io_result{closed_ ? boost::asio::error::bad_descriptor : boost::asio::error::operation_aborted, 0};
+    }
+
+    boost::system::error_code error;
+    if (closed_) {
+        error = boost::asio::error::bad_descriptor;
+    } else if (close_sent_ || (close_received_ && opcode != OPCODE_CLOSE)) {
+        // nothing is sent after a close frame
+        error = boost::asio::error::broken_pipe;
+    }
+    if (error) {
+        release_write();
+        co_return io_result{error, 0};
+    }
+    if (opcode == OPCODE_CLOSE) close_sent_ = true;
+
+    size_t size = boost::asio::buffer_size(payload);
+    uint8_t header[14];
+    uint8_t mask[MASK_SIZE_BYTES];
+    size_t header_size = build_header(opcode, size, header, mask);
+
+    std::vector<boost::asio::const_buffer> output;
+    output.reserve(payload.size() + 1);
+    output.emplace_back(header, header_size);
+    std::vector<uint8_t> masked;
+    if (server_role_) {
+        output.insert(output.end(), payload.begin(), payload.end());
+    } else if (size > 0) {
+        masked.resize(size);
+        boost::asio::buffer_copy(boost::asio::buffer(masked), payload);
+        for (size_t i = 0; i < size; ++i) masked[i] ^= mask[i % MASK_SIZE_BYTES];
+        output.emplace_back(masked.data(), masked.size());
+    }
+
+    auto [ec, bytes] = co_await socket_->write(output);
+    release_write();
+    co_return io_result{ec, ec ? 0 : size};
+}
+
+awaitable<boost::system::error_code> websocket::send_close(uint16_t code) {
+    LOG_DEBUG("sending close frame: {}", code);
+    uint8_t payload[2] = {uint8_t(code >> 8), uint8_t(code & 0xFF)};
+    auto [ec, bytes] = co_await send_frame(OPCODE_CLOSE, {boost::asio::buffer(payload)}, true);
+    co_return ec;
+}
+
+awaitable<void> websocket::send_ping(uint8_t buffer[], size_t size) {
+    co_await send_frame(OPCODE_PING, {boost::asio::buffer(buffer, std::min(size, MAX_CONTROL_PAYLOAD))}, true);
+}
+
+awaitable<void> websocket::send_pong(uint8_t buffer[], size_t size) {
+    co_await send_frame(OPCODE_PONG, {boost::asio::buffer(buffer, std::min(size, MAX_CONTROL_PAYLOAD))}, true);
 }
 
 awaitable<io_result> websocket::write(const uint8_t buffer[], size_t size) {
-    co_return co_await send_message(binary_ ? 0x02 : 0x01, buffer, size);
+    co_return co_await write(std::vector<boost::asio::const_buffer>{boost::asio::buffer(buffer, size)});
 }
 
 awaitable<io_result> websocket::write(std::string_view str) {
-    co_return co_await send_message(binary_ ? 0x02 : 0x01,
-        reinterpret_cast<const uint8_t*>(str.data()), str.size());
+    co_return co_await write(std::vector<boost::asio::const_buffer>{boost::asio::buffer(str.data(), str.size())});
 }
 
 awaitable<io_result> websocket::write(const std::vector<boost::asio::const_buffer>& buffers) {
-    // Not supported for websocket
-    co_return io_result{boost::asio::error::operation_not_supported, 0};
+    // As a stream, writing nothing sends nothing (not an empty message)
+    if (boost::asio::buffer_size(buffers) == 0) {
+        co_return io_result{closed_ ? boost::asio::error::bad_descriptor : boost::system::error_code{}, 0};
+    }
+    co_return co_await send_frame(binary_ ? OPCODE_BINARY : OPCODE_TEXT, buffers, false);
 }
 
+// ---------------------------------------------------------------------------
+// Closing
+// ---------------------------------------------------------------------------
+
+void websocket::close() {
+    close(CLOSE_NORMAL);
+}
+
+void websocket::close(uint16_t code) {
+    if (closed_) return;
+    closed_ = true;
+    ++keepalive_generation_;
+    keepalive_timer_->cancel();
+    close_timer_->cancel();
+    wake_writers();
+
+    // A close frame can be sent now only between frames: not while a write is in progress
+    if (close_sent_ || close_received_ || writing_ || !socket_->is_open()) {
+        socket_->close();
+        return;
+    }
+    close_sent_ = true;
+
+    uint8_t header[14];
+    uint8_t mask[MASK_SIZE_BYTES];
+    size_t header_size = build_header(OPCODE_CLOSE, 2, header, mask);
+    std::vector<uint8_t> frame(header, header + header_size);
+    uint8_t payload[2] = {uint8_t(code >> 8), uint8_t(code & 0xFF)};
+    for (size_t i = 0; i < 2; ++i) frame.push_back(server_role_ ? payload[i] : payload[i] ^ mask[i]);
+
+    // The closing handshake goes on without this websocket, on its socket: pending reads
+    // end now, and what was received but not read yet is passed on
+    std::string input(reinterpret_cast<const char*>(in_.data() + in_begin_), buffered());
+    socket_->cancel();
+    co_spawn(io_context_, linger(socket_, std::move(frame), std::move(input), frame_remaining_), detached);
+}
+
+awaitable<void> websocket::linger(std::shared_ptr<socket> socket, std::vector<uint8_t> close_frame,
+                                  std::string input, uint64_t skip) {
+    // Close the socket after the timeout, whatever is pending on it
+    auto timer = std::make_shared<boost::asio::steady_timer>(socket->get_io_context(), CLOSE_TIMEOUT);
+    timer->async_wait([socket](const boost::system::error_code& ec) {
+        if (!ec) socket->close();
+    });
+
+    auto [write_ec, written] = co_await socket->write(close_frame.data(), close_frame.size());
+    if (!write_ec) {
+        // Wait for the close frame of the peer, skipping anything else
+        uint8_t chunk[1024];
+        for (;;) {
+            auto skipped = std::min<uint64_t>(skip, input.size());
+            input.erase(0, skipped);
+            skip -= skipped;
+            if (skip == 0) {
+                frame_header header;
+                if (parse_header(reinterpret_cast<const uint8_t*>(input.data()), input.size(), header)) {
+                    if (header.opcode == OPCODE_CLOSE) break;
+                    input.erase(0, header.size);
+                    skip = header.payload_size;
+                    continue;
+                }
+            }
+            auto [ec, bytes] = co_await socket->read_some(chunk, sizeof(chunk));
+            if (ec) break;
+            input.append(reinterpret_cast<const char*>(chunk), bytes);
+        }
+    }
+    timer->cancel();
+    socket->close();
+}
+
+awaitable<void> websocket::close_graceful(uint16_t code) {
+    if (closed_) co_return;
+    if (!close_sent_ && !close_received_) {
+        if (co_await send_close(code)) {
+            close(code);
+            co_return;
+        }
+    }
+    if (closed_) co_return;
+    if (!close_received_) {
+        close_timer_->expires_after(CLOSE_TIMEOUT);
+        if (reading_) {
+            // The reader gets the close frame of the peer, and closes (which ends this wait)
+            co_await close_timer_->async_wait(use_nothrow_awaitable);
+        } else {
+            // Read until the close frame of the peer, discarding anything else
+            auto discard = [this]() -> awaitable<void> {
+                uint8_t buffer[512];
+                for (;;) {
+                    auto [ec, bytes] = co_await read_message_some(buffer, sizeof(buffer));
+                    if (ec) co_return;
+                }
+            };
+            co_await (discard() || close_timer_->async_wait(use_nothrow_awaitable));
+        }
+    }
+    close(code);
+}
+
+void websocket::cancel() {
+    socket_->cancel();
+    wake_writers();
+}
+
+// ---------------------------------------------------------------------------
+// Keepalive
+// ---------------------------------------------------------------------------
+
+void websocket::set_keepalive(std::chrono::milliseconds ping_interval, std::chrono::milliseconds idle_timeout) {
+    ping_interval_ = ping_interval;
+    idle_timeout_ = idle_timeout;
+    auto generation = ++keepalive_generation_;
+    keepalive_timer_->cancel();
+    if (closed_ || (ping_interval.count() <= 0 && idle_timeout.count() <= 0)) return;
+
+    std::weak_ptr<websocket> weak = weak_from_this();
+    if (weak.expired()) {
+        LOG_ERROR("websocket keepalive requires the websocket to be owned by a std::shared_ptr");
+        return;
+    }
+    keepalive_timer_ = std::make_shared<boost::asio::steady_timer>(io_context_);
+    last_ping_ = {};
+
+    co_spawn(io_context_, [weak, timer = keepalive_timer_, generation]() -> awaitable<void> {
+        using clock = std::chrono::steady_clock;
+        for (;;) {
+            clock::time_point next = clock::time_point::max();
+            {
+                // Not kept alive while waiting
+                auto self = weak.lock();
+                if (!self || self->closed_ || self->keepalive_generation_ != generation) co_return;
+                auto now = clock::now();
+                auto received = self->last_received_;
+                if (self->idle_timeout_.count() > 0) {
+                    if (now - received >= self->idle_timeout_) {
+                        LOG_DEBUG("websocket idle for too long, closing");
+                        self->close(CLOSE_GOING_AWAY);
+                        co_return;
+                    }
+                    next = received + self->idle_timeout_;
+                }
+                if (self->ping_interval_.count() > 0) {
+                    auto since = std::max(received, self->last_ping_);
+                    if (now - since >= self->ping_interval_) {
+                        // Sent on its own: a ping stuck behind a write that does not end
+                        // does not hold the idle timeout
+                        self->last_ping_ = now;
+                        co_spawn(self->io_context_, [self]() -> awaitable<void> {
+                            co_await self->send_ping();
+                        }, detached);
+                        since = now;
+                    }
+                    next = std::min(next, since + self->ping_interval_);
+                }
+            }
+            timer->expires_at(next);
+            co_await timer->async_wait(use_nothrow_awaitable);
+        }
+    }, detached);
+}
+
+void websocket::start_timeout() {
+    set_keepalive(CONNECTION_TIMEOUT_SECONDS, 2 * CONNECTION_TIMEOUT_SECONDS);
+}
+
+// ---------------------------------------------------------------------------
+// Delegated to the socket
+// ---------------------------------------------------------------------------
+
 awaitable<boost::system::error_code> websocket::wait(boost::asio::socket_base::wait_type type) {
+    if (type == boost::asio::socket_base::wait_read && buffered() > 0) {
+        co_return boost::system::error_code{};
+    }
     co_return co_await socket_->wait(type);
 }
 
@@ -421,23 +600,6 @@ awaitable<boost::system::error_code> websocket::connect(
     const std::string& port,
     std::chrono::seconds timeout) {
     co_return co_await socket_->connect(host, port, timeout);
-}
-
-void websocket::close() {
-    timer_.cancel();
-    socket_->close();
-}
-
-awaitable<void> websocket::close_graceful() {
-    if (!close_sent_ && socket_->is_open()) {
-        co_await send_close();
-    } else if (socket_->is_open()) {
-        close();
-    }
-}
-
-void websocket::cancel() {
-    socket_->cancel();
 }
 
 bool websocket::requires_handshake() const {
@@ -449,7 +611,7 @@ awaitable<boost::system::error_code> websocket::handshake(const std::string& hos
 }
 
 bool websocket::is_open() const {
-    return socket_->is_open();
+    return !closed_ && socket_->is_open();
 }
 
 bool websocket::is_secure() const {
@@ -457,7 +619,9 @@ bool websocket::is_secure() const {
 }
 
 size_t websocket::available() const {
-    return socket_->available();
+    // received, framing included
+    if (closed_) return 0;
+    return buffered() + socket_->available();
 }
 
 std::string websocket::get_remote_ip() const {

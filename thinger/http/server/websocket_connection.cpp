@@ -53,7 +53,7 @@ namespace thinger::http{
             LOG_LEVEL(2, "waiting websocket data");
 
             auto buf = buffer_.prepare(next_read_size);
-            auto [ec, bytes_transferred] = co_await ws_->read_some(
+            auto [ec, bytes_transferred] = co_await ws_->read_message_some(
                 static_cast<uint8_t*>(buf.data()), buf.size());
 
             if (ec) {
