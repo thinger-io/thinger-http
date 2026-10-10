@@ -164,6 +164,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_stream_test.cpp)
     add_thinger_test(test_integration_websocket_stream integration/websocket_stream_test.cpp)
 endif()
 
+# Integration tests - WebSocket messages through the message interface
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_message_test.cpp)
+    add_thinger_test(test_integration_websocket_message integration/websocket_message_test.cpp)
+endif()
+
 # Integration tests - Sockets defined by the application
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/custom_socket_test.cpp)
     add_thinger_test(test_integration_custom_socket integration/custom_socket_test.cpp)

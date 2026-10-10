@@ -243,16 +243,24 @@ awaitable<std::pair<std::string, bool>> websocket_client::receive_async() {
         co_return std::make_pair(std::string{}, false);
     }
 
+    // A whole message: every frame of it, read in pieces
+    std::string message;
     std::array<uint8_t, 65536> buffer;
-    auto [ec, bytes_read] = co_await websocket_->read_message_some(buffer.data(), buffer.size());
-
-    if (ec) {
-        co_return std::make_pair(std::string{}, false);
+    for (;;) {
+        auto [ec, bytes_read] = co_await websocket_->read_message_some(buffer.data(), buffer.size());
+        if (ec) {
+            co_return std::make_pair(std::string{}, false);
+        }
+        message.append(reinterpret_cast<const char*>(buffer.data()), bytes_read);
+        if (message.size() > MAX_MESSAGE_SIZE) {
+            LOG_ERROR("websocket message larger than {} bytes, closing", MAX_MESSAGE_SIZE);
+            websocket_->close();
+            co_return std::make_pair(std::string{}, false);
+        }
+        if (websocket_->remaining_in_frame() == 0 && websocket_->is_message_complete()) break;
     }
 
-    std::string message(reinterpret_cast<char*>(buffer.data()), bytes_read);
     bool is_binary = websocket_->is_binary();
-
     co_return std::make_pair(std::move(message), is_binary);
 }
 
