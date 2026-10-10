@@ -30,6 +30,7 @@ Benchmarked with [bombardier](https://github.com/codesenberg/bombardier) — 100
 - **Server-Sent Events (SSE)** - Real-time server push
 - **SSL/TLS** - HTTPS and WSS support via OpenSSL, with per-domain certificates (SNI)
 - **Virtual Hosts** - Routes per host name, exact or by pattern, on the same listener
+- **Reverse Proxy** - Forward requests to HTTP, HTTPS or Unix socket targets, streaming bodies and tunneling WebSockets
 - **C++20 Coroutines** - Async-first API with sync wrappers
 - **Lightweight** - Minimal dependencies, suitable for embedded systems
 
@@ -568,6 +569,54 @@ server.set_trusted_proxies({"10.0.0.1"}, http::forwarded_header::forwarded);
 ```
 
 No proxy is trusted by default, and the header of any other peer is ignored, so a client cannot change its address by sending it: code that trusts a local address (e.g. `127.0.0.1` to skip checks) stays safe. List only proxies that append to (or overwrite) the header, and only the header they set: the other one reaches the server as the client sent it.
+
+### Reverse Proxy
+
+`http::reverse_proxy` forwards the request of a route handler to another server (a target) and sends its response back: over TCP, TLS or a Unix socket, streaming both bodies, and turning the connection into a tunnel for protocol upgrades such as WebSockets. Use it from a coroutine handler, before reading the body; the not-found handler of a virtual host forwards everything it receives, whatever the method:
+
+```cpp
+http::reverse_proxy proxy;   // thread-safe: one for every route and thread
+
+// Everything on app.example.com, WebSockets included
+auto app = *http::proxy_target::from_url("http://127.0.0.1:3000");
+server.host("app.example.com").set_not_found_handler(
+    [&](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        co_await proxy.forward(req, res, app);
+    });
+
+// /plugins/:name/...: to a Unix socket per plugin, without the prefix, with other credentials
+server.get("/plugins/:name/:path(.*)", [&](http::request& req, http::response& res) -> thinger::awaitable<void> {
+    http::proxy_options options;
+    options.path = "/" + req["path"];                 // the query of the request is kept
+    options.on_request = [](http::request&, http::http_request& outgoing) {
+        outgoing.remove_headers("Authorization");
+        outgoing.add_header("Authorization", "Bearer " + plugin_token);
+    };
+    options.on_response = [](http::request&, http::http_response& response) {
+        response.add_header("X-Plugin", "1");
+    };
+    auto target = http::proxy_target::unix_socket("/run/plugins/" + req["name"] + ".sock");
+    auto result = co_await proxy.forward(req, res, target, options);
+    // result.status, result.complete, result.request_bytes, result.response_bytes, result.error...
+});
+
+// HTTPS target with a private CA and its own SNI name
+auto device = *http::proxy_target::from_url("https://10.0.0.5:8443/ui");
+device.tls.server_name = "device.internal";   // sent with SNI and verified in its certificate
+device.tls.ca_file = "/etc/ssl/private-ca.pem";  // trusted instead of the system CAs
+```
+
+- **Target**: `proxy_target::from_url()` (`http://`, `https://`, `ws://`, `wss://`, with a base path prepended to every request) or `proxy_target::unix_socket()`. TLS targets are verified by default (chain and name), against the system CAs or only `ca_file`/`ca_pem` if set; `verify = false` is for testing only.
+- **Request**: method, path and query, and the end-to-end headers. The path can be replaced (`options.path`), and the `Host` header is the target's unless `preserve_host` or `host` are set. Hop-by-hop headers are removed: `Connection` and the headers it lists, `Keep-Alive`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade` (except on upgrades), `Proxy-*`, and `Expect`. `TRACE`, `CONNECT` and unknown methods are not forwarded.
+- **Forwarding headers**: `X-Forwarded-For`, `-Proto` and `-Host` by default, `Forwarded` (RFC 7239) or none (`options.forwarding`). They agree with `req.get_request_ip()`: the ones received from a [trusted proxy](#client-ip-behind-proxies) (the header it sets) are kept and extended with the peer; from any other peer they are dropped, as the client could forge them.
+- **Bodies** are streamed with flow control both ways: the request body goes to the target as the client sends it, and the response to the client as the target sends it (chunked responses and event streams included), each part read only once the previous one was written, so neither is ever held whole. `max_body_size` limits the request body (413).
+- **Upgrades**: a request with `Connection: upgrade` (WebSocket or any other protocol) gets the `101` of the target, then the connection becomes a byte tunnel to it, starting with whatever either side sent right after the handshake. `allow_upgrade = false` forwards them as plain requests.
+- **Errors**, through the [error formatter](#error-format): `502` if the target cannot be reached (connection refused, TLS verification) or its response is invalid, `504` if it times out. `connect_timeout` (10 s) covers the connection and TLS handshake, `idle_timeout` (60 s, `0` disables it, e.g. for event streams) the time without data in either direction, and `total_timeout` (none by default) the whole exchange. Once the response has started, a failure closes the connection with the client without ending the body, so it sees it incomplete.
+- **Hooks**: `on_request` changes the request for the target (method, path, headers), `on_response` the status and headers of its response (also of a `101`),. Headers they add with invalid characters fail the request (`500`) instead of being sent.
+
+Framing is never forwarded as received, to avoid request smuggling between the proxy and the target. The request body is framed again from what the strict server parser accepted (requests with ambiguous framing are rejected before reaching the handler): its `Content-Length`, or chunked again without extensions or trailers, and never past its end, so a pipelined request is never sent as part of it. The response of the target is parsed strictly too: a status line other than `HTTP/1.x` with a three-digit code, obsolete line folding, `Transfer-Encoding` other than a single `chunked`, `Content-Length` together with it or invalid (or repeated with different values) are answered with `502`; its body is decoded and framed again for the client (chunked, or ended by closing the connection for HTTP/1.0 clients), and anything the target sends after its end is dropped. Each request uses a new connection to the target, closed after the response; reusing them is left to a connection pool.
+
+The flow control comes from `res.start_stream(head, content_length)`, `co_await res.write_stream(data)` and `co_await res.end_stream()`, available to any handler: each write completes once the data is written to the connection, the framing is chosen by the response (`Content-Length` if given, chunked, or closing the connection for HTTP/1.0 clients), and a body that does not match its `Content-Length` closes the connection instead of desynchronizing it. See `examples/http_server/reverse_proxy_example.cpp`.
 
 ### CORS
 

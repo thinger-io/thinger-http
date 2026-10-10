@@ -147,6 +147,25 @@ server.host("*.devices.example.com").get("/:path(.*)", [](http::request& req, ht
 });
 ```
 
+### reverse_proxy_example
+
+A front server forwarding to a backend (started by the example, or the URL given): `/api/...` without its prefix and with the credentials of the proxy, and everything on `app.localhost` as it is, event streams, uploads and WebSockets included. Errors of the proxy (`502`, `504`) use a JSON format.
+
+```bash
+./reverse_proxy_example [backend_url]
+curl -i localhost:8096/api/hello?name=proxy
+curl -N -H "Host: app.localhost" localhost:8096/events
+```
+
+```cpp
+http::reverse_proxy proxy;
+auto target = *http::proxy_target::from_url("http://127.0.0.1:3000");
+server.host("app.localhost").set_not_found_handler(
+    [&](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        co_await proxy.forward(req, res, target);
+    });
+```
+
 ### advanced_http_server
 
 Complete example with multiple features.

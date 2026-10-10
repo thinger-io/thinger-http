@@ -67,3 +67,7 @@ target_link_libraries(openapi_example PRIVATE thinger::http)
 # Virtual hosts example (sites per Host header, error format, trusted proxies)
 add_executable(virtual_hosts_example virtual_hosts_example.cpp)
 target_link_libraries(virtual_hosts_example PRIVATE thinger::http)
+
+# Reverse proxy example (forwarding requests, streams and WebSockets to a backend)
+add_executable(reverse_proxy_example reverse_proxy_example.cpp)
+target_link_libraries(reverse_proxy_example PRIVATE thinger::http)
