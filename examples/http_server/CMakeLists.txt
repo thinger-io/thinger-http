@@ -71,3 +71,7 @@ target_link_libraries(virtual_hosts_example PRIVATE thinger::http)
 # Reverse proxy example (forwarding requests, streams and WebSockets to a backend)
 add_executable(reverse_proxy_example reverse_proxy_example.cpp)
 target_link_libraries(reverse_proxy_example PRIVATE thinger::http)
+
+# Device web service proxy example (response policy for embedded device interfaces)
+add_executable(device_proxy_example device_proxy_example.cpp)
+target_link_libraries(device_proxy_example PRIVATE thinger::http)

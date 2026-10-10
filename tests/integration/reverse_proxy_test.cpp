@@ -14,6 +14,7 @@
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
 #include <unistd.h>
+#include "../../examples/http_server/device_proxy_policy.hpp"
 #include <atomic>
 #include <cctype>
 #include <filesystem>
@@ -945,6 +946,91 @@ TEST_CASE("Reverse proxy rewrites paths and hosts, and runs hooks", "[proxy][hoo
     SECTION("Custom host") {
         mode.set("custom");
         REQUIRE(raw_request(proxy.port, request).json()["headers"]["host"] == "internal.example");
+    }
+}
+
+TEST_CASE("Reverse proxy hooks express a device web service policy", "[proxy][hooks][integration]") {
+    std::atomic<uint16_t> target_port{0};
+    test_server target;
+    target.server.get("/", [](http::response& res) {
+        res.header("X-Frame-Options", "DENY");
+        res.header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'");
+        res.header("Set-Cookie", "session=abc; Domain=device.local; Path=/; HttpOnly");
+        res.header("Set-Cookie", "theme=dark; domain=device.local; SameSite=Lax");
+        res.send("device page");
+    });
+    auto redirect = [&](const std::string& path, std::function<std::string()> location) {
+        target.server.get(path, [location](http::response& res) { res.redirect(location()); });
+    };
+    redirect("/login", [] { return "/home"; });
+    redirect("/absolute", [&] { return "http://127.0.0.1:" + std::to_string(target_port) + "/home?x=1"; });
+    redirect("/external", [] { return "https://other.example/x"; });
+    redirect("/inside", [] { return "/devices/d1/services/web/home"; });
+    redirect("/userinfo", [&] { return "http://127.0.0.1:" + std::to_string(target_port) + "@evil.example/"; });
+    target.start();
+    target_port = target.port;
+
+    // 0: no policy (the defaults of the proxy); 1: recommended; 2: frames from anywhere, cross-site cookies
+    shared_value<int> mode;
+    http::reverse_proxy reverse_proxy;
+    auto destination = target_of(target.port);
+    test_server proxy;
+    proxy.server.get("/devices/:device/services/web/:path(.*)", [&](http::request& req, http::response& res) -> awaitable<void> {
+        device_proxy::policy policy;
+        policy.base_path = "/devices/" + req["device"] + "/services/web";
+        int current = mode.get();
+        if (current == 1) policy.console_origin = "https://console.example.com";
+        if (current == 2) {
+            policy.allow_any_frame = true;
+            policy.cross_site_cookies = true;
+        }
+        http::proxy_options options;
+        options.path = "/" + req["path"];
+        if (current != 0) {
+            options.on_response = [policy, destination](http::request& req, http::http_response& response) {
+                device_proxy::apply(policy, {destination.authority(), req.header("Host")}, response);
+            };
+        }
+        co_await reverse_proxy.forward(req, res, destination, options);
+    });
+    proxy.start();
+
+    auto page = [&] { return raw_request(proxy.port, get("/devices/d1/services/web/")); };
+    auto location = [&](const std::string& path) {
+        auto res = raw_request(proxy.port, get("/devices/d1/services/web" + path));
+        REQUIRE(res.status == 302);
+        return res.header("Location");
+    };
+
+    SECTION("The proxy changes nothing by default") {
+        auto res = page();
+        REQUIRE(res.body == "device page");
+        REQUIRE(res.header("X-Frame-Options") == "DENY");
+        REQUIRE(res.header("Content-Security-Policy") == "default-src 'self'; frame-ancestors 'none'");
+        REQUIRE(res.header("Set-Cookie").find("Domain=device.local") != std::string::npos);
+        REQUIRE(location("/login") == "/home");
+    }
+
+    SECTION("Recommended: only the console may embed the device") {
+        mode.set(1);
+        auto res = page();
+        REQUIRE_FALSE(res.has("X-Frame-Options"));
+        REQUIRE(res.header("Content-Security-Policy") == "default-src 'self'; frame-ancestors https://console.example.com");
+        REQUIRE(res.header("Set-Cookie") == "session=abc; Path=/; HttpOnly, theme=dark; SameSite=Lax");
+        REQUIRE(location("/login") == "/devices/d1/services/web/home");
+        REQUIRE(location("/absolute") == "/devices/d1/services/web/home?x=1");
+        REQUIRE(location("/inside") == "/devices/d1/services/web/home");
+        REQUIRE(location("/external") == "https://other.example/x");
+        REQUIRE(location("/userinfo") == "http://127.0.0.1:" + std::to_string(target.port) + "@evil.example/");
+    }
+
+    SECTION("Frames from any site and cross-site cookies") {
+        mode.set(2);
+        auto res = page();
+        REQUIRE_FALSE(res.has("X-Frame-Options"));
+        REQUIRE_FALSE(res.has("Content-Security-Policy"));
+        REQUIRE(res.header("Set-Cookie") ==
+                "session=abc; Path=/; HttpOnly; Secure; SameSite=None, theme=dark; Secure; SameSite=None");
     }
 }
 

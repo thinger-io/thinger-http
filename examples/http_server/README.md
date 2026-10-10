@@ -166,6 +166,16 @@ server.host("app.localhost").set_not_found_handler(
     });
 ```
 
+### device_proxy_example
+
+Device web interfaces served by a console under `/devices/<id>/services/web/`, with an explicit response policy (`device_proxy_policy.hpp`): frame protections replaced by `frame-ancestors` allowing only the console, cookies without the device `Domain`, and redirects kept under the proxy path. The header documents the risks of each rule and of its less safe variants (removing frame protections, cross-site cookies).
+
+```bash
+./device_proxy_example
+curl -i localhost:8098/devices/sensor1/services/web/
+curl -i localhost:8098/devices/sensor1/services/web/login
+```
+
 ### advanced_http_server
 
 Complete example with multiple features.
