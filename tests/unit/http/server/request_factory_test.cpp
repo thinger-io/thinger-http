@@ -254,3 +254,19 @@ TEST_CASE("Request factory rejects CONNECT", "[request_factory][unit]") {
         REQUIRE(bool(!parse_headers(parser, request)));
     }
 }
+
+// Found by differential fuzzing against llhttp: the target was checked to start with "/" once
+// percent-decoded, so "%2Fa" was accepted (and routed as "/a"), though it is not in origin
+// form (RFC 9112 section 3.2.1)
+TEST_CASE("Request factory requires a target starting with a slash as sent", "[request_factory][unit]") {
+    auto accepts = [](const std::string& target) {
+        request_factory parser;
+        return bool(parse_headers(parser, "GET " + target + " HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+    };
+
+    REQUIRE(accepts("/a%2Fb"));
+    for (const char* target : {"%2Fa", "%2fa/b", "%2F", "a/b", "?a=b"}) {
+        INFO("target: " << target);
+        REQUIRE_FALSE(accepts(target));
+    }
+}

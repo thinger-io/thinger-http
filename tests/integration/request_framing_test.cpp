@@ -361,6 +361,15 @@ TEST_CASE("Request target with bytes other than ASCII is rejected", "[server][fr
     }
 }
 
+// Found by differential fuzzing against llhttp: the target was checked to start with "/" once
+// percent-decoded, so "%2Fhealth" was served as "/health", though it is not in origin form
+// (RFC 9112 section 3.2.1)
+TEST_CASE("Request target starting with an encoded slash is rejected", "[server][framing][integration]") {
+    framing_server fixture;
+    fixture.start();
+    require_rejected(fixture, "GET %2Fhealth HTTP/1.1\r\nHost: localhost\r\n\r\n");
+}
+
 namespace {
     // GET /health with `count` headers in all (Host included)
     std::string request_with_headers(int count) {

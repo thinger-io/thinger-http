@@ -58,8 +58,10 @@ namespace thinger::http {
                     std::string parsed_uri;
                     bool parsed_ok = util::url::url_decode(tempString1_, parsed_uri);
                     if (parsed_ok) {
-                        // http_request path must be absolute and not contain "..".
-                        if (parsed_uri.empty() || parsed_uri[0] != '/' || parsed_uri.find("..") != std::string::npos) {
+                        // The target must be in origin form, starting with "/" as sent (RFC 9112
+                        // section 3.2.1: an encoded "%2F" is not one), and its decoded path must
+                        // not contain ".."
+                        if (tempString1_.empty() || tempString1_[0] != '/' || parsed_uri.find("..") != std::string::npos) {
                             return false;
                         }
                         on_http_uri(tempString1_);
