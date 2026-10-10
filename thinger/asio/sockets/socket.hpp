@@ -74,11 +74,8 @@ protected:
     static size_t send_now(native_handle_type descriptor, const std::vector<boost::asio::const_buffer>& buffers,
                            boost::system::error_code& ec);
 
-    std::string context_;
     boost::asio::io_context &io_context_;
     static std::atomic<unsigned long> connections;
-    static std::map<std::string, unsigned long> context_count;
-    static std::mutex mutex_;
 };
 
 }
