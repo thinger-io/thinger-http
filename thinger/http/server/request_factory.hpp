@@ -2,6 +2,7 @@
 #define HTTP_REQUEST_PARSER_HPP
 
 #include <memory>
+#include <string>
 #include <boost/logic/tribool.hpp>
 #include <boost/tuple/tuple.hpp>
 #include <boost/lexical_cast.hpp>
@@ -28,6 +29,24 @@ namespace thinger::http {
         template<typename InputIterator>
         boost::tribool parse(InputIterator& begin, InputIterator end) {
             while (begin != end) {
+                // The bytes of the uri, a header name or a header value are appended at once,
+                // as consume() would one by one (up to the header section limit: the byte
+                // over it is left to consume(), which fails)
+                if (std::string* target = run_target()) {
+                    size_t room = max_header_section_size - header_section_size_;
+                    auto run_end = begin;
+                    size_t size = 0;
+                    while (run_end != end && size < room && is_run_char(static_cast<char>(*run_end))) {
+                        ++run_end;
+                        ++size;
+                    }
+                    if (size > 0) {
+                        target->append(begin, run_end);
+                        header_section_size_ += size;
+                        begin = run_end;
+                        continue;
+                    }
+                }
                 boost::tribool result = consume(*begin++);
                 // parsed completed or parse failed
                 if (result || !result)
@@ -75,17 +94,53 @@ namespace thinger::http {
         /// Handle the next character of input.
         boost::tribool consume(char input);
 
+        /// String a byte that consume() only appends in the current state would go to (the
+        /// uri, a header name or a header value), null in the other states
+        std::string* run_target() {
+            switch (state_) {
+                case uri: return &tempString1_;
+                case header_name: return &tempString1_;
+                case header_value: return &tempString2_;
+                default: return nullptr;
+            }
+        }
+
+        /// Whether consume() only appends `c` in the current state (see run_target)
+        bool is_run_char(char c) const {
+            switch (state_) {
+                case uri: return c != ' ' && !is_ctl(c);
+                case header_name: return is_char(c) && !is_ctl(c) && !is_tspecial(c);
+                case header_value: return !is_ctl(c);
+                default: return false;
+            }
+        }
+
         /// Check if a byte is an HTTP character.
-        static bool is_char(int c);
+        static bool is_char(int c) {
+            return c >= 0 && c <= 127;
+        }
 
         /// Check if a byte is an HTTP control character.
-        static bool is_ctl(int c);
+        static bool is_ctl(int c) {
+            return (c >= 0 && c <= 31) || (c == 127);
+        }
 
         /// Check if a byte is defined as an HTTP special character.
-        static bool is_tspecial(int c);
+        static bool is_tspecial(int c) {
+            switch (c) {
+                case '(': case ')': case '<': case '>': case '@': case ',': case ';': case ':':
+                case '\\': case '"': case '/': case '[': case ']': case '?': case '=': case '{':
+                case '}': case ' ': case '\t':
+                    return true;
+                default:
+                    return false;
+            }
+        }
 
         /// Check if a byte is a digit.
-        static bool is_digit(int c);
+        static bool is_digit(int c) {
+            return c >= '0' && c <= '9';
+        }
 
         std::shared_ptr<http_request> req;
 

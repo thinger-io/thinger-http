@@ -218,45 +218,6 @@ namespace thinger::http {
         }
     }
 
-    bool request_factory::is_char(int c) {
-        return c >= 0 && c <= 127;
-    }
-
-    bool request_factory::is_ctl(int c) {
-        return (c >= 0 && c <= 31) || (c == 127);
-    }
-
-    bool request_factory::is_tspecial(int c) {
-        switch (c) {
-            case '(':
-            case ')':
-            case '<':
-            case '>':
-            case '@':
-            case ',':
-            case ';':
-            case ':':
-            case '\\':
-            case '"':
-            case '/':
-            case '[':
-            case ']':
-            case '?':
-            case '=':
-            case '{':
-            case '}':
-            case ' ':
-            case '\t':
-                return true;
-            default:
-                return false;
-        }
-    }
-
-    bool request_factory::is_digit(int c) {
-        return c >= '0' && c <= '9';
-    }
-
     std::shared_ptr<http_request> request_factory::consume_request() {
         std::shared_ptr<http_request> request(req);
         req.reset();
