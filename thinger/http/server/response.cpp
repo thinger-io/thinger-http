@@ -281,6 +281,29 @@ namespace {
         return offered;
     }
 
+    // Whether a comma-separated header (any of its values) holds `token` (case-insensitive)
+    bool has_token(const std::vector<std::string>& values, std::string_view token) {
+        for (const auto& value : values) {
+            std::vector<std::string> tokens;
+            boost::split(tokens, value, boost::is_any_of(","));
+            for (auto& candidate : tokens) {
+                boost::trim(candidate);
+                if (boost::iequals(candidate, token)) return true;
+            }
+        }
+        return false;
+    }
+
+    // A Sec-WebSocket-Key: 16 bytes in base64 (RFC 6455, 4.1)
+    bool valid_websocket_key(const std::string& key) {
+        if (key.size() != 24 || !key.ends_with("==")) return false;
+        for (size_t i = 0; i < 22; ++i) {
+            char c = key[i];
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '+' && c != '/') return false;
+        }
+        return ::thinger::util::base64::decode(key).size() == 16;
+    }
+
 }
 
 std::shared_ptr<http_response> response::websocket_handshake(const std::vector<std::string>& protocols,
@@ -288,9 +311,22 @@ std::shared_ptr<http_response> response::websocket_handshake(const std::vector<s
                                                              std::string& protocol) {
     const auto& request = *state_->request;
 
-    // Check if this is a WebSocket upgrade request
+    // Check if this is a WebSocket upgrade request (RFC 6455, 4.2.1)
     if (!boost::iequals(request.get_header(http::header::upgrade), "websocket")) {
         error(http_response::status::upgrade_required, "This service requires use of WebSockets");
+        return nullptr;
+    }
+    if (request.get_method() != method::GET) {
+        error(http_response::status::bad_request, "A WebSocket handshake must be a GET request");
+        return nullptr;
+    }
+    if (!has_token(request.get_headers_with_key(http::header::connection), "upgrade")) {
+        error(http_response::status::bad_request, "A WebSocket handshake requires Connection: Upgrade");
+        return nullptr;
+    }
+    if (request.get_header("Sec-WebSocket-Version") != "13") {
+        header("Sec-WebSocket-Version", "13");
+        error(http_response::status::upgrade_required, "Unsupported WebSocket version");
         return nullptr;
     }
 
@@ -317,8 +353,8 @@ std::shared_ptr<http_response> response::websocket_handshake(const std::vector<s
 
     // Get WebSocket key
     auto ws_key = request.get_header("Sec-WebSocket-Key");
-    if (ws_key.empty()) {
-        error(http_response::status::bad_request, "Missing Sec-WebSocket-Key header");
+    if (!valid_websocket_key(ws_key)) {
+        error(http_response::status::bad_request, "Missing or invalid Sec-WebSocket-Key header");
         return nullptr;
     }
 
