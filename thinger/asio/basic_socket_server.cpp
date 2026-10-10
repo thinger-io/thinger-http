@@ -57,10 +57,13 @@ void basic_socket_server<Protocol>::stop_acceptor_thread() {
 
 template<typename Protocol>
 void basic_socket_server<Protocol>::close_acceptor() {
-    // Close the acceptor to cancel pending async operations, but do NOT
-    // destroy it (reset) here. The async_accept handler may still be in
-    // flight on the io_context thread and needs the acceptor alive until
-    // the handler completes. The unique_ptr will clean up on destruction.
+    // Once a handler accepting a connection (if any) is done: the ones still to run do nothing.
+    // Closing the acceptor cancels the pending accept
+    std::unique_lock<std::recursive_mutex> lock;
+    if (accept_state_) {
+        lock = std::unique_lock(accept_state_->mutex);
+        accept_state_->stopped = true;
+    }
     if (acceptor_ && acceptor_->is_open()) {
         boost::system::error_code ec;
         acceptor_->close(ec);
@@ -118,6 +121,7 @@ void basic_socket_server<Protocol>::accept_connection() {
     auto serve = make_connection_server();
     if (!serve) return;
     serve_ = std::make_shared<const connection_server>(std::move(serve));
+    accept_state_ = std::make_shared<accept_state>();
 
     // On a thread of its own, every pending connection is accepted at once, without waiting
     if (acceptor_thread_) {
@@ -131,14 +135,20 @@ void basic_socket_server<Protocol>::accept_connection() {
         return;
     }
 
+    std::scoped_lock lock(accept_state_->mutex);
     accept_next();
 }
 
 template<typename Protocol>
 void basic_socket_server<Protocol>::accept_next() {
-    // The connection is accepted on the next io_context from the provider
+    // Called with the accept state locked. The connection is accepted on the next io_context
+    // from the provider
     boost::asio::any_io_executor executor = connection_context_provider_().get_executor();
-    acceptor_->async_accept(executor, [this](const boost::system::error_code& e, socket_type peer) {
+    acceptor_->async_accept(executor, [this, state = accept_state_](const boost::system::error_code& e, socket_type peer) {
+        // Stopped meanwhile (from any thread): the server may be gone
+        std::scoped_lock lock(state->mutex);
+        if (state->stopped) return;
+
         if (!e) {
             if (is_connection_allowed(peer.native_handle())) {
                 (*serve_)(std::move(peer));
@@ -221,8 +231,10 @@ void basic_socket_server<Protocol>::retry_accept() {
     if (!running_) return;
     // Retry after a delay to avoid tight loop on persistent errors
     auto timer = std::make_shared<boost::asio::steady_timer>(acceptor_->get_executor(), std::chrono::seconds(1));
-    timer->async_wait([this, timer](const boost::system::error_code& e) {
+    timer->async_wait([this, timer, state = accept_state_](const boost::system::error_code& e) {
         if (e == boost::asio::error::operation_aborted) return;
+        std::scoped_lock lock(state->mutex);
+        if (state->stopped) return;
         if (acceptor_thread_) accept_pending();
         else accept_next();
     });

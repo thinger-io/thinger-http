@@ -5,6 +5,7 @@
 
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/local/stream_protocol.hpp>
+#include <mutex>
 #include <optional>
 
 namespace thinger::asio {
@@ -19,7 +20,9 @@ class worker_thread;
 // to the next worker, in turn, where the socket is registered and set up, waking that worker up
 // once. Accepting does not wait behind the connections a worker serves.
 //
-// Derived servers stop in their destructors: the acceptor thread uses their overrides.
+// stop() may be called from any thread: once it returns, the listening socket is closed and no
+// connection is handed to the handler anymore. Derived servers stop in their destructors: the
+// acceptor thread and the accept handlers use their overrides.
 template<typename Protocol>
 class basic_socket_server : public socket_server_base {
 public:
@@ -80,6 +83,16 @@ private:
     std::unique_ptr<acceptor_type> acceptor_;
     Protocol protocol_ = endpoint_type().protocol();
     std::shared_ptr<const connection_server> serve_;
+
+    // What the handlers accepting connections while listening share with the server. stop()
+    // marks it stopped while holding its mutex, which the handlers hold while they use the
+    // server (and its acceptor): a handler running later does nothing, as the server may be
+    // gone by then. Recursive, as the connection handler may stop the server
+    struct accept_state {
+        std::recursive_mutex mutex;
+        bool stopped = false;
+    };
+    std::shared_ptr<accept_state> accept_state_;
 };
 
 extern template class basic_socket_server<boost::asio::ip::tcp>;

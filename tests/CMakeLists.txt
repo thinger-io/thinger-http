@@ -178,6 +178,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/socket_io_test.cpp)
     add_thinger_test(test_integration_socket_io integration/socket_io_test.cpp)
 endif()
 
+# Integration tests - Socket servers stopped while accepting
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/socket_server_stop_test.cpp)
+    add_thinger_test(test_integration_socket_server_stop integration/socket_server_stop_test.cpp)
+endif()
+
 # Integration tests - Routing
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/routing_test.cpp)
     add_thinger_test(test_integration_routing integration/routing_test.cpp)
