@@ -85,7 +85,10 @@ bool response::mark_responded() {
 std::shared_ptr<http_response> response::new_response() const {
     auto message = state_->draft ? std::make_shared<http_response>(*state_->draft)
                                  : std::make_shared<http_response>();
-    message->set_keep_alive(state_->request->keep_alive());
+    // A protocol switch keeps the Connection header set for it (Upgrade)
+    if (message->get_status() != http_response::status::switching_protocols) {
+        message->set_keep_alive(state_->request->keep_alive());
+    }
     if (!state_->draft && state_->cors_enabled) add_cors_headers(*message);
     return message;
 }
