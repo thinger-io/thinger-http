@@ -170,20 +170,20 @@ void tcp_socket_server::accept_connection() {
     // Start accepting a connection
     acceptor_->async_accept(socket, [sock = std::move(sock), this](const boost::system::error_code& e) mutable {
         if (!e) {
-            // Get remote socket ip
-            auto remote_ip = sock->get_remote_ip();
-
-            // Check if IP is allowed
-            if (!is_remote_allowed(remote_ip)) {
-                sock->close();
-                LOG_WARNING("rejecting connection from: ip: {}, port: {}, secure: {}", 
-                           remote_ip, sock->get_local_port(), sock->is_secure());
-                if (running_) accept_connection();
-                return;
+            // Check if IP is allowed (the remote address is only looked up to filter it)
+            if (filters_remotes()) {
+                auto remote_ip = sock->get_remote_ip();
+                if (!is_remote_allowed(remote_ip)) {
+                    sock->close();
+                    LOG_WARNING("rejecting connection from: ip: {}, port: {}, secure: {}",
+                               remote_ip, sock->get_local_port(), sock->is_secure());
+                    if (running_) accept_connection();
+                    return;
+                }
             }
 
             LOG_INFO("received connection from: ip: {}, port: {}, secure: {}", 
-                    remote_ip, sock->get_local_port(), sock->is_secure());
+                    sock->get_remote_ip(), sock->get_local_port(), sock->is_secure());
 
             if (tcp_no_delay_) {
                 sock->enable_tcp_no_delay();

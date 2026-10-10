@@ -44,7 +44,8 @@ protected:
     virtual bool create_acceptor() = 0;
     virtual void accept_connection() = 0;
     
-    // Helper method for IP filtering
+    // Helper methods for IP filtering
+    bool filters_remotes() const { return !allowed_remotes_.empty() || !forbidden_remotes_.empty(); }
     bool is_remote_allowed(const std::string& remote_ip) const;
 
 protected:
