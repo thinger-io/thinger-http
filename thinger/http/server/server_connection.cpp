@@ -126,7 +126,9 @@ awaitable<void> server_connection::read_loop() {
             // Dispatch to handler (awaitable — handler decides body reading strategy)
             if (handler_) {
                 co_await handler_(req);
-                reset_timeout();
+                // Not once the response closed the connection (or it was taken over): the
+                // timer would be armed just to be cancelled
+                if (running_) reset_timeout();
             }
 
             // A response sent later, from a copy of the response, may still take over the
