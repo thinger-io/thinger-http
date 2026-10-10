@@ -52,6 +52,10 @@ target_link_libraries(server_streaming_upload_example PRIVATE thinger::http)
 add_executable(server_schema_example server_schema_example.cpp)
 target_link_libraries(server_schema_example PRIVATE thinger::http)
 
+# Body decoders example (JSON, MessagePack, CBOR, forms, text and custom types by Content-Type)
+add_executable(server_body_decoders_example server_body_decoders_example.cpp)
+target_link_libraries(server_body_decoders_example PRIVATE thinger::http)
+
 # Install examples
 install(TARGETS simple_http_server simple_https_server advanced_http_server
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/examples

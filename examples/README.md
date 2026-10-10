@@ -84,4 +84,5 @@ server.start("0.0.0.0", 8080);
 | `routing_example` | URL routing and parameters |
 | `server_auth_example` | Basic authentication |
 | `server_cors_example` | CORS configuration |
+| `server_body_decoders_example` | Request bodies as JSON, MessagePack, CBOR, forms, text or custom types |
 | `logging_example` | Logging setup with spdlog |

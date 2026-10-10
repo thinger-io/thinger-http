@@ -227,7 +227,7 @@ A connection is kept alive by the server only while it reads requests, runs a ha
 
 ### Coroutine Handlers
 
-Handlers can be coroutines that `co_await` other work (database queries, HTTP calls, timers). Declaring the JSON body in the signature makes the server read it, parse it and validate it against the route schema before the handler runs; invalid JSON or a body that does not match the schema is answered with `400` and the handler is not called:
+Handlers can be coroutines that `co_await` other work (database queries, HTTP calls, timers). Declaring the JSON body in the signature makes the server read it, decode it (JSON by default, or the [body types](#body-types) the route accepts) and validate it against the route schema before the handler runs; a body that cannot be decoded or does not match the schema is answered with `400` and the handler is not called:
 
 ```cpp
 server.post("/api/users", [&db](http::request& req, nlohmann::json& body, http::response& res) -> thinger::awaitable<void> {
@@ -374,6 +374,64 @@ A schema that cannot be parsed (e.g. a `$ref` to a schema component not register
 
 Valijson is enabled by default. Disable with `-DTHINGER_HTTP_ENABLE_VALIJSON=OFF`.
 
+### Body Types
+
+Handlers taking the body as `nlohmann::json&` get it decoded by its `Content-Type`, before the schema validation, so one handler and one schema serve every format. Only JSON is accepted unless the route or the application accept more types, so the formats a server parses never grow by accident:
+
+```cpp
+// Device data as JSON, MessagePack, CBOR, UBJSON or a urlencoded form
+server.post("/devices/:device/data", [](http::request& req, nlohmann::json& data, http::response& res) {
+    res.encode({{"device", req["device"]}, {"received", data}});   // replies in the type the client Accepts
+}).schema(data_schema).accepts({"json", "msgpack", "cbor", "ubjson", "form"});
+
+// Raw text, as a JSON string; binary, as a json::binary value
+server.post("/devices/:device/log", [](nlohmann::json& line, http::response& res) { /* ... */ }).accepts({"text"});
+
+// Application default for the routes without accepts() ({"json"} unless set)
+server.accept_body_types({"json", "msgpack", "cbor"});
+
+// Built-in decoders can be removed, and others added
+server.body_decoders().remove("ubjson");
+server.body_decoders().add("csv", {"text/csv"}, [](std::string_view body, const http::media_type& type,
+                                                   const http::body_limits& limits) -> nlohmann::json {
+    return parse_csv(body);   // throw http::body_decode_error("...") to answer 400
+});
+
+// Limits of decoded bodies
+server.set_body_limits({.max_depth = 32});
+```
+
+`accepts()` takes decoder names or media types. The built-in decoders:
+
+| Name | Media types | Decoded as |
+|---|---|---|
+| `json` | `application/json` and any `+json` (`application/problem+json`) | The JSON value |
+| `msgpack` | `application/msgpack`, `application/x-msgpack` | The value; `bin` and `ext` as binary values |
+| `cbor` | `application/cbor` and any `+cbor` | The value; byte strings as binary values. Tagged items are rejected |
+| `ubjson` | `application/ubjson` | The value |
+| `form` | `application/x-www-form-urlencoded` | An object of strings (see below) |
+| `text` | `text/plain` | A string |
+| `binary` | `application/octet-stream` | A binary value (`json::binary`) |
+
+- **Content-Type**: parsed as RFC 9110 defines it: the media type is case-insensitive, and parameters are ignored except `charset`, which must be UTF-8 (`us-ascii` too for text) for JSON, forms and text. A type the route does not accept, a malformed `Content-Type`, an unsupported charset or several different `Content-Type` headers are answered with `415 Unsupported Media Type`, before the body is read.
+- **Without Content-Type**, the body is taken as JSON, as before body types existed. A route that does not accept JSON answers `415` then.
+- **Behavior change**: JSON routes used to parse any body as JSON, whatever its `Content-Type`; now a body sent with another type is answered with `415` (e.g. `curl -d '{...}'` without `-H "Content-Type: application/json"`, which sends a form). This also stops cross-site forms and `text/plain` posts from browsers, which need no CORS preflight, from reaching JSON routes.
+- **Empty bodies** are `null`, whatever their type, and the schema decides whether they are valid.
+- **Errors**: a body that cannot be decoded is answered with `400` (`Invalid JSON`, `Invalid MessagePack`, `Invalid CBOR: nested deeper than 128 levels`, `Invalid form data: malformed percent-encoding`...), through the [error formatter](#error-format), like `415`. A custom decoder throws `http::body_decode_error` with its message (and `415` if the type is unsupported); any other exception is answered with `400` `Invalid <name> body`.
+- **Routes reading the body themselves** (`(request&, response&)` handlers) accept any type, unless they list theirs with `accepts()`: then other types get `415`, and listed types need no decoder (`.accepts({"image/png", "image/jpeg"})`).
+
+Forms are decoded as browsers encode them: `name=value` pairs separated by `&`, percent-decoded, with `+` as a space, in names too. Each name is a member of the object with its value as a string; a repeated name, an array of its values in order (`tags=a&tags=b` is `{"tags": ["a", "b"]}`, but `tags=a` alone is `{"tags": "a"}`, so a schema for repeated fields should accept both, or the clients always send at least two). A pair without `=` has an empty value, and empty pairs and pairs without name are skipped. Numbers are not converted: `age=30` is `"30"`. Malformed percent-encoding or names and values that are not UTF-8 are answered with `400`.
+
+Thinger.io's server decodes the same formats (`api_request::get_request_data`), with these differences: it matches the `Content-Type` by prefix and takes any other type (or none) as binary, where this library answers `415`; of a repeated form name it keeps one value; malformed percent-encoding gives empty strings; `text/html` is text too (`body_decoders().add("text", {"text/plain", "text/html"}, http::body_decoder_registry::decode_text)` does the same here); and it has none of the limits below.
+
+Limits, against bodies that are small but expensive to decode or use, besides `set_max_body_size()` (checked first, also for decompressed bodies):
+
+- **Nesting**: arrays and objects nested deeper than `max_depth` (128 by default) are rejected in every format. Decoding never recurses, and the decoded value is often used recursively (schema validation, `dump()`, copies, comparisons), which could overflow the stack otherwise. This applies to JSON bodies too, which had no limit before.
+- **Values**: a body never decodes to more values than it has bytes, so memory is bounded by the body size. Declared lengths are never allocated up front (a MessagePack array of 4 billion elements in 5 bytes fails at the end of the input), and UBJSON arrays of values without payload (`[$Z#l` and a count: billions of nulls in 9 bytes) are rejected.
+- **UTF-8**: strings (and object keys) must be valid UTF-8 in every format, so a decoded value can always be dumped as JSON.
+
+Repeated object keys keep the last value. `res.encode(value)` replies with JSON, MessagePack, CBOR or UBJSON, whichever the `Accept` header prefers (JSON if none, or none of them, with `Vary: Accept`). The [OpenAPI](#openapi) document lists the media types each route accepts in its `requestBody`, with the same schema, and [in-memory dispatch](#in-memory-dispatch) decodes bodies the same way (`request->set_content(body, "application/msgpack")`). See `examples/http_server/server_body_decoders_example.cpp`.
+
 ### Middleware
 
 Middlewares run for every request, in registration order, before the route handler. Register them before `listen()`/`start()`. A middleware is a coroutine that returns `true` to continue the chain, or responds and returns `false` to stop it (the route handler is not called):
@@ -453,7 +511,7 @@ All routes, with their documentation and metadata, are available from `server.ro
 
 ### OpenAPI
 
-The server builds an OpenAPI 3.1 document from its routes: paths and path parameters from the route patterns (including the regex of `:param(regex)`), request bodies from the validation schemas, and summaries, tags, parameters, responses and examples from the route documentation. Hidden routes (`.hidden()`), static files and the document itself are left out.
+The server builds an OpenAPI 3.1 document from its routes: paths and path parameters from the route patterns (including the regex of `:param(regex)`), request bodies from the validation schemas (one entry per [body type](#body-types) accepted), and summaries, tags, parameters, responses and examples from the route documentation. Hidden routes (`.hidden()`), static files and the document itself are left out.
 
 ```cpp
 // Shared schemas: referenced from routes, published as components and validated at runtime
@@ -504,7 +562,7 @@ server.dispatch(executor, request, [](std::shared_ptr<http::http_response> respo
 
 The server does not need to be listening. Chunked responses are collected whole. Handlers can keep a copy of the response and answer later. The timeout covers the whole request, handler included: if it expires the result is `504` and the handler is cancelled (its pending awaits are aborted). WebSockets, SSE and `take_over()` answer `501`, as there is no connection. The request is served by the [virtual host](#virtual-hosts) of its URL (or `Host` header). `remote_ip` is the peer address: `get_request_ip()` returns it (or the forwarded client address, if it is a [trusted proxy](#client-ip-behind-proxies)), and it is empty unless set: internal calls never pass as a trusted local address by default.
 
-Everything about routes, hosts, middlewares and request settings (error format, trusted proxies, body limit, CORS), `dispatch()` included, comes from `http::http_application`, which the server extends with its listeners, TLS and connection settings. An `http::http_application` can also be used on its own, without a server, only to dispatch requests in memory.
+Everything about routes, hosts, middlewares and request settings (error format, trusted proxies, body limit and decoders, CORS), `dispatch()` included, comes from `http::http_application`, which the server extends with its listeners, TLS and connection settings. An `http::http_application` can also be used on its own, without a server, only to dispatch requests in memory.
 
 ### Virtual Hosts
 
@@ -534,13 +592,13 @@ server.host_regex("(.+)\\.proxy\\.example\\.com").get("/:path(.*)", proxy_handle
 server.get("/", [](http::response& res) { res.send("default site"); });
 ```
 
-Hosts are matched in order: exact names, then patterns in registration order, then the default host (`server.host("*")` returns the server itself). Register them before `listen()`. Once the host is chosen, everything works as for a single host: routes and `404`/`405` come from that host only, and the global middlewares (`server.use()`) run for every host after route matching, with `req.get_matched_route()` set to the route of the matched host and `req.get_virtual_host()` to the host. `server.openapi()` documents the default host; for another one build a generator over its router: `http::openapi_generator(server.host("api.example.com").router())`.
+Hosts are matched in order: exact names, then patterns in registration order, then the default host (`server.host("*")` returns the server itself). Register them before `listen()`. Once the host is chosen, everything works as for a single host: routes and `404`/`405` come from that host only, and the global middlewares (`server.use()`) run for every host after route matching, with `req.get_matched_route()` set to the route of the matched host and `req.get_virtual_host()` to the host. `server.openapi()` documents the default host; for another one build a generator over its router: `http::openapi_generator(server.host("api.example.com").router(), &server.get_body_settings())` (the body settings document the [body types](#body-types) of the application).
 
 For HTTPS, the certificate is chosen per domain before any request is read, through SNI: register one per host name (wildcards such as `*.devices.example.com` included) with `thinger::asio::certificate_manager::instance().set_certificate(hostname, certificate, private_key)`. Virtual hosts then pick the routes for the same name from the `Host` header. See `examples/http_server/virtual_hosts_example.cpp`.
 
 ### Error Format
 
-Errors sent with `res.error(status, message)`, and the ones the server generates itself (`400` for invalid JSON, schema validation and invalid request framing or bodies, `401` of basic auth, `404`/`405`, `413`, `500` from middlewares, handlers and invalid route schemas, and `501`/`504` of in-memory dispatch) go through an error formatter. By default the message is sent as `text/plain`, and errors with details (schema validation) as JSON `{"error": {"message": ..., "context": [...]}}`. A formatter changes it for all of them:
+Errors sent with `res.error(status, message)`, and the ones the server generates itself (`400` for bodies that cannot be decoded, schema validation and invalid request framing or bodies, `401` of basic auth, `404`/`405`, `413`, `415` for body types not accepted, `500` from middlewares, handlers and invalid route schemas, and `501`/`504` of in-memory dispatch) go through an error formatter. By default the message is sent as `text/plain`, and errors with details (schema validation) as JSON `{"error": {"message": ..., "context": [...]}}`. A formatter changes it for all of them:
 
 ```cpp
 server.set_error_formatter([](const http::http_error& error, http::http_response& response) {
