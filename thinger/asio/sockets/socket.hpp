@@ -14,6 +14,9 @@
 
 namespace thinger::asio {
 
+// Like the asio objects they wrap, sockets are not thread-safe: use them (close() and cancel()
+// included) on a thread running their io_context (see get_io_context()), dispatching there
+// from any other thread.
 class socket : private boost::asio::noncopyable {
 
 public:

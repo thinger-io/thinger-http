@@ -12,6 +12,7 @@ namespace thinger::asio {
 /// Bidirectional coroutine-based pipe between two sockets.
 /// Takes exclusive ownership of both sockets and closes them when the pipe ends.
 /// set_on_end() must be called before run()/start().
+/// cancel(), the transfer stats and the socket getters may be called from any thread.
 class socket_pipe : public std::enable_shared_from_this<socket_pipe> {
 public:
     static constexpr size_t BUFFER_SIZE = 8192;
@@ -25,7 +26,8 @@ public:
     /// Fire-and-forget: co_spawn(run()) on the source socket's io_context.
     void start();
 
-    /// Close both sockets immediately.
+    /// Close both sockets, each on its own io_context (right away when called from a thread
+    /// running it), so run() completes. Thread-safe; only the first call closes them.
     void cancel();
 
     /// Completion callback (called from destructor).

@@ -8,6 +8,8 @@
 #include <chrono>
 #include <numeric>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 
 using namespace thinger;
 using namespace thinger::asio;
@@ -16,6 +18,43 @@ namespace net = boost::asio;
 using net::ip::tcp;
 
 namespace {
+
+// A pipe created on the io thread, published to the test thread
+class pipe_slot {
+public:
+    void set(std::shared_ptr<socket_pipe> pipe) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pipe_ = std::move(pipe);
+        }
+        ready_.notify_all();
+    }
+
+    // The pipe, once created (waiting up to the timeout), or none
+    std::shared_ptr<socket_pipe> wait(std::chrono::milliseconds timeout = 5s) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ready_.wait_for(lock, timeout, [this] { return pipe_ != nullptr; });
+        return pipe_;
+    }
+
+    // The pipe, if created
+    std::shared_ptr<socket_pipe> get() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return pipe_;
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::shared_ptr<socket_pipe> pipe_;
+};
+
+// Wait up to the timeout for a flag set on the io thread
+bool wait_for(const std::atomic<bool>& flag, std::chrono::milliseconds timeout = 5s) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!flag && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(5ms);
+    return flag;
+}
 
 // Create an acceptor on an OS-assigned port (port 0) to avoid conflicts
 tcp::acceptor make_acceptor(net::io_context& io) {
@@ -53,7 +92,7 @@ awaitable<void> echo_server(tcp::acceptor& acceptor) {
 awaitable<void> proxy_session(
     tcp::socket client_raw,
     uint16_t backend_port,
-    std::shared_ptr<socket_pipe>& pipe_out)
+    pipe_slot& pipe_out)
 {
     auto& io = static_cast<net::io_context&>(client_raw.get_executor().context());
 
@@ -66,7 +105,7 @@ awaitable<void> proxy_session(
 
     // Create and run the pipe
     auto pipe = std::make_shared<socket_pipe>(client_sock, backend_sock);
-    pipe_out = pipe;
+    pipe_out.set(pipe);
     co_await pipe->run();
 }
 
@@ -84,7 +123,7 @@ TEST_CASE("Socket pipe bidirectional forwarding", "[socket-pipe]") {
     tcp::acceptor proxy_acc = make_acceptor(io);
     uint16_t proxy_port = get_port(proxy_acc);
 
-    std::shared_ptr<socket_pipe> pipe;
+    pipe_slot pipe;
     co_spawn(io, [&]() -> awaitable<void> {
         auto [ec, sock] = co_await proxy_acc.async_accept(use_nothrow_awaitable);
         if (!ec) {
@@ -154,7 +193,7 @@ TEST_CASE("Socket pipe bidirectional forwarding", "[socket-pipe]") {
     std::this_thread::sleep_for(50ms);
     echo_acc.close();
     proxy_acc.close();
-    if (pipe) pipe->cancel();
+    if (auto p = pipe.get()) p->cancel();
     io.stop();
     io_thread.join();
 }
@@ -169,7 +208,7 @@ TEST_CASE("Socket pipe cancel stops both directions", "[socket-pipe]") {
     tcp::acceptor proxy_acc = make_acceptor(io);
     uint16_t proxy_port = get_port(proxy_acc);
 
-    std::shared_ptr<socket_pipe> pipe;
+    pipe_slot pipe_created;
     std::atomic<bool> pipe_finished{false};
 
     co_spawn(io, [&]() -> awaitable<void> {
@@ -181,7 +220,8 @@ TEST_CASE("Socket pipe cancel stops both directions", "[socket-pipe]") {
         auto backend_sock = std::make_shared<tcp_socket>("cancel-test-backend", ctx);
         co_await backend_sock->connect("127.0.0.1", std::to_string(echo_port), std::chrono::seconds(5));
 
-        pipe = std::make_shared<socket_pipe>(client_sock, backend_sock);
+        auto pipe = std::make_shared<socket_pipe>(client_sock, backend_sock);
+        pipe_created.set(pipe);
         co_await pipe->run();
         pipe_finished = true;
     }, detached);
@@ -200,13 +240,13 @@ TEST_CASE("Socket pipe cancel stops both directions", "[socket-pipe]") {
     size_t n = client.read_some(net::buffer(buf));
     REQUIRE(std::string(buf, n) == msg);
 
-    // Cancel the pipe
+    // Cancel the pipe, from this thread
+    auto pipe = pipe_created.wait();
     REQUIRE(pipe);
     pipe->cancel();
 
     // Wait for pipe to finish
-    std::this_thread::sleep_for(100ms);
-    REQUIRE(pipe_finished);
+    REQUIRE(wait_for(pipe_finished));
 
     // Sockets should no longer be usable
     REQUIRE_FALSE(pipe->get_source()->is_open());
@@ -307,7 +347,7 @@ TEST_CASE("Socket pipe transfer stats are correct", "[socket-pipe]") {
     tcp::acceptor proxy_acc = make_acceptor(io);
     uint16_t proxy_port = get_port(proxy_acc);
 
-    std::shared_ptr<socket_pipe> pipe;
+    pipe_slot pipe_created;
 
     co_spawn(io, [&]() -> awaitable<void> {
         auto [ec, sock] = co_await proxy_acc.async_accept(use_nothrow_awaitable);
@@ -318,7 +358,8 @@ TEST_CASE("Socket pipe transfer stats are correct", "[socket-pipe]") {
         auto backend_sock = std::make_shared<tcp_socket>("stats-test-backend", ctx);
         co_await backend_sock->connect("127.0.0.1", std::to_string(echo_port), std::chrono::seconds(5));
 
-        pipe = std::make_shared<socket_pipe>(client_sock, backend_sock);
+        auto pipe = std::make_shared<socket_pipe>(client_sock, backend_sock);
+        pipe_created.set(pipe);
         co_await pipe->run();
     }, detached);
 
@@ -339,6 +380,7 @@ TEST_CASE("Socket pipe transfer stats are correct", "[socket-pipe]") {
 
     std::this_thread::sleep_for(50ms);
 
+    auto pipe = pipe_created.wait();
     REQUIRE(pipe);
     // source->target = data from client going to echo server = 13 bytes
     REQUIRE(pipe->bytes_source_to_target() == 13);

@@ -1,6 +1,7 @@
 #include "socket_pipe.hpp"
 #include "../util/logger.hpp"
 
+#include <boost/asio/dispatch.hpp>
 #include <vector>
 
 namespace thinger::asio {
@@ -31,10 +32,20 @@ void socket_pipe::start() {
     }, detached);
 }
 
+namespace {
+
+// Close a socket on its own io_context, as sockets are not thread-safe: right away when called
+// from a thread running it, otherwise once it gets there
+void close_on_own_context(const std::shared_ptr<socket>& sock) {
+    boost::asio::dispatch(sock->get_io_context(), [sock] { sock->close(); });
+}
+
+} // namespace
+
 void socket_pipe::cancel() {
     if (cancelled_.exchange(true)) return;
-    source_->close();
-    target_->close();
+    close_on_own_context(source_);
+    close_on_own_context(target_);
 }
 
 void socket_pipe::set_on_end(std::function<void()> listener) {
