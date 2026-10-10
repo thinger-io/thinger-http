@@ -227,3 +227,30 @@ TEST_CASE("Request factory accepts only HTTP/1.x with single-digit versions", "[
         REQUIRE_FALSE(version_of(version).has_value());
     }
 }
+
+// Found by differential fuzzing against llhttp (tests/fuzz/fuzz_http_differential3.cpp): bytes
+// above 0x7F were accepted in the request target, which is ASCII (RFC 9112 section 3.2)
+TEST_CASE("Request factory accepts only visible ASCII in the request target", "[request_factory][unit]") {
+    auto accepts = [](const std::string& target) {
+        request_factory parser;
+        return bool(parse_headers(parser, "GET " + target + " HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+    };
+
+    REQUIRE(accepts("/a"));
+    REQUIRE(accepts("/%C3%A9?q=%FF#f"));
+    for (const char* target : {"/\xc3\xa9", "/\xff", "/a?b=\x80", "/a#\xa0", "/\x7f", "/\x01"}) {
+        INFO("target: " << target);
+        REQUIRE_FALSE(accepts(target));
+    }
+}
+
+// Found by differential fuzzing against llhttp: CONNECT (not served) was parsed as any other
+// request, though what follows its header section is tunnel data (RFC 9110 section 9.3.6)
+TEST_CASE("Request factory rejects CONNECT", "[request_factory][unit]") {
+    for (const char* request : {"CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n",
+                                "CONNECT /a HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello"}) {
+        INFO("request: " << request);
+        request_factory parser;
+        REQUIRE(bool(!parse_headers(parser, request)));
+    }
+}

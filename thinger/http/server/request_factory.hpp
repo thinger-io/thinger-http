@@ -114,7 +114,7 @@ namespace thinger::http {
         /// Whether consume() only appends `c` in the current state (see run_target)
         bool is_run_char(char c) const {
             switch (state_) {
-                case uri: return c != ' ' && !is_ctl(c);
+                case uri: return c != ' ' && is_char(c) && !is_ctl(c);
                 case header_name: return is_char(c) && !is_ctl(c) && !is_tspecial(c);
                 case header_value: return !is_ctl(c);
                 default: return false;

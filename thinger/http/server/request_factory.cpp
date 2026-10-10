@@ -35,6 +35,13 @@ namespace thinger::http {
                     // store read method
                     on_http_method(tempString1_);
                     tempString1_.clear();
+                    // CONNECT asks for a tunnel to the authority in its target (authority-form,
+                    // RFC 9112 section 3.2.3), which is not served. What follows its header
+                    // section is tunnel data, not content nor another request (RFC 9110 section
+                    // 9.3.6): reading it as HTTP would frame the stream unlike a proxy does
+                    if (req->get_method() == method::CONNECT) {
+                        return false;
+                    }
                     state_ = uri;
                     return boost::indeterminate;
                 }
@@ -65,7 +72,10 @@ namespace thinger::http {
                         return false;
                     }
                 }
-                else if (is_ctl(input)) {
+                // The request-target is ASCII (RFC 9112 section 3.2, RFC 3986): other bytes must
+                // be percent-encoded. An invalid request line is rejected, not autocorrected, as
+                // it may be crafted to bypass filters along the request chain (RFC 9112 section 3)
+                else if (!is_char(input) || is_ctl(input)) {
                     return false;
                 }
                 else {

@@ -325,6 +325,42 @@ TEST_CASE("Folded header lines (obs-fold) are rejected", "[server][framing][smug
     }
 }
 
+// Found by differential fuzzing against llhttp (tests/fuzz/fuzz_http_differential3.cpp):
+// CONNECT is not served, and what follows its header section is tunnel data, not content nor
+// another request (RFC 9110 section 9.3.6). Reading a body or a next request after it framed
+// the stream unlike a proxy that implements CONNECT
+TEST_CASE("CONNECT requests are rejected", "[server][framing][smuggling][integration]") {
+    framing_server fixture;
+    fixture.start();
+
+    SECTION("Authority form") {
+        require_rejected(fixture, "CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n");
+    }
+    SECTION("Origin form, with a body") {
+        require_rejected(fixture, "CONNECT /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello");
+    }
+}
+
+// Found by differential fuzzing against llhttp: bytes above 0x7F were accepted in the request
+// target. They must be percent-encoded (RFC 9112 section 3.2), and an invalid request line is
+// rejected rather than autocorrected (RFC 9112 section 3)
+TEST_CASE("Request target with bytes other than ASCII is rejected", "[server][framing][integration]") {
+    framing_server fixture;
+    fixture.start();
+
+    SECTION("UTF-8 in the path") {
+        require_rejected(fixture, "GET /health\xc3\xa9 HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    }
+    SECTION("Byte above 0x7F in the query") {
+        require_rejected(fixture, "GET /health?a=\xff HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    }
+    SECTION("Percent-encoded is accepted") {
+        auto result = raw_exchange(fixture.port, "GET /health?a=%C3%A9 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        INFO("response: " << result.data);
+        REQUIRE(result.data.starts_with("HTTP/1.1 200"));
+    }
+}
+
 namespace {
     // GET /health with `count` headers in all (Host included)
     std::string request_with_headers(int count) {

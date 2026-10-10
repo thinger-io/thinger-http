@@ -100,7 +100,9 @@ namespace {
         fuzz::check(sp1 != std::string_view::npos && sp2 != std::string_view::npos, "request line without two spaces", input);
         std::string_view target = request_line.substr(sp1 + 1, sp2 - sp1 - 1);
         std::string_view version = request_line.substr(sp2 + 1);
+        fuzz::check(request_line.substr(0, sp1) != "CONNECT", "CONNECT request accepted", input);
         fuzz::check(!target.empty() && target[0] == '/', "target not in origin form", input);
+        for (char c : target) fuzz::check(c > 32 && c < 127, "target with a byte other than visible ASCII", input);
         fuzz::check(request.get_uri() == target, "target differs from the request line", input);
         fuzz::check(version.size() == 8 && version.substr(0, 7) == "HTTP/1." && is_digits(version.substr(7, 1)),
                     "HTTP version other than HTTP/1.DIGIT accepted", input);
