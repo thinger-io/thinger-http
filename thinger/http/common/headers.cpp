@@ -1,6 +1,7 @@
 #include "headers.hpp"
 #include <charconv>
 #include <regex>
+#include "../../util/ascii.hpp"
 #include "../../util/logger.hpp"
 
 namespace thinger::http{
@@ -11,24 +12,30 @@ namespace thinger::http{
              * Firefox send both keep-alive and upgrade values in Connection header, i.e., when opening a WebSocket,
              * so it is necessary to test values separately.
              */
-            std::vector<std::string> strs;
-            boost::split(strs, value, boost::is_any_of(","));
-            for(auto& str:strs){
-                boost::algorithm::trim(str);
-                if(is_header(str, connection::keep_alive)){
+            static constexpr std::string_view whitespace = " \t\n\v\f\r";
+            std::string_view options = value;
+            while(true){
+                auto comma = options.find(',');
+                auto option = options.substr(0, comma);
+                auto first = option.find_first_not_of(whitespace);
+                option = first == std::string_view::npos ? std::string_view{} :
+                         option.substr(first, option.find_last_not_of(whitespace) - first + 1);
+                if(is_header(option, connection::keep_alive)){
                     keep_alive_ = true;
                 }
-                else if (is_header(str, connection::close)){
+                else if (is_header(option, connection::close)){
                     keep_alive_ = false;
                 }
-                else if(is_header(str, connection::upgrade)){
+                else if(is_header(option, connection::upgrade)){
                     upgrade_ = true;
                 }
+                if(comma == std::string_view::npos) break;
+                options.remove_prefix(comma + 1);
             }
         }
 
         if(is_header(key, header::accept)){
-            stream_ = boost::iequals(value, accept::event_stream);
+            stream_ = ::thinger::util::ascii::iequals(value, accept::event_stream);
         }else if(is_header(key, header::content_length)){
             // Content-Length = 1*DIGIT: anything else (sign, spaces, lists, overflow) or a
             // repeated header with a different value makes the message framing ambiguous
@@ -187,7 +194,7 @@ namespace thinger::http{
 
     bool headers::is_content_type(const std::string& value) const
     {
-        return boost::istarts_with(get_header(header::content_type), value);
+        return ::thinger::util::ascii::istarts_with(get_header(header::content_type), value);
     }
 
     bool headers::empty_headers() const{
@@ -267,7 +274,4 @@ namespace thinger::http{
 		return "";
 	}
 
-    bool inline headers::is_header(std::string_view key, std::string_view header) const{
-        return boost::iequals(key, header);
-    }
 }

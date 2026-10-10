@@ -1,5 +1,5 @@
 #include "http_request.hpp"
-#include <unordered_map>
+#include <string_view>
 #include <set>
 #include "../../util/logger.hpp"
 
@@ -19,20 +19,20 @@ namespace thinger::http {
     static const std::string PATCH_STR = "PATCH";
 
     method get_method(const std::string &method) {
-        static std::unordered_map<std::string, http::method> methods = {
-            {GET_STR, method::GET},
-            {HEAD_STR, method::HEAD},
-            {POST_STR, method::POST},
-            {PUT_STR, method::PUT},
-            {DELETE_STR, method::DELETE},
-            {TRACE_STR, method::TRACE},
-            {OPTIONS_STR, method::OPTIONS},
-            {CONNECT_STR, method::CONNECT},
-            {PATCH_STR, method::PATCH}
+        // a few short names: comparing them is cheaper than hashing
+        static constexpr std::pair<std::string_view, http::method> methods[] = {
+            {"GET", method::GET},
+            {"POST", method::POST},
+            {"PUT", method::PUT},
+            {"DELETE", method::DELETE},
+            {"PATCH", method::PATCH},
+            {"HEAD", method::HEAD},
+            {"OPTIONS", method::OPTIONS},
+            {"TRACE", method::TRACE},
+            {"CONNECT", method::CONNECT}
         };
-        auto it = methods.find(method);
-        if (it != methods.end()) {
-            return it->second;
+        for (const auto& [name, value] : methods) {
+            if (name == method) return value;
         }
         return method::UNKNOWN;
     }
@@ -372,7 +372,7 @@ namespace thinger::http {
         }
 
         // use host always in lowercase
-        boost::algorithm::to_lower(host_);
+        ::thinger::util::ascii::to_lower(host_);
 
         // update host header
         if(get_port()!=https_port && get_port()!=http_port){
@@ -392,13 +392,13 @@ namespace thinger::http {
 
     void http_request::process_header(std::string key, std::string value){
         // adjust host
-        if(boost::iequals(key, http::header::host)){
+        if(::thinger::util::ascii::iequals(key, http::header::host)){
             set_host(std::move(value));
         }else{
             // detect chunked transfer encoding: it must be the only coding, in a single header,
             // as no other is supported (and the body could not be framed safely)
-            if(boost::iequals(key, http::header::transfer_encoding)){
-                if(boost::iequals(value, "chunked") && !has_transfer_encoding_header()){
+            if(::thinger::util::ascii::iequals(key, http::header::transfer_encoding)){
+                if(::thinger::util::ascii::iequals(value, "chunked") && !has_transfer_encoding_header()){
                     chunked_transfer_ = true;
                 }else{
                     invalid_transfer_encoding_ = true;

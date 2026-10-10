@@ -4,6 +4,7 @@
 #include "memory_response.hpp"
 #include "../../util/logger.hpp"
 #include "../../util/base64.hpp"
+#include "../../util/ascii.hpp"
 #include <boost/algorithm/string.hpp>
 #include <optional>
 
@@ -115,7 +116,8 @@ virtual_host& http_application::host(const std::string& name) {
     }
 
     // Registering the same pattern again returns the existing host
-    auto pattern = boost::algorithm::to_lower_copy(name);
+    auto pattern = name;
+    ::thinger::util::ascii::to_lower(pattern);
     for (const auto& host : pattern_hosts_) {
         if (host->name() == pattern) return *host;
     }
@@ -128,6 +130,12 @@ virtual_host& http_application::host_regex(const std::string& pattern) {
 }
 
 virtual_host& http_application::resolve_host(request& req) {
+    // Without virtual hosts, every request is served by the application
+    if (exact_hosts_.empty() && pattern_hosts_.empty()) {
+        req.set_virtual_host(this);
+        return *this;
+    }
+
     auto http_request = req.get_http_request();
     const auto& host_header = http_request->get_header(header::host);
     auto name = virtual_host::normalize_host(host_header.empty() ? http_request->get_host() : host_header);

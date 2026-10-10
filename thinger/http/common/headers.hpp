@@ -6,6 +6,7 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/lexical_cast.hpp>
 #include "http_frame.hpp"
+#include "../../util/ascii.hpp"
 
 namespace thinger::http{
 
@@ -100,7 +101,10 @@ public:
     int get_http_version_major() const;
     int get_http_version_minor() const;
     bool keep_alive() const;
-    bool inline is_header(std::string_view key, std::string_view header) const;
+    // Header names (and tokens) compare case-insensitively
+    static bool is_header(std::string_view key, std::string_view header) {
+        return ::thinger::util::ascii::iequals(key, header);
+    }
 
     // debug
     void debug_headers(std::ostream& os) const;

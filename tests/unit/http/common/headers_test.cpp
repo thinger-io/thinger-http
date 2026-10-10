@@ -122,6 +122,18 @@ TEST_CASE("Headers process_header", "[http][headers]") {
         REQUIRE(h.upgrade() == true);
     }
 
+    SECTION("Connection options: any case, surrounding whitespace, empty elements") {
+        thinger::http::http_request h;
+        h.process_header("Connection", ",\t UPGRADE \t,, Close ,");
+        REQUIRE(h.keep_alive() == false);
+        REQUIRE(h.upgrade() == true);
+
+        thinger::http::http_request other;
+        other.process_header("Connection", "keep-alive-ish, closed, upgrades");
+        REQUIRE(other.keep_alive() == true);   // HTTP/1.1 default: no option matched
+        REQUIRE(other.upgrade() == false);
+    }
+
     SECTION("Connection: Upgrade alone sets upgrade flag") {
         thinger::http::http_request h;
         h.process_header("Connection", "Upgrade");

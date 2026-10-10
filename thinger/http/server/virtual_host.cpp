@@ -1,6 +1,7 @@
 #include "virtual_host.hpp"
 #include "request.hpp"
 #include "response.hpp"
+#include "../../util/ascii.hpp"
 #include <boost/algorithm/string.hpp>
 #include <filesystem>
 
@@ -58,7 +59,8 @@ namespace {
 
 virtual_host::virtual_host() : name_("*") {}
 
-virtual_host::virtual_host(const std::string& name) : name_(boost::algorithm::to_lower_copy(name)) {
+virtual_host::virtual_host(const std::string& name) : name_(name) {
+    ::thinger::util::ascii::to_lower(name_);
     if (is_host_pattern(name_)) {
         pattern_ = std::regex(host_pattern_to_regex(name_, parameters_), std::regex::icase);
     }
@@ -87,7 +89,7 @@ std::string virtual_host::normalize_host(std::string_view host) {
         result = host.substr(0, host.find(':'));
     }
     boost::algorithm::trim(result);
-    boost::algorithm::to_lower(result);
+    ::thinger::util::ascii::to_lower(result);
     if (result.ends_with('.')) result.pop_back();
     return result;
 }
