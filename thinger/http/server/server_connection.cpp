@@ -260,8 +260,8 @@ void server_connection::process_output_queue() {
         // Log response
         frame->log("SERVER RESPONSE", 0);
 
-        std::vector<boost::asio::const_buffer> buffers;
-        buffers.reserve(32);
+        auto& buffers = write_buffers_;
+        buffers.clear();
         frame->fill_buffer(buffers);
 
         // Most frames fit in the socket send buffer: write them right away, without waiting.

@@ -118,6 +118,9 @@ private:
     // Request handler callback (awaitable coroutine)
     std::function<awaitable<void>(std::shared_ptr<request>)> handler_;
 
+    // Buffers of the frame being written (kept, so they are not allocated for every frame)
+    std::vector<boost::asio::const_buffer> write_buffers_;
+
     // State
     bool writing_{false};
     bool running_{false};

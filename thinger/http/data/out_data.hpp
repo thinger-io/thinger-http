@@ -39,7 +39,6 @@ public:
     }
 
 protected:
-
     virtual bool supports_buffer() {
         return true;
     }
