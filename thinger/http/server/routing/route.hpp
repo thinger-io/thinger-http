@@ -39,9 +39,10 @@ namespace thinger::http {
 // simple parameters, then parameters that may match slashes (as ":path(.+)"), which take
 // the rest of the path. If the rest of the path does not match below the chosen option,
 // the next one is tried. Different constraints at the same position are tried in the
-// order they were first registered there, and wildcards in registration order; registering
-// a route with the same structure as another one, or one that may match the same paths as
-// another one where only that order decides, logs a warning. A parameter regex that
+// order they were first registered there, and wildcards in registration order. Registering
+// a route with the same structure as another one logs a warning, and so does adding a
+// constraint (or wildcard) next to one that may overlap with it (a cheap check: unless
+// they cannot start with the same character). A parameter regex that
 // depends on what surrounds it (anchors ^ $, word boundaries, lookaheads, back-references)
 // makes its route match the whole path with its regex, after all the other options.
 // - The path is matched as received, before percent-decoding: "%2F" is not a slash, and

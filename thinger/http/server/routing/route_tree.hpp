@@ -44,8 +44,9 @@ public:
 
     // Add a route (by reference: it must outlive the tree). Logs a warning if it repeats
     // the path structure of another route (it would never match: the first one wins),
-    // or if both may match the same paths and only the registration order decides
-    // between them.
+    // or if it adds a constraint (or wildcard) next to another one that may match the
+    // same segments (a cheap check: they may start with the same character), where the
+    // registration order decides.
     void insert(const route& target, std::string_view method_name);
 
     // Route matching a path, appending its parameters to `captures`; null if none
@@ -53,16 +54,12 @@ public:
 
 private:
     struct node;
-    struct step;
-    struct shape;
 
     std::unique_ptr<node> root_;
-    // Path structure of every route, for the duplicate and ambiguity warnings
-    std::vector<shape> shapes_;
 
     static const leaf* match(const node& current, std::string_view path, size_t position,
                              detail::route_captures& captures);
-    void check_ambiguity(const shape& added, std::string_view method_name) const;
+    static void warn_overlap(const route& added, const route& existing, std::string_view method_name);
 };
 
 } // namespace thinger::http

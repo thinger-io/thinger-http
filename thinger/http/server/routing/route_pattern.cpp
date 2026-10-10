@@ -1,6 +1,5 @@
 #include "route_pattern.hpp"
 #include <algorithm>
-#include <deque>
 #include <stdexcept>
 
 namespace thinger::http::detail {
@@ -455,83 +454,27 @@ bool path_matcher::match(std::string_view text, route_captures& captures) const 
     return true;
 }
 
+std::bitset<256> path_matcher::first_chars() const {
+    std::bitset<256> chars;
+    if (words_) {
+        for (const auto& word : *words_) {
+            if (word.empty()) return std::bitset<256>().set();
+            chars.set(static_cast<unsigned char>(word.front()));
+        }
+        return chars;
+    }
+    if (!regex_) {
+        for (const auto& a : atoms_) {
+            chars |= a.chars;
+            if (a.min > 0) return chars;
+        }
+    }
+    // Unknown, or the match may be empty
+    return std::bitset<256>().set();
+}
+
 bool path_matcher::may_overlap(const path_matcher& other) const {
-    // Alternative words: whether the other matcher matches any of them
-    route_captures captures;
-    if (words_ || other.words_) {
-        const auto& words = words_ ? *words_ : *other.words_;
-        const auto& matcher = words_ ? other : *this;
-        return std::any_of(words.begin(), words.end(), [&](const std::string& word) { return matcher.match(word, captures); });
-    }
-    if (regex_ || other.regex_) return true;
-
-    // Intersection of both atom sequences as automata: states (atom, repetitions so far),
-    // repetitions beyond the minimum of an unbounded atom being equivalent
-    struct automaton {
-        const std::vector<atom>& atoms;
-        std::vector<size_t> offsets;  // first state of each atom; the last one accepts
-
-        explicit automaton(const std::vector<atom>& a) : atoms(a) {
-            size_t states = 0;
-            for (const auto& item : atoms) {
-                offsets.push_back(states);
-                states += cap(item) + 1;
-            }
-            offsets.push_back(states);
-        }
-        static uint32_t cap(const atom& a) { return a.max == unbounded ? a.min : a.max; }
-        size_t size() const { return offsets.back() + 1; }
-        size_t accept() const { return offsets.back(); }
-        std::pair<size_t, uint32_t> decode(size_t state) const {
-            size_t index = std::upper_bound(offsets.begin(), offsets.end(), state) - offsets.begin() - 1;
-            return {index, static_cast<uint32_t>(state - offsets[index])};
-        }
-    };
-
-    automaton a(atoms_);
-    automaton b(other.atoms_);
-    if (a.size() * b.size() > (1u << 20)) return true;
-
-    std::vector<bool> visited(a.size() * b.size());
-    std::deque<std::pair<size_t, size_t>> pending;
-    auto visit = [&](size_t x, size_t y) {
-        if (visited[x * b.size() + y]) return;
-        visited[x * b.size() + y] = true;
-        pending.emplace_back(x, y);
-    };
-    visit(0, 0);
-    while (!pending.empty()) {
-        auto [x, y] = pending.front();
-        pending.pop_front();
-        bool x_accepts = x == a.accept();
-        bool y_accepts = y == b.accept();
-        if (x_accepts && y_accepts) return true;
-
-        // Leave an atom once repeated its minimum
-        if (!x_accepts) {
-            auto [index, count] = a.decode(x);
-            if (count >= a.atoms[index].min) visit(a.offsets[index + 1], y);
-        }
-        if (!y_accepts) {
-            auto [index, count] = b.decode(y);
-            if (count >= b.atoms[index].min) visit(x, b.offsets[index + 1]);
-        }
-
-        // Consume a character both atoms accept
-        if (!x_accepts && !y_accepts) {
-            auto [x_index, x_count] = a.decode(x);
-            auto [y_index, y_count] = b.decode(y);
-            const auto& x_atom = a.atoms[x_index];
-            const auto& y_atom = b.atoms[y_index];
-            bool x_more = x_atom.max == unbounded || x_count < x_atom.max;
-            bool y_more = y_atom.max == unbounded || y_count < y_atom.max;
-            if (x_more && y_more && (x_atom.chars & y_atom.chars).any()) {
-                visit(a.offsets[x_index] + std::min(x_count + 1, automaton::cap(x_atom)),
-                      b.offsets[y_index] + std::min(y_count + 1, automaton::cap(y_atom)));
-            }
-        }
-    }
-    return false;
+    return (first_chars() & other.first_chars()).any();
 }
 
 } // namespace thinger::http::detail

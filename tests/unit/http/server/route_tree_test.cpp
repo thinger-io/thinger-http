@@ -306,7 +306,9 @@ TEST_CASE("Duplicate and ambiguous routes are warned at registration", "[route_t
         router[method::GET]["/users/:hex([0-9a-f]+)"] = noop;
         router[method::GET]["/kinds/:kind(sensor|actuator)"] = noop;
         router[method::GET]["/kinds/:name([a-z]+)"] = noop;
-        REQUIRE(log.count("may match the same paths") == 2);
+        router[method::GET]["/codes/:code(\\d+|new)"] = noop;  // std::regex: may start with anything
+        router[method::GET]["/codes/:id([a-z]+)"] = noop;
+        REQUIRE(log.count("may overlap with") == 3);
         REQUIRE(find(router, "/users/12").pattern() == "/users/:id([0-9]+)");
         REQUIRE(find(router, "/users/ab").pattern() == "/users/:hex([0-9a-f]+)");
     }
@@ -317,21 +319,23 @@ TEST_CASE("Duplicate and ambiguous routes are warned at registration", "[route_t
         router[method::GET]["/items/:id([0-9]+)/b"] = noop;
         // [0-9]+ was registered first at that position: its node goes first
         REQUIRE(find(router, "/items/12/b").pattern() == "/items/:id([0-9]+)/b");
-        REQUIRE(log.count("/items/:id([0-9]+)/b and GET /items/:n([0-9]{1,3})/b may match the same paths: "
-                          "the first one takes precedence") == 1);
+        // warned once, when the second constraint was added
+        REQUIRE(log.count("Route GET /items/:n([0-9]{1,3})/b may overlap with route GET /items/:id([0-9]+)/a; "
+                          "the first registered takes precedence") == 1);
+        REQUIRE(log.warnings() == 1);
     }
 
     SECTION("Overlapping wildcards decided by registration order") {
         router[method::GET]["/files/:path(.+)"] = noop;
         router[method::GET]["/files/:path(.*)"] = noop;
-        REQUIRE(log.count("may match the same paths") == 1);
+        REQUIRE(log.count("may overlap with") == 1);
     }
 
-    SECTION("Constraints that cannot overlap") {
+    SECTION("Constraints that cannot start with the same character") {
         router[method::GET]["/users/:id([0-9]+)"] = noop;
         router[method::GET]["/users/:name([a-z]+)"] = noop;
-        router[method::GET]["/items/:id([0-9]{1,3})/a"] = noop;
-        router[method::GET]["/items/:code([0-9]{2,8})/b"] = noop;
+        router[method::GET]["/items/:id([0-9]+)"] = noop;
+        router[method::GET]["/items/:name(new|old)"] = noop;
         router[method::GET]["/kinds/:kind(sensor|actuator)"] = noop;
         router[method::GET]["/kinds/:id([0-9]+)"] = noop;
         REQUIRE(log.warnings() == 0);

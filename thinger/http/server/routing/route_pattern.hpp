@@ -59,7 +59,8 @@ public:
     // the same texts
     const std::string& key() const { return key_; }
 
-    // Whether some text may match both matchers (true when it cannot be ruled out)
+    // Whether some text may match both matchers: false only when they cannot start with
+    // the same character (a cheap check, true when in doubt)
     bool may_overlap(const path_matcher& other) const;
 
 private:
@@ -79,6 +80,9 @@ private:
     };
 
     static constexpr size_t max_atoms = 64;
+
+    // Characters a match may start with (all of them if unknown, or if it may be empty)
+    std::bitset<256> first_chars() const;
 
     static bool compile_regex(std::string_view regex, std::vector<atom>& atoms);
     bool match_atoms(size_t index, size_t position, std::string_view text, size_t* starts) const;
