@@ -3,7 +3,6 @@
 
 #include <queue>
 #include <atomic>
-#include <mutex>
 #include "request_factory.hpp"
 #include "../common/http_frame.hpp"
 #include "../common/http_request.hpp"
@@ -112,9 +111,9 @@ private:
     uint8_t buffer_[MAX_BUFFER_SIZE];
     request_factory request_parser_;
 
-    // Queue for HTTP pipelining
+    // Queue for HTTP pipelining (only used from the connection thread, as everything that
+    // reads or writes the connection)
     std::queue<std::shared_ptr<http_stream>> request_queue_;
-    std::mutex queue_mutex_;
 
     // Request handler callback (awaitable coroutine)
     std::function<awaitable<void>(std::shared_ptr<request>)> handler_;

@@ -112,10 +112,7 @@ awaitable<void> server_connection::read_loop() {
             auto stream = std::make_shared<http_stream>(++request_id_, http_req->keep_alive());
 
             // Add to queue for pipelining
-            {
-                std::lock_guard<std::mutex> lock(queue_mutex_);
-                request_queue_.push(stream);
-            }
+            request_queue_.push(stream);
 
             // Log the request
             http_req->log("SERVER REQUEST", 0);
@@ -174,10 +171,7 @@ awaitable<void> server_connection::read_loop() {
                 LOG_ERROR("invalid http request");
             }
             auto stream = std::make_shared<http_stream>(++request_id_, false);
-            {
-                std::lock_guard<std::mutex> lock(queue_mutex_);
-                request_queue_.push(stream);
-            }
+            request_queue_.push(stream);
             handle_stock_error(stream, status);
             break;
         } else {
@@ -247,7 +241,6 @@ void server_connection::frame_written(http_stream& stream, const std::shared_ptr
             close();
         } else {
             // Remove completed stream from queue
-            std::lock_guard<std::mutex> lock(queue_mutex_);
             if (!request_queue_.empty()) {
                 request_queue_.pop();
             }
@@ -257,19 +250,12 @@ void server_connection::frame_written(http_stream& stream, const std::shared_ptr
 
 void server_connection::process_output_queue() {
     while (!writing_) {
-        std::shared_ptr<http_stream> stream;
-        std::shared_ptr<http_frame> frame;
+        if (request_queue_.empty()) return;
+        auto stream = request_queue_.front();
+        if (stream->empty_queue()) return;
 
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex_);
-            if (request_queue_.empty()) return;
-
-            stream = request_queue_.front();
-            if (stream->empty_queue()) return;
-
-            frame = stream->current_frame();
-            stream->pop_frame();
-        }
+        auto frame = stream->current_frame();
+        stream->pop_frame();
 
         // Log response
         frame->log("SERVER RESPONSE", 0);
@@ -316,18 +302,13 @@ void server_connection::queue_frame(const std::shared_ptr<http_stream>& stream, 
     stream->add_frame(std::move(frame));
     if (waiting_response_) response_started_.cancel();
 
-    std::shared_ptr<http_stream> front_stream;
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (request_queue_.empty()) {
-            LOG_ERROR("trying to send response without a pending request!");
-            return;
-        }
-        front_stream = request_queue_.front();
+    if (request_queue_.empty()) {
+        LOG_ERROR("trying to send response without a pending request!");
+        return;
     }
 
     // Only process if this is the front stream (for pipelining order)
-    if (front_stream->id() == stream->id()) {
+    if (request_queue_.front()->id() == stream->id()) {
         process_output_queue();
     }
 }
