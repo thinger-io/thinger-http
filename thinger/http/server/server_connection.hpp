@@ -67,8 +67,10 @@ private:
     // Wait until the response of a stream has started, or the connection is closed
     awaitable<void> wait_response(const http_stream& stream);
 
-    // Wait until the client sends data (false) or closes the connection (true)
-    awaitable<bool> wait_peer_closed();
+    // Wait until the client sends data or closes the connection; a socket that cannot wait
+    // (e.g. one defined by an application) is not watched
+    enum class peer_state { data, closed, not_watchable };
+    awaitable<peer_state> wait_peer_closed();
 
     // Queue a response frame (on the connection executor)
     void queue_frame(const std::shared_ptr<http_stream>& stream, std::shared_ptr<http_frame> frame);

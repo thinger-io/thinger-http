@@ -4,6 +4,11 @@
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
+#include <thinger/http/server/http_application.hpp>
+#include <thinger/http/server/server_connection.hpp>
+#include <thinger/http/server/response_sink.hpp>
+
+#include <mutex>
 
 #include "server_test_helpers.hpp"
 #include "../fixtures/stream_test_helpers.hpp"
@@ -205,4 +210,63 @@ TEST_CASE("Custom socket: tunnel with a WebSocket", "[socket][custom][websocket]
         REQUIRE(client.closed_within(2s));
         REQUIRE(wait_for(pipe_ended));
     }
+}
+
+TEST_CASE("Custom socket: HTTP served over it answers late responses", "[socket][custom][server][integration]") {
+    // A socket that cannot wait() for the peer: the server does not watch it while a response
+    // is pending (instead of taking it for a client that left)
+    http::http_application app;
+    app.get("/later", [](http::response& res) {
+        std::thread([res]() mutable {
+            std::this_thread::sleep_for(100ms);
+            res.send("late answer");
+        }).detach();
+    });
+    app.get("/now", [](http::response& res) { res.send("right away"); });
+
+    boost::asio::io_context ioc;
+    auto work = boost::asio::make_work_guard(ioc);
+    std::mutex mutex;
+    std::string written;
+    auto socket = std::make_shared<memory_socket>(ioc, [&](std::string data) {
+        std::lock_guard<std::mutex> lock(mutex);
+        written += data;
+    });
+    auto connection = std::make_shared<http::server_connection>(socket);
+    connection->set_handler([&app](std::shared_ptr<http::request> req) {
+        auto sink = std::make_shared<http::connection_sink>(req->get_http_connection(), req->get_http_stream());
+        return app.handle(std::move(req), std::move(sink));
+    });
+    boost::asio::post(ioc, [connection] { connection->start(); });
+    std::thread io_thread([&ioc] { ioc.run(); });
+
+    auto received = [&](const std::string& text) {
+        auto deadline = std::chrono::steady_clock::now() + 3s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (written.find(text) != std::string::npos) return true;
+            }
+            std::this_thread::sleep_for(5ms);
+        }
+        return false;
+    };
+
+    socket->push("GET /later HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    REQUIRE(received("late answer"));
+    // still serving the connection
+    socket->push("GET /now HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    REQUIRE(received("right away"));
+    REQUIRE(socket->is_open());
+
+    std::promise<void> closed;
+    boost::asio::post(ioc, [socket, &closed] {
+        socket->close();
+        closed.set_value();
+    });
+    closed.get_future().wait();
+    connection.reset();
+    work.reset();
+    ioc.stop();
+    io_thread.join();
 }

@@ -204,22 +204,25 @@ awaitable<void> server_connection::wait_response(const http_stream& stream) {
         auto result = co_await (response_started_.async_wait(use_nothrow_awaitable) || wait_peer_closed());
         if (result.index() == 0) continue;
 
-        if (std::get<1>(result)) {
+        if (std::get<1>(result) == peer_state::closed) {
             LOG_DEBUG("http client left while waiting for a response");
             waiting_response_ = false;
             close();
             co_return;
         }
 
-        // A pipelined request (or data for a takeover) is waiting: leave it for later
+        // A pipelined request (or data for a takeover) is waiting: leave it for later. Or the
+        // socket cannot be watched: the response is waited for alone
         watch_peer = false;
     }
     waiting_response_ = false;
 }
 
-awaitable<bool> server_connection::wait_peer_closed() {
-    if (co_await socket_->wait(boost::asio::socket_base::wait_read)) co_return true;
-    co_return co_await socket_->peer_closed();
+awaitable<server_connection::peer_state> server_connection::wait_peer_closed() {
+    if (auto ec = co_await socket_->wait(boost::asio::socket_base::wait_read)) {
+        co_return ec == boost::asio::error::operation_not_supported ? peer_state::not_watchable : peer_state::closed;
+    }
+    co_return co_await socket_->peer_closed() ? peer_state::closed : peer_state::data;
 }
 
 void server_connection::frame_written(http_stream& stream, const std::shared_ptr<http_frame>& frame, bool written) {

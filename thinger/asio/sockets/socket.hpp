@@ -85,7 +85,8 @@ public:
     // waiting (then nothing is written). Not to be mixed with a pending write.
     virtual size_t write_now(const std::vector<boost::asio::const_buffer> &buffers, boost::system::error_code &ec);
 
-    // wait (operation_not_supported by default)
+    // wait (operation_not_supported by default: then an HTTP server on the socket does not
+    // watch for a client leaving while a response is pending)
     virtual awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type);
 
     // Once the socket is readable (see wait()): whether the peer closed the connection
