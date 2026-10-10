@@ -63,10 +63,21 @@ nlohmann::json openapi_generator::build_operation(const route& r) const {
     }
     if (!parameters.empty()) operation["parameters"] = std::move(parameters);
 
-    // Request body: the route schema and examples
+    // Request body: the route schema and examples, for each media type it accepts (the schema
+    // describes the decoded body, whatever its type)
     const auto& schema = r.get_schema();
     const auto& examples = r.get_examples();
-    if (!schema.is_null() || !examples.empty() || r.takes_json_body()) {
+    if (!schema.is_null() || !examples.empty() || r.takes_json_body() || !r.get_accepted_types().empty()) {
+        const auto& bodies = bodies_ ? *bodies_ : body_settings::defaults();
+        std::vector<std::string> media_types;
+        if (!r.get_accepted_types().empty()) {
+            media_types = accepted_media_types(bodies.decoders, r.get_accepted_types());
+        } else if (r.takes_json_body()) {
+            media_types = accepted_media_types(bodies.decoders, bodies.accepted);
+        }
+        // Routes reading the body themselves, documented with a schema or examples: JSON
+        if (media_types.empty()) media_types.emplace_back(default_body_media_type);
+
         nlohmann::json media = {{"schema", schema.is_null() ? nlohmann::json::object() : schema}};
         if (examples.size() == 1) {
             media["example"] = examples.front();
@@ -75,7 +86,9 @@ nlohmann::json openapi_generator::build_operation(const route& r) const {
                 media["examples"]["example" + std::to_string(i + 1)] = {{"value", examples[i]}};
             }
         }
-        operation["requestBody"] = {{"required", true}, {"content", {{"application/json", std::move(media)}}}};
+        nlohmann::json content = nlohmann::json::object();
+        for (const auto& type : media_types) content[type] = media;
+        operation["requestBody"] = {{"required", true}, {"content", std::move(content)}};
     }
 
     // Responses (OpenAPI requires at least one)

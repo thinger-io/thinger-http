@@ -67,6 +67,11 @@ public:
     // JSON response
     void json(const nlohmann::json& data, http::http_response::status status = http::http_response::status::ok);
 
+    // The value as JSON, MessagePack, CBOR or UBJSON, as the Accept header of the request
+    // prefers (by quality, then in that order); JSON if it accepts none of them or is missing.
+    // The response has "Vary: Accept".
+    void encode(const nlohmann::json& data, http::http_response::status status = http::http_response::status::ok);
+
     // Text response
     void send(const std::string& text, const std::string& content_type = "text/plain");
 

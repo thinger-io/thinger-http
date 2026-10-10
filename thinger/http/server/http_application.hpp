@@ -5,6 +5,7 @@
 #include "error_format.hpp"
 #include "trusted_proxies.hpp"
 #include "openapi.hpp"
+#include "body_decoders.hpp"
 #include "response_sink.hpp"
 #include "../../util/types.hpp"
 #include <chrono>
@@ -117,8 +118,27 @@ public:
     // Maximum allowed request body size
     void set_max_body_size(size_t size);
 
+    // Decoders of request bodies by media type, for the routes taking the body decoded:
+    // JSON, MessagePack, CBOR, UBJSON, urlencoded forms, text and binary are built in (see
+    // body_decoder_registry); remove or add decoders here. Set before serving.
+    body_decoder_registry& body_decoders() { return body_settings_.decoders; }
+
+    // Body types accepted by the routes taking the body decoded that do not set their own
+    // (route::accepts): names of decoders or media types; {"json"} by default. Others are
+    // answered with 415 Unsupported Media Type. Set before serving.
+    void accept_body_types(std::vector<std::string> types);
+    const std::vector<std::string>& get_body_types() const { return body_settings_.accepted; }
+
+    // Limits of decoded bodies (nesting depth); set before serving
+    void set_body_limits(body_limits limits) { body_settings_.limits = limits; }
+    const body_limits& get_body_limits() const { return body_settings_.limits; }
+
+    // Decoders, accepted types and limits together, e.g. for the openapi_generator of a
+    // virtual host: openapi_generator(app.host(name).router(), &app.get_body_settings())
+    const body_settings& get_body_settings() const { return body_settings_; }
+
     // Format of the error responses: those sent with response::error() and the ones the
-    // server generates (400 invalid JSON or schema validation, 404, 405, 413, 500...).
+    // server generates (400 invalid body or schema validation, 404, 405, 413, 415, 500...).
     // By default the message is sent as text/plain, and errors with details (schema
     // validation) as JSON {"error": {"message": ..., "context": [...]}}. Set it before
     // serving; it may be called concurrently from the worker threads.
@@ -139,7 +159,9 @@ private:
     awaitable<bool> run_middlewares(request& req, response& res);
     awaitable<void> discard_unread_body(request& req);
 
-    openapi_generator openapi_{router_};
+    // Body decoders, accepted types and limits (before openapi_, which documents them)
+    body_settings body_settings_;
+    openapi_generator openapi_{router_, &body_settings_};
     std::vector<async_middleware_function> middlewares_;
     bool cors_enabled_{false};
 

@@ -4,6 +4,7 @@
 
 #include "request.hpp"
 #include "trusted_proxies.hpp"
+#include "body_decoders.hpp"
 #include "routing/route.hpp"
 
 namespace thinger::http{
@@ -172,6 +173,10 @@ namespace thinger::http{
 
     std::string request::header(const std::string& key) const {
         return http_request_ ? http_request_->get_header(key) : "";
+    }
+
+    const body_settings& request::get_body_settings() const {
+        return body_settings_ ? *body_settings_ : body_settings::defaults();
     }
 
     // --- Body reading ---

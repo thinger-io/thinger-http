@@ -35,6 +35,7 @@ public:
         timed_out = 408,
         conflict = 409,
         payload_too_large = 413,
+        unsupported_media_type = 415,
         request_header_fields_too_large = 431,
         upgrade_required = 426,
         too_many_requests = 429,

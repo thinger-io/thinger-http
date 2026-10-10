@@ -82,6 +82,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/body_reader_test.cpp)
     add_thinger_test(test_body_reader unit/http/server/body_reader_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/body_decoders_test.cpp)
+    add_thinger_test(test_body_decoders unit/http/server/body_decoders_test.cpp)
+endif()
+
 # Unit tests - HTTP Common
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/common/headers_test.cpp)
     add_thinger_test(test_headers unit/http/common/headers_test.cpp)
@@ -216,6 +220,10 @@ endif()
 # Integration tests - Schema validation
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/schema_validation_test.cpp)
     add_thinger_test(test_integration_schema_validation integration/schema_validation_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/body_decoders_test.cpp)
+    add_thinger_test(test_integration_body_decoders integration/body_decoders_test.cpp)
 endif()
 
 # Integration tests - Virtual hosts

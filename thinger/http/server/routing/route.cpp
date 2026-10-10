@@ -3,6 +3,7 @@
 #include "../response.hpp"
 #include <regex>
 #include <algorithm>
+#include "../../../util/ascii.hpp"
 #include "../../../util/logger.hpp"
 
 namespace thinger::http {
@@ -29,6 +30,12 @@ route::route(const std::string& pattern)
 
 route& route::deferred_body(bool enabled) {
     deferred_body_ = enabled;
+    return *this;
+}
+
+route& route::accepts(std::vector<std::string> types) {
+    for (auto& type : types) ::thinger::util::ascii::to_lower(type);
+    accepted_types_ = std::move(types);
     return *this;
 }
 
@@ -117,12 +124,55 @@ bool route::matches(const std::string& path, std::smatch& matches) const {
     return std::regex_match(path, matches, regex_);
 }
 
-bool route::parse_json_body(request& req, response& res, nlohmann::json& json) const {
+std::optional<body_type_match> route::match_body_type(request& req, response& res) const {
+    const auto& settings = req.get_body_settings();
+    const auto& http_request = *req.get_http_request();
+
+    // Content-Type is a single value: repeated with different values, the type is ambiguous
+    auto values = http_request.get_headers_with_key(header::content_type);
+    for (size_t i = 1; i < values.size(); ++i) {
+        if (values[i] != values[0]) {
+            res.error(http_response::status::unsupported_media_type, "Multiple Content-Type values");
+            return std::nullopt;
+        }
+    }
+
+    auto match = http::match_body_type(settings.decoders, accepted_types_.empty() ? settings.accepted : accepted_types_,
+                                       values.empty() ? std::string_view{} : std::string_view(values[0]));
+    if (match.accepted && !match.format && takes_json_body_) {
+        // Listed by accepts(), but no decoder can give it to the callback
+        LOG_WARNING("Route {} accepts {}, but there is no body decoder for it", pattern_, match.type.type);
+        match.accepted = false;
+        match.error = "Unsupported Media Type: " + match.type.type;
+    }
+    if (!match.accepted) {
+        res.error(http_response::status::unsupported_media_type, match.error);
+        return std::nullopt;
+    }
+    return match;
+}
+
+bool route::accepts_body(request& req, response& res) const {
+    // Routes reading the body themselves accept any type unless they list theirs
+    if (!takes_json_body_ && accepted_types_.empty()) return true;
+    if (!req.has_pending_body() && req.get_http_request()->get_body().empty()) return true;
+    return match_body_type(req, res).has_value();
+}
+
+bool route::decode_body(request& req, response& res, nlohmann::json& json) const {
+    // An empty body is null, whatever its type (the schema decides whether it is valid)
     const auto& body = req.get_http_request()->get_body();
     if (!body.empty()) {
-        json = nlohmann::json::parse(body, nullptr, false);
-        if (json.is_discarded()) {
-            res.error(http_response::status::bad_request, "Invalid JSON");
+        auto match = match_body_type(req, res);
+        if (!match) return false;
+        try {
+            json = match->format->decode(body, match->type, req.get_body_settings().limits);
+        } catch (const body_decode_error& e) {
+            res.error(e.status(), e.what());
+            return false;
+        } catch (const std::exception& e) {
+            LOG_DEBUG("Body decoder {} failed on route {}: {}", match->format->name, pattern_, e.what());
+            res.error(http_response::status::bad_request, "Invalid " + match->format->name + " body");
             return false;
         }
     }
@@ -135,7 +185,7 @@ bool route::parse_json_body(request& req, response& res, nlohmann::json& json) c
 thinger::awaitable<void> route::handle_request_coro(request& req, response& res) const {
     if (takes_json_body_) {
         req.json_body_ = nullptr;
-        if (!parse_json_body(req, res, req.json_body_)) co_return;
+        if (!decode_body(req, res, req.json_body_)) co_return;
     }
     if (sync_callback_) {
         sync_callback_(req, res);

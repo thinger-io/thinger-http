@@ -62,6 +62,8 @@ namespace thinger::http{
                 "HTTP/1.1 409 Conflict";
         const std::string payload_too_large =
                 "HTTP/1.1 413 Payload Too Large";
+        const std::string unsupported_media_type =
+                "HTTP/1.1 415 Unsupported Media Type";
         const std::string request_header_fields_too_large =
                 "HTTP/1.1 431 Request Header Fields Too Large";
         const std::string unknown =
@@ -121,6 +123,8 @@ namespace thinger::http{
                     return conflict;
                 case http_response::status::payload_too_large:
                     return payload_too_large;
+                case http_response::status::unsupported_media_type:
+                    return unsupported_media_type;
                 case http_response::status::request_header_fields_too_large:
                     return request_header_fields_too_large;
                 default:
@@ -313,6 +317,12 @@ namespace thinger::http{
                 "<body><h1>413 Payload Too Large</h1></body>"
                 "</html>");
 
+        static const std::string unsupported_media_type(
+                "<html>"
+                "<head><title>Unsupported Media Type</title></head>"
+                "<body><h1>415 Unsupported Media Type</h1></body>"
+                "</html>");
+
         static const std::string request_header_fields_too_large(
                 "<html>"
                 "<head><title>Request Header Fields Too Large</title></head>"
@@ -365,6 +375,8 @@ namespace thinger::http{
                     return too_many_requests;
                 case http_response::status::payload_too_large:
                     return payload_too_large;
+                case http_response::status::unsupported_media_type:
+                    return unsupported_media_type;
                 case http_response::status::request_header_fields_too_large:
                     return request_header_fields_too_large;
                 default:

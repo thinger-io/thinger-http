@@ -2,6 +2,7 @@
 #define THINGER_HTTP_OPENAPI_HPP
 
 #include "routing/route_handler.hpp"
+#include "body_decoders.hpp"
 #include <nlohmann/json.hpp>
 #include <functional>
 #include <string>
@@ -11,7 +12,8 @@ namespace thinger::http {
 
 // Builds an OpenAPI 3.1 document from the routes of a router: paths and parameters from
 // the route patterns, and the rest from the route documentation (summary, tags, params,
-// responses, examples) and its body schema. Hidden routes are left out.
+// responses, examples), its body schema and the body types it accepts (one entry of the
+// request body content per media type). Hidden routes are left out.
 //
 // The library does not interpret route metadata: use the hooks to turn it into whatever
 // the application needs (x- extensions, security requirements...).
@@ -24,7 +26,10 @@ public:
     // Called with the whole document once built (e.g. to add securitySchemes)
     using document_hook = std::function<void(nlohmann::json& document)>;
 
-    explicit openapi_generator(const route_handler& router) : router_(router) {}
+    // `bodies`: the body decoders and the types accepted by default (those of the
+    // application, see http_application::body_decoders); the defaults if null
+    explicit openapi_generator(const route_handler& router, const body_settings* bodies = nullptr)
+        : router_(router), bodies_(bodies) {}
 
     openapi_generator& title(const std::string& value) { title_ = value; return *this; }
     openapi_generator& version(const std::string& value) { version_ = value; return *this; }
@@ -43,6 +48,7 @@ private:
     nlohmann::json build_operation(const route& r) const;
 
     const route_handler& router_;
+    const body_settings* bodies_;
     std::string title_ = "API";
     std::string version_ = "1.0.0";
     std::string description_;

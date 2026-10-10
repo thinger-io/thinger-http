@@ -1,6 +1,7 @@
 #include "response.hpp"
 #include "request.hpp"
 #include "mime_types.hpp"
+#include "body_decoders.hpp"
 #include "../../util/logger.hpp"
 #include "../../util/base64.hpp"
 #include "../../util/sha1.hpp"
@@ -158,6 +159,24 @@ void response::json(const nlohmann::json& data, http::http_response::status stat
     auto message = new_response();
     message->set_status(status);
     message->set_content(data.dump(), "application/json");
+    send_message(std::move(message));
+}
+
+void response::encode(const nlohmann::json& data, http::http_response::status status) {
+    if (!ensure_not_responded()) return;
+    // Repeated Accept headers make one list
+    std::string accept;
+    if (state_->request) {
+        for (const auto& value : state_->request->get_headers_with_key(header::accept)) {
+            if (!accept.empty()) accept += ", ";
+            accept += value;
+        }
+    }
+    auto encoding = negotiate_response_encoding(accept);
+    auto message = new_response();
+    message->set_status(status);
+    message->set_content(encode_body(data, encoding.format), encoding.media_type);
+    message->add_header("Vary", "Accept");
     send_message(std::move(message));
 }
 

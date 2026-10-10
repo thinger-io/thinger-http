@@ -9,7 +9,9 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <optional>
 #include "../request.hpp"
+#include "../body_decoders.hpp"
 #include "../../../util/types.hpp"
 
 #ifdef THINGER_HTTP_VALIJSON_ENABLED
@@ -70,9 +72,10 @@ using route_callback_request_json_response = std::function<void(request&, nlohma
 using route_callback_awaitable = std::function<thinger::awaitable<void>(request&, response&)>;
 
 // Route callback signatures, synchronous or coroutines returning awaitable<void>. Those
-// taking a JSON body get it read, parsed and validated against the route schema before
-// they run; coroutines taking (request&, response&) or (response&) read the body
-// themselves (deferred body) unless deferred_body(false) is set on the route.
+// taking a JSON body get it read, decoded (from JSON or the other types the route accepts,
+// see route::accepts) and validated against the route schema before they run; coroutines
+// taking (request&, response&) or (response&) read the body themselves (deferred body)
+// unless deferred_body(false) is set on the route.
 template<typename F>
 concept request_response_callback = std::invocable<F&, request&, response&>;
 
@@ -225,6 +228,19 @@ public:
     // a schema component not registered yet), requests to the route are answered with 500.
     route& schema(const nlohmann::json& json_schema);
 
+    // Body types the route accepts: names of body decoders ("json", "msgpack", "cbor",
+    // "ubjson", "form", "text", "binary", or custom ones, see body_decoder_registry) or media
+    // types ("application/cbor", "image/png"). A body of another type is answered with 415
+    // Unsupported Media Type before it is read; a body without Content-Type is taken as
+    // JSON. Routes taking the body decoded accept, without this, the types of the
+    // application (http_application::accept_body_types: JSON only by default), and only
+    // those with a decoder. Routes reading the body themselves accept any type without
+    // this, or the listed ones, decoder or not (they get the raw body).
+    route& accepts(std::vector<std::string> types);
+
+    // Types set with accepts(), lowercase; empty if none (the application ones apply)
+    const std::vector<std::string>& get_accepted_types() const { return accepted_types_; }
+
     // --- API documentation (read by tools such as OpenAPI generators) ---
     route& summary(const std::string& text);
     route& description(const std::string& desc);
@@ -252,8 +268,12 @@ public:
     const nlohmann::json& get_schema() const { return json_schema_; }
     bool is_hidden() const { return hidden_; }
 
-    // Whether the callback receives the request body parsed as JSON
+    // Whether the callback receives the request body decoded as JSON
     bool takes_json_body() const { return takes_json_body_; }
+
+    // Check the type of the request body (before reading it) against the accepted types:
+    // false, after answering 415, if it is not accepted. Requests without a body pass.
+    bool accepts_body(request& req, response& res) const;
 
     // Shared schemas (OpenAPI components) that route schemas can reference with
     // {"$ref": "#/components/schemas/<name>"}; set by the router that owns the route
@@ -275,8 +295,8 @@ public:
     // Get route parameters from regex
     const std::vector<std::string>& get_parameters() const { return parameters_; }
     
-    // Handle the request: parse and validate the JSON body for callbacks taking it, then
-    // run the callback
+    // Handle the request: decode and validate the body for callbacks taking it, then run
+    // the callback
     thinger::awaitable<void> handle_request_coro(request& req, response& res) const;
     
     // Get the original pattern
@@ -288,6 +308,7 @@ private:
     std::vector<std::string> parameters_;
     std::map<std::string, std::string> parameter_patterns_;
     nlohmann::json json_schema_;
+    std::vector<std::string> accepted_types_;
 
     // Documentation and metadata
     std::string summary_;
@@ -322,9 +343,13 @@ private:
         }
     }
 
-    // Parse the request body as JSON and validate it against the schema; responds with
-    // an error and returns false if it is not valid
-    bool parse_json_body(request& req, response& res, nlohmann::json& json) const;
+    // Type of the request body against the accepted types: nullopt, after answering 415,
+    // if it is not accepted
+    std::optional<body_type_match> match_body_type(request& req, response& res) const;
+
+    // Decode the request body and validate it against the schema; responds with an error
+    // and returns false if it cannot be decoded or is not valid
+    bool decode_body(request& req, response& res, nlohmann::json& json) const;
 
 #ifdef THINGER_HTTP_VALIJSON_ENABLED
     std::shared_ptr<valijson::Schema> schema_;

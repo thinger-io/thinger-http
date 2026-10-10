@@ -20,6 +20,7 @@ namespace thinger::http{
     class route;
     class virtual_host;
     class trusted_proxies;
+    struct body_settings;
 
     /**
      * Class that represents a single HTTP request over the API. It means, that the HTTP request
@@ -169,6 +170,10 @@ namespace thinger::http{
         /// Maximum body size accepted by read_body() (set by the server)
         void set_max_body_size(size_t size) { max_body_size_ = size; }
 
+        /// How the matched route decodes the body (set by the server; the defaults if not)
+        void set_body_settings(const body_settings* settings) { body_settings_ = settings; }
+        const body_settings& get_body_settings() const;
+
         /// Underlying socket. Do not read or write it while the server owns the connection:
         /// read the body with read()/read_some(), or own the socket with response::take_over().
         std::shared_ptr<asio::socket> get_socket() const;
@@ -219,6 +224,9 @@ namespace thinger::http{
 
         /// Max body size for read_body()
         size_t max_body_size_ = 8 * 1024 * 1024;
+
+        /// Body decoders, accepted types and limits of the application (null: defaults)
+        const body_settings* body_settings_ = nullptr;
 
         /// Body parsed as JSON by the matched route, for callbacks taking it
         friend class route;

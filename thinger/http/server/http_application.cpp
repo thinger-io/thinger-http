@@ -209,6 +209,11 @@ void http_application::set_max_body_size(size_t size) {
     max_body_size_ = size;
 }
 
+void http_application::accept_body_types(std::vector<std::string> types) {
+    for (auto& type : types) ::thinger::util::ascii::to_lower(type);
+    body_settings_.accepted = std::move(types);
+}
+
 // Request processing
 // The connection cannot be reused after this request (unread or broken body, failed
 // handler...): close it once the response is sent. The response, unless already
@@ -226,6 +231,7 @@ awaitable<void> http_application::handle(std::shared_ptr<request> req, std::shar
     res.set_error_formatter(error_formatter_);
     req->set_trusted_proxies(trusted_proxies_);
     req->set_max_body_size(max_body_size_);
+    req->set_body_settings(&body_settings_);
 
     // Ambiguous body framing (invalid Content-Length, unsupported Transfer-Encoding, or
     // both): where this request ends, and so where the next one starts, is unknown
@@ -288,6 +294,9 @@ awaitable<void> http_application::handle_request(std::shared_ptr<request> req, r
     if (!matched_route) {
         // No route matched → fallback / 404
         co_await host.router().handle_unmatched(req, res);
+    } else if (req->has_pending_body() && !matched_route->accepts_body(*req, res)) {
+        // UNSUPPORTED TYPE: answered 415 before reading the body (dropped afterwards)
+        co_return;
     } else if (matched_route->is_deferred_body() || !req->has_pending_body()) {
         // DEFERRED: handler reads body at its discretion (bounded by the maximum body size
         // in read_body()); or NO BODY: dispatch directly
