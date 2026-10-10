@@ -6,6 +6,7 @@
 #include "request_builder.hpp"
 #include "../../asio/worker_client.hpp"
 #include "../../asio/workers.hpp"
+#include <concepts>
 #include <condition_variable>
 #include <mutex>
 #include <atomic>
@@ -308,6 +309,7 @@ public:
      * The callback receives a shared_ptr to maintain ownership.
      */
     template<typename Callback>
+        requires std::invocable<Callback&, std::shared_ptr<websocket_client>>   // not a subprotocol
     void websocket(const std::string& url, Callback&& callback, const std::string& subprotocol = "") {
         run([this, url, cb = std::forward<Callback>(callback), proto = subprotocol]() mutable -> awaitable<void> {
             auto result = co_await upgrade_websocket(url, proto);
