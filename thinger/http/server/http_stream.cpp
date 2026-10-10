@@ -19,7 +19,7 @@ namespace thinger::http {
     }
 
     void http_stream::add_frame(std::shared_ptr<http_frame> frame) {
-        queue_.push(frame);
+        queue_.push(std::move(frame));
         responded_ = true;
     }
 

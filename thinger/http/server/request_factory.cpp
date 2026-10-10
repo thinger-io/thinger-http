@@ -27,7 +27,11 @@ namespace thinger::http {
             case method:
                 if (input == ' ') {
                     // initialize a new http request if necessary
-                    if(!req) req = std::make_shared<http_request>();
+                    if(!req){
+                        req = std::make_shared<http_request>();
+                        // room for the headers of most requests, without growing
+                        req->get_headers().reserve(16);
+                    }
                     // store read method
                     on_http_method(tempString1_);
                     tempString1_.clear();

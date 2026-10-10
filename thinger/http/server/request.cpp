@@ -23,9 +23,9 @@ namespace thinger::http{
             body_reader_.set_framing(http_request_->is_chunked_transfer(), http_request_->pending_body_size());
         }
         if (http_connection) {
-            body_reader_.set_source([connection = std::weak_ptr<server_connection>(http_connection)](
-                    uint8_t* buffer, size_t size) -> thinger::awaitable<size_t> {
-                auto conn = connection.lock();
+            // (capturing only `this` fits in the function, without allocating)
+            body_reader_.set_source([this](uint8_t* buffer, size_t size) -> thinger::awaitable<size_t> {
+                auto conn = http_connection_.lock();
                 if (!conn) co_return 0;
                 auto [ec, bytes] = co_await conn->get_socket()->read_some(buffer, size);
                 co_return bytes;

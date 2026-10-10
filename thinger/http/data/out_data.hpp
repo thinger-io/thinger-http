@@ -17,6 +17,8 @@ public:
 
     virtual awaitable<io_result> to_socket(std::shared_ptr<thinger::asio::socket> socket) {
         std::vector<boost::asio::const_buffer> buffer;
+        // enough for the status line, a few headers and the body of a response at once
+        buffer.reserve(32);
         fill_buffer(buffer);
         co_return co_await socket->write(buffer);
     }

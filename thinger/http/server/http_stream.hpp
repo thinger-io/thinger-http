@@ -2,6 +2,7 @@
 #define HTTP_STREAM_HPP
 
 #include <atomic>
+#include <list>
 #include <queue>
 #include <memory>
 #include <functional>
@@ -39,9 +40,10 @@ namespace thinger::http {
 
         /**
          * Queue for each HTTP frame composing a response. A response can be composed on several frames
-         * i.e., while sending large files
+         * i.e., while sending large files. A list, as a deque allocates its storage up front,
+         * and most responses are a single frame
          */
-        std::queue<std::shared_ptr<http_frame>> queue_;
+        std::queue<std::shared_ptr<http_frame>, std::list<std::shared_ptr<http_frame>>> queue_;
 
         /**
          * Set when the response takes over the connection: receives the socket, and the

@@ -374,7 +374,10 @@ namespace thinger::http{
         return position == std::string::npos ? std::string{} : line.substr(position + 1);
     }
 
-    http_response::http_response()= default;
+    http_response::http_response(){
+        // room for the usual headers (connection, content length and type, and a few more)
+        headers_.reserve(8);
+    }
 
     bool http_response::is_redirect_response() const{
         return status_ == status::temporary_redirect ||

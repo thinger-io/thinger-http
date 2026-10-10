@@ -34,6 +34,10 @@ namespace thinger::http{
 
         virtual ~request();
 
+        // Not copyable: its body reader refers to it
+        request(const request&) = delete;
+        request& operator=(const request&) = delete;
+
     public:
         /// get parameter
         const std::string& operator[](const std::string& param) const;
