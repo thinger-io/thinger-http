@@ -11,6 +11,7 @@ add_fuzz_target(fuzz_chunked_decoder fuzz_chunked_decoder.cpp)
 add_fuzz_target(fuzz_http_differential fuzz_http_differential.cpp)
 add_fuzz_target(fuzz_url_decode fuzz_url_decode.cpp)
 add_fuzz_target(fuzz_utf8_validate fuzz_utf8_validate.cpp)
+add_fuzz_target(fuzz_body_decoders fuzz_body_decoders.cpp)
 
 # llhttp (Node.js's HTTP parser, MIT), the reference of the three-way differential target. It
 # is fetched and built only here, never linked into the library. Its release tags carry the
