@@ -1,6 +1,7 @@
 #ifndef HTTP_REQUEST_PARSER_HPP
 #define HTTP_REQUEST_PARSER_HPP
 
+#include <iterator>
 #include <memory>
 #include <string>
 #include <boost/logic/tribool.hpp>
@@ -41,7 +42,12 @@ namespace thinger::http {
                         ++size;
                     }
                     if (size > 0) {
-                        target->append(begin, run_end);
+                        if constexpr (std::contiguous_iterator<InputIterator>) {
+                            // (from a range of other than chars, append() builds a temporary string)
+                            target->append(reinterpret_cast<const char*>(std::to_address(begin)), size);
+                        } else {
+                            target->append(begin, run_end);
+                        }
                         header_section_size_ += size;
                         begin = run_end;
                         continue;
