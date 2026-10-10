@@ -378,6 +378,10 @@ void server_connection::release() {
         });
 }
 
+void server_connection::extend_timeout() {
+    if (running_) reset_timeout();
+}
+
 std::shared_ptr<asio::socket> server_connection::get_socket() {
     return socket_;
 }

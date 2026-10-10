@@ -28,6 +28,8 @@ namespace thinger::http{
                 auto conn = http_connection_.lock();
                 if (!conn) co_return 0;
                 auto [ec, bytes] = co_await conn->get_socket()->read_some(buffer, size);
+                // a body that keeps arriving keeps the connection alive (e.g. a long upload)
+                if (bytes > 0) conn->extend_timeout();
                 co_return bytes;
             });
         }

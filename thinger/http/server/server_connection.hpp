@@ -51,6 +51,10 @@ public:
     // Update connection timeout
     void update_connection_timeout(std::chrono::seconds timeout);
 
+    // Extend the connection deadline after some activity outside the read loop, such as
+    // reading the request body (on the connection thread)
+    void extend_timeout();
+
     // Set request handler (awaitable — dispatch coroutine)
     void set_handler(std::function<awaitable<void>(std::shared_ptr<request>)> handler) {
         handler_ = std::move(handler);
