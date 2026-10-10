@@ -38,6 +38,8 @@ public:
     virtual bool stop();
     bool is_running() const { return running_; }
     virtual std::string get_service_name() const = 0;
+    // The port listened on: 0 while not listening (before start(), after stop()), and for
+    // servers without ports (Unix domain sockets). Never throws
     virtual uint16_t local_port() const = 0;
 
 protected:

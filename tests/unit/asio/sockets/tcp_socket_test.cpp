@@ -86,20 +86,12 @@ TEST_CASE("TCP Socket TCP_NODELAY Option", "[tcp_socket][unit]") {
     boost::asio::io_context io_context;
     tcp_socket sock("test", io_context);
 
-    SECTION("enable/disable TCP_NODELAY doesn't throw on closed socket") {
-        // These might throw or not depending on implementation
-        // On a closed socket, setting options typically fails silently or throws
-        // We just verify they don't crash
-        try {
-            sock.enable_tcp_no_delay();
-        } catch (const boost::system::system_error&) {
-            // Expected on closed socket
-        }
-
-        try {
-            sock.disable_tcp_no_delay();
-        } catch (const boost::system::system_error&) {
-            // Expected on closed socket
-        }
+    SECTION("enable/disable TCP_NODELAY fail without throwing on a closed socket") {
+        bool enabled = true;
+        bool disabled = true;
+        REQUIRE_NOTHROW(enabled = sock.enable_tcp_no_delay());
+        REQUIRE_NOTHROW(disabled = sock.disable_tcp_no_delay());
+        REQUIRE_FALSE(enabled);
+        REQUIRE_FALSE(disabled);
     }
 }

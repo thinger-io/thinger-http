@@ -57,9 +57,9 @@ public:
     std::string get_local_port() const override;
     std::string get_remote_port() const override;
 
-    // other methods
-    void enable_tcp_no_delay();
-    void disable_tcp_no_delay();
+    // other methods: false if the option could not be set (e.g. the socket is closed)
+    bool enable_tcp_no_delay();
+    bool disable_tcp_no_delay();
     virtual boost::asio::ip::tcp::socket &get_socket();
 
 protected:

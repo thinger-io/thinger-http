@@ -3,6 +3,7 @@
 #include "../util/logger.hpp"
 #include <cerrno>
 #include <chrono>
+#include <exception>
 #include <system_error>
 #include <thread>
 #include <type_traits>
@@ -28,6 +29,20 @@ public:
 private:
     int descriptor_;
 };
+
+// Sets up and serves an accepted connection. Nothing doing it may throw out of an accept handler
+// or a worker: it would end the process. What is thrown is logged, and only drops the connection
+// (its socket is destroyed, and closed, while unwinding)
+template<typename Function>
+void serve_without_throwing(Function&& serve) noexcept {
+    try {
+        serve();
+    } catch (const std::exception& e) {
+        LOG_ERROR("cannot serve an accepted connection: {}", e.what());
+    } catch (...) {
+        LOG_ERROR("cannot serve an accepted connection");
+    }
+}
 
 } // namespace
 
@@ -150,9 +165,11 @@ void basic_socket_server<Protocol>::accept_next() {
         if (state->stopped) return;
 
         if (!e) {
-            if (is_connection_allowed(peer.native_handle())) {
-                (*serve_)(std::move(peer));
-            }
+            serve_without_throwing([&] {
+                if (is_connection_allowed(peer.native_handle())) {
+                    (*serve_)(std::move(peer));
+                }
+            });
 
             // Continue accepting connections
             if (running_) accept_next();
@@ -190,7 +207,7 @@ void basic_socket_server<Protocol>::accept_pending() {
             int enabled = 1;
             ::setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
 #endif
-            hand_over(descriptor);
+            serve_without_throwing([&] { hand_over(descriptor); });
             continue;
         }
         int error = errno;
@@ -222,7 +239,7 @@ void basic_socket_server<Protocol>::hand_over(native_handle_type accepted) {
                 return;
             }
             descriptor.release();
-            (*serve)(std::move(peer));
+            serve_without_throwing([&] { (*serve)(std::move(peer)); });
         });
 }
 

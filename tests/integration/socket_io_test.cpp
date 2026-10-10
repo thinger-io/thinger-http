@@ -339,8 +339,8 @@ TEST_CASE_METHOD(TcpEchoFixture, "TCP: enable and disable tcp_no_delay",
         auto ec = co_await client.connect("127.0.0.1", port_str(), 5s);
         REQUIRE_FALSE(ec);
 
-        REQUIRE_NOTHROW(client.enable_tcp_no_delay());
-        REQUIRE_NOTHROW(client.disable_tcp_no_delay());
+        REQUIRE(client.enable_tcp_no_delay());
+        REQUIRE(client.disable_tcp_no_delay());
     });
 }
 

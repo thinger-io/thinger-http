@@ -187,12 +187,18 @@ awaitable<boost::system::error_code> tcp_socket::wait(boost::asio::socket_base::
     co_return ec;
 }
 
-void tcp_socket::enable_tcp_no_delay() {
-    socket_.set_option(boost::asio::ip::tcp::no_delay(true));
+bool tcp_socket::enable_tcp_no_delay() {
+    boost::system::error_code ec;
+    socket_.set_option(boost::asio::ip::tcp::no_delay(true), ec);
+    if (ec) LOG_DEBUG("cannot enable tcp_no_delay: {}", ec.message());
+    return !ec;
 }
 
-void tcp_socket::disable_tcp_no_delay() {
-    socket_.set_option(boost::asio::ip::tcp::no_delay(false));
+bool tcp_socket::disable_tcp_no_delay() {
+    boost::system::error_code ec;
+    socket_.set_option(boost::asio::ip::tcp::no_delay(false), ec);
+    if (ec) LOG_DEBUG("cannot disable tcp_no_delay: {}", ec.message());
+    return !ec;
 }
 
 bool tcp_socket::is_open() const {

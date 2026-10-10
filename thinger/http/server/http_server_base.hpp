@@ -62,7 +62,7 @@ public:
     // Check if server is listening
     bool is_listening() const;
 
-    // Get the port assigned by the OS after listen()
+    // Get the port assigned by the OS after listen(): 0 while not listening, never throws
     uint16_t local_port() const;
     
     // Abstract methods that derived classes must implement

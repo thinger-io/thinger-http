@@ -66,7 +66,10 @@ std::string tcp_socket_server::get_service_name() const {
 }
 
 uint16_t tcp_socket_server::local_port() const {
-    return acceptor() ? acceptor()->local_endpoint().port() : 0;
+    if (!acceptor()) return 0;
+    boost::system::error_code ec;
+    auto endpoint = acceptor()->local_endpoint(ec);
+    return ec ? 0 : endpoint.port();
 }
 
 std::optional<boost::asio::ip::tcp::endpoint> tcp_socket_server::listening_endpoint(boost::asio::io_context& io_context) {
@@ -108,12 +111,14 @@ void serve_connection(std::shared_ptr<tcp_socket> sock, const connection_setup& 
     LOG_INFO("received connection from: ip: {}, port: {}, secure: {}",
             sock->get_remote_ip(), sock->get_local_port(), sock->is_secure());
 
-    if (setup.tcp_no_delay) {
-        sock->enable_tcp_no_delay();
+    // Fails if the connection is already gone: drop it
+    if (setup.tcp_no_delay && !sock->enable_tcp_no_delay()) {
+        return;
     }
 
     if (sock->requires_handshake()) {
-        // Use co_spawn to run the coroutine-based handshake
+        // Use co_spawn to run the coroutine-based handshake. What the handler throws is
+        // logged, as when it is called right away (see basic_socket_server)
         co_spawn(sock->get_io_context(),
             [sock, handler = setup.handler]() -> awaitable<void> {
                 auto ec = co_await sock->handshake();
@@ -124,7 +129,16 @@ void serve_connection(std::shared_ptr<tcp_socket> sock, const connection_setup& 
                 }
                 if (handler) handler(sock);
             },
-            detached);
+            [](std::exception_ptr error) {
+                if (!error) return;
+                try {
+                    std::rethrow_exception(error);
+                } catch (const std::exception& e) {
+                    LOG_ERROR("cannot serve a TLS connection: {}", e.what());
+                } catch (...) {
+                    LOG_ERROR("cannot serve a TLS connection");
+                }
+            });
     } else {
         if (setup.handler) setup.handler(std::move(sock));
     }

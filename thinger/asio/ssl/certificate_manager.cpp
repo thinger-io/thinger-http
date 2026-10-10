@@ -235,15 +235,21 @@ int certificate_manager::sni_callback(SSL* ssl, int* al, void* arg) {
     
     if (hostname != nullptr) {
         LOG_DEBUG("SNI connection for: {}", hostname);
-        
-        auto& mgr = certificate_manager::instance();
-        auto certificate = mgr.get_certificate(hostname);
-        
-        if (certificate) {
-            auto ssl_ctx = certificate->native_handle();
-            SSL_set_SSL_CTX(ssl, ssl_ctx);
-        } else {
-            LOG_WARNING("Using default server certificate for hostname: {}", hostname);
+
+        // Called from OpenSSL: nothing may be thrown through it
+        try {
+            auto& mgr = certificate_manager::instance();
+            auto certificate = mgr.get_certificate(hostname);
+
+            if (certificate) {
+                auto ssl_ctx = certificate->native_handle();
+                SSL_set_SSL_CTX(ssl, ssl_ctx);
+            } else {
+                LOG_WARNING("Using default server certificate for hostname: {}", hostname);
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("cannot select the certificate for hostname {}: {}", hostname, e.what());
+            return SSL_TLSEXT_ERR_ALERT_FATAL;
         }
     }
     
