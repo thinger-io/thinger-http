@@ -134,7 +134,7 @@ awaitable<void> server_connection::read_loop() {
 
             // A response sent later, from a copy of the response, may still take over the
             // connection: wait for it to start before reading what follows this request
-            co_await wait_response(*stream);
+            if (!stream->responded()) co_await wait_response(*stream);
 
             // Read-ahead bytes the request did not consume belong to whatever follows it
             // (they may come from later socket reads, e.g. after a chunked body)

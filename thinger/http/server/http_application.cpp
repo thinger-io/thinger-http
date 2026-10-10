@@ -210,11 +210,6 @@ void http_application::set_max_body_size(size_t size) {
 }
 
 // Request processing
-awaitable<void> http_application::handle(std::shared_ptr<request> req, std::shared_ptr<response_sink> sink) {
-    response res(std::move(sink), req->get_http_request(), cors_enabled_);
-    co_await process_request(req, res);
-}
-
 // The connection cannot be reused after this request (unread or broken body, failed
 // handler...): close it once the response is sent. The response, unless already
 // prepared, also tells the client.
@@ -223,7 +218,8 @@ static void close_after_response(request& req) {
     if (auto http_request = req.get_http_request()) http_request->set_keep_alive(false);
 }
 
-awaitable<void> http_application::process_request(std::shared_ptr<request> req, response& res) {
+awaitable<void> http_application::handle(std::shared_ptr<request> req, std::shared_ptr<response_sink> sink) {
+    response res(std::move(sink), req->get_http_request(), cors_enabled_);
     auto http_request = req->get_http_request();
 
     // Server settings the request and its response depend on
@@ -277,7 +273,7 @@ awaitable<void> http_application::process_request(std::shared_ptr<request> req, 
 
     // Drop any body left unread (unmatched route, or a handler that did not read it all)
     // so it is not parsed as the next request
-    co_await discard_unread_body(*req);
+    if (req->has_pending_body()) co_await discard_unread_body(*req);
 }
 
 awaitable<void> http_application::handle_request(std::shared_ptr<request> req, response& res) {
@@ -286,7 +282,7 @@ awaitable<void> http_application::handle_request(std::shared_ptr<request> req, r
     auto* matched_route = host.router().find_route(req);
 
     // 2. Run middlewares (before reading the body), sharing the handler response
-    if (!co_await run_middlewares(*req, res)) co_return;
+    if (!middlewares_.empty() && !co_await run_middlewares(*req, res)) co_return;
 
     // 3. Three-way dispatch
     if (!matched_route) {
