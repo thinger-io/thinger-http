@@ -157,6 +157,9 @@ awaitable<std::shared_ptr<http_response>> client_connection::send_request(
 
     co_await (do_request() || do_timeout());
 
+    // The response is read: the connection may serve another request now
+    claimed_ = false;
+
     co_return response;
 }
 
@@ -242,6 +245,9 @@ awaitable<stream_result> client_connection::send_request_streaming(
     };
 
     co_await (do_request() || do_timeout());
+
+    // The response is read: the connection may serve another request now
+    claimed_ = false;
 
     co_return result;
 }

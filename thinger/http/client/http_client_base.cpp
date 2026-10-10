@@ -56,8 +56,9 @@ std::shared_ptr<client_connection> http_client_base::get_or_create_connection(
         connection = pool_.get_unix_connection(socket_path);
     }
 
-    // If found in pool and still open, reuse it
-    if (connection && connection->is_open()) {
+    // Reuse it if no other request is using it (never touching its socket otherwise) and it
+    // is still open. A closed one stays claimed: it is replaced in the pool below
+    if (connection && connection->claim() && connection->is_open()) {
         LOG_DEBUG("Reusing connection from pool for {}", request->get_host());
         connection->set_max_content_size(max_content_size_);
         return connection;
@@ -81,6 +82,7 @@ std::shared_ptr<client_connection> http_client_base::get_or_create_connection(
         }
         connection = std::make_shared<client_connection>(sock, timeout_);
         connection->set_max_content_size(max_content_size_);
+        connection->claim();
 
         // Store in pool for reuse
         pool_.store_connection(request->get_host(),
@@ -91,6 +93,7 @@ std::shared_ptr<client_connection> http_client_base::get_or_create_connection(
         auto sock = std::make_shared<thinger::asio::unix_socket>("http_client", io_context);
         connection = std::make_shared<client_connection>(sock, socket_path, timeout_);
         connection->set_max_content_size(max_content_size_);
+        connection->claim();
 
         // Store in pool for reuse
         pool_.store_unix_connection(socket_path, connection);

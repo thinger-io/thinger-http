@@ -1,8 +1,8 @@
 #ifndef THINGER_HTTP_CLIENT_CONNECTION_HPP
 #define THINGER_HTTP_CLIENT_CONNECTION_HPP
 
+#include <atomic>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <boost/noncopyable.hpp>
 
@@ -55,6 +55,10 @@ public:
     std::shared_ptr<thinger::asio::socket> get_socket() const { return socket_; }
     bool is_open() const { return socket_ && socket_->is_open(); }
 
+    // A connection serves one request at a time: whoever hands it out claims it first, and
+    // the request releases it once done. False while another request is using it
+    bool claim() { return !claimed_.exchange(true); }
+
     // Forward max response size to the underlying parser.
     void set_max_content_size(size_t size) { response_parser_.set_max_content_size(size); }
 
@@ -69,7 +73,7 @@ private:
     uint8_t buffer_[MAX_BUFFER_SIZE];
     std::string buffered_;
     response_factory response_parser_;
-    std::mutex connection_mutex_;
+    std::atomic<bool> claimed_{false};
 };
 
 }

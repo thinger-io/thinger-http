@@ -4,9 +4,12 @@
 #include <thinger/http/client/client_connection.hpp>
 #include <thinger/asio/sockets/tcp_socket.hpp>
 #include <boost/asio.hpp>
+#include <atomic>
+#include <chrono>
 #include <thread>
 #include <set>
 #include "../fixtures/test_server_fixture.hpp"
+#include "server_test_helpers.hpp"
 
 using namespace thinger;
 
@@ -277,4 +280,53 @@ TEST_CASE_METHOD(thinger::http::test::TestServerFixture, "HTTP Client connection
         client.wait();
         REQUIRE(second_succeeded);
     }
+}
+
+TEST_CASE("HTTP Client never hands out a connection busy with another request", "[http][client][pool]") {
+    using namespace std::chrono_literals;
+
+    // /hold answers once /release is served, or "expired" after a while. Both run on the
+    // single server thread, the only one using the timer
+    http::server server;
+    std::atomic<bool> held{false};
+    std::shared_ptr<boost::asio::steady_timer> hold_timer;
+    server.get("/hold", [&](http::request&, http::response& res) -> awaitable<void> {
+        auto timer = std::make_shared<boost::asio::steady_timer>(co_await boost::asio::this_coro::executor, 5s);
+        hold_timer = timer;
+        held = true;
+        auto [ec] = co_await timer->async_wait(use_nothrow_awaitable);
+        res.send(ec ? "released" : "expired");
+    });
+    server.get("/release", [&](http::request&, http::response& res) {
+        if (hold_timer) hold_timer->cancel();
+        res.send("ok");
+    });
+    server_test::running_server running(server);
+    std::string base_url = "http://127.0.0.1:" + std::to_string(running.port);
+
+    http::async_client client;
+    client.timeout(10s);
+
+    std::string hold_result;
+    client.get(base_url + "/hold", [&](http::client_response& res) {
+        hold_result = res.ok() ? res.body() : res.error();
+    });
+
+    // The first request is connected and waiting for its response
+    auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!held && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    REQUIRE(held);
+
+    // Written on the connection of the first request, the server would read it only after
+    // answering that one, and its response could be read by the first request instead
+    bool release_ok = false;
+    client.get(base_url + "/release", [&](http::client_response& res) {
+        release_ok = res.ok();
+    });
+
+    client.wait();
+    REQUIRE(release_ok);
+    REQUIRE(hold_result == "released");
 }
