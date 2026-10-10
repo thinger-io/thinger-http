@@ -1,16 +1,14 @@
 #ifndef THINGER_ASIO_TCP_SOCKET_SERVER_HPP
 #define THINGER_ASIO_TCP_SOCKET_SERVER_HPP
 
-#include "socket_server_base.hpp"
+#include "basic_socket_server.hpp"
 #include "sockets/tcp_socket.hpp"
 #include "sockets/ssl_socket.hpp"
 #include <boost/asio/ssl.hpp>
 
 namespace thinger::asio {
 
-class worker_thread;
-
-class tcp_socket_server : public socket_server_base {
+class tcp_socket_server : public basic_socket_server<boost::asio::ip::tcp> {
 public:
     // Constructor with io_context providers
     tcp_socket_server(std::string host, 
@@ -27,10 +25,7 @@ public:
                      std::set<std::string> allowed_remotes = {}, 
                      std::set<std::string> forbidden_remotes = {});
 
-    ~tcp_socket_server();
-
-    // Override stop to properly close acceptor
-    bool stop() override;
+    ~tcp_socket_server() override;
 
     // TCP specific configuration
     void set_tcp_no_delay(bool tcp_no_delay);
@@ -48,29 +43,12 @@ public:
     uint16_t local_port() const override;
 
 protected:
-    bool create_acceptor() override;
-    void accept_connection() override;
+    std::optional<endpoint_type> listening_endpoint(boost::asio::io_context& io_context) override;
+    void on_listening() override;
+    connection_server make_connection_server() const override;
+    bool is_connection_allowed(native_handle_type descriptor) const override;
 
 private:
-    bool listen(boost::asio::io_context& io_context);
-    void close_acceptor();
-    void stop_acceptor_thread();
-    void retry_accept();
-
-    // With a thread of its own: wait for connections, accept the pending ones, and hand each
-    // one over to the worker serving it
-    void wait_connections();
-    void accept_pending();
-    void hand_over(int descriptor);
-
-    // Thread accepting the connections of a server on the workers: accepting does not wait
-    // behind the connections a worker serves, and the workers serve them in turn. Declared
-    // before the acceptor, which uses its io_context
-    bool own_acceptor_thread_ = false;
-    std::unique_ptr<worker_thread> acceptor_thread_;
-
-    std::unique_ptr<boost::asio::ip::tcp::acceptor> acceptor_;
-    boost::asio::ip::tcp protocol_ = boost::asio::ip::tcp::v4();
     std::string host_;
     std::string port_;
     bool tcp_no_delay_ = true;
