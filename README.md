@@ -26,7 +26,7 @@ Benchmarked with [bombardier](https://github.com/codesenberg/bombardier) — 100
 ## Features
 
 - **HTTP Server & Client** - Full HTTP/1.1 support with connection pooling
-- **WebSocket** - Server and client support with text/binary messages
+- **WebSocket** - Server and client support with text/binary messages, or as a byte stream socket for other protocols and tunnels
 - **Server-Sent Events (SSE)** - Real-time server push
 - **SSL/TLS** - HTTPS and WSS support via OpenSSL, with per-domain certificates (SNI)
 - **Virtual Hosts** - Routes per host name, exact or by pattern, on the same listener
@@ -873,6 +873,98 @@ res.upgrade_websocket([](auto ws) {
 }, protocols);
 ```
 
+A client offering several subprotocols (`Sec-WebSocket-Protocol: a, b`) gets the first one it offers that is in the set; one offering none of them, or none at all when the set is not empty, is answered with `400`.
+
+### WebSocket as a Socket
+
+`res.upgrade_websocket_stream()` hands the accepted WebSocket out as a socket (`thinger::asio::websocket`, a `thinger::asio::socket`), with the same interface as TCP, TLS and Unix sockets: a protocol written for a socket (MQTT, a custom binary protocol...) runs over WebSocket unchanged, without telling the difference, and a tunnel connects it to any other socket.
+
+```cpp
+server.get("/mqtt", [](http::request& req, http::response& res) {
+    res.upgrade_websocket_stream({.protocols = {"mqtt", "mqttv3.1", "mqttv3.1.1"}},
+        [](std::shared_ptr<thinger::asio::websocket> ws, std::string protocol) {
+            // protocol: the subprotocol accepted, e.g. "mqttv3.1"
+            co_spawn(ws->get_io_context(), run_protocol(ws), thinger::detached);
+        });
+});
+
+// A protocol written for any socket: a 4-byte length and a payload, answered with an echo
+thinger::awaitable<void> run_protocol(std::shared_ptr<thinger::asio::socket> socket) {
+    for (;;) {
+        uint8_t header[4];
+        auto [ec, bytes] = co_await socket->read(header, sizeof(header));  // exactly 4 bytes
+        if (ec) co_return;  // boost::asio::error::eof once the client closed
+        std::vector<uint8_t> payload((header[0] << 24) | (header[1] << 16) | (header[2] << 8) | header[3]);
+        if (!payload.empty() && std::get<0>(co_await socket->read(payload.data(), payload.size()))) co_return;
+        co_await socket->write({boost::asio::buffer(header), boost::asio::buffer(payload)});  // one message
+    }
+}
+```
+
+The handler runs on the io_context of the socket once the `101` response is written; like any socket, the WebSocket is used there (see [Thread Safety](#thread-safety)). Its options:
+
+| Option | Default | Description |
+|---|---|---|
+| `protocols` | none | Subprotocols spoken, alternatives included. The first one the client offers (in its order of preference) that is in the list is accepted, returned in the response and passed to the handler |
+| `protocol_required` | `true` | With `protocols`: a client offering none of them is answered with `400`. If `false`, it is accepted without a subprotocol (and the handler gets an empty one). Without `protocols`, any client is accepted without one |
+| `binary` | `true` | Messages written are binary, or text (`ws->set_binary()` changes it later) |
+| `ping_interval` | `0` (off) | Ping the client once nothing was received from it for this long |
+| `idle_timeout` | `0` (off) | Close the connection once nothing was received for this long, pongs included |
+
+A request that is not a WebSocket upgrade gets `426`; one without `Sec-WebSocket-Key`, `400`. Frames the client sends right after its request, without waiting for the response, are kept for the first reads.
+
+As a stream:
+
+- Reads return the payload of the data messages received, binary or text, as one continuous stream: neither messages nor the frames of a fragmented message are delimited. `read()` waits for exactly the bytes asked, across frames and messages; `read_some()` returns what one frame holds at most, and never 0 bytes (empty frames are skipped); `read_until()` and the `streambuf` reads work as on TCP.
+- Each write sends one whole message (unfragmented). Writes may be called while others are pending, from several coroutines: they are sent one after another, in call order, never interleaved. Writing 0 bytes sends nothing.
+- Pings are answered (and unsolicited pongs ignored) while reading, so some read must be pending, as a protocol reading its socket has. The keepalive counts on it too: what is not read is not received.
+- A close frame from the client is answered, the connection closed, and reads end with `boost::asio::error::eof`, as on a TCP connection closed by its peer. Writes fail afterwards.
+- `close()` sends a close frame (code 1000) and returns at once: the socket is closed for its user, and the closing handshake finishes on its own (the connection is closed when the client answers, or after 5 seconds). If a write is in progress, the connection is closed without it. `co_await ws->close_graceful()` does the same, waiting. A WebSocket released without closing it sends 1001 (going away), and so does the idle timeout; protocol errors (an unmasked frame, an unknown opcode...) are answered with 1002.
+
+For message-oriented code `upgrade_websocket()` (above) remains; `ws->read_message_some()` with `is_message_complete()` and `is_binary()` gives the message boundaries over the same socket.
+
+### Tunnels
+
+`thinger::asio::socket_pipe` copies data both ways between two sockets until either end closes: a WebSocket and a TCP, TLS or Unix socket (a VNC server, a Docker container, a service behind a proxy), or a socket of your own (see [Custom Sockets](#custom-sockets)):
+
+```cpp
+server.get("/vnc", [](http::request& req, http::response& res) {
+    res.upgrade_websocket_stream({.protocols = {"binary"}}, [](std::shared_ptr<thinger::asio::websocket> ws, std::string) {
+        co_spawn(ws->get_io_context(), [ws]() -> thinger::awaitable<void> {
+            // the other end, on the io_context of the WebSocket
+            auto target = std::make_shared<thinger::asio::tcp_socket>("vnc", ws->get_io_context());
+            if (co_await target->connect("10.0.0.5", "5900", std::chrono::seconds(10))) {
+                ws->close();
+                co_return;
+            }
+            auto pipe = std::make_shared<thinger::asio::socket_pipe>(ws, target);
+            co_await pipe->run();   // until either end closes (or pipe->start() to run it detached)
+        }, thinger::detached);
+    });
+});
+```
+
+- Each direction writes what it read before reading more, so a slow reader slows its writer down (flow control): nothing piles up in memory.
+- When either end closes (or fails), the pipe closes both: the WebSocket client gets a close frame when the other end closes, and the other end is closed when the client closes. `pipe->cancel()` ends it from any thread.
+- Both sockets are used from the coroutine running the pipe: create the other one on the io_context of the WebSocket (`unix_socket` and `ssl_socket` take it in their constructors too).
+
+### Client WebSocket as a Socket
+
+A WebSocket opened by the client is a socket too, e.g. to tunnel to a WebSocket target or to run a protocol over it:
+
+```cpp
+auto ws = co_await client.websocket("wss://server.com/tunnel", "binary");
+if (ws) {
+    // ws->get_protocol(): the subprotocol the server accepted
+    std::shared_ptr<thinger::asio::websocket> socket = ws->release_socket();
+    socket->set_binary(true);   // the client writes text messages by default
+    auto pipe = std::make_shared<thinger::asio::socket_pipe>(socket, other_socket);
+    co_await pipe->run();
+}
+```
+
+It is used on its io_context (`socket->get_io_context()`): with `async_client`, the one of the coroutine that opened it.
+
 ### WebSocket Client (Sync)
 
 ```cpp
@@ -996,6 +1088,84 @@ client.websocket("wss://server.com/ws", [](std::shared_ptr<http::websocket_clien
 client.wait();
 ```
 
+## Custom Sockets
+
+Protocols and tunnels work on `thinger::asio::socket`, so an application can define its own socket type and use it wherever a socket is used, e.g. a virtual stream multiplexed inside another connection as an end of a `socket_pipe`, or under a protocol. A socket must implement:
+
+| Method | Guarantee |
+|---|---|
+| `read_some(buffer, max_size)` | Waits until at least one byte is available and returns it: never 0 bytes without an error (unless `max_size` is 0). `boost::asio::error::eof` once the other end closed the stream and everything it sent was read |
+| `write(buffer, size)` | Returns once all the bytes are written (accepted, as a TCP socket copies them to the kernel), or with an error |
+| `close()` | Closes right away, without waiting: `is_open()` is `false` afterwards, pending operations complete with an error and new ones fail. Idempotent, and safe from the destructor |
+| `cancel()` | Pending operations complete with `operation_aborted`; the socket stays open |
+| `is_open()` | Whether it is open |
+
+Everything else has a default: `read()` (exact), `read(streambuf)`, `read_until()` and the other `write()` overloads are built on these; `connect()` and `wait()` answer `operation_not_supported`; `is_secure()` is `false`, `available()` 0 and the address getters empty. Override them when the socket can do better. As C++ hides the overloads of a name a class declares, add `using socket::read;` and `using socket::write;` to call the default overloads on the derived type.
+
+Sockets are not thread-safe: every call, `close()` and `cancel()` included, happens on a thread running the io_context passed to the constructor, and operations complete there. Data arriving from another thread (e.g. from the connection the virtual stream runs inside) is handed over by posting it to that io_context. At most one read and one write are pending at a time. Pending operations should support per-operation cancellation (asio operations and timers do), used by the awaitable operators (`||`); `close()` must end them anyway.
+
+```cpp
+// A virtual stream: what is written goes to `send`; what is received comes from push(),
+// called from any thread (an empty string ends the stream)
+class virtual_stream : public thinger::asio::socket, public std::enable_shared_from_this<virtual_stream> {
+public:
+    virtual_stream(boost::asio::io_context& io_context, std::function<void(std::string)> send)
+        : socket("virtual", io_context), signal_(io_context), send_(std::move(send)) {}
+
+    // keep the default overloads visible next to the ones implemented
+    using socket::read;
+    using socket::write;
+
+    void push(std::string data) {
+        boost::asio::post(io_context_, [self = shared_from_this(), data = std::move(data)] {
+            if (data.empty()) self->eof_ = true;
+            self->inbox_ += data;
+            self->signal_.cancel();     // wakes the pending read
+        });
+    }
+
+    thinger::awaitable<thinger::io_result> read_some(uint8_t buffer[], size_t max_size) override {
+        for (;;) {
+            if (!open_) co_return thinger::io_result{boost::asio::error::bad_descriptor, 0};
+            if (!inbox_.empty()) {
+                size_t bytes = std::min(max_size, inbox_.size());
+                std::memcpy(buffer, inbox_.data(), bytes);
+                inbox_.erase(0, bytes);
+                co_return thinger::io_result{boost::system::error_code{}, bytes};
+            }
+            if (eof_) co_return thinger::io_result{boost::asio::error::eof, 0};
+            // wait for push(), close() or cancel(), or the cancellation of this read
+            auto generation = cancelled_;
+            signal_.expires_at(std::chrono::steady_clock::time_point::max());
+            co_await signal_.async_wait(thinger::use_nothrow_awaitable);
+            auto state = co_await boost::asio::this_coro::cancellation_state;
+            if (cancelled_ != generation || state.cancelled() != boost::asio::cancellation_type::none)
+                co_return thinger::io_result{boost::asio::error::operation_aborted, 0};
+        }
+    }
+
+    thinger::awaitable<thinger::io_result> write(const uint8_t buffer[], size_t size) override {
+        if (!open_) co_return thinger::io_result{boost::asio::error::bad_descriptor, 0};
+        send_(std::string(reinterpret_cast<const char*>(buffer), size));
+        co_return thinger::io_result{boost::system::error_code{}, size};
+    }
+
+    void close() override { open_ = false; signal_.cancel(); }
+    void cancel() override { ++cancelled_; signal_.cancel(); }
+    bool is_open() const override { return open_; }
+
+private:
+    boost::asio::steady_timer signal_;
+    std::function<void(std::string)> send_;
+    std::string inbox_;
+    bool eof_ = false;
+    bool open_ = true;
+    uint64_t cancelled_ = 0;
+};
+```
+
+This `write()` returns at once; a socket whose other end may be slow should wait (e.g. for room in a window) to keep the flow control of a tunnel. `tests/fixtures/stream_test_helpers.hpp` has a complete one, used in tests in a tunnel with a WebSocket.
+
 ## Server-Sent Events (SSE)
 
 ### SSE Server
@@ -1099,6 +1269,7 @@ See the [examples](examples/) directory for complete working examples:
 - `http::async_client` - Thread-safe, uses internal worker threads
 - `http::websocket_client` - Single connection, thread-safe send operations
 - `http::websocket_connection` - Server-side WebSocket, thread-safe send, callbacks on IO thread
+- `asio::socket` (TCP, TLS, Unix, `asio::websocket`, custom sockets) - Not thread-safe, like the asio objects they wrap: use a socket on a thread running its io_context (`get_io_context()`), dispatching there from other threads. `socket_pipe::cancel()` may be called from any thread
 
 ## License
 

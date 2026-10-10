@@ -9,8 +9,14 @@
 
 namespace thinger::asio {
 
-/// Bidirectional coroutine-based pipe between two sockets.
-/// Takes exclusive ownership of both sockets and closes them when the pipe ends.
+/// Bidirectional coroutine-based pipe between two sockets: a tunnel between any two sockets
+/// (TCP, TLS, Unix, a WebSocket, or one defined by the application, see sockets/socket.hpp).
+/// Each direction writes what it read before reading more, so a slow reader slows its writer
+/// down. Takes exclusive ownership of both sockets and closes them when the pipe ends, which
+/// it does when either direction ends (the end of a stream, or an error): closing one end of
+/// the tunnel closes the other.
+/// Both sockets are used from the coroutine running run() (start() runs it on the io_context
+/// of the source), so they must belong to that io_context.
 /// set_on_end() must be called before run()/start().
 /// cancel(), the transfer stats and the socket getters may be called from any thread.
 class socket_pipe : public std::enable_shared_from_this<socket_pipe> {
