@@ -65,6 +65,9 @@ namespace thinger::http{
         /// Proxies whose forwarding header get_request_ip() accepts (set by the server)
         void set_trusted_proxies(std::shared_ptr<const trusted_proxies> proxies) { trusted_proxies_ = std::move(proxies); }
 
+        /// Trusted proxies set by the server (null if none is trusted)
+        const std::shared_ptr<const trusted_proxies>& get_trusted_proxies() const { return trusted_proxies_; }
+
         /// Virtual host serving the request (the application itself for the default host)
         const virtual_host* get_virtual_host() const { return virtual_host_; }
         void set_virtual_host(const virtual_host* host) { virtual_host_ = host; }

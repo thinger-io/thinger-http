@@ -8,6 +8,7 @@
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/request_handler.hpp>
+#include <thinger/http/server/reverse_proxy.hpp>     // forwarding requests to other servers
 
 // Routing
 #include <thinger/http/server/routing/route_handler.hpp>

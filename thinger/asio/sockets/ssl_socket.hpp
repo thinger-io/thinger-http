@@ -43,6 +43,10 @@ public:
     // some getters to check the state
     bool is_secure() const override;
 
+    // OpenSSL handle of the TLS stream, e.g. to set the name a client verifies in the
+    // certificate of the server before the handshake
+    SSL* native_handle() { return ssl_stream_.native_handle(); }
+
 private:
     // Move up to `size` bytes of read_ahead_ to `buffer`; how many were moved
     size_t take_read_ahead(uint8_t buffer[], size_t size);

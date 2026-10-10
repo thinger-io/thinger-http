@@ -238,6 +238,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/route_hardening_test.cpp)
     add_thinger_test(test_integration_route_hardening integration/route_hardening_test.cpp)
 endif()
 
+# Integration tests - Reverse proxy
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/reverse_proxy_test.cpp)
+    add_thinger_test(test_integration_reverse_proxy integration/reverse_proxy_test.cpp)
+endif()
+
 # ==================== ALL TESTS RUNNER ====================
 
 # Collect all test files
