@@ -30,13 +30,15 @@ public:
     virtual size_t get_size() = 0;
     virtual void to_buffer(std::vector<boost::asio::const_buffer>& buffer) const = 0;
 
-protected:
+    // Buffers of this data and the data following it (see set_next_data)
     void fill_buffer(std::vector<boost::asio::const_buffer>& buffer) {
         to_buffer(buffer);
         if (data_) {
             data_->fill_buffer(buffer);
         }
     }
+
+protected:
 
     virtual bool supports_buffer() {
         return true;

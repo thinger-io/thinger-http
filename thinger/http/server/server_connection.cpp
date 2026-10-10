@@ -226,31 +226,24 @@ awaitable<bool> server_connection::wait_peer_closed() {
     co_return co_await socket_->peer_closed();
 }
 
-awaitable<void> server_connection::write_frame(std::shared_ptr<http_stream> stream,
-                                                std::shared_ptr<http_frame> frame) {
-    // Log response
-    frame->log("SERVER RESPONSE", 0);
-
-    // Write frame to socket
-    co_await frame->to_socket(socket_);
-
+void server_connection::frame_written(http_stream& stream, const std::shared_ptr<http_frame>& frame) {
     // Reset timeout on activity. The timer holds a weak reference: once the read loop stopped
-    // (the connection closes after this response), only this write keeps the connection, so
-    // a response still unfinished when its queued frames are written (e.g. chunks written
-    // from detached code after the handler returned) loses the connection here
+    // (the connection closes after this response), only a pending write keeps the connection,
+    // so a response still unfinished when its queued frames are written (e.g. chunks written
+    // from detached code after the handler returned) loses the connection then
     reset_timeout();
 
     // Check if stream is complete
     if (frame->end_stream()) {
         // Response of a request taking over the connection: the socket may now belong to
         // someone else, never close it from here
-        if (stream->takes_over()) {
-            stream->takeover_response_written();
-            complete_takeover(*stream);
-            co_return;
+        if (stream.takes_over()) {
+            stream.takeover_response_written();
+            complete_takeover(stream);
+            return;
         }
 
-        if (!stream->keep_alive()) {
+        if (!stream.keep_alive()) {
             close();
         } else {
             // Remove completed stream from queue
@@ -263,33 +256,60 @@ awaitable<void> server_connection::write_frame(std::shared_ptr<http_stream> stre
 }
 
 void server_connection::process_output_queue() {
-    if (writing_) return;
+    while (!writing_) {
+        std::shared_ptr<http_stream> stream;
+        std::shared_ptr<http_frame> frame;
 
-    std::shared_ptr<http_stream> stream;
-    std::shared_ptr<http_frame> frame;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (request_queue_.empty()) return;
 
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (request_queue_.empty()) return;
+            stream = request_queue_.front();
+            if (stream->empty_queue()) return;
 
-        stream = request_queue_.front();
-        if (stream->empty_queue()) return;
+            frame = stream->current_frame();
+            stream->pop_frame();
+        }
 
-        frame = stream->current_frame();
-        stream->pop_frame();
+        // Log response
+        frame->log("SERVER RESPONSE", 0);
+
+        std::vector<boost::asio::const_buffer> buffers;
+        buffers.reserve(32);
+        frame->fill_buffer(buffers);
+
+        // Most frames fit in the socket send buffer: write them right away, without waiting.
+        // A write error is left to the read loop, as for a write that waited
+        boost::system::error_code ec;
+        size_t written = socket_->write_now(buffers, ec);
+        if (written == boost::asio::buffer_size(buffers) ||
+            (ec && ec != boost::asio::error::would_block && ec != boost::asio::error::operation_not_supported)) {
+            frame_written(*stream, frame);
+            continue;
+        }
+
+        // Write the rest once the socket accepts it
+        auto remaining = boost::asio::buffer_sequence_begin(buffers);
+        while (written > 0 && written >= remaining->size()) {
+            written -= remaining->size();
+            ++remaining;
+        }
+        if (written > 0) *remaining += written;
+        buffers.erase(buffers.begin(), remaining);
+
+        writing_ = true;
+        co_spawn(socket_->get_io_context(),
+            [this, self = shared_from_this(), stream = std::move(stream), frame = std::move(frame),
+             buffers = std::move(buffers)]() -> awaitable<void> {
+                co_await socket_->write(buffers);
+                frame_written(*stream, frame);
+                writing_ = false;
+
+                // Process more frames if available
+                process_output_queue();
+            },
+            detached);
     }
-
-    writing_ = true;
-
-    co_spawn(socket_->get_io_context(),
-        [this, self = shared_from_this(), stream, frame]() -> awaitable<void> {
-            co_await write_frame(stream, frame);
-            writing_ = false;
-
-            // Process more frames if available
-            process_output_queue();
-        },
-        detached);
 }
 
 void server_connection::queue_frame(const std::shared_ptr<http_stream>& stream, std::shared_ptr<http_frame> frame) {

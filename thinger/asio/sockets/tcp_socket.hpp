@@ -44,6 +44,7 @@ public:
     awaitable<io_result> write(const uint8_t buffer[], size_t size) override;
     awaitable<io_result> write(std::string_view str) override;
     awaitable<io_result> write(const std::vector<boost::asio::const_buffer> &buffers) override;
+    size_t write_now(const std::vector<boost::asio::const_buffer> &buffers, boost::system::error_code &ec) override;
 
     // wait
     awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type) override;

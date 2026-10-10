@@ -42,6 +42,11 @@ public:
     virtual awaitable<io_result> write(std::string_view str) = 0;
     virtual awaitable<io_result> write(const std::vector<boost::asio::const_buffer> &buffers) = 0;
 
+    // Write what the socket accepts right now, without waiting: the bytes written, with
+    // would_block if none, or operation_not_supported if the socket cannot write without
+    // waiting (then nothing is written). Not to be mixed with a pending write.
+    virtual size_t write_now(const std::vector<boost::asio::const_buffer> &buffers, boost::system::error_code &ec);
+
     // wait
     virtual awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type) = 0;
 

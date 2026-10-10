@@ -35,6 +35,10 @@ public:
     awaitable<io_result> write(const uint8_t buffer[], size_t size) override;
     awaitable<io_result> write(std::string_view str) override;
     awaitable<io_result> write(const std::vector<boost::asio::const_buffer>& buffers) override;
+    // Writes go through the TLS stream: never written without waiting
+    size_t write_now(const std::vector<boost::asio::const_buffer>& buffers, boost::system::error_code& ec) override {
+        return socket::write_now(buffers, ec);
+    }
 
     // some getters to check the state
     bool is_secure() const override;

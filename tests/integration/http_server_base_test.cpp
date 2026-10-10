@@ -1656,6 +1656,53 @@ static std::string read_one_response(boost::asio::ip::tcp::socket& sock,
     return response;
 }
 
+TEST_CASE("Server writes responses larger than the socket buffer whole and in order",
+          "[server][keepalive][integration]") {
+    ServerBaseTestFixture fixture;
+    auto& server = fixture.server;
+
+    // Bodies of several MB: written in part right away, the rest as the client reads
+    auto body = [](char seed) {
+        std::string text(4 * 1024 * 1024 + 123, ' ');
+        for (size_t i = 0; i < text.size(); ++i) text[i] = static_cast<char>('a' + (seed + i * 7) % 26);
+        return text;
+    };
+    server.get("/big/:seed", [&body](http::request& req, http::response& res) {
+        res.send(body(req["seed"][0]));
+    });
+    server.get("/small", [](http::response& res) {
+        res.send("small");
+    });
+
+    fixture.start_server();
+
+    boost::asio::io_context ioc;
+    auto sock = raw_connect(ioc, fixture.port);
+
+    // Pipelined: the second response must wait for the first one, written in several parts
+    std::string requests = "GET /big/a HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                           "GET /small HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                           "GET /big/b HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    boost::asio::write(sock, boost::asio::buffer(requests));
+
+    // Let the server fill the socket buffers before reading
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    boost::asio::streambuf buf;
+    auto first = read_one_response(sock, buf);
+    auto second = read_one_response(sock, buf);
+    auto third = read_one_response(sock, buf);
+
+    auto body_of = [](const std::string& response) {
+        auto position = response.find("\r\n\r\n");
+        return position == std::string::npos ? std::string{} : response.substr(position + 4);
+    };
+    REQUIRE(first.starts_with("HTTP/1.1 200"));
+    REQUIRE(body_of(first) == body('a'));
+    REQUIRE(body_of(second) == "small");
+    REQUIRE(body_of(third) == body('b'));
+}
+
 TEST_CASE("Server Keep-Alive behavior", "[server][keepalive][integration]") {
     ServerBaseTestFixture fixture;
     auto& server = fixture.server;
