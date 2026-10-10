@@ -2,8 +2,8 @@
 //
 // Each input is processed as the server does (fuzz::process_request: request_factory in
 // headers-only mode, framing validation, body_reader) and by
-// boost::beast::http::request_parser. Beast is used only here, as a reference: it is never
-// linked into the library.
+// boost::beast::http::request_parser. Beast is used only by the fuzz targets, as a reference:
+// it is never linked into the library.
 //
 // A request smuggling bug shows up as a disagreement on where a request ends: a front end
 // that frames the stream like one parser and a back end like the other see different
@@ -24,112 +24,14 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
-#include <boost/algorithm/string/predicate.hpp>
-#include <boost/beast/http/error.hpp>
-#include <boost/beast/http/parser.hpp>
-#include <boost/beast/http/string_body.hpp>
-#include "fuzz_common.hpp"
+#include "fuzz_differential.hpp"
 
 namespace beast_http = boost::beast::http;
 
 namespace {
 
-    struct beast_result {
-        fuzz::outcome result = fuzz::outcome::incomplete;
-        boost::beast::error_code error;
-        std::string method;
-        std::string target;
-        unsigned version = 0;
-        bool chunked = false;
-        uint64_t content_length = 0;
-        bool keep_alive = false;
-        std::string body;
-        size_t end = 0;
-    };
-
-    beast_result beast_process(const uint8_t* data, size_t size) {
-        beast_result r;
-        beast_http::request_parser<beast_http::string_body> parser;
-        parser.eager(true);
-        // No size limits other than the input itself (ours are checked by their own tests)
-        parser.header_limit(UINT32_MAX);
-        parser.body_limit(size);
-
-        size_t offset = 0;
-        while (!parser.is_done()) {
-            boost::beast::error_code ec;
-            size_t bytes = parser.put(boost::asio::buffer(data + offset, size - offset), ec);
-            offset += bytes;
-            if (ec == beast_http::error::need_more) {
-                r.result = fuzz::outcome::incomplete;
-                return r;
-            }
-            if (ec) {
-                r.result = fuzz::outcome::rejected;
-                r.error = ec;
-                return r;
-            }
-            if (bytes == 0 && !parser.is_done()) {
-                r.result = fuzz::outcome::incomplete;
-                return r;
-            }
-        }
-
-        auto& message = parser.get();
-        r.result = fuzz::outcome::accepted;
-        r.method = std::string(message.method_string());
-        r.target = std::string(message.target());
-        r.version = message.version();
-        r.chunked = parser.chunked();
-        r.content_length = parser.content_length().value_or(0);
-        r.keep_alive = parser.keep_alive();
-        r.body = message.body();
-        r.end = offset;
-        return r;
-    }
-
-    bool is_known_method(std::string_view method) {
-        for (auto known : {"GET", "HEAD", "POST", "PUT", "DELETE", "TRACE", "OPTIONS", "CONNECT", "PATCH"}) {
-            if (method == known) return true;
-        }
-        return false;
-    }
-
-    // Overwrite the values of the header lines named `name` in the header section of `input`
-    // with 'x' (keeping their size). Returns whether there was any.
-    bool neutralize_header(std::string& input, size_t header_end, std::string_view name) {
-        bool found = false;
-        size_t pos = input.find("\r\n") + 2;
-        while (pos < header_end - 2) {
-            size_t end = input.find("\r\n", pos);
-            size_t colon = input.find(':', pos);
-            if (colon < end && boost::iequals(std::string_view(input).substr(pos, colon - pos), name)) {
-                for (size_t i = colon + 2; i < end; i++) input[i] = 'x';
-                found = true;
-            }
-            pos = end + 2;
-        }
-        return found;
-    }
-
-    // Rename (first character to 'X') the lines in the body of a chunked request, between
-    // `begin` and `end`, that start with a field Beast validates in trailers. A line in chunk
-    // data may be renamed too: it changes the body for both parsers, not its framing.
-    bool rename_trailers(std::string& input, size_t begin, size_t end) {
-        bool found = false;
-        for (size_t pos = begin; pos < end; pos++) {
-            if (pos >= 2 && input[pos - 2] == '\r' && input[pos - 1] == '\n') {
-                std::string_view line = std::string_view(input).substr(pos, end - pos);
-                for (std::string_view name : {"Content-Length:", "Transfer-Encoding:", "Connection:", "Proxy-Connection:"}) {
-                    if (line.size() >= name.size() && boost::iequals(line.substr(0, name.size()), name)) {
-                        input[pos] = 'X';
-                        found = true;
-                    }
-                }
-            }
-        }
-        return found;
-    }
+    using fuzz::beast_result;
+    using fuzz::describe;
 
     /**
      * Discrepancies known to be acceptable, where we accept a request Beast rejects (see
@@ -154,44 +56,18 @@ namespace {
         if (req.is_chunked_transfer() &&
             (theirs.error == beast_http::error::bad_transfer_encoding || theirs.error == beast_http::error::bad_content_length ||
              theirs.error == beast_http::error::multiple_content_length || theirs.error == beast_http::error::bad_value)) {
-            if (rename_trailers(input, ours.header_end, ours.end)) return "framing or Connection field in the trailer section";
+            if (fuzz::rename_trailers(input, ours.header_end, ours.end)) return "framing or Connection field in the trailer section";
         }
 
         // Beast rejects a Connection (or Proxy-Connection) value that is not a valid token
         // list. We only look for the tokens we know in it: it does not frame the message.
         if (theirs.error == beast_http::error::bad_value) {
-            bool connection = neutralize_header(input, ours.header_end, "Connection");
-            bool proxy_connection = neutralize_header(input, ours.header_end, "Proxy-Connection");
+            bool connection = fuzz::neutralize_header(input, ours.header_end, "Connection");
+            bool proxy_connection = fuzz::neutralize_header(input, ours.header_end, "Proxy-Connection");
             if (connection || proxy_connection) return "Connection header that is not a token list";
         }
 
         return nullptr;
-    }
-
-    std::string describe(const fuzz::server_result& r) {
-        std::string s = fuzz::to_string(r.result);
-        if (r.result == fuzz::outcome::accepted) {
-            auto& req = *r.request;
-            s += " method=" + thinger::http::get_method(req.get_method()) + " target=" + fuzz::escape(req.get_uri()) +
-                 " version=" + std::to_string(req.get_http_version_major()) + "." + std::to_string(req.get_http_version_minor()) +
-                 " chunked=" + std::to_string(req.is_chunked_transfer()) +
-                 " content_length=" + std::to_string(req.get_content_length()) +
-                 " header_end=" + std::to_string(r.header_end) + " end=" + std::to_string(r.end) +
-                 " body=[" + fuzz::escape(r.body) + "]";
-        }
-        return s;
-    }
-
-    std::string describe(const beast_result& r) {
-        std::string s = fuzz::to_string(r.result);
-        if (r.result == fuzz::outcome::rejected) s += " (" + r.error.message() + ")";
-        if (r.result == fuzz::outcome::accepted) {
-            s += " method=" + r.method + " target=" + fuzz::escape(r.target) +
-                 " version=" + std::to_string(r.version / 10) + "." + std::to_string(r.version % 10) +
-                 " chunked=" + std::to_string(r.chunked) + " content_length=" + std::to_string(r.content_length) +
-                 " end=" + std::to_string(r.end) + " body=[" + fuzz::escape(r.body) + "]";
-        }
-        return s;
     }
 
     [[noreturn]] void disagree(const char* what, std::string_view input, const fuzz::server_result& ours, const beast_result& theirs) {
@@ -202,7 +78,7 @@ namespace {
     // request when both accept it and the connection would carry another one, 0 otherwise.
     size_t compare(const uint8_t* data, size_t size, int normalizations = 0) {
         fuzz::server_result ours = fuzz::process_request(data, size);
-        beast_result theirs = beast_process(data, size);
+        beast_result theirs = fuzz::beast_process(data, size);
         std::string_view input(reinterpret_cast<const char*>(data), size);
 
         using fuzz::outcome;
@@ -234,11 +110,7 @@ namespace {
         if (req.get_http_version_major() * 10 + req.get_http_version_minor() != static_cast<int>(theirs.version)) {
             disagree("different HTTP version", input, ours, theirs);
         }
-        auto method = req.get_method();
-        if (method == thinger::http::method::UNKNOWN ? is_known_method(theirs.method)
-                                                      : thinger::http::get_method(method) != theirs.method) {
-            disagree("different method", input, ours, theirs);
-        }
+        if (!fuzz::same_method(req.get_method(), theirs.method)) disagree("different method", input, ours, theirs);
 
         return req.keep_alive() ? ours.end : 0;
     }
