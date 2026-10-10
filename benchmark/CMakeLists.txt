@@ -11,3 +11,7 @@ target_link_libraries(benchmark_routing PRIVATE thinger::http)
 # Server with the same ~200 routes, for end-to-end load tests (wrk, bombardier)
 add_executable(benchmark_routes_server routing/routes_server.cpp)
 target_link_libraries(benchmark_routes_server PRIVATE thinger::http)
+
+# Server with a few routes, for end-to-end load tests of the per-request cost
+add_executable(benchmark_few_routes_server routing/few_routes_server.cpp)
+target_link_libraries(benchmark_few_routes_server PRIVATE thinger::http)
