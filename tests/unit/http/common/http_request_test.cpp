@@ -1,6 +1,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <thinger/http/common/http_request.hpp>
+#include <random>
+#include <regex>
 #include <sstream>
+#include <vector>
 
 using namespace thinger::http;
 
@@ -334,5 +337,82 @@ TEST_CASE("HTTP Request URL building", "[http][request][unit]") {
                         (url.find("q=test%20query") != std::string::npos);
         REQUIRE(has_query);
         REQUIRE(url.find("page=2") != std::string::npos);
+    }
+}
+
+namespace {
+
+    // set_uri() as it was implemented with a regular expression, kept here as the reference
+    // the hand-written parsing must match exactly
+    void regex_set_uri(const std::string& uri, std::string& resource,
+                       std::multimap<std::string, std::string>& params) {
+        std::smatch what;
+        std::string::const_iterator start = uri.begin();
+        std::string::const_iterator end   = uri.end();
+
+        static const std::regex resource_regex("(\\/[^\\?#]*)");
+        if(std::regex_search(start, end, what, resource_regex)){
+            resource = thinger::http::util::url::url_decode(std::string(what[0].first, what[1].second));
+            start = what[0].second;
+        }
+
+        if(start!=uri.end() && *start=='?'){
+            ++start;
+            thinger::http::util::url::parse_url_encoded_data(start, end, params);
+        }
+    }
+
+    // Parse `uri` with set_uri() and with the reference, from the same previous state
+    void check_same_as_regex(const std::string& uri) {
+        INFO("uri: \"" << uri << "\"");
+        for (bool previous_state : {false, true}) {
+            http_request req;
+            std::string resource;
+            std::multimap<std::string, std::string> params;
+            if (previous_state) {
+                req.set_resource("/previous");
+                req.add_uri_parameter("key", "value");
+                resource = "/previous";
+                params.emplace("key", "value");
+            }
+
+            req.set_uri(uri);
+            regex_set_uri(uri, resource, params);
+
+            REQUIRE(req.get_resource() == resource);
+            REQUIRE(req.get_uri_parameters() == params);
+            REQUIRE(req.get_uri() == uri);
+        }
+    }
+
+}
+
+TEST_CASE("HTTP Request URI parsing matches the regex it replaced", "[http][request][unit]") {
+
+    SECTION("Edge cases") {
+        const std::vector<std::string> uris = {
+            "", "/", "//", "///", "a", "abc", "*", "?", "#", "?a=1", "#a=1", "?/a", "#/a",
+            "a/b", "abc/def?x=1", "a?b/c?d=1", "a#b/c?d=1", "/a#b?c=1", "/a?b#c", "/a?b=1#c=2",
+            "/a?b=1?c=2", "/a??b=1", "/a?#", "/a#?", "/?", "/#", "/a/", "/a/?", "/a/#",
+            "/a/b/c/", "/a%20b", "/a%2", "/a%", "/a%zz", "/a%2Fb?c%3D=%26", "/a+b?c+d=e+f",
+            "/a?=1", "/a?&&", "/a?k", "/a?k=", "/a?k=v&k=w", "/a?%=%", "/a?k=%zz",
+            "?a=1/b", "x?a=1/b", "%2F?a", "http://host/path?x=1", "/a\nb?c", "/a b?c d=e f",
+            std::string("/a\0b?c=\0", 8), "/\xff\xfe?\xff=\xfe",
+        };
+        for (const auto& uri : uris) check_same_as_regex(uri);
+    }
+
+    SECTION("Generated uris") {
+        // Fixed seed: every run checks the same uris
+        std::mt19937 random(12345);
+        const std::string alphabet = "/?#&=%ab01 +F";
+        std::uniform_int_distribution<size_t> length(0, 24);
+        std::uniform_int_distribution<size_t> pick(0, alphabet.size() - 1);
+        for (int i = 0; i < 20000; ++i) {
+            std::string uri;
+            auto size = length(random);
+            for (size_t j = 0; j < size; ++j) uri.push_back(alphabet[pick(random)]);
+            check_same_as_regex(uri);
+        }
     }
 }

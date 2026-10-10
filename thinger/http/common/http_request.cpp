@@ -299,17 +299,18 @@ namespace thinger::http {
     }
 
     void http_request::set_uri(const std::string& uri){
-        std::smatch what;
         std::string::const_iterator start = uri.begin();
         std::string::const_iterator end   = uri.end();
 
-        static const std::regex resource_regex("(\\/[^\\?#]*)");
-        if(std::regex_search(start, end, what, resource_regex)){
-            resource_ = util::url::url_decode(std::string(what[0].first, what[1].second));
-            start = what[0].second;
+        // The resource goes from the first '/' (wherever it is) up to the first '?' or '#'
+        // after it, or the end. Without any '/', it is left as is
+        if(auto slash = uri.find('/'); slash != std::string::npos){
+            auto resource_end = std::min(uri.find_first_of("?#", slash), uri.size());
+            resource_ = util::url::url_decode(uri.substr(slash, resource_end - slash));
+            start = uri.begin() + static_cast<std::ptrdiff_t>(resource_end);
         }
 
-        // Regex will stop at ? or # or end of the uri. Check if there is parameters available for its parsing
+        // Query parameters follow the resource (or start the uri, if it has no resource)
         if(start!=uri.end() && *start=='?'){
             ++start;
             parse_url_encoded_data(start, end, uri_params_);
