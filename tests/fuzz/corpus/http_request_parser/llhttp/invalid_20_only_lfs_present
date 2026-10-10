@@ -1,0 +1,19 @@
+POST / HTTP/1.1
+Transfer-Encoding: chunked
+Trailer: Baz
+Foo: abc
+Bar: def
+
+1
+A
+1;abc
+B
+1;def=ghi
+C
+1;jkl="mno"
+D
+0
+
+Baz: ghi
+
+\

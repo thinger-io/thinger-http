@@ -1,0 +1,8 @@
+POST /hello HTTP/1.1
+Host: localhost
+Foo: bar
+ Content-Length: 38
+
+GET /bye HTTP/1.1
+Host: localhost
+

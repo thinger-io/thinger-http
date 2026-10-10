@@ -1,0 +1,13 @@
+POST / HTTP/1.1
+Host: localhost
+transfer-encoding: chunked
+Content-Length: 4
+
+43
+POST /smuggled HTTP/1.1
+Host: localhost
+Content-Length: 15
+
+x=1
+0
+

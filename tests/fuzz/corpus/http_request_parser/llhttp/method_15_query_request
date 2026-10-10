@@ -1,0 +1,7 @@
+QUERY /contacts HTTP/1.1
+Host: example.org
+Content-Type: example/query
+Accept: text/csv
+Content-Length: 41
+
+select surname, givenname, email limit 10

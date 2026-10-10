@@ -1,0 +1,9 @@
+POST /ws HTTP/1.1
+Host: localhost
+Upgrade: h2c
+Connection: Upgrade
+Content-Length: 5
+
+helloGET /a HTTP/1.1
+Host: localhost
+

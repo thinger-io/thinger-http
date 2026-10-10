@@ -1,0 +1,15 @@
+GET / HTTP/1.1
+Host: a
+Connection: close 
+Transfer-Encoding: chunked 
+
+5;ABCD
+34
+E
+0
+
+GET / HTTP/1.1 
+Host: a
+Content-Length: 5
+
+0

@@ -1,0 +1,4 @@
+GET /a HTTP/1.1
+Host: localhost
+
+GET /b HTT

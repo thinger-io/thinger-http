@@ -1,0 +1,7 @@
+3 
+  
+foo
+
+GET /next HTTP/1.1
+Host: localhost
+

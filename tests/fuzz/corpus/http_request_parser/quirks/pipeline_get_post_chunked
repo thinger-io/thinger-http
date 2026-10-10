@@ -1,0 +1,15 @@
+GET /a HTTP/1.1
+Host: localhost
+
+POST /b HTTP/1.1
+Host: localhost
+Content-Length: 5
+
+helloPOST /c HTTP/1.1
+Host: localhost
+Transfer-Encoding: chunked
+
+5
+hello
+0
+
