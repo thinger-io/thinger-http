@@ -391,15 +391,6 @@ namespace thinger::http {
         if(::thinger::util::ascii::iequals(key, http::header::host)){
             set_host(std::move(value));
         }else{
-            // detect chunked transfer encoding: it must be the only coding, in a single header,
-            // as no other is supported (and the body could not be framed safely)
-            if(::thinger::util::ascii::iequals(key, http::header::transfer_encoding)){
-                if(::thinger::util::ascii::iequals(value, "chunked") && !has_transfer_encoding_header()){
-                    chunked_transfer_ = true;
-                }else{
-                    invalid_transfer_encoding_ = true;
-                }
-            }
             // handle header by parent
             headers::process_header(std::move(key), std::move(value));
         }

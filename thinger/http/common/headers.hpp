@@ -98,6 +98,20 @@ public:
     // and removed, so checking it for every parsed header is not a scan of all the headers)
     bool has_content_length_header() const { return content_length_header_; }
     bool has_transfer_encoding_header() const { return transfer_encoding_header_; }
+    // Whether the body is chunked: "Transfer-Encoding: chunked" (see has_valid_framing)
+    bool is_chunked_transfer() const { return chunked_transfer_; }
+    // Whether the body framing of a received message is unambiguous (RFC 9112, section 6.3):
+    // a valid Content-Length, or "Transfer-Encoding: chunked" alone (the only coding, in a
+    // single header: no other is supported), but not both, and Transfer-Encoding only from
+    // HTTP/1.1 on (section 6.1: in an HTTP/1.0 message, its framing is faulty). Otherwise
+    // where the message ends, and so where the next one starts, is unknown: it must be
+    // rejected, and the connection closed.
+    bool has_valid_framing() const {
+        bool before_http_1_1 = http_version_major_ < 1 || (http_version_major_ == 1 && http_version_minor_ < 1);
+        return !invalid_content_length_ && !invalid_transfer_encoding_
+            && !(chunked_transfer_ && content_length_header_)
+            && !(before_http_1_1 && transfer_encoding_header_);
+    }
     int get_http_version_major() const;
     int get_http_version_minor() const;
     bool keep_alive() const;
@@ -114,6 +128,9 @@ public:
     virtual void process_header(std::string key, std::string value);
 
 protected:
+    // Keep track of the body framing (Content-Length, Transfer-Encoding) of a received header
+    void process_framing_header(std::string_view key, std::string_view value);
+
     // Keep track of the framing headers present, after adding or removing a `key` header
     void on_header_added(std::string_view key);
     void on_header_removed(std::string_view key);
@@ -127,6 +144,8 @@ protected:
     bool invalid_content_length_  = false;
     bool content_length_header_   = false;
     bool transfer_encoding_header_ = false;
+    bool chunked_transfer_         = false;
+    bool invalid_transfer_encoding_ = false;
     uint8_t http_version_major_   = 1;
     uint8_t http_version_minor_   = 1;
 };

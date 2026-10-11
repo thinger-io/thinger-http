@@ -36,7 +36,16 @@ namespace thinger::http{
 
         if(is_header(key, header::accept)){
             stream_ = ::thinger::util::ascii::iequals(value, accept::event_stream);
-        }else if(is_header(key, header::content_length)){
+        }else{
+            process_framing_header(key, value);
+        }
+
+        on_header_added(key);
+        headers_.emplace_back(std::move(key), std::move(value));
+    }
+
+    void headers::process_framing_header(std::string_view key, std::string_view value){
+        if(is_header(key, header::content_length)){
             // Content-Length = 1*DIGIT: anything else (sign, spaces, lists, overflow) or a
             // repeated header with a different value makes the message framing ambiguous
             size_t length = 0;
@@ -48,10 +57,14 @@ namespace thinger::http{
                 invalid_content_length_ = true;
             }
             content_length_ = length;
+        }else if(is_header(key, header::transfer_encoding)){
+            // chunked must be the only coding, in a single header
+            if(::thinger::util::ascii::iequals(value, "chunked") && !transfer_encoding_header_){
+                chunked_transfer_ = true;
+            }else{
+                invalid_transfer_encoding_ = true;
+            }
         }
-
-        on_header_added(key);
-        headers_.emplace_back(std::move(key), std::move(value));
     }
 
     void headers::add_header(std::string key, std::string value){
