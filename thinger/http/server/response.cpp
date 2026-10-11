@@ -287,6 +287,8 @@ void response::redirect(const std::string& url, http::http_response::status redi
     auto response = new_response();
     response->set_status(redirect_type);
     response->add_header(header::location, url);
+    // (without it, a keep-alive client would read the body until the connection closes)
+    response->set_content_length(0);
     send_message(std::move(response));
 }
 
