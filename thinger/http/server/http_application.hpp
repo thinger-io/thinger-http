@@ -162,9 +162,10 @@ private:
     std::shared_ptr<http_response> make_error_response(http_response::status status, const std::string& message) const;
     // Middlewares, body reading and handler of a matched request, then what is left of its body
     awaitable<void> serve(std::shared_ptr<request> req, response& res, virtual_host& host, const route* matched_route);
-    // The same, within the timeout of the route
+    // The same, within the timeout of the route (or of the host)
     awaitable<void> serve_with_timeout(std::shared_ptr<request> req, response res, virtual_host& host,
-                                       const route& matched_route);
+                                       const route* matched_route, std::chrono::milliseconds timeout,
+                                       http_response::status status);
     awaitable<bool> run_middlewares(request& req, response& res);
     awaitable<void> discard_unread_body(request& req);
 

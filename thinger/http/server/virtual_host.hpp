@@ -4,6 +4,7 @@
 #include "routing/route_handler.hpp"
 #include "routing/route.hpp"
 #include "routing/route_registrar.hpp"
+#include <algorithm>
 #include <chrono>
 #include <optional>
 #include <regex>
@@ -59,6 +60,35 @@ public:
     }
     void set_not_found_handler(std::nullptr_t) { router_.set_fallback_handler(nullptr); }
 
+    // Limits of the requests served by this host: the default of its routes (a group or a
+    // route can set its own, see route::max_body_size, route::timeout, route::decode_limits),
+    // and the limits of its not-found handler (e.g. a reverse proxy for the whole host).
+    // Unset, the application ones apply (http_application::set_max_body_size,
+    // set_body_limits; no timeout). Precedence: route > group > host > application. On the
+    // application itself, they are those of the default host only. Set before serving.
+    virtual_host& max_body_size(size_t size) {
+        max_body_size_ = size;
+        return *this;
+    }
+
+    virtual_host& timeout(std::chrono::milliseconds timeout,
+                          http_response::status status = http_response::status::gateway_timeout) {
+        timeout_ = std::max(timeout, std::chrono::milliseconds{0});
+        timeout_status_ = status;
+        return *this;
+    }
+
+    virtual_host& decode_limits(body_limits limits) {
+        decode_limits_ = limits;
+        return *this;
+    }
+
+    // Limits set on the host (nullopt if unset)
+    const std::optional<size_t>& get_max_body_size() const { return max_body_size_; }
+    const std::optional<std::chrono::milliseconds>& get_timeout() const { return timeout_; }
+    http_response::status get_timeout_status() const { return timeout_status_; }
+    const std::optional<body_limits>& get_decode_limits() const { return decode_limits_; }
+
     // Name the host was registered with ("*" for the default host)
     const std::string& name() const { return name_; }
 
@@ -95,6 +125,12 @@ private:
     std::string name_;
     std::optional<std::regex> pattern_;
     std::vector<std::string> parameters_;
+
+    // Limits of the host (unset: the application ones)
+    std::optional<size_t> max_body_size_;
+    std::optional<std::chrono::milliseconds> timeout_;
+    http_response::status timeout_status_ = http_response::status::gateway_timeout;
+    std::optional<body_limits> decode_limits_;
 };
 
 // Routes registered through a group get its path prefix, and inherit its tags, metadata

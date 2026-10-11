@@ -256,12 +256,17 @@ awaitable<void> http_application::handle(std::shared_ptr<request> req, std::shar
         res.error(http_response::status::internal_server_error);
         co_return;
     }
-    if (matched_route) {
-        if (const auto& limit = matched_route->get_max_body_size()) req->set_max_body_size(*limit);
-        if (matched_route->get_timeout().count() > 0) {
-            co_await serve_with_timeout(std::move(req), std::move(res), *host, *matched_route);
-            co_return;
-        }
+    // Limits of the route, else of its host (which also apply to its not-found handler),
+    // else of the application
+    const auto& limit = matched_route && matched_route->get_max_body_size() ? matched_route->get_max_body_size()
+                                                                           : host->get_max_body_size();
+    if (limit) req->set_max_body_size(*limit);
+    bool route_timeout = matched_route && matched_route->get_timeout();
+    const auto& timeout = route_timeout ? matched_route->get_timeout() : host->get_timeout();
+    if (timeout && timeout->count() > 0) {
+        auto status = route_timeout ? matched_route->get_timeout_status() : host->get_timeout_status();
+        co_await serve_with_timeout(std::move(req), std::move(res), *host, matched_route, *timeout, status);
+        co_return;
     }
     co_await serve(std::move(req), res, *host, matched_route);
 }
@@ -349,10 +354,11 @@ namespace {
 }
 
 awaitable<void> http_application::serve_with_timeout(std::shared_ptr<request> req, response res,
-                                                     virtual_host& host, const route& matched_route) {
+                                                     virtual_host& host, const route* matched_route,
+                                                     std::chrono::milliseconds timeout,
+                                                     http_response::status status) {
     auto executor = co_await boost::asio::this_coro::executor;
     auto deadline = std::make_shared<request_deadline>(executor);
-    auto timeout = matched_route.get_timeout();
 
     // The timer stops once the response starts, whatever thread starts it
     res.on_start([weak = std::weak_ptr<request_deadline>(deadline)] {
@@ -370,8 +376,7 @@ awaitable<void> http_application::serve_with_timeout(std::shared_ptr<request> re
     // On expiry, the request is answered with an error. A body still unread may be being
     // read by the handler, which goes on: the connection closes after the response
     deadline->timer.expires_after(timeout);
-    deadline->timer.async_wait([deadline, req, res, status = matched_route.get_timeout_status()](
-                                   const boost::system::error_code& ec) mutable {
+    deadline->timer.async_wait([deadline, req, res, status](const boost::system::error_code& ec) mutable {
         if (ec || res.has_responded()) return;
         bool pending_body = req->has_pending_body();
         if (pending_body) close_after_response(*req);
@@ -388,8 +393,8 @@ awaitable<void> http_application::serve_with_timeout(std::shared_ptr<request> re
     // signal alive while its slot is in use)
     auto cancel = std::make_shared<boost::asio::cancellation_signal>();
     co_spawn(executor,
-        [this, req, res, &host, &matched_route, deadline, cancel]() mutable -> awaitable<void> {
-            co_await serve(req, res, host, &matched_route);
+        [this, req, res, &host, matched_route, deadline, cancel]() mutable -> awaitable<void> {
+            co_await serve(req, res, host, matched_route);
             deadline->served = true;
             deadline->wake.cancel();
         },

@@ -51,8 +51,8 @@ using websocket_stream_handler = std::function<void(std::shared_ptr<asio::websoc
 // Response to a request. It is a handle: copies share the response, so a handler may keep
 // a copy and answer later, from any thread. Only the first answer is sent: the others are
 // dropped, even when they run at the same time from several threads. Setting the status or
-// headers before answering (status(), header()) is not thread-safe: do it from one thread,
-// before any answer.
+// headers before answering (status(), header()) is not thread-safe: do it from the thread
+// running the handler, before any answer (a route timeout answers with the headers set so far).
 class response {
 public:
     response(const std::shared_ptr<server_connection>& connection,

@@ -336,6 +336,89 @@ TEST_CASE("The reverse proxy honors the route limit and its own, the smaller one
     CHECK(backend_calls == 3);
 }
 
+TEST_CASE("Virtual hosts set the limits of their routes and not-found handler", "[server][body][limits][timeout][vhost][integration]") {
+    http::server backend;
+    backend.set_max_body_size(1024 * 1024);
+    backend.post("/echo", [](http::request& req, http::response& res) {
+        res.send("size=" + std::to_string(req.body().size()));
+    });
+    backend.get("/slow", [](http::response& res) -> thinger::awaitable<void> {
+        co_await sleep_for(1500ms);
+        res.send("late");
+    });
+    running_server running_backend(backend);
+    auto target = *http::proxy_target::from_url("http://127.0.0.1:" + std::to_string(running_backend.port));
+
+    http::server server;
+    server.set_max_body_size(1024);
+    http::reverse_proxy proxy;
+    auto forward = [&](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        co_await proxy.forward(req, res, target);
+    };
+
+    // A whole host forwarded to the backend, with larger bodies and a timeout
+    server.host("proxy.example.com").max_body_size(64 * 1024).timeout(300ms).set_not_found_handler(forward);
+    // The default host forwards too, with the application limits
+    server.set_not_found_handler(forward);
+
+    // Host defaults for its routes, which groups and routes override
+    auto size_handler = [](http::request& req, http::response& res) {
+        res.send("size=" + std::to_string(req.body().size()));
+    };
+    auto slow = [](http::response& res) -> thinger::awaitable<void> {
+        co_await sleep_for(800ms);
+        res.send("done");
+    };
+    auto& api = server.host("api.example.com").max_body_size(64 * 1024).timeout(150ms).decode_limits({.max_depth = 1});
+    api.post("/size", size_handler);
+    api.post("/small", size_handler).max_body_size(100);
+    api.group("/group").max_body_size(512).post("/size", size_handler);
+    api.get("/slow", slow);
+    api.get("/no-timeout", slow).timeout(0ms);
+    api.post("/json", [](nlohmann::json& body, http::response& res) { res.json(body); });
+    running_server running(server);
+
+    auto request = [](const std::string& host, const std::string& method, const std::string& path,
+                      const std::string& body = "") {
+        return method + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\nContent-Length: " +
+               std::to_string(body.size()) + "\r\n\r\n" + body;
+    };
+    auto body = std::string(4000, 'x');
+
+    SECTION("Whole-host proxy: a body over the application limit, within the host one") {
+        CHECK(raw_exchange(running.port, request("proxy.example.com", "POST", "/echo", body)).data.find("size=4000") != std::string::npos);
+        auto chunked = post_chunked("/echo", body);
+        chunked.replace(chunked.find("Host: localhost"), 15, "Host: proxy.example.com");
+        connection conn(running.port);
+        conn.send(chunked);
+        CHECK(conn.read_response().find("size=4000") != std::string::npos);
+        // Over the host limit
+        CHECK(raw_exchange(running.port, request("proxy.example.com", "POST", "/echo", std::string(70000, 'x'))).data.starts_with("HTTP/1.1 413"));
+        // The default host keeps the application limit
+        CHECK(raw_exchange(running.port, request("other.example.com", "POST", "/echo", body)).data.starts_with("HTTP/1.1 413"));
+    }
+
+    SECTION("Whole-host proxy: the host timeout") {
+        auto start = clock::now();
+        auto result = raw_exchange(running.port, request("proxy.example.com", "GET", "/slow"));
+        CHECK(result.data.starts_with("HTTP/1.1 504"));
+        CHECK(clock::now() - start < 1200ms);
+        // the default host has no timeout
+        result = raw_exchange(running.port, request("other.example.com", "GET", "/slow"), 5s);
+        CHECK(result.data.starts_with("HTTP/1.1 200"));
+    }
+
+    SECTION("Host defaults, overridden by groups and routes") {
+        CHECK(raw_exchange(running.port, request("api.example.com", "POST", "/size", body)).data.find("size=4000") != std::string::npos);
+        CHECK(raw_exchange(running.port, request("api.example.com", "POST", "/small", body)).data.starts_with("HTTP/1.1 413"));
+        CHECK(raw_exchange(running.port, request("api.example.com", "POST", "/group/size", body)).data.starts_with("HTTP/1.1 413"));
+        CHECK(raw_exchange(running.port, request("api.example.com", "GET", "/slow")).data.starts_with("HTTP/1.1 504"));
+        CHECK(raw_exchange(running.port, request("api.example.com", "GET", "/no-timeout")).data.starts_with("HTTP/1.1 200"));
+        CHECK(raw_exchange(running.port, request("api.example.com", "POST", "/json", "[1]")).data.starts_with("HTTP/1.1 200"));
+        CHECK(raw_exchange(running.port, request("api.example.com", "POST", "/json", "[[1]]")).data.starts_with("HTTP/1.1 400"));
+    }
+}
+
 TEST_CASE("In-memory dispatch honors the route limits", "[server][body][limits][dispatch][integration]") {
     http::server server;
     server.set_max_body_size(1024);

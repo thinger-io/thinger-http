@@ -1,6 +1,7 @@
 #include "route.hpp"
 #include "route_pattern.hpp"
 #include "../response.hpp"
+#include "../virtual_host.hpp"
 #include <regex>
 #include <algorithm>
 #include "../../../util/ascii.hpp"
@@ -45,7 +46,7 @@ route& route::max_body_size(size_t size) {
 }
 
 route& route::timeout(std::chrono::milliseconds timeout, http_response::status status) {
-    timeout_ = timeout.count() > 0 ? timeout : std::chrono::milliseconds{0};
+    timeout_ = std::max(timeout, std::chrono::milliseconds{0});
     timeout_status_ = status;
     return *this;
 }
@@ -182,8 +183,12 @@ bool route::decode_body(request& req, response& res, nlohmann::json& json) const
         auto match = match_body_type(req, res);
         if (!match) return false;
         try {
-            json = match->format->decode(body, match->type,
-                                         decode_limits_ ? *decode_limits_ : req.get_body_settings().limits);
+            // Limits of the route, else of its virtual host, else of the application
+            const auto* host = req.get_virtual_host();
+            const auto& limits = decode_limits_ ? *decode_limits_
+                               : host && host->get_decode_limits() ? *host->get_decode_limits()
+                               : req.get_body_settings().limits;
+            json = match->format->decode(body, match->type, limits);
         } catch (const body_decode_error& e) {
             res.error(e.status(), e.what());
             return false;
