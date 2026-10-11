@@ -39,6 +39,7 @@ To reproduce, see [`benchmark/compare`](benchmark/compare/): `benchmark/compare/
 - **Virtual Hosts** - Routes per host name, exact or by pattern, on the same listener
 - **Reverse Proxy** - Forward requests to HTTP, HTTPS or Unix socket targets, streaming bodies and tunneling WebSockets
 - **C++20 Coroutines** - Async-first API with sync wrappers
+- **Graceful Shutdown** - Stop listening, finish the requests in flight and tell long-lived connections, within a grace period; connection statistics at no cost per request
 - **Lightweight** - Minimal dependencies, suitable for embedded systems
 
 ## Quick Start
@@ -800,6 +801,54 @@ server.wait();  // Wait for shutdown
 
 // Stop server
 server.stop();
+```
+
+`stop()` stops listening right away and leaves the connections open as they are (on `http::server`, its io_context stops too). For a graceful stop, see below.
+
+### Shutdown
+
+`shutdown(grace)` stops the server gracefully, e.g. before a deploy or on `SIGTERM`:
+
+- it stops listening right away: new connections are refused (TCP and Unix sockets; the socket file is removed);
+- idle keep-alive connections are closed at once;
+- a connection handling a request finishes it: its response tells the client with `Connection: close` (unless the response already started: then the connection is closed after it), and the connection closes after it;
+- connections taken over are told (once, on their thread): a `websocket_connection` closes with 1001 (Going Away), an `sse_connection` closes, and others call what the application set with `on_shutdown()` (`websocket_connection`, `sse_connection`), or with `http::on_server_shutdown(socket, callback)` for the socket of `take_over()` or `upgrade_websocket_stream()`. Proxied WebSockets (reverse proxy tunnels) are not told: they end when either side closes. The server calls `on_shutdown()` once when the shutdown starts, for anything else the application runs;
+- once every connection is gone, or the grace period passes, whatever is left is closed, and the server stops as with `stop()` (`wait()` returns).
+
+`shutdown()` waits for that end, and returns whether every connection finished in time. `begin_shutdown(grace, on_done)` returns at once, and calls `on_done(clean)` at the end. Both can be called from any thread, several times (later calls wait for the same end), and from an `asio::signal_set` handler (not from a raw signal handler: they lock and allocate). On a thread of the server (a handler, or a worker of a `pool_server`) only `begin_shutdown()` can be used: `shutdown()` cannot wait there, so it starts it and returns `false`. `stop()` during a shutdown ends it at once (`false`).
+
+```cpp
+thinger::http::pool_server server;
+// ... routes ...
+server.on_shutdown([&] { devices.disconnect_all(); });
+server.listen("0.0.0.0", 8080);
+
+boost::asio::signal_set signals(io_context, SIGINT, SIGTERM);
+signals.async_wait([&](auto, int) {
+    server.begin_shutdown(std::chrono::seconds(30), [](bool clean) {
+        LOG_INFO("shut down{}", clean ? "" : " (some connections were cut)");
+    });
+});
+server.wait();  // returns once the shutdown ends
+
+// a WebSocket that says goodbye its own way
+res.upgrade_websocket([](std::shared_ptr<thinger::http::websocket_connection> ws) {
+    ws->on_shutdown([ws] { ws->send_text("{\"event\":\"restarting\"}"); ws->stop(); });
+});
+```
+
+Compared with Node.js: `server.close()` also stops listening, closes idle connections (since Node 19) and waits for the others, but has no grace period (that is `closeAllConnections()`, called by the application) and does not tell upgraded connections, which keep it waiting until they close. Here `shutdown(grace)` does `close()`, `closeIdleConnections()` and, once the grace period ends, `closeAllConnections()`, and new connections accepted meanwhile (e.g. in the middle of a TLS handshake) are closed at once.
+
+### Statistics
+
+`stats()` returns the connections open by what they serve (`http_connections`, `websocket_connections`, `sse_connections`, `tunnel_connections` for reverse proxy upgrades, `taken_over_connections` for other `take_over()`s, and `active_connections()`), and the connections served since the server was created (`total_connections`). Counting costs nothing per request: a connection joins or leaves a list (picked by its io_context, so threads do not contend for it) only when it opens, changes what it serves and closes; `stats()` reads those lists, so it is meant for a monitoring endpoint, not for every request. There is no request counter, nor bytes in and out: they would cost on every request. A connection taken over counts until its socket is destroyed, or until closed for `websocket_connection` and `sse_connection`.
+
+```cpp
+server.get("/v1/server/statistics", [&server](thinger::http::response& res) {
+    auto stats = server.stats();
+    res.json({{"http", stats.http_connections}, {"websocket", stats.websocket_connections},
+              {"sse", stats.sse_connections}, {"total", stats.active_connections()}});
+});
 ```
 
 ## HTTP Client
