@@ -49,6 +49,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/client/response_factory_test.cpp
     add_thinger_test(test_response_factory unit/http/client/response_factory_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/client/proxy_test.cpp)
+    add_thinger_test(test_proxy unit/http/client/proxy_test.cpp)
+endif()
+
 # Unit tests - HTTP Server
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/server_test.cpp)
     add_thinger_test(test_server unit/http/server/server_test.cpp)
