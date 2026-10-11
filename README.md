@@ -17,15 +17,15 @@ Requests per second with [wrk](https://github.com/wg/wrk) on Linux (2× Intel Xe
 
 | | **thinger-http** | nginx 1.24 + njs 0.8 | [Crow](https://github.com/CrowCpp/Crow) 1.2.1 | [cpp-httplib](https://github.com/yhirose/cpp-httplib) 0.14.3 | Node.js 24, 8 processes | Node.js 24, 1 process |
 |---|--:|--:|--:|--:|--:|--:|
-| GET "Hello World!" | 509,864 | 699,266 ¹ | 387,267 | 150,714 | 186,788 | 23,672 |
-| GET with path parameters, JSON answer | 409,513 | 296,820 | 3,105 ² | 140,148 | 172,803 | 22,019 |
-| POST a JSON body, echoed as JSON | 316,709 | 275,361 | 3,104 ² | 122,433 | 127,368 | 16,281 |
-| GET on a new connection per request | 124,177 | 129,880 | 107,541 | 69,668 | 16,150 | 8,296 |
+| GET "Hello World!" | 533,603 | 436,056 | 398,276 | 155,638 | 188,349 | 22,874 |
+| GET with path parameters, JSON answer | 396,260 | 284,629 | 3,105 ¹ | 136,233 | 174,683 | 22,406 |
+| POST a JSON body, echoed as JSON | 316,636 | 275,039 | 3,102 ¹ | 123,080 | 128,428 | 16,474 |
+| GET on a new connection per request | 125,826 | 125,841 | 105,992 | 70,103 | 15,968 | 8,180 |
 
-thinger-http answers with a median latency of 246 µs, 307 µs, 398 µs and 110 µs in these four cases (p99 under 430 µs with keep-alive). JSON bodies are decoded within the default [limits](#body-types) (nesting depth, values, UTF-8).
+thinger-http answers with a median latency of 235 µs, 318 µs, 398 µs and 108 µs in these four cases (p99 under 430 µs with keep-alive). JSON bodies are decoded within the default [limits](#body-types) (nesting depth, values, UTF-8).
 
-¹ nginx answers `/hello` straight from its configuration (`return 200`), without running a handler; its JSON routes run in njs.
-² With its default settings Crow stalls about 40 ms on each of these responses (Nagle's algorithm and delayed ACKs); its `/hello` is not affected.
+Every route is a handler: nginx runs all of them in njs, rather than answering from its configuration.
+¹ With its default settings Crow stalls about 40 ms on each of these responses (Nagle's algorithm and delayed ACKs); its `/hello` is not affected.
 cpp-httplib serves one connection per thread, so it gets 128 threads on the same 8 cores, and runs with `TCP_NODELAY`.
 
 To reproduce, see [`benchmark/compare`](benchmark/compare/): `benchmark/compare/run.sh` builds the servers and runs every case.

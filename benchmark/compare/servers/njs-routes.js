@@ -1,4 +1,8 @@
-// The JSON routes of servers/thinger_server.cpp on nginx + njs
+// The routes of servers/thinger_server.cpp on nginx + njs
+function hello(r) {
+    r.headersOut['Content-Type'] = 'text/plain';
+    r.return(200, 'Hello World!');
+}
 function params(r) {
     const m = r.uri.match(/^\/v1\/users\/([^/]+)\/devices\/([^/]+)$/);
     if (!m) { r.return(404); return; }
@@ -11,4 +15,4 @@ function echo(r) {
     r.headersOut['Content-Type'] = 'application/json';
     r.return(200, JSON.stringify(body));
 }
-export default {params, echo};
+export default {hello, params, echo};
