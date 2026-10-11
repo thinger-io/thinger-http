@@ -511,7 +511,7 @@ All routes, with their documentation and metadata, are available from `server.ro
 
 ### Limits and Timeouts per Route
 
-Routes and groups can set their own maximum body size, request timeout and [decode limits](#body-types), instead of the application ones:
+Routes, groups and [virtual hosts](#virtual-hosts) can set their own maximum body size, request timeout and [decode limits](#body-types), instead of the application ones:
 
 ```cpp
 server.set_max_body_size(1024 * 1024);   // 1 MB for every route that does not set its own
@@ -529,24 +529,29 @@ server.post("/v1/devices/:device/call", call_device)
 
 // Another status for the timeout
 server.get("/v1/reports/:id", get_report).timeout(30s, http::http_response::status::service_unavailable);
+
+// A whole host forwarded by a reverse proxy: limits of its not-found handler, and the
+// default of its routes
+server.host("devices.example.com").max_body_size(64 * 1024 * 1024).timeout(60s).set_not_found_handler(forward);
 ```
 
-Group limits are copied to each route as it is registered, so set them on the group first; a route overrides them with its own (`.timeout(0ms)` removes the timeout of its group).
+The limit of a request is the one of its route, else of the group it was registered in, else of its virtual host, else of the application (route > group > host > application). Group limits are copied to each route as it is registered, so set them on the group first; a route overrides them with its own (`.timeout(0ms)` removes the timeout of its group or host). Host limits apply when a request is served, to the routes of the host that do not set theirs and to its not-found handler (a proxy for the whole host, say), which has no route. On the server itself they are those of the default host only, while `set_max_body_size()` and `set_body_limits()` apply to every host.
 
-**Maximum body size** (`.max_body_size(bytes)`, `set_max_body_size()` if unset, `std::numeric_limits<size_t>::max()` for none) bounds every way the body is read, with `413 Payload Too Large` answered through the [error formatter](#error-format) and the connection closed:
+**Maximum body size** (`.max_body_size(bytes)`, `set_max_body_size()` if unset everywhere, `std::numeric_limits<size_t>::max()` for none) bounds every way the body is read, with `413 Payload Too Large` answered through the [error formatter](#error-format) and the connection closed:
 
 - Bodies the server reads (handlers taking the body decoded, synchronous handlers, `.deferred_body(false)`): a `Content-Length` over the limit is rejected before reading anything; a chunked body, as soon as it goes past it; a compressed body, also once decompressed.
-- Coroutines reading the body themselves (`read_body()`, `read()`, `read_some()`): reading a larger body fails (`req.get_body_error()` is `too_large`, a `Content-Length` one at the first read, without reading it), and the server answers `413` unless the handler did. **Behavior change**: these reads had no limit before; now they are bounded by `set_max_body_size()` (8 MB by default) unless the route sets its own: give routes receiving files or other large uploads the limit they need.
-- The [reverse proxy](#reverse-proxy): the request body it streams is bounded by the route limit and by `proxy_options::max_body_size`, whichever is smaller. The not-found handler of a host (a proxy for a whole host) has no route: the application limit applies.
+- Coroutines reading the body themselves (`read_body()`, `read()`, `read_some()`): reading a larger body fails (`req.get_body_error()` is `too_large`, a `Content-Length` one at the first read, without reading it), and the server answers `413` unless the handler did. **Behavior change**: these reads had no limit before; now they are bounded by `set_max_body_size()` (8 MB by default) unless the route (or its group or host) sets its own: give routes receiving files or other large uploads, and hosts forwarded whole, the limit they need.
+- The [reverse proxy](#reverse-proxy): the request body it streams is bounded by the route limit and by `proxy_options::max_body_size`, whichever is smaller. The not-found handler of a host (a proxy for a whole host) has no route: the limit of the host applies, or else the application one.
 - [In-memory dispatch](#in-memory-dispatch): the same, from the body of the request.
 - A body left unread by the handler (e.g. a middleware answered `401` before it was read) is discarded only up to the smaller of `set_max_body_size()` and the route limit; a larger one closes the connection instead of being read, so a route accepting large bodies does not make the server read them for nothing.
 
-**Timeout** (`.timeout(duration, status = 504)`, none by default) is the maximum time from the dispatch of a request (its headers received and its route matched) until its response **starts**, middlewares and body reading included. If no answer has started by then, the request is answered with `504 Gateway Timeout` (or the status given, e.g. `503 Service Unavailable`) through the [error formatter](#error-format), with the message `No response within the timeout` and the headers set on the response so far (e.g. CORS headers of a middleware).
+**Timeout** (`.timeout(duration, status = 504)`, none by default) is the maximum time from the dispatch of a request (its headers received and its route matched) until its response **starts**, middlewares and body reading included. If no answer has started by then, the request is answered with `504 Gateway Timeout` (or the status given, e.g. `503 Service Unavailable`) through the [error formatter](#error-format), with the message `No response within the timeout` and the headers set on the response so far (e.g. CORS headers of a middleware). As for any answer, set the status and headers (`res.status()`, `res.header()`) from the thread running the handler, before answering: a handler with a timeout that sets headers later, from another thread, would race with the timeout copying them.
 
 - **Handlers are not cancelled**: a coroutine goes on until it ends, and anything it sends afterwards (or a copy of the response, from another thread) is dropped: `has_responded()` is `true` for every copy, and late answers are logged at debug level only. Keep handlers bounded on their own (their own timeouts on what they wait for).
 - **Started responses are never cut**: once the response starts (`send()`, `json()`, `start_stream()`, `start_chunked()`, `start_sse()`, WebSocket upgrades, `take_over()`), the timer is cancelled and the response takes as long as it needs.
 - **The connection**: if the body was read whole, the connection stays alive and serves the next request right away, while the handler may still run. If part of the body is still unread (the handler may be reading it), the response closes the connection, as nothing else can tell where the body ends; the handler then sees the body incomplete.
 - **Connection timeout**: while a request waits for its response within its own timeout, the connection timeout (`set_connection_timeout()`, 120 s) does not close the connection, so a route can wait longer than it; it applies again to the idle connection afterwards, and uploads extend it as before.
+- **Not-found handlers** get the timeout of their virtual host, if it sets one.
 - **In-memory dispatch** applies the route timeout too; `dispatch_options::timeout` still bounds the whole call (and cancels the handler), whichever expires first.
 
 The [OpenAPI](#openapi) document shows the limits set on a route (or its group) as `x-max-body-size` (bytes) and `x-timeout-ms` extensions of its operation.
@@ -1364,7 +1369,7 @@ See the [examples](examples/) directory for complete working examples:
 ## Thread Safety
 
 - `http::server` - Thread-safe, can handle concurrent requests
-- `http::response` - Copies share the response and can answer from any thread, even at the same time: only the first answer is sent. Chunks (`write_chunk()`, `end_chunked()`) are written in call order once `start_chunked()` returned `true`. Set the status and headers (`status()`, `header()`) from one thread, before answering
+- `http::response` - Copies share the response and can answer from any thread, even at the same time: only the first answer is sent. Chunks (`write_chunk()`, `end_chunked()`) are written in call order once `start_chunked()` returned `true`. Set the status and headers (`status()`, `header()`) from the thread running the handler, before answering, also on routes with a timeout: a timeout answer (504) copies the headers set so far
 - `http::client` - Single-threaded, create one per thread or use `async_client`
 - `http::async_client` - Thread-safe, uses internal worker threads
 - `http::websocket_client` - Single connection, thread-safe send operations
