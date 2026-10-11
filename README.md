@@ -13,15 +13,22 @@ A modern C++20 HTTP/WebSocket library built on Boost.ASIO with coroutine support
 
 ## Performance
 
-Benchmarked with [bombardier](https://github.com/codesenberg/bombardier) — 100 concurrent connections, 10s duration, "Hello World!" endpoint. All frameworks compiled with `-O3` (Release mode) on Apple M2 Max.
+Requests per second with [wrk](https://github.com/wg/wrk) on Linux (2× Intel Xeon E5-2699 v4, Ubuntu 24.04, GCC 13, `-O3`). Every server has the same routes, 8 threads or workers pinned to the same 8 cores, and wrk runs on 16 other cores: 128 keep-alive connections (32 for a new connection per request), 10 s, median of 5 rounds in rotating order.
 
-| Framework | Req/s | Avg Latency | Throughput |
-|---|--:|--:|--:|
-| **thinger-http** | **~131,000** | **0.76ms** | 20.4 MB/s |
-| [Crow](https://github.com/CrowCpp/Crow) | ~122,000 | 0.82ms | 22.7 MB/s |
-| [cpp-httplib](https://github.com/yhirose/cpp-httplib) | ~34,000 | 3.89ms | 3.6 MB/s |
+| | **thinger-http** | nginx 1.24 + njs 0.8 | [Crow](https://github.com/CrowCpp/Crow) 1.2.1 | [cpp-httplib](https://github.com/yhirose/cpp-httplib) 0.14.3 | Node.js 24, 8 processes | Node.js 24, 1 process |
+|---|--:|--:|--:|--:|--:|--:|
+| GET "Hello World!" | 509,864 | 699,266 ¹ | 387,267 | 150,714 | 186,788 | 23,672 |
+| GET with path parameters, JSON answer | 409,513 | 296,820 | 3,105 ² | 140,148 | 172,803 | 22,019 |
+| POST a JSON body, echoed as JSON | 316,709 | 275,361 | 3,104 ² | 122,433 | 127,368 | 16,281 |
+| GET on a new connection per request | 124,177 | 129,880 | 107,541 | 69,668 | 16,150 | 8,296 |
 
-> All three frameworks run multi-threaded by default. See [`benchmark/`](benchmark/) for details and instructions to reproduce.
+thinger-http answers with a median latency of 246 µs, 307 µs, 398 µs and 110 µs in these four cases (p99 under 430 µs with keep-alive). JSON bodies are decoded within the default [limits](#body-types) (nesting depth, values, UTF-8).
+
+¹ nginx answers `/hello` straight from its configuration (`return 200`), without running a handler; its JSON routes run in njs.
+² With its default settings Crow stalls about 40 ms on each of these responses (Nagle's algorithm and delayed ACKs); its `/hello` is not affected.
+cpp-httplib serves one connection per thread, so it gets 128 threads on the same 8 cores, and runs with `TCP_NODELAY`.
+
+To reproduce, see [`benchmark/compare`](benchmark/compare/): `benchmark/compare/run.sh` builds the servers and runs every case.
 
 ## Features
 

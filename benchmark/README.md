@@ -1,5 +1,9 @@
 # HTTP Framework Benchmarks
 
+> The comparison in the main README (thinger-http, nginx + njs, Crow, cpp-httplib, Node.js) is
+> produced by [`compare/run.sh`](compare/). This page describes the older single-endpoint
+> benchmark and the routing benchmarks in `routing/`.
+
 This directory contains performance benchmarks comparing thinger-http with other popular C++ HTTP frameworks.
 
 ## Frameworks Tested
