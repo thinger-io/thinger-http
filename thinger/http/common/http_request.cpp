@@ -397,9 +397,14 @@ namespace thinger::http {
     }
 
     void http_request::to_buffer(std::vector<boost::asio::const_buffer>& buffer) const{
+        to_buffer(buffer, get_uri(), {});
+    }
+
+    void http_request::to_buffer(std::vector<boost::asio::const_buffer>& buffer, std::string_view request_target,
+                                 std::string_view extra_headers) const{
         buffer.emplace_back(boost::asio::buffer(http::get_method(method_)));
         buffer.emplace_back(boost::asio::buffer(misc_strings::space));
-        buffer.emplace_back(boost::asio::buffer(get_uri()));
+        buffer.emplace_back(boost::asio::buffer(request_target.data(), request_target.size()));
         buffer.emplace_back(boost::asio::buffer(misc_strings::space));
         buffer.emplace_back(boost::asio::buffer(misc_strings::http_1_1));
         buffer.emplace_back(boost::asio::buffer(misc_strings::crlf));
@@ -423,6 +428,10 @@ namespace thinger::http {
                 buffer.emplace_back(boost::asio::buffer(value));
                 buffer.emplace_back(boost::asio::buffer(misc_strings::crlf));
             }
+        }
+
+        if(!extra_headers.empty()){
+            buffer.emplace_back(boost::asio::buffer(extra_headers.data(), extra_headers.size()));
         }
 
         buffer.emplace_back(boost::asio::buffer(misc_strings::crlf));

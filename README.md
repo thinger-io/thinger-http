@@ -904,6 +904,65 @@ client.verify_ssl(false);  // Disable SSL verification
 client.unix_socket("/path/to/socket");  // Unix domain socket
 ```
 
+### Proxies
+
+Requests can go through an HTTP proxy. Plain `http://` requests are sent to the proxy with the full URL as target (absolute-form, RFC 9112 §3.2.2); `https://`, `ws://` and `wss://` ones go through a tunnel opened with `CONNECT host:port` (RFC 9110 §9.3.6), with TLS end to end: SNI and the certificate are those of the origin, never of the proxy. WebSockets use a tunnel even without TLS, as browsers do, since forwarding proxies may not pass upgrades on.
+
+By default the client reads the proxy from the environment, with the conventions of curl:
+
+| Variable | Used for |
+|---|---|
+| `http_proxy` | `http://` and `ws://` requests. **Only lowercase**: `HTTP_PROXY` is ignored, as in a CGI program it holds the `Proxy` header of the request being served ([httpoxy](https://httpoxy.org), CVE-2016-5385) |
+| `https_proxy`, `HTTPS_PROXY` | `https://` and `wss://` requests |
+| `all_proxy`, `ALL_PROXY` | both, when the variable of the scheme is not set |
+| `no_proxy`, `NO_PROXY` | hosts reached directly |
+
+Lowercase comes first; empty variables count as not set. The environment is read when the client is created.
+
+```cpp
+thinger::http::client client;
+
+// One proxy for every scheme (replaces the environment), with the hosts reached directly
+client.proxy("http://user:password@proxy.corp:3128", "internal.corp, 10.0.0.0/8");
+
+// Or one per scheme
+client.proxy(http::proxy_config{
+    .http = "http://proxy.corp:3128",
+    .https = "http://proxy.corp:3129",
+    .no_proxy = "internal.corp"});
+
+client.proxy("");                       // no proxy at all, whatever the environment says
+client.proxy_from_environment(false);   // ignore the environment (when proxy() is not set)
+
+// Per request (and its redirects), over the client settings
+auto res = client.request("https://api.example.com/data")
+    .proxy("http://other-proxy:8080")   // or .proxy("") to connect directly
+    .get();
+
+// Which proxy a URL would use ("http://host:port", empty if direct)
+std::string via = client.proxy_for("https://api.example.com/");
+```
+
+**Precedence**: the settings of the request, then those set with `proxy()`, then the environment (unless disabled). Each replaces the next one whole, `NO_PROXY` included.
+
+**Proxy URLs**: `http://[user:password@]host[:port]`. The scheme is optional (`proxy.corp:3128` is an HTTP proxy) and the port 80 by default, as in Go and Node (curl uses 1080). User and password are percent-decoded and sent as `Proxy-Authorization: Basic` to the proxy only: in the `CONNECT` of a tunnel, or with each forwarded request, never to the origin. Only HTTP proxies are supported: an `https://` proxy (TLS to the proxy) or a SOCKS one fails the requests that would use it with `client_error::invalid_proxy`, as does an invalid URL, rather than connecting directly.
+
+**NO_PROXY**: comma separated, case-insensitive, spaces trimmed. Host names are compared with the host of the URL, never resolved.
+- `example.com`, `.example.com` and `*.example.com` all match `example.com` and its subdomains (as curl; Go matches only the subdomains with a leading dot);
+- IP addresses (`10.1.2.3`, `::1`, `[::1]`) and CIDR ranges (`10.0.0.0/8`, `fd00::/8`);
+- any of them with a port (`example.com:8080`, `[::1]:8443`) only for that port;
+- `*` alone matches every host.
+
+`localhost`, `*.localhost`, loopback addresses (`127.0.0.0/8`, `::1`) and Unix sockets never use the proxy, as in Go: a proxy reaching "localhost" would reach itself.
+
+**Redirects**: the proxy is chosen again for each hop, so a redirect to a `NO_PROXY` host goes directly (and the other way round).
+
+**Errors**: when the proxy refuses the tunnel, the request fails with `client_error::proxy_authentication_required` (407) or `client_error::proxy_tunnel_failed` (any other status), and the response of the proxy is kept: `res.status()`, its headers (`Proxy-Authenticate`) and body (`stream_result::status_code` when streaming). A plain `http://` request through a forwarding proxy gets the 407 as its response, without error. The answer to `CONNECT` is parsed as strictly as any response (a 2xx has no body, and nothing may follow it before the client speaks). The timeout of the client covers the connection to the proxy and the `CONNECT` too.
+
+**Connections** are only shared by requests reaching the origin the same way (directly or through the same proxy, with the same credentials) and trusting the same CAs.
+
+Streaming works the same way through a proxy, forwarded or tunneled: the stream callback (`request(...).get(callback)`, `send_streaming()`) and the chunked callback of a request (`http_request::set_chunked_callback()`, e.g. to follow Docker logs) get the body as it arrives.
+
 ### Trusted CAs
 
 Servers are verified against the system CAs by default (`verify_ssl(true)`). Private CAs (an internal PKI, or a TLS-inspecting proxy re-signing traffic) can be trusted on top of them, per client or per request, from a PEM file (one or more certificates) or PEM text:

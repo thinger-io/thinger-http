@@ -170,7 +170,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/client_response_framing_test.c
     add_thinger_test(test_integration_client_response_framing integration/client_response_framing_test.cpp)
 endif()
 
-# Integration tests - CAs trusted by the client
+# Integration tests - Client through an HTTP proxy, and CAs added to the client
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/client_proxy_test.cpp)
+    add_thinger_test(test_integration_client_proxy integration/client_proxy_test.cpp)
+endif()
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/client_ca_test.cpp)
     add_thinger_test(test_integration_client_ca integration/client_ca_test.cpp)
 endif()

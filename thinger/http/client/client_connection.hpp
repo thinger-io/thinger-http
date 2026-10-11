@@ -5,9 +5,11 @@
 #include <memory>
 #include <string>
 #include <boost/noncopyable.hpp>
+#include <boost/asio/ssl/context.hpp>
 
 #include "../common/http_request.hpp"
 #include "../common/http_response.hpp"
+#include "proxy.hpp"
 #include "response_factory.hpp"
 #include "stream_types.hpp"
 #include "../../asio/sockets/tcp_socket.hpp"
@@ -16,12 +18,24 @@
 
 namespace thinger::http {
 
+// How a connection reaches its origin through an HTTP proxy
+struct proxy_route {
+    std::shared_ptr<const proxy_endpoint> proxy;
+    // Open a tunnel to the origin with CONNECT (https, ws, wss); otherwise the requests are
+    // sent to the proxy, with an absolute-form target (plain http)
+    bool tunnel = false;
+    // TLS with the origin inside the tunnel; null for none
+    std::shared_ptr<boost::asio::ssl::context> tls;
+};
+
 class client_connection : public std::enable_shared_from_this<client_connection>, public boost::noncopyable {
 
     static constexpr unsigned MAX_BUFFER_SIZE = 4096;
     static constexpr unsigned MAX_RETRIES = 3;
     static constexpr auto DEFAULT_TIMEOUT = std::chrono::seconds{60};
     static constexpr auto CONNECT_TIMEOUT = std::chrono::seconds{10};
+    // Largest answer of a proxy refusing a tunnel (an error page) read whole
+    static constexpr size_t MAX_PROXY_RESPONSE_SIZE = 1048576;
 
 public:
     static std::atomic<unsigned long> connections;
@@ -32,6 +46,10 @@ public:
 
     client_connection(std::shared_ptr<thinger::asio::unix_socket> socket,
                       const std::string& path,
+                      std::chrono::seconds timeout = DEFAULT_TIMEOUT);
+
+    // Through an HTTP proxy (it connects on the first request)
+    client_connection(boost::asio::io_context& io_context, proxy_route route,
                       std::chrono::seconds timeout = DEFAULT_TIMEOUT);
 
     virtual ~client_connection();
@@ -52,6 +70,10 @@ public:
     // (client_error). The connection is closed after any of them
     const boost::system::error_code& last_error() const { return error_; }
 
+    // The answer of the proxy when it refused to open a tunnel (last_error() is then
+    // proxy_authentication_required or proxy_tunnel_failed), null otherwise
+    const std::shared_ptr<http_response>& proxy_response() const { return proxy_response_; }
+
     // Bytes received after the last response, read along with it (e.g. data the server
     // sent right after a protocol upgrade response): they come before anything read from
     // the released socket
@@ -69,11 +91,17 @@ public:
 private:
     // Internal helpers
     awaitable<boost::system::error_code> ensure_connected(const http_request& request);
+    awaitable<boost::system::error_code> connect_socket(const std::string& host, const std::string& port);
+    awaitable<boost::system::error_code> connect_through_proxy(const http_request& request);
+    awaitable<boost::system::error_code> open_tunnel(const http_request& request);
+    awaitable<io_result> write_to_proxy(const http_request& request);
     awaitable<std::shared_ptr<http_response>> exchange(std::shared_ptr<http_request> request);
     awaitable<std::shared_ptr<http_response>> read_response(const http_request& request);
 
     std::shared_ptr<thinger::asio::socket> socket_;
     std::string socket_path_;
+    proxy_route route_;
+    std::shared_ptr<http_response> proxy_response_;
     std::chrono::seconds timeout_;
     uint8_t buffer_[MAX_BUFFER_SIZE];
     std::string buffered_;

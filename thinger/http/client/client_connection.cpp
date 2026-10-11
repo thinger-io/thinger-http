@@ -1,5 +1,6 @@
 #include "client_connection.hpp"
 #include "client_error.hpp"
+#include "../../asio/sockets/ssl_socket.hpp"
 #include "../../util/logger.hpp"
 #include "../../util/compression.hpp"
 #include <boost/asio/ssl/error.hpp>
@@ -51,22 +52,38 @@ client_connection::client_connection(std::shared_ptr<thinger::asio::unix_socket>
               path, timeout.count(), connections.load());
 }
 
+client_connection::client_connection(boost::asio::io_context& io_context, proxy_route route,
+                                     std::chrono::seconds timeout)
+    : socket_(std::make_shared<thinger::asio::tcp_socket>("http_client", io_context))
+    , route_(std::move(route))
+    , timeout_(timeout) {
+    ++connections;
+    LOG_TRACE("created http client connection through proxy {} with timeout: {} seconds. total: {}",
+              route_.proxy ? route_.proxy->url() : "", timeout.count(), connections.load());
+}
+
 client_connection::~client_connection() {
     --connections;
     LOG_TRACE("releasing http client connection. total: {}", connections.load());
 }
 
 awaitable<boost::system::error_code> client_connection::ensure_connected(const http_request& request) {
-    boost::system::error_code ec;
     if (socket_->is_open()) {
-        co_return ec;
+        co_return boost::system::error_code{};
     }
+    if (route_.proxy) {
+        co_return co_await connect_through_proxy(request);
+    }
+    co_return co_await connect_socket(request.get_host(), request.get_port());
+}
 
-    LOG_TRACE("connecting to: {}:{}", request.get_host(), request.get_port());
+awaitable<boost::system::error_code> client_connection::connect_socket(const std::string& host, const std::string& port) {
+    boost::system::error_code ec;
+    LOG_TRACE("connecting to: {}:{}", host, port);
 
     for (unsigned retry = 0; retry < MAX_RETRIES; ++retry) {
         if (socket_path_.empty()) {
-            ec = co_await socket_->connect(request.get_host(), request.get_port(), CONNECT_TIMEOUT);
+            ec = co_await socket_->connect(host, port, CONNECT_TIMEOUT);
         } else {
             auto unix_socket = std::static_pointer_cast<thinger::asio::unix_socket>(socket_);
             ec = co_await unix_socket->connect(socket_path_, CONNECT_TIMEOUT);
@@ -97,6 +114,111 @@ awaitable<boost::system::error_code> client_connection::ensure_connected(const h
         socket_->close();
     }
     co_return ec;
+}
+
+awaitable<boost::system::error_code> client_connection::connect_through_proxy(const http_request& request) {
+    // A new TCP socket every time: the previous one may have become a TLS stream
+    auto tcp = std::make_shared<thinger::asio::tcp_socket>("http_client", socket_->get_io_context());
+    socket_ = tcp;
+    if (auto ec = co_await connect_socket(route_.proxy->host, route_.proxy->port)) {
+        co_return ec;
+    }
+    if (!route_.tunnel) {
+        co_return boost::system::error_code{};
+    }
+    if (auto ec = co_await open_tunnel(request)) {
+        co_return ec;
+    }
+    if (!route_.tls) {
+        co_return boost::system::error_code{};
+    }
+
+    // TLS with the origin, end to end through the tunnel: SNI and the certificate verified
+    // for the name of the origin, not of the proxy
+    auto tls = std::make_shared<thinger::asio::ssl_socket>("http_client", tcp, route_.tls);
+    socket_ = tls;
+    auto ec = co_await tls->handshake(request.get_host());
+    if (ec) {
+        LOG_ERROR("TLS handshake with {} through the proxy {} failed: {}",
+                  request.get_host(), route_.proxy->url(), ec.message());
+    }
+    co_return ec;
+}
+
+awaitable<boost::system::error_code> client_connection::open_tunnel(const http_request& request) {
+    // CONNECT host:port, in authority-form (RFC 9110 section 9.3.6, RFC 9112 section 3.2.3),
+    // with the credentials of the proxy: only it sees them
+    const auto& host = request.get_host();
+    std::string authority = (host.find(':') != std::string::npos ? "[" + host + "]" : host) + ":" + request.get_port();
+    http_request connect;
+    connect.set_method(method::CONNECT);
+    connect.set_uri(authority);
+    connect.add_header(header::host, authority);
+    if (request.has_header(header::user_agent)) {
+        connect.add_header(header::user_agent, request.get_header(header::user_agent));
+    }
+    if (!route_.proxy->authorization.empty()) {
+        connect.add_header("Proxy-Authorization", route_.proxy->authorization);
+    }
+    LOG_DEBUG("opening a tunnel to {} through the proxy {}", authority, route_.proxy->url());
+
+    std::vector<boost::asio::const_buffer> buffers;
+    connect.to_buffer(buffers);
+    if (auto [ec, bytes] = co_await socket_->write(buffers); ec) {
+        co_return ec;
+    }
+
+    // Its answer is parsed as strictly as any response: a 2xx to CONNECT has no body, and
+    // the tunnel starts right after it
+    response_factory parser;
+    parser.set_request_method(method::CONNECT);
+    parser.set_max_content_size(MAX_PROXY_RESPONSE_SIZE);
+    while (true) {
+        auto [ec, bytes] = co_await socket_->read_some(buffer_, MAX_BUFFER_SIZE);
+
+        uint8_t* begin = buffer_;
+        uint8_t* end = buffer_ + bytes;
+        boost::tribool result = boost::indeterminate;
+        if (begin != end) {
+            result = parser.parse_some(begin, end);
+        }
+        if (boost::indeterminate(result) && ec) {
+            if (ec != boost::asio::error::eof) co_return ec;
+            result = parser.end_of_stream();
+        }
+        if (!result) {
+            LOG_WARNING("invalid answer to CONNECT from the proxy {}: {}", route_.proxy->url(),
+                        make_error_code(parser.error()).message());
+            co_return parser.error();
+        }
+        if (boost::indeterminate(result)) continue;
+
+        auto response = parser.consume_response();
+        int status = response->get_status_code();
+        if (status >= 200 && status < 300) {
+            // Nothing comes from the origin before the client speaks (TLS, or its request)
+            if (begin != end) co_return client_error::proxy_tunnel_failed;
+            co_return boost::system::error_code{};
+        }
+        LOG_WARNING("the proxy {} refused a tunnel to {}: {}", route_.proxy->url(), authority, status);
+        proxy_response_ = std::move(response);
+        co_return status == 407 ? client_error::proxy_authentication_required : client_error::proxy_tunnel_failed;
+    }
+}
+
+awaitable<io_result> client_connection::write_to_proxy(const http_request& request) {
+    // The absolute-form target names the origin (RFC 9112 section 3.2.2). The proxy consumes
+    // its credentials (RFC 9110 section 11.7.2): unless the request has its own, they are
+    // written here, never added to the request
+    std::string target = request.get_url();
+    std::string credentials;
+    if (!route_.proxy->authorization.empty() && !request.has_header("Proxy-Authorization")) {
+        credentials = "Proxy-Authorization: " + route_.proxy->authorization + "\r\n";
+    }
+    std::vector<boost::asio::const_buffer> buffers;
+    buffers.reserve(32);
+    request.to_buffer(buffers, target, credentials);
+    co_return co_await socket_->write(buffers);
 }
 
 awaitable<std::shared_ptr<http_response>> client_connection::read_response(const http_request& request) {
@@ -151,6 +273,7 @@ awaitable<std::shared_ptr<http_response>> client_connection::exchange(std::share
     bool timed_out = false;
     error_ = {};
     buffered_.clear();
+    proxy_response_.reset();
 
     // Timeout timer
     boost::asio::steady_timer timer(socket_->get_io_context());
@@ -167,7 +290,11 @@ awaitable<std::shared_ptr<http_response>> client_connection::exchange(std::share
         }
 
         request->log("CLIENT->", 0);
-        co_await request->to_socket(socket_);
+        if (route_.proxy && !route_.tunnel) {
+            co_await write_to_proxy(*request);
+        } else {
+            co_await request->to_socket(socket_);
+        }
         response = co_await read_response(*request);
     };
 
@@ -227,6 +354,8 @@ awaitable<stream_result> client_connection::send_request_streaming(
     auto response = co_await exchange(std::move(request));
     if (!response) {
         result.error = error_.message();
+        // (the status of a proxy refusing the tunnel, with its error)
+        if (proxy_response_) result.status_code = proxy_response_->get_status_code();
         co_return result;
     }
 

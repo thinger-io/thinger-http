@@ -77,6 +77,18 @@ public:
         return *this;
     }
 
+    // Proxy for this request (and its redirects), instead of the one of the client: one URL
+    // for every scheme ("" to connect directly), and the hosts reached directly
+    request_builder& proxy(const std::string& url, const std::string& no_proxy = "") {
+        request_->set_proxy_config(proxy_config{url, url, no_proxy});
+        return *this;
+    }
+
+    request_builder& proxy(proxy_config config) {
+        request_->set_proxy_config(std::move(config));
+        return *this;
+    }
+
     // CAs trusted to verify the server of this request, besides those of the client: a PEM
     // file, or PEM text
     request_builder& ca_file(std::string path) {

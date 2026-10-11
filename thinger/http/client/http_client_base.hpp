@@ -6,6 +6,7 @@
 #include "client_connection.hpp"
 #include "client_response.hpp"
 #include "connection_pool.hpp"
+#include "proxy.hpp"
 #include "websocket_client.hpp"
 #include "stream_types.hpp"
 #include "../../util/types.hpp"
@@ -35,6 +36,11 @@ protected:
     std::string unix_socket_;
     size_t max_content_size_{8 * 1048576};  // 8 MB default; buffered-mode responses above this are rejected
 
+    // Proxy set with proxy() (null if none), and the one of the environment (null if not
+    // used): the first one set applies
+    std::shared_ptr<const proxy_resolver> proxy_;
+    std::shared_ptr<const proxy_resolver> env_proxy_;
+
     // CAs trusted besides (or instead of) the system ones
     std::vector<std::string> ca_files_;
     std::vector<std::string> ca_pems_;
@@ -49,13 +55,13 @@ protected:
     // Apply default headers
     void apply_default_headers(const std::shared_ptr<http_request>& request);
 
-    // Create or get connection for request (null, and why in `ec`, if its CAs cannot be
-    // loaded)
+    // Create or get connection for request (null, and why in `ec`, if its proxy or CAs
+    // cannot be used)
     std::shared_ptr<client_connection> get_or_create_connection(const std::shared_ptr<http_request>& request,
                                                                 boost::system::error_code& ec);
 
 public:
-    http_client_base() = default;
+    http_client_base();
     virtual ~http_client_base();
 
     // Configuration setters (fluent API)
@@ -67,6 +73,14 @@ public:
     http_client_base& verify_ssl(bool verify) { verify_ssl_ = verify; return *this; }
     http_client_base& unix_socket(const std::string& path) { unix_socket_ = path; return *this; }
     http_client_base& max_content_size(size_t size) { max_content_size_ = size; return *this; }
+
+    // Proxy for every request (see proxy_config), instead of the one of the environment: one
+    // URL for every scheme ("" to connect directly), and the hosts reached directly
+    http_client_base& proxy(const std::string& url, const std::string& no_proxy = "");
+    http_client_base& proxy(const proxy_config& config);
+    // Use the proxy of the environment variables (read now) when none is set with proxy();
+    // on by default (read when the client is created)
+    http_client_base& proxy_from_environment(bool enabled);
 
     // CAs trusted to verify servers, besides the system ones: a PEM file (one or more
     // certificates), or PEM text. Loaded when first needed, again if the file changes
@@ -83,6 +97,11 @@ public:
     bool get_auto_decompress() const { return auto_decompress_; }
     bool get_verify_ssl() const { return verify_ssl_; }
     size_t get_max_content_size() const { return max_content_size_; }
+
+    // The proxy a request to `url` goes through ("http://host:port"), empty if it connects
+    // directly (or if the proxy cannot be used)
+    std::string proxy_for(const std::string& url) const;
+    std::string proxy_for(const http_request& request) const;
 
     // Request creation
     std::shared_ptr<http_request> create_request(method m, const std::string& url);
@@ -126,9 +145,10 @@ public:
     size_t pool_size() const { return pool_.size(); }
 
 private:
-    // How a connection reaches the origin of a request: with which TLS context, and the key
-    // of connections that can be shared
+    // How a connection reaches the origin of a request: through a proxy or not, with which
+    // TLS context, and the key of connections that can be shared
     struct connection_plan {
+        proxy_route route;
         std::shared_ptr<boost::asio::ssl::context> tls;
         std::string key;
     };
@@ -142,6 +162,9 @@ private:
     std::mutex tls_mutex_;
     std::map<std::string, tls_entry> tls_contexts_;
     uint64_t next_tls_id_{0};
+
+    // The proxy of a request: none, with an error if it is set but cannot be used
+    proxy_resolver::choice select_proxy(const http_request& request) const;
 
     // The TLS context of a request, from the CAs of the client and the request
     std::shared_ptr<boost::asio::ssl::context> tls_context(const http_request& request, uint64_t& id,

@@ -1,5 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <thinger/http/client/proxy.hpp>
+#include <thinger/http/client/client.hpp>
+#include <thinger/http/client/connection_pool.hpp>
+#include <thinger/asio/sockets/tcp_socket.hpp>
 #include <thinger/util/base64.hpp>
 #include <map>
 
@@ -249,4 +252,65 @@ TEST_CASE("Proxy selection", "[proxy][client][unit]") {
         REQUIRE(invalid.select(true, "direct.com", "443").error.empty());
         REQUIRE(invalid.select(true, "localhost", "443").error.empty());
     }
+}
+
+TEST_CASE("Client proxy precedence", "[proxy][client][unit]") {
+    client http_client;
+    http_client.proxy_from_environment(false);
+    REQUIRE(http_client.proxy_for("http://example.com/").empty());
+
+    SECTION("One proxy for every scheme, with its NO_PROXY") {
+        http_client.proxy("http://user:pass@proxy:3128", "internal.corp");
+        REQUIRE(http_client.proxy_for("http://example.com/") == "http://proxy:3128");
+        REQUIRE(http_client.proxy_for("https://example.com/") == "http://proxy:3128");
+        REQUIRE(http_client.proxy_for("ws://example.com/") == "http://proxy:3128");
+        REQUIRE(http_client.proxy_for("wss://example.com/") == "http://proxy:3128");
+        REQUIRE(http_client.proxy_for("https://www.internal.corp/").empty());
+        REQUIRE(http_client.proxy_for("http://localhost:8080/").empty());
+        REQUIRE(http_client.proxy_for("not a url").empty());
+    }
+
+    SECTION("A proxy per scheme") {
+        http_client.proxy(proxy_config{"http://plain:1", "http://tls:2", ""});
+        REQUIRE(http_client.proxy_for("http://example.com/") == "http://plain:1");
+        REQUIRE(http_client.proxy_for("ws://example.com/") == "http://plain:1");
+        REQUIRE(http_client.proxy_for("https://example.com/") == "http://tls:2");
+        REQUIRE(http_client.proxy_for("wss://example.com/") == "http://tls:2");
+    }
+
+    SECTION("The request settings come first, an empty one connecting directly") {
+        http_client.proxy("http://proxy:3128");
+        http_request request;
+        REQUIRE(request.set_url("https://example.com/"));
+        REQUIRE(http_client.proxy_for(request) == "http://proxy:3128");
+        request.set_proxy_config(proxy_config{"", "http://other:8080", ""});
+        REQUIRE(http_client.proxy_for(request) == "http://other:8080");
+        request.set_proxy_config(proxy_config{});
+        REQUIRE(http_client.proxy_for(request).empty());
+    }
+
+    SECTION("Unix sockets never use the proxy") {
+        http_client.proxy("http://proxy:3128");
+        http_request request;
+        REQUIRE(request.set_url("http://localhost/containers/json"));
+        request.set_unix_socket("/var/run/docker.sock");
+        request.set_host("docker.example");
+        REQUIRE(http_client.proxy_for(request).empty());
+    }
+}
+
+TEST_CASE("Connection pool keys connections by route", "[proxy][client][pool][unit]") {
+    boost::asio::io_context io_context;
+    connection_pool pool;
+    auto direct = std::make_shared<client_connection>(std::make_shared<thinger::asio::tcp_socket>("test", io_context));
+    auto proxied = std::make_shared<client_connection>(std::make_shared<thinger::asio::tcp_socket>("test", io_context));
+
+    pool.store_connection("example.com", 80, false, direct);
+    REQUIRE_FALSE(pool.get_connection("example.com", 80, false, "tls:0|forward:proxy|3128|"));
+    pool.store_connection("example.com", 80, false, proxied, "tls:0|forward:proxy|3128|");
+
+    REQUIRE(pool.get_connection("example.com", 80, false) == direct);
+    REQUIRE(pool.get_connection("example.com", 80, false, "tls:0|forward:proxy|3128|") == proxied);
+    REQUIRE_FALSE(pool.get_connection("example.com", 80, false, "tls:0|forward:other|3128|"));
+    REQUIRE(pool.size() == 2);
 }

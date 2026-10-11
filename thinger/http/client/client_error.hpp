@@ -19,7 +19,10 @@ namespace thinger::http {
         incomplete_response,        // the connection ended before the end of the response
         unexpected_upgrade,         // 101 Switching Protocols for a request without Upgrade
         aborted,                    // the streaming callback stopped the download
-        invalid_ca_certificate      // a CA certificate (file or PEM) could not be loaded
+        invalid_ca_certificate,     // a CA certificate (file or PEM) could not be loaded
+        proxy_authentication_required,  // the proxy answered CONNECT with 407 (see client_response::status())
+        proxy_tunnel_failed,        // the proxy answered CONNECT with another status than 2xx, or sent data before the origin
+        invalid_proxy               // the proxy URL is invalid or not supported (only http:// proxies are)
     };
 
     const boost::system::error_category& client_error_category();

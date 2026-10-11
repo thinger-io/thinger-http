@@ -24,6 +24,9 @@ namespace thinger::http {
                     case client_error::unexpected_upgrade: return "unexpected protocol switch (101) without Upgrade in the request";
                     case client_error::aborted: return "download aborted";
                     case client_error::invalid_ca_certificate: return "a CA certificate could not be loaded";
+                    case client_error::proxy_authentication_required: return "proxy authentication required (407 to CONNECT)";
+                    case client_error::proxy_tunnel_failed: return "the proxy did not open a tunnel to the origin (CONNECT)";
+                    case client_error::invalid_proxy: return "invalid or unsupported proxy URL";
                 }
                 return "unknown client error";
             }

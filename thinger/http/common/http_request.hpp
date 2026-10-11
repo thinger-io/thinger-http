@@ -6,6 +6,7 @@
 #include <utility>
 #include "headers.hpp"
 #include "../client/cookie_store.hpp"
+#include "../client/proxy.hpp"
 #include "../util/url.hpp"
 
 namespace thinger::http {
@@ -106,6 +107,11 @@ public:
     std::function<void(int, const std::string&)> get_chunked_callback();
     void set_chunked_callback(std::function<void(int, const std::string&)> callback);
 
+    // client side: proxy settings for this request, instead of those of the client (see
+    // http_client_base::proxy()); an empty proxy_config connects directly
+    void set_proxy_config(proxy_config config) { proxy_config_ = std::move(config); }
+    const std::optional<proxy_config>& get_proxy_config() const { return proxy_config_; }
+
     // client side: CAs trusted to verify the server of this request, besides those of the
     // client (see http_client_base::add_ca_file()): a PEM file, or PEM text
     void add_ca_file(std::string path) { ca_files_.push_back(std::move(path)); }
@@ -117,6 +123,10 @@ public:
     bool end_stream() override;
     size_t get_size() override;
     void to_buffer(std::vector<boost::asio::const_buffer> &buffer) const override;
+    // The request with another request target (e.g. absolute-form, for a proxy), and
+    // `extra_headers` (complete lines, CRLF included) after its own headers
+    void to_buffer(std::vector<boost::asio::const_buffer> &buffer, std::string_view request_target,
+                   std::string_view extra_headers) const;
     void process_header(std::string key, std::string value) override;
 
     // logs
@@ -152,6 +162,7 @@ private:
     std::string unix_socket_;
     cookie_store cookie_store_;
     std::function<void(int, const std::string&)> on_chunked_;
+    std::optional<proxy_config> proxy_config_;
     std::vector<std::string> ca_files_;
     std::vector<std::string> ca_pems_;
 

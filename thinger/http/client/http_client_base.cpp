@@ -12,6 +12,10 @@
 
 namespace thinger::http {
 
+http_client_base::http_client_base()
+    : env_proxy_(std::make_shared<const proxy_resolver>(proxy_config::from_environment())) {
+}
+
 http_client_base::~http_client_base() {
     LOG_DEBUG("Destroying HTTP client base");
     pool_.clear();
@@ -43,6 +47,44 @@ void http_client_base::apply_default_headers(const std::shared_ptr<http_request>
     if (auto_decompress_ && !request->has_header("Accept-Encoding")) {
         request->add_header("Accept-Encoding", "gzip, deflate");
     }
+}
+
+http_client_base& http_client_base::proxy(const std::string& url, const std::string& no_proxy) {
+    return proxy(proxy_config{url, url, no_proxy});
+}
+
+http_client_base& http_client_base::proxy(const proxy_config& config) {
+    proxy_ = std::make_shared<const proxy_resolver>(config);
+    return *this;
+}
+
+http_client_base& http_client_base::proxy_from_environment(bool enabled) {
+    env_proxy_ = enabled ? std::make_shared<const proxy_resolver>(proxy_config::from_environment()) : nullptr;
+    return *this;
+}
+
+proxy_resolver::choice http_client_base::select_proxy(const http_request& request) const {
+    if (!request.get_unix_socket().empty()) return {};
+    // The settings of the request, of the client, or of the environment: the first set
+    const auto& host = request.get_host();
+    const auto& port = request.get_port();
+    if (const auto& config = request.get_proxy_config()) {
+        return proxy_resolver(*config).select(request.is_ssl(), host, port);
+    }
+    if (proxy_) return proxy_->select(request.is_ssl(), host, port);
+    if (env_proxy_) return env_proxy_->select(request.is_ssl(), host, port);
+    return {};
+}
+
+std::string http_client_base::proxy_for(const http_request& request) const {
+    auto choice = select_proxy(request);
+    return choice.proxy ? choice.proxy->url() : std::string{};
+}
+
+std::string http_client_base::proxy_for(const std::string& url) const {
+    http_request request;
+    if (!request.set_url(url)) return {};
+    return proxy_for(request);
 }
 
 std::shared_ptr<boost::asio::ssl::context> http_client_base::tls_context(
@@ -120,20 +162,42 @@ http_client_base::connection_plan http_client_base::plan_connection(const http_r
         if (ec) return plan;
     }
 
-    // Connections are shared only by requests trusting the same CAs
+    auto choice = select_proxy(request);
+    if (!choice.error.empty()) {
+        LOG_ERROR("cannot use the proxy for {}: {}", request.get_url(), choice.error);
+        ec = client_error::invalid_proxy;
+        return plan;
+    }
+
+    // Connections are shared only by requests reaching their origin the same way, and
+    // trusting the same CAs: never a direct one for a proxied request, nor the other way
     plan.key = "tls:" + std::to_string(tls_id);
+    if (choice.proxy) {
+        plan.route.proxy = choice.proxy;
+        // Plain requests are forwarded by the proxy. TLS goes end to end through a tunnel, as
+        // do protocol upgrades (WebSocket), which a forwarding proxy may not pass on (as
+        // browsers do)
+        plan.route.tunnel = request.is_ssl() || request.has_header(header::upgrade);
+        plan.route.tls = plan.tls;
+        plan.key += (plan.route.tunnel ? "|connect:" : "|forward:") + choice.proxy->key();
+    }
     return plan;
 }
 
 std::shared_ptr<client_connection> http_client_base::make_connection(const connection_plan& plan) {
     auto& io_context = get_io_context();
-    std::shared_ptr<thinger::asio::socket> sock;
-    if (plan.tls) {
-        sock = std::make_shared<thinger::asio::ssl_socket>("http_client", io_context, plan.tls);
+    std::shared_ptr<client_connection> connection;
+    if (plan.route.proxy) {
+        connection = std::make_shared<client_connection>(io_context, plan.route, timeout_);
     } else {
-        sock = std::make_shared<thinger::asio::tcp_socket>("http_client", io_context);
+        std::shared_ptr<thinger::asio::socket> sock;
+        if (plan.tls) {
+            sock = std::make_shared<thinger::asio::ssl_socket>("http_client", io_context, plan.tls);
+        } else {
+            sock = std::make_shared<thinger::asio::tcp_socket>("http_client", io_context);
+        }
+        connection = std::make_shared<client_connection>(sock, timeout_);
     }
-    auto connection = std::make_shared<client_connection>(sock, timeout_);
     connection->set_max_content_size(max_content_size_);
     return connection;
 }
@@ -144,6 +208,7 @@ std::shared_ptr<client_connection> http_client_base::get_or_create_connection(
     ec = {};
     const std::string& socket_path = request->get_unix_socket();
 
+    // Unix sockets are local: never through a proxy
     if (!socket_path.empty()) {
         auto connection = pool_.get_unix_connection(socket_path);
         if (connection && connection->claim() && connection->is_open()) {
@@ -172,7 +237,8 @@ std::shared_ptr<client_connection> http_client_base::get_or_create_connection(
         return connection;
     }
 
-    LOG_DEBUG("Creating new connection for {}", request->get_host());
+    LOG_DEBUG("Creating new connection for {}{}", request->get_host(),
+              plan.route.proxy ? " through the proxy " + plan.route.proxy->url() : std::string{});
     connection = make_connection(plan);
     connection->claim();
     pool_.store_connection(request->get_host(), port, request->is_ssl(), connection, plan.key);
@@ -296,7 +362,8 @@ awaitable<client_response> http_client_base::send_with_redirects(
 
     if (!response) {
         auto ec = connection->last_error();
-        co_return client_response(ec ? ec : boost::asio::error::invalid_argument, nullptr);
+        // (with the answer of a proxy refusing the tunnel, if that was the error)
+        co_return client_response(ec ? ec : boost::asio::error::invalid_argument, connection->proxy_response());
     }
 
     // Handle redirects
@@ -349,7 +416,11 @@ awaitable<client_response> http_client_base::send_with_redirects(
             redirect_request->set_header(header::cookie, request->get_cookie_store().get_cookie_string());
         }
 
-        // The CAs of the request apply to every hop
+        // The proxy and CAs of the request apply to every hop; whether the proxy is used is
+        // decided again for the host of each one (NO_PROXY)
+        if (const auto& config = request->get_proxy_config()) {
+            redirect_request->set_proxy_config(*config);
+        }
         for (const auto& file : request->get_ca_files()) redirect_request->add_ca_file(file);
         for (const auto& pem : request->get_ca_pems()) redirect_request->add_ca_pem(pem);
 
@@ -416,7 +487,8 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
 
     apply_default_headers(request);
 
-    // A connection of its own, never pooled: it becomes the WebSocket
+    // A connection of its own, never pooled: it becomes the WebSocket. Through a proxy, it
+    // is a tunnel (CONNECT) for ws:// too, as the request has Upgrade
     boost::system::error_code ec;
     auto plan = plan_connection(*request, ec);
     if (ec) {
