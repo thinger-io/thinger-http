@@ -1,8 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <thinger/http/client/proxy.hpp>
 #include <thinger/http/client/client.hpp>
-#include <thinger/http/client/connection_pool.hpp>
-#include <thinger/asio/sockets/tcp_socket.hpp>
 #include <thinger/util/base64.hpp>
 #include <map>
 
@@ -297,20 +295,4 @@ TEST_CASE("Client proxy precedence", "[proxy][client][unit]") {
         request.set_host("docker.example");
         REQUIRE(http_client.proxy_for(request).empty());
     }
-}
-
-TEST_CASE("Connection pool keys connections by route", "[proxy][client][pool][unit]") {
-    boost::asio::io_context io_context;
-    connection_pool pool;
-    auto direct = std::make_shared<client_connection>(std::make_shared<thinger::asio::tcp_socket>("test", io_context));
-    auto proxied = std::make_shared<client_connection>(std::make_shared<thinger::asio::tcp_socket>("test", io_context));
-
-    pool.store_connection("example.com", 80, false, direct);
-    REQUIRE_FALSE(pool.get_connection("example.com", 80, false, "tls:0|forward:proxy|3128|"));
-    pool.store_connection("example.com", 80, false, proxied, "tls:0|forward:proxy|3128|");
-
-    REQUIRE(pool.get_connection("example.com", 80, false) == direct);
-    REQUIRE(pool.get_connection("example.com", 80, false, "tls:0|forward:proxy|3128|") == proxied);
-    REQUIRE_FALSE(pool.get_connection("example.com", 80, false, "tls:0|forward:other|3128|"));
-    REQUIRE(pool.size() == 2);
 }

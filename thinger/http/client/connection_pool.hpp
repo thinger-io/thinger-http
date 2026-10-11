@@ -1,115 +1,123 @@
 #ifndef THINGER_HTTP_CLIENT_CONNECTION_POOL_HPP
 #define THINGER_HTTP_CLIENT_CONNECTION_POOL_HPP
 
+#include <chrono>
+#include <cstdint>
+#include <list>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
-#include <shared_mutex>
-#include <boost/multi_index_container.hpp>
-#include <boost/multi_index/member.hpp>
-#include <boost/multi_index/composite_key.hpp>
-#include <boost/multi_index/hashed_index.hpp>
-#include <boost/multi_index/sequenced_index.hpp>
+#include <unordered_map>
+#include <vector>
 #include "client_connection.hpp"
 
 namespace thinger::http {
 
+/**
+ * Keep-alive pool of the connections of a client (RFC 9112 section 9.3). A connection is lent
+ * to one request at a time (a lease), and given back when the request ends: kept idle for the
+ * next request with the same key if it can carry another one, closed otherwise. The key tells
+ * which connections are interchangeable: same origin (or Unix socket), reached the same way
+ * (directly or through which proxy, trusting which CAs).
+ *
+ * Idle connections are bounded per key and in total (the oldest is closed to make room),
+ * and closed after an idle timeout, shortened to the one the server announces
+ * (Keep-Alive: timeout=N) minus a margin. One taken from the pool is checked first, without
+ * waiting: if the server closed it, reset it or sent something unasked, it is closed and the
+ * next one tried. Thread-safe: a lease may be taken and given back on any thread.
+ */
 class connection_pool {
-private:
-    // Connection entry in the pool
-    struct connection_entry {
-        std::string host;
-        uint16_t port;
-        bool ssl;
-        std::string unix_socket_path;  // Empty for TCP connections
-        std::string route;             // How the origin is reached (proxy, trusted CAs); empty for direct
-        std::weak_ptr<client_connection> connection;
-
-        connection_entry(const std::string& h, uint16_t p, bool s,
-                        const std::string& unix_path,
-                        const std::string& r,
-                        std::shared_ptr<client_connection> conn)
-            : host(h), port(p), ssl(s), unix_socket_path(unix_path), route(r), connection(conn) {}
-    };
-    
-    // Tags for multi_index_container
-    struct by_key {};
-    struct by_sequence {};
-    
-    // Define the multi_index_container with composite key indexing
-    using connection_container = boost::multi_index_container<
-        connection_entry,
-        boost::multi_index::indexed_by<
-            // Hashed index by composite key (host, port, ssl, unix_socket_path, route)
-            boost::multi_index::hashed_unique<
-                boost::multi_index::tag<by_key>,
-                boost::multi_index::composite_key<
-                    connection_entry,
-                    boost::multi_index::member<connection_entry, std::string, &connection_entry::host>,
-                    boost::multi_index::member<connection_entry, uint16_t, &connection_entry::port>,
-                    boost::multi_index::member<connection_entry, bool, &connection_entry::ssl>,
-                    boost::multi_index::member<connection_entry, std::string, &connection_entry::unix_socket_path>,
-                    boost::multi_index::member<connection_entry, std::string, &connection_entry::route>
-                >
-            >,
-            // Sequenced index for LRU-style access if needed in future
-            boost::multi_index::sequenced<
-                boost::multi_index::tag<by_sequence>
-            >
-        >
-    >;
-    
-    connection_container connections_;
-    mutable std::shared_mutex mutex_;
-    
 public:
-    connection_pool() = default;
-    ~connection_pool();
-    
-    // Get a connection from the pool (returns nullptr if not found or expired). `route` tells
-    // how the connection reaches the origin (e.g. through which proxy): connections are only
-    // shared by requests with the same one
-    std::shared_ptr<client_connection> get_connection(const std::string& host,
-                                                     uint16_t port,
-                                                     bool ssl,
-                                                     const std::string& route = {});
-    
-    // Get a unix socket connection from the pool
-    std::shared_ptr<client_connection> get_unix_connection(const std::string& unix_path);
-    
-    // Store a connection in the pool
-    void store_connection(const std::string& host,
-                         uint16_t port,
-                         bool ssl,
-                         std::shared_ptr<client_connection> connection,
-                         const std::string& route = {});
-    
-    // Store a unix socket connection in the pool
-    void store_unix_connection(const std::string& unix_path,
-                              std::shared_ptr<client_connection> connection);
-    
-    // Remove expired connections (optional cleanup method)
-    // Returns the number of connections removed
-    size_t cleanup_expired();
-    
-    // Get the number of connections in the pool
-    size_t size() const;
-    
-    // Clear all connections from the pool (always closes them)
-    void clear();
-    
-private:
-    std::shared_ptr<client_connection> get_connection_impl(const std::string& host,
-                                                          uint16_t port,
-                                                          bool ssl,
-                                                          const std::string& unix_path,
-                                                          const std::string& route);
+    struct config {
+        // Idle connections kept per key (0: none, the pool is disabled)
+        size_t max_idle_per_host = 8;
+        // Idle connections kept in total (0: none)
+        size_t max_idle = 100;
+        // Time an idle connection is kept
+        std::chrono::milliseconds idle_timeout{4000};
+    };
 
-    void store_connection_impl(const std::string& host,
-                              uint16_t port,
-                              bool ssl,
-                              const std::string& unix_path,
-                              const std::string& route,
-                              std::shared_ptr<client_connection> connection);
+    // Subtracted from the idle timeout a server announces, so the connection is not reused
+    // just as the server closes it
+    static constexpr std::chrono::milliseconds keep_alive_margin{1000};
+
+    struct host_stats {
+        size_t idle = 0;
+        size_t active = 0;
+    };
+
+    struct stats {
+        size_t idle = 0;            // connections kept idle
+        size_t active = 0;          // connections lent to requests
+        size_t created = 0;         // connections created (since the pool was)
+        size_t reused = 0;          // requests sent on an idle connection
+        std::map<std::string, host_stats> hosts;    // by origin ("https://host:port", "unix:/path")
+    };
+
+private:
+    struct state;
+
+public:
+    // A connection lent to a request, given back to the pool when released or destroyed
+    class lease {
+    public:
+        lease() = default;
+        lease(lease&& other) noexcept = default;
+        lease& operator=(lease&& other) noexcept;
+        lease(const lease&) = delete;
+        lease& operator=(const lease&) = delete;
+        ~lease() { release(); }
+
+        explicit operator bool() const { return connection_ != nullptr; }
+        client_connection* operator->() const { return connection_.get(); }
+        client_connection& operator*() const { return *connection_; }
+        const std::shared_ptr<client_connection>& connection() const { return connection_; }
+
+        // Give the connection back: kept idle if it can carry another request, closed
+        // otherwise. The lease is empty afterwards
+        void release();
+
+    private:
+        friend class connection_pool;
+        lease(std::weak_ptr<state> pool, std::string key, std::shared_ptr<client_connection> connection)
+            : pool_(std::move(pool)), key_(std::move(key)), connection_(std::move(connection)) {}
+
+        std::weak_ptr<state> pool_;
+        std::string key_;
+        std::shared_ptr<client_connection> connection_;
+    };
+
+    connection_pool();
+    ~connection_pool();
+    connection_pool(const connection_pool&) = delete;
+    connection_pool& operator=(const connection_pool&) = delete;
+
+    // Limits, applied to the connections already idle too
+    void configure(const config& config);
+    config get_config() const;
+
+    // Close each idle connection with a timer on its io_context (the default). Without them,
+    // expired connections are closed when the pool is next used: for an io_context that only
+    // runs while requests do, as a pending timer would keep it running
+    void use_idle_timers(bool enabled);
+
+    // An idle connection for `key`, claimed for a request; empty if there is none usable
+    lease acquire(const std::string& key);
+
+    // Lend a new connection for `key`; `origin` names it in the stats
+    lease add(const std::string& key, const std::string& origin, std::shared_ptr<client_connection> connection);
+
+    // Idle connections
+    size_t size() const;
+
+    stats get_stats() const;
+
+    // Close the idle connections (those lent are not affected)
+    void clear();
+
+private:
+    std::shared_ptr<state> state_;
 };
 
 } // namespace thinger::http

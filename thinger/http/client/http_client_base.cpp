@@ -202,47 +202,111 @@ std::shared_ptr<client_connection> http_client_base::make_connection(const conne
     return connection;
 }
 
-std::shared_ptr<client_connection> http_client_base::get_or_create_connection(
-    const std::shared_ptr<http_request>& request, boost::system::error_code& ec) {
-
+connection_pool::lease http_client_base::get_connection(const std::shared_ptr<http_request>& request,
+                                                        boost::system::error_code& ec, bool reuse) {
     ec = {};
     const std::string& socket_path = request->get_unix_socket();
 
-    // Unix sockets are local: never through a proxy
+    // Connections are interchangeable if they reach the same origin the same way. Through a
+    // forwarding proxy, they reach the proxy: any origin is requested on them (as curl does)
+    std::string key;
+    std::string origin;
+    connection_plan plan;
     if (!socket_path.empty()) {
-        auto connection = pool_.get_unix_connection(socket_path);
-        if (connection && connection->claim() && connection->is_open()) {
-            LOG_DEBUG("Reusing connection from pool for {}", socket_path);
-            connection->set_max_content_size(max_content_size_);
-            return connection;
+        // Unix sockets are local: never through a proxy
+        key = origin = "unix:" + socket_path;
+    } else {
+        plan = plan_connection(*request, ec);
+        if (ec) return {};
+        if (plan.route.proxy && !plan.route.tunnel) {
+            key = plan.key;
+            origin = "proxy " + plan.route.proxy->url();
+        } else {
+            origin = (request->is_ssl() ? "https://" : "http://") + request->get_host() + ":" + request->get_port();
+            key = origin + "|" + plan.key;
         }
+    }
+
+    if (reuse) {
+        if (auto lease = pool_.acquire(key)) {
+            LOG_DEBUG("Reusing connection from pool for {}", origin);
+            lease->set_max_content_size(max_content_size_);
+            lease->set_timeout(timeout_);
+            return lease;
+        }
+    }
+
+    std::shared_ptr<client_connection> connection;
+    if (!socket_path.empty()) {
         auto sock = std::make_shared<thinger::asio::unix_socket>("http_client", get_io_context());
         connection = std::make_shared<client_connection>(sock, socket_path, timeout_);
         connection->set_max_content_size(max_content_size_);
-        connection->claim();
-        pool_.store_unix_connection(socket_path, connection);
-        return connection;
+    } else {
+        LOG_DEBUG("Creating new connection for {}{}", request->get_host(),
+                  plan.route.proxy ? " through the proxy " + plan.route.proxy->url() : std::string{});
+        connection = make_connection(plan);
     }
+    return pool_.add(key, origin, std::move(connection));
+}
 
-    auto plan = plan_connection(*request, ec);
-    if (ec) return nullptr;
-    auto port = static_cast<uint16_t>(std::stoi(request->get_port()));
+http_client_base& http_client_base::max_idle_connections_per_host(size_t max) {
+    auto config = pool_.get_config();
+    config.max_idle_per_host = max;
+    pool_.configure(config);
+    return *this;
+}
 
-    // Reuse it if no other request is using it (never touching its socket otherwise) and it
-    // is still open. A closed one stays claimed: it is replaced in the pool below
-    auto connection = pool_.get_connection(request->get_host(), port, request->is_ssl(), plan.key);
-    if (connection && connection->claim() && connection->is_open()) {
-        LOG_DEBUG("Reusing connection from pool for {}", request->get_host());
-        connection->set_max_content_size(max_content_size_);
-        return connection;
+http_client_base& http_client_base::max_idle_connections(size_t max) {
+    auto config = pool_.get_config();
+    config.max_idle = max;
+    pool_.configure(config);
+    return *this;
+}
+
+http_client_base& http_client_base::idle_timeout(std::chrono::milliseconds timeout) {
+    auto config = pool_.get_config();
+    config.idle_timeout = timeout;
+    pool_.configure(config);
+    return *this;
+}
+
+bool http_client_base::can_retry(const client_connection& connection, const http_request& request) {
+    // A server may close an idle connection at any time (RFC 9112 section 9.3.1): a request
+    // failing on a reused one before any byte of its response arrived most likely met that.
+    // It is sent again on a new connection if that is safe, as Go does: nothing of it was
+    // written, or it is idempotent (RFC 9110 section 9.2.2) or has an idempotency key.
+    // Otherwise (e.g. a POST) the server may have processed it, and the error is returned.
+    // Never after a timeout: the server may be just slow
+    const auto& ec = connection.last_error();
+    if (!ec || !connection.reused() || connection.response_started()) return false;
+    if (ec == boost::asio::error::timed_out || ec == boost::asio::error::operation_aborted) return false;
+    if (connection.request_unsent()) return true;
+    switch (request.get_method()) {
+        case method::GET:
+        case method::HEAD:
+        case method::OPTIONS:
+        case method::TRACE:
+        case method::PUT:
+        case method::DELETE:
+            return true;
+        default:
+            return request.has_header("Idempotency-Key") || request.has_header("X-Idempotency-Key");
     }
+}
 
-    LOG_DEBUG("Creating new connection for {}{}", request->get_host(),
-              plan.route.proxy ? " through the proxy " + plan.route.proxy->url() : std::string{});
-    connection = make_connection(plan);
-    connection->claim();
-    pool_.store_connection(request->get_host(), port, request->is_ssl(), connection, plan.key);
-    return connection;
+awaitable<std::shared_ptr<http_response>> http_client_base::send_request(const std::shared_ptr<http_request>& request,
+                                                                          connection_pool::lease& lease) {
+    auto response = co_await lease->send_request(request);
+    if (!response && can_retry(*lease, *request)) {
+        LOG_DEBUG("reused connection to {} failed before the response ({}): sending again on a new one",
+                  request->get_host(), lease->last_error().message());
+        boost::system::error_code ec;
+        if (auto fresh = get_connection(request, ec, false)) {
+            lease = std::move(fresh);
+            response = co_await lease->send_request(request);
+        }
+    }
+    co_return response;
 }
 
 // HTTP methods implementation
@@ -319,10 +383,7 @@ awaitable<client_response> http_client_base::options(const std::string& url, hea
 }
 
 awaitable<client_response> http_client_base::send(std::shared_ptr<http_request> request) {
-    boost::system::error_code ec;
-    auto connection = get_or_create_connection(request, ec);
-    if (!connection) co_return client_response(ec, nullptr);
-    co_return co_await send_with_redirects(std::move(request), connection, 0);
+    co_return co_await send_with_redirects(std::move(request));
 }
 
 awaitable<stream_result> http_client_base::send_streaming(std::shared_ptr<http_request> request,
@@ -334,41 +395,58 @@ awaitable<stream_result> http_client_base::send_streaming(std::shared_ptr<http_r
     }
     apply_default_headers(request);
     boost::system::error_code ec;
-    auto connection = get_or_create_connection(request, ec);
-    if (!connection) {
+    auto lease = get_connection(request, ec);
+    if (!lease) {
         stream_result result;
         result.error = ec.message();
         co_return result;
     }
-    co_return co_await connection->send_request_streaming(std::move(request), std::move(callback));
+    // (the callback is not called before the response starts: it is not called twice for a
+    // request sent again)
+    auto forward = [&callback](const stream_info& info) { return callback(info); };
+    auto result = co_await lease->send_request_streaming(request, forward);
+    if (lease->last_error() && can_retry(*lease, *request)) {
+        LOG_DEBUG("reused connection to {} failed before the response ({}): sending again on a new one",
+                  request->get_host(), lease->last_error().message());
+        if (auto fresh = get_connection(request, ec, false)) {
+            lease = std::move(fresh);
+            result = co_await lease->send_request_streaming(request, forward);
+        }
+    }
+    // Back to the pool only if the body was read whole (not aborted by the callback)
+    co_return result;
 }
 
 awaitable<std::pair<client_response, std::shared_ptr<client_connection>>>
 http_client_base::send_with_connection(std::shared_ptr<http_request> request) {
-    boost::system::error_code ec;
-    auto connection = get_or_create_connection(request, ec);
-    if (!connection) co_return std::make_pair(client_response(ec, nullptr), connection);
-    auto response = co_await send_with_redirects(request, connection, 0);
-    co_return std::make_pair(std::move(response), connection);
+    std::shared_ptr<client_connection> connection;
+    auto response = co_await send_with_redirects(std::move(request), &connection);
+    co_return std::make_pair(std::move(response), std::move(connection));
 }
 
-awaitable<client_response> http_client_base::send_with_redirects(
-    std::shared_ptr<http_request> request,
-    std::shared_ptr<client_connection> connection,
-    unsigned int redirect_count) {
+awaitable<client_response> http_client_base::send_with_redirects(std::shared_ptr<http_request> request,
+                                                                 std::shared_ptr<client_connection>* used) {
+    for (unsigned int redirect_count = 0;; ++redirect_count) {
+        boost::system::error_code ec;
+        auto lease = get_connection(request, ec);
+        if (!lease) co_return client_response(ec, nullptr);
 
-    // Send request
-    auto response = co_await connection->send_request(request);
+        auto response = co_await send_request(request, lease);
+        if (used) *used = lease.connection();
 
-    if (!response) {
-        auto ec = connection->last_error();
-        // (with the answer of a proxy refusing the tunnel, if that was the error)
-        co_return client_response(ec ? ec : boost::asio::error::invalid_argument, connection->proxy_response());
-    }
+        if (!response) {
+            ec = lease->last_error();
+            // (with the answer of a proxy refusing the tunnel, if that was the error)
+            co_return client_response(ec ? ec : boost::asio::error::invalid_argument, lease->proxy_response());
+        }
 
-    // Handle redirects
-    if (follow_redirects_ && response->is_redirect_response() &&
-        redirect_count < max_redirects_ && response->has_header("Location")) {
+        // Back to the pool (if it can carry another request): the redirect may reuse it
+        lease.release();
+
+        if (!follow_redirects_ || !response->is_redirect_response() ||
+            redirect_count >= max_redirects_ || !response->has_header("Location")) {
+            co_return client_response(boost::system::error_code{}, response);
+        }
 
         std::string location = response->get_header("Location");
         LOG_DEBUG("Following redirect #{} to: {}", redirect_count + 1, location);
@@ -424,15 +502,8 @@ awaitable<client_response> http_client_base::send_with_redirects(
         for (const auto& file : request->get_ca_files()) redirect_request->add_ca_file(file);
         for (const auto& pem : request->get_ca_pems()) redirect_request->add_ca_pem(pem);
 
-        // Get connection for redirect (may be different host)
-        boost::system::error_code ec;
-        auto redirect_connection = get_or_create_connection(redirect_request, ec);
-        if (!redirect_connection) co_return client_response(ec, nullptr);
-
-        co_return co_await send_with_redirects(redirect_request, redirect_connection, redirect_count + 1);
+        request = std::move(redirect_request);
     }
-
-    co_return client_response(boost::system::error_code{}, response);
 }
 
 // Simple URL version delegates to the request version

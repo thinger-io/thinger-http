@@ -2,10 +2,14 @@
 #define THINGER_HTTP_CLIENT_CONNECTION_HPP
 
 #include <atomic>
+#include <chrono>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <boost/noncopyable.hpp>
 #include <boost/asio/ssl/context.hpp>
+#include <boost/asio/steady_timer.hpp>
 
 #include "../common/http_request.hpp"
 #include "../common/http_response.hpp"
@@ -81,12 +85,39 @@ public:
     std::shared_ptr<thinger::asio::socket> get_socket() const { return socket_; }
     bool is_open() const { return socket_ && socket_->is_open(); }
 
-    // A connection serves one request at a time: whoever hands it out claims it first, and
-    // the request releases it once done. False while another request is using it
+    // A connection serves one request at a time: whoever hands it out claims it first (the
+    // pool, taking it), and it is unclaimed when idle again (given back to the pool). False
+    // while another request is using it
     bool claim() { return !claimed_.exchange(true); }
+    void unclaim() { claimed_ = false; }
+
+    // After a request: whether the connection can carry another one (RFC 9112 section 9.3):
+    // the response was read whole, neither side asked to close it, nothing past the response
+    // was received, and it did not switch protocols. Virtual for test doubles
+    virtual bool reusable() const { return reusable_ && is_open(); }
+
+    // While idle: whether it can no longer be used: closed, or the peer closed it, reset it,
+    // or sent something unasked. Checked without waiting before reusing it. Virtual for test
+    // doubles
+    virtual bool stale() const { return !is_open() || socket_->readable_now(); }
+
+    // How the last request failed, to tell whether it can be sent again on a new connection:
+    // the connection was open before it (reused, not connected for it), nothing of the
+    // request was written, or some byte of the response was received
+    bool reused() const { return reused_; }
+    bool request_unsent() const { return request_unsent_; }
+    bool response_started() const { return response_started_; }
+
+    // The idle timeout the server announced with its last response (Keep-Alive: timeout=N)
+    std::optional<std::chrono::seconds> keep_alive_timeout() const { return keep_alive_timeout_; }
+
+    // While idle in a pool: call `on_expired` (on the io_context of the connection) after
+    // `timeout`. Calling it again replaces the previous wait (completed with an error)
+    void expire_after(std::chrono::steady_clock::duration timeout, std::function<void()> on_expired);
 
     // Forward max response size to the underlying parser.
     void set_max_content_size(size_t size) { response_parser_.set_max_content_size(size); }
+    void set_timeout(std::chrono::seconds timeout) { timeout_ = timeout; }
 
 private:
     // Internal helpers
@@ -108,6 +139,12 @@ private:
     response_factory response_parser_;
     boost::system::error_code error_;
     std::atomic<bool> claimed_{false};
+    bool reused_ = false;
+    bool request_unsent_ = false;
+    bool response_started_ = false;
+    bool reusable_ = false;
+    std::optional<std::chrono::seconds> keep_alive_timeout_;
+    boost::asio::steady_timer idle_timer_;
 };
 
 }

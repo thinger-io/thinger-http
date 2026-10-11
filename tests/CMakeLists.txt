@@ -179,6 +179,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/client_ca_test.cpp)
     add_thinger_test(test_integration_client_ca integration/client_ca_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/client_keepalive_test.cpp)
+    add_thinger_test(test_integration_client_keepalive integration/client_keepalive_test.cpp)
+endif()
+
 # Integration tests - Server
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/server_basic_test.cpp)
     add_thinger_test(test_integration_server_basic integration/server_basic_test.cpp)

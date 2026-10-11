@@ -1,8 +1,10 @@
 #include "client_connection.hpp"
 #include "client_error.hpp"
 #include "../../asio/sockets/ssl_socket.hpp"
+#include "../../util/ascii.hpp"
 #include "../../util/logger.hpp"
 #include "../../util/compression.hpp"
+#include <charconv>
 #include <boost/asio/ssl/error.hpp>
 
 namespace thinger::http {
@@ -28,6 +30,43 @@ void decompress(http_response& response) {
     response.remove_header("Content-Encoding");
 }
 
+std::string_view trim(std::string_view value) {
+    static constexpr std::string_view whitespace = " \t";
+    auto first = value.find_first_not_of(whitespace);
+    if (first == std::string_view::npos) return {};
+    return value.substr(first, value.find_last_not_of(whitespace) - first + 1);
+}
+
+// Whether a Connection header lists `option` (e.g. "close")
+bool has_connection_option(std::string_view value, std::string_view option) {
+    while (true) {
+        auto comma = value.find(',');
+        if (::thinger::util::ascii::iequals(trim(value.substr(0, comma)), option)) return true;
+        if (comma == std::string_view::npos) return false;
+        value.remove_prefix(comma + 1);
+    }
+}
+
+// The timeout of a Keep-Alive header ("timeout=5, max=100"), in seconds
+std::optional<std::chrono::seconds> keep_alive_timeout_of(std::string_view value) {
+    while (!value.empty()) {
+        auto comma = value.find(',');
+        auto parameter = trim(value.substr(0, comma));
+        if (::thinger::util::ascii::istarts_with(parameter, "timeout=")) {
+            auto number = trim(parameter.substr(8));
+            long seconds = 0;
+            auto [end, ec] = std::from_chars(number.data(), number.data() + number.size(), seconds);
+            if (ec == std::errc{} && end == number.data() + number.size() && seconds >= 0) {
+                return std::chrono::seconds{seconds};
+            }
+            return std::nullopt;
+        }
+        if (comma == std::string_view::npos) break;
+        value.remove_prefix(comma + 1);
+    }
+    return std::nullopt;
+}
+
 }
 
 std::atomic<unsigned long> client_connection::connections(0);
@@ -35,7 +74,8 @@ std::atomic<unsigned long> client_connection::connections(0);
 client_connection::client_connection(std::shared_ptr<thinger::asio::socket> socket,
                                      std::chrono::seconds timeout)
     : socket_(std::move(socket))
-    , timeout_(timeout) {
+    , timeout_(timeout)
+    , idle_timer_(socket_->get_io_context()) {
     ++connections;
     LOG_TRACE("created http client connection with timeout: {} seconds. total: {}",
               timeout.count(), connections.load());
@@ -46,7 +86,8 @@ client_connection::client_connection(std::shared_ptr<thinger::asio::unix_socket>
                                      std::chrono::seconds timeout)
     : socket_(std::move(socket))
     , socket_path_(path)
-    , timeout_(timeout) {
+    , timeout_(timeout)
+    , idle_timer_(socket_->get_io_context()) {
     ++connections;
     LOG_TRACE("created http client connection (for unix socket: {}) with timeout: {} seconds. total: {}",
               path, timeout.count(), connections.load());
@@ -56,7 +97,8 @@ client_connection::client_connection(boost::asio::io_context& io_context, proxy_
                                      std::chrono::seconds timeout)
     : socket_(std::make_shared<thinger::asio::tcp_socket>("http_client", io_context))
     , route_(std::move(route))
-    , timeout_(timeout) {
+    , timeout_(timeout)
+    , idle_timer_(io_context) {
     ++connections;
     LOG_TRACE("created http client connection through proxy {} with timeout: {} seconds. total: {}",
               route_.proxy ? route_.proxy->url() : "", timeout.count(), connections.load());
@@ -224,6 +266,7 @@ awaitable<io_result> client_connection::write_to_proxy(const http_request& reque
 awaitable<std::shared_ptr<http_response>> client_connection::read_response(const http_request& request) {
     while (true) {
         auto [ec, bytes] = co_await socket_->read_some(buffer_, MAX_BUFFER_SIZE);
+        if (bytes > 0) response_started_ = true;
 
         uint8_t* begin = buffer_;
         uint8_t* end = buffer_ + bytes;
@@ -247,9 +290,17 @@ awaitable<std::shared_ptr<http_response>> client_connection::read_response(const
         if (boost::indeterminate(result)) continue;
 
         // Data past the response, other than that of a switched protocol (another response
-        // than the one requested, or garbage), leaves the connection out of sync
-        bool reusable = response_parser_.keep_alive() && begin == end;
+        // than the one requested, or garbage), leaves the connection out of sync. A client
+        // asking to close it sends nothing more on it (RFC 9112 section 9.6)
+        bool reusable = response_parser_.keep_alive() && begin == end &&
+                        !has_connection_option(request.get_header(header::connection), "close");
         auto response = response_parser_.consume_response();
+        if (reusable) {
+            reusable_ = true;
+            if (response->has_header("Keep-Alive")) {
+                keep_alive_timeout_ = keep_alive_timeout_of(response->get_header("Keep-Alive"));
+            }
+        }
         if (response->get_status_code() == 101) {
             if (!request.has_header(header::upgrade)) {
                 error_ = client_error::unexpected_upgrade;
@@ -274,6 +325,11 @@ awaitable<std::shared_ptr<http_response>> client_connection::exchange(std::share
     error_ = {};
     buffered_.clear();
     proxy_response_.reset();
+    reused_ = socket_->is_open();
+    request_unsent_ = false;
+    response_started_ = false;
+    reusable_ = false;
+    keep_alive_timeout_.reset();
 
     // Timeout timer
     boost::asio::steady_timer timer(socket_->get_io_context());
@@ -290,10 +346,16 @@ awaitable<std::shared_ptr<http_response>> client_connection::exchange(std::share
         }
 
         request->log("CLIENT->", 0);
+        io_result written;
         if (route_.proxy && !route_.tunnel) {
-            co_await write_to_proxy(*request);
+            written = co_await write_to_proxy(*request);
         } else {
-            co_await request->to_socket(socket_);
+            written = co_await request->to_socket(socket_);
+        }
+        if (auto [write_ec, bytes] = written; write_ec) {
+            error_ = write_ec;
+            request_unsent_ = bytes == 0;
+            co_return;
         }
         response = co_await read_response(*request);
     };
@@ -314,11 +376,10 @@ awaitable<std::shared_ptr<http_response>> client_connection::exchange(std::share
         error_ = boost::asio::error::timed_out;
     }
     // Never reused after an error: where the next response would start is unknown
-    if (!response) close();
-
-    // The response is read: the connection may serve another request now, unless it
-    // switched protocols (then it is never handed out again)
-    if (!response || response->get_status_code() != 101) claimed_ = false;
+    if (!response) {
+        reusable_ = false;
+        close();
+    }
 
     co_return response;
 }
@@ -371,6 +432,13 @@ void client_connection::close() {
         socket_->close();
     }
     response_parser_.reset();
+}
+
+void client_connection::expire_after(std::chrono::steady_clock::duration timeout, std::function<void()> on_expired) {
+    idle_timer_.expires_after(timeout);
+    idle_timer_.async_wait([on_expired = std::move(on_expired)](const boost::system::error_code& ec) {
+        if (!ec) on_expired();
+    });
 }
 
 std::string client_connection::take_buffered() {

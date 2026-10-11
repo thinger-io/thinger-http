@@ -13,6 +13,9 @@ async_client::~async_client() {
     if (is_running()) {
         stop();
     }
+    // Before the workers may stop (once no client is left), with the io_contexts of the
+    // connections: those given back to the pool after stop() too
+    clear_connections();
 }
 
 void async_client::track_request_start() {
@@ -35,6 +38,9 @@ bool async_client::stop() {
 
     // Call base implementation
     bool result = worker_client::stop();
+
+    // The idle connections belong to the io_contexts of the workers, which may go away
+    clear_connections();
 
     // Notify any waiters
     {

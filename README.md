@@ -904,6 +904,32 @@ client.verify_ssl(false);  // Disable SSL verification
 client.unix_socket("/path/to/socket");  // Unix domain socket
 ```
 
+### Connection Pool (Keep-Alive)
+
+Each client keeps its connections open between requests (RFC 9112 §9.3): sequential requests to a server reuse one connection instead of connecting (and negotiating TLS) again. A connection carries one request at a time; concurrent requests to the same server open more.
+
+```cpp
+client.max_idle_connections_per_host(8);   // idle connections kept per origin (0 disables the pool)
+client.max_idle_connections(100);          // in total
+client.idle_timeout(std::chrono::seconds(4));
+
+auto stats = client.pool_stats();          // idle and in use, per origin; created and reused
+client.clear_connections();                // close the idle ones
+```
+
+| Setting | Default | Why |
+|---|---|---|
+| Idle per origin | 8 | Go keeps 2 (`MaxIdleConnsPerHost`), too few for bursts of concurrent calls: the extra connections are closed and opened again on the next burst. undici and Node keep any number |
+| Idle in total | 100 | As Go (`MaxIdleConns`) |
+| Idle timeout | 4 s | As undici: shorter than the idle timeout of most servers (5 s in Node and Apache, 60-75 s in nginx and load balancers), so the server rarely closes a connection just as a request is sent on it. Go keeps them 90 s, relying on retrying |
+
+- **Reuse**: a connection is given back to the pool only after a response read whole (a streamed one too, unless its callback aborted it), delimited by its length or chunked, with nothing received past it, and neither the server (`Connection: close`, HTTP/1.0 without keep-alive) nor the request asked to close it. Never after an error, a timeout or a `101` (WebSocket): `send_with_connection()` hands over a connection that switched protocols, and lets the pool reuse any other. The most recently used connection is reused first; when a limit is reached, the oldest idle one is closed.
+- **Server timeout**: `Keep-Alive: timeout=N` in a response shortens the idle timeout to N - 1 s (as undici, which subtracts 1-2 s); with N ≤ 1 the connection is not kept.
+- **Closed while idle**: a server may close an idle connection at any time. Before reusing one, the client checks without waiting whether the server (or proxy) closed it, reset it or sent anything: then it is closed and the request goes on another, whatever its method, as nothing was sent.
+- **Retries**: if a request sent on a reused connection fails before any byte of its response arrives (the server closed the connection as the request was sent), it is sent once more on a new connection when that is safe, as Go does: nothing of it was written, or its method is idempotent (`GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE`, RFC 9110 §9.2.2), or it has an `Idempotency-Key` (or `X-Idempotency-Key`) header. A `POST` or `PATCH` is not sent again, as the server may have processed it: the error is returned. Neither are requests on new connections, nor after a timeout. curl retries any method; Node (`http.Agent`) does not retry, and undici only with its opt-in `RetryAgent`.
+- **Keys**: connections are shared by requests to the same origin (scheme, host, port, or Unix socket) reaching it the same way (directly or through the same proxy and credentials) and trusting the same CAs. Through a forwarding proxy (plain `http://`), the connection reaches the proxy, so it is shared by requests to any origin, as curl does; tunnels (`CONNECT`) belong to their origin.
+- **Lifetime**: the `async_client` closes idle connections with a timer on its workers; the synchronous `client` runs its io_context only during a call, so it closes expired ones on the next call (and never reuses them). Destroying the client, or stopping the `async_client` (or the workers), closes its idle connections.
+
 ### Proxies
 
 Requests can go through an HTTP proxy. Plain `http://` requests are sent to the proxy with the full URL as target (absolute-form, RFC 9112 §3.2.2); `https://`, `ws://` and `wss://` ones go through a tunnel opened with `CONNECT host:port` (RFC 9110 §9.3.6), with TLS end to end: SNI and the certificate are those of the origin, never of the proxy. WebSockets use a tunnel even without TLS, as browsers do, since forwarding proxies may not pass upgrades on.
@@ -959,7 +985,7 @@ std::string via = client.proxy_for("https://api.example.com/");
 
 **Errors**: when the proxy refuses the tunnel, the request fails with `client_error::proxy_authentication_required` (407) or `client_error::proxy_tunnel_failed` (any other status), and the response of the proxy is kept: `res.status()`, its headers (`Proxy-Authenticate`) and body (`stream_result::status_code` when streaming). A plain `http://` request through a forwarding proxy gets the 407 as its response, without error. The answer to `CONNECT` is parsed as strictly as any response (a 2xx has no body, and nothing may follow it before the client speaks). The timeout of the client covers the connection to the proxy and the `CONNECT` too.
 
-**Connections** are only shared by requests reaching the origin the same way (directly or through the same proxy, with the same credentials) and trusting the same CAs.
+**Connections** are only shared by requests reaching the origin the same way (directly or through the same proxy, with the same credentials) and trusting the same CAs; through a forwarding proxy, by requests to any origin (see [Connection Pool](#connection-pool-keep-alive)).
 
 Streaming works the same way through a proxy, forwarded or tunneled: the stream callback (`request(...).get(callback)`, `send_streaming()`) and the chunked callback of a request (`http_request::set_chunked_callback()`, e.g. to follow Docker logs) get the body as it arrives.
 
@@ -1049,7 +1075,7 @@ Responses are parsed as strictly as the server parses requests, so a response is
 - **Header lines**: CRLF line endings, a token as name, no obsolete line folding nor control characters (`invalid_header`); the whitespace around a value is not part of it. At most 100 lines and 16 KB (`header_section_too_large`).
 - **Body**: none for responses to `HEAD`, 1xx, 204 and 304, whatever their headers. Otherwise `Transfer-Encoding: chunked` (decoded strictly, trailers dropped: `malformed_body`), `Content-Length`, or else until the server closes the connection. `Transfer-Encoding` other than a single `chunked` (no other coding is supported), in an HTTP/1.0 response or together with `Content-Length`, and a `Content-Length` other than digits, or repeated with different values, are `invalid_framing`. A response cut by the end of the connection is `incomplete_response`; one larger than `max_content_size()` (8 MB) is `body_too_large`, unless streamed.
 - **Interim responses** (`100 Continue`, `103 Early Hints`) are skipped. `101 Switching Protocols` ends the response, and is accepted only for a request with `Upgrade` (`unexpected_upgrade`).
-- **Connection reuse**: only after a response delimited by its length or chunked, kept alive, and with nothing received past its end.
+- **Connection reuse**: only after a response delimited by its length or chunked, kept alive, and with nothing received past its end (see [Connection Pool](#connection-pool-keep-alive)).
 
 ### Async Client (async_client)
 

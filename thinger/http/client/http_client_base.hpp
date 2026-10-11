@@ -46,7 +46,7 @@ protected:
     std::vector<std::string> ca_pems_;
     bool system_ca_{true};
 
-    // Connection pool for keep-alive
+    // Connections kept alive between requests
     connection_pool pool_;
 
     // Abstract method - each derived class provides its own io_context
@@ -55,10 +55,10 @@ protected:
     // Apply default headers
     void apply_default_headers(const std::shared_ptr<http_request>& request);
 
-    // Create or get connection for request (null, and why in `ec`, if its proxy or CAs
-    // cannot be used)
-    std::shared_ptr<client_connection> get_or_create_connection(const std::shared_ptr<http_request>& request,
-                                                                boost::system::error_code& ec);
+    // A connection for a request: an idle one of the pool if `reuse` and there is one, or a
+    // new one (empty, and why in `ec`, if its proxy or CAs cannot be used)
+    connection_pool::lease get_connection(const std::shared_ptr<http_request>& request,
+                                          boost::system::error_code& ec, bool reuse = true);
 
 public:
     http_client_base();
@@ -89,6 +89,12 @@ public:
     // Trust the system CAs (the default); false trusts only those added
     http_client_base& use_system_ca(bool enabled) { system_ca_ = enabled; return *this; }
 
+    // Keep-alive pool (see connection_pool): idle connections kept per origin (0 disables
+    // it: a new connection for each request), in total, and for how long
+    http_client_base& max_idle_connections_per_host(size_t max);
+    http_client_base& max_idle_connections(size_t max);
+    http_client_base& idle_timeout(std::chrono::milliseconds timeout);
+
     // Configuration getters
     std::chrono::seconds get_timeout() const { return timeout_; }
     unsigned int get_max_redirects() const { return max_redirects_; }
@@ -97,6 +103,9 @@ public:
     bool get_auto_decompress() const { return auto_decompress_; }
     bool get_verify_ssl() const { return verify_ssl_; }
     size_t get_max_content_size() const { return max_content_size_; }
+    size_t get_max_idle_connections_per_host() const { return pool_.get_config().max_idle_per_host; }
+    size_t get_max_idle_connections() const { return pool_.get_config().max_idle; }
+    std::chrono::milliseconds get_idle_timeout() const { return pool_.get_config().idle_timeout; }
 
     // The proxy a request to `url` goes through ("http://host:port"), empty if it connects
     // directly (or if the proxy cannot be used)
@@ -126,7 +135,8 @@ public:
     awaitable<stream_result> send_streaming(std::shared_ptr<http_request> request,
                                             stream_callback callback);
 
-    // Send and get connection back (for upgrades like WebSocket)
+    // Send and get the connection of the (last) response back: for upgrades like WebSocket,
+    // as one that switched protocols is never reused. Any other may be reused by the client
     awaitable<std::pair<client_response, std::shared_ptr<client_connection>>>
         send_with_connection(std::shared_ptr<http_request> request);
 
@@ -140,9 +150,11 @@ public:
         std::shared_ptr<http_request> request,
         const std::string& subprotocol = "");
 
-    // Connection pool management
+    // Connection pool management: close the idle connections, count them, and the
+    // connections by origin, idle and in use
     void clear_connections() { pool_.clear(); }
     size_t pool_size() const { return pool_.size(); }
+    connection_pool::stats pool_stats() const { return pool_.get_stats(); }
 
 private:
     // How a connection reaches the origin of a request: through a proxy or not, with which
@@ -173,10 +185,15 @@ private:
     connection_plan plan_connection(const http_request& request, boost::system::error_code& ec);
     std::shared_ptr<client_connection> make_connection(const connection_plan& plan);
 
-    // Internal send with redirect handling
+    // Send following redirects; the connection of the last response in `used`, if given
     awaitable<client_response> send_with_redirects(std::shared_ptr<http_request> request,
-                                                   std::shared_ptr<client_connection> connection,
-                                                   unsigned int redirect_count = 0);
+                                                   std::shared_ptr<client_connection>* used = nullptr);
+
+    // Send on the connection of `lease`, and again on a new one (then in `lease`) if a reused
+    // one failed and the request can be sent twice (see can_retry)
+    awaitable<std::shared_ptr<http_response>> send_request(const std::shared_ptr<http_request>& request,
+                                                           connection_pool::lease& lease);
+    static bool can_retry(const client_connection& connection, const http_request& request);
 
     // Check if URLs have same origin (for security when forwarding headers)
     static bool is_same_origin(const std::string& url1, const std::string& url2);

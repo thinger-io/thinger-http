@@ -1,8 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
 #include <thinger/http_client.hpp>
-#include <thinger/http/client/connection_pool.hpp>
-#include <thinger/http/client/client_connection.hpp>
-#include <thinger/asio/sockets/tcp_socket.hpp>
 #include <boost/asio.hpp>
 #include <atomic>
 #include <chrono>
@@ -207,55 +204,6 @@ TEST_CASE_METHOD(thinger::http::test::TestServerFixture, "HTTP Client connection
         }
         REQUIRE(server1_requests == 2);
         REQUIRE(server2_requests == 1);
-    }
-    
-    SECTION("Connection pool cleanup expired connections") {
-        http::connection_pool pool;
-        boost::asio::io_context context;
-        
-        // Create mock TCP socket for testing
-        class test_tcp_socket : public thinger::asio::tcp_socket {
-        public:
-            test_tcp_socket(boost::asio::io_context& ctx) 
-                : tcp_socket("test", ctx) {}
-        };
-        
-        // Create connections that will expire
-        const int expired_connections = 10;
-        for (int i = 0; i < expired_connections; ++i) {
-            auto socket = std::make_shared<test_tcp_socket>(context);
-            auto conn = std::make_shared<http::client_connection>(socket);
-            pool.store_connection("expired_host_" + std::to_string(i), 80, false, conn);
-            // Let conn go out of scope so the weak_ptr expires
-        }
-        
-        // Create connections that will stay alive
-        const int alive_connections = 5;
-        std::vector<std::shared_ptr<http::client_connection>> active_connections;
-        for (int i = 0; i < alive_connections; ++i) {
-            auto socket = std::make_shared<test_tcp_socket>(context);
-            auto conn = std::make_shared<http::client_connection>(socket);
-            active_connections.push_back(conn);  // Keep alive
-            pool.store_connection("alive_host_" + std::to_string(i), 80, false, conn);
-        }
-        
-        // Verify initial pool size
-        REQUIRE(pool.size() == expired_connections + alive_connections);
-        
-        // Run cleanup
-        size_t cleaned = pool.cleanup_expired();
-        
-        // Verify exact number of connections cleaned
-        REQUIRE(cleaned == expired_connections);
-        REQUIRE(pool.size() == alive_connections);
-        
-        // Try to get an alive connection - should succeed
-        auto alive_conn = pool.get_connection("alive_host_0", 80, false);
-        REQUIRE(alive_conn != nullptr);
-        
-        // Try to get an expired connection - should fail
-        auto expired_conn = pool.get_connection("expired_host_0", 80, false);
-        REQUIRE(expired_conn == nullptr);
     }
     
     SECTION("Connection pool handles connection failures gracefully") {
