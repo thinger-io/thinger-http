@@ -3,6 +3,7 @@
 
 #include <string>
 #include <memory>
+#include <optional>
 #include <set>
 #include <vector>
 #include <nlohmann/json.hpp>
@@ -11,6 +12,7 @@
 #include "http_stream.hpp"
 #include "server_connection.hpp"
 #include "body_reader.hpp"
+#include "body_decoders.hpp"
 #include "../common/http_response.hpp"
 #include "../../util/types.hpp"
 
@@ -231,9 +233,11 @@ namespace thinger::http{
         /// Body decoders, accepted types and limits of the application (null: defaults)
         const body_settings* body_settings_ = nullptr;
 
-        /// Body parsed as JSON by the matched route, for callbacks taking it
+        /// Body parsed as JSON by the matched route, for callbacks taking it, and the type
+        /// of the body it accepted (matched before the body is read)
         friend class route;
         nlohmann::json json_body_;
+        std::optional<body_type_match> body_type_;
     };
 
 }
