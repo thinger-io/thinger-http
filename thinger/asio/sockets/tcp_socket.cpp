@@ -209,6 +209,10 @@ bool tcp_socket::is_secure() const {
     return false;
 }
 
+bool tcp_socket::readable_now() const {
+    return socket_.is_open() && poll_readable(const_cast<boost::asio::ip::tcp::socket&>(socket_).native_handle());
+}
+
 size_t tcp_socket::available() const {
     boost::system::error_code ec;
     auto size = socket_.available(ec);

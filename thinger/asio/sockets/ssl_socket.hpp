@@ -42,6 +42,8 @@ public:
 
     // some getters to check the state
     bool is_secure() const override;
+    // Decrypted data waiting to be read counts too
+    bool readable_now() const override;
 
     // OpenSSL handle of the TLS stream, e.g. to set the name a client verifies in the
     // certificate of the server before the handshake

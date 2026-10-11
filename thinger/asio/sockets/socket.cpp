@@ -2,6 +2,7 @@
 #include <iostream>
 #include "socket.hpp"
 #if !defined(BOOST_ASIO_WINDOWS)
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #endif
@@ -88,6 +89,27 @@ namespace thinger::asio {
 
     size_t socket::available() const {
         return 0;
+    }
+
+    bool socket::readable_now() const {
+        return false;
+    }
+
+    bool socket::poll_readable(native_handle_type descriptor) {
+#if !defined(BOOST_ASIO_WINDOWS)
+        pollfd fd{};
+        fd.fd = descriptor;
+        fd.events = POLLIN;
+        int ready;
+        do {
+            ready = ::poll(&fd, 1, 0);
+        } while (ready < 0 && errno == EINTR);
+        // POLLIN, POLLHUP, POLLERR or POLLNVAL, or poll itself failing
+        return ready != 0;
+#else
+        (void) descriptor;
+        return false;
+#endif
     }
 
     std::string socket::get_remote_ip() const {

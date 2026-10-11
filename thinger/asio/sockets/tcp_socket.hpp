@@ -53,6 +53,7 @@ public:
     bool is_open() const override;
     bool is_secure() const override;
     size_t available() const override;
+    bool readable_now() const override;
     std::string get_remote_ip() const override;
     std::string get_local_port() const override;
     std::string get_remote_port() const override;

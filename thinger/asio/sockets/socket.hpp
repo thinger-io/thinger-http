@@ -107,6 +107,10 @@ public:
     virtual bool is_secure() const;
     // Bytes that can be read without waiting (0 by default)
     virtual size_t available() const;
+    // Without waiting: whether a read would complete now, with data, the end of the stream or
+    // an error (e.g. on an idle connection, which should have nothing to read, the peer
+    // closing it). False by default (unknown)
+    virtual bool readable_now() const;
     // Addresses of the connection (empty by default)
     virtual std::string get_remote_ip() const;
     virtual std::string get_local_port() const;
@@ -127,6 +131,9 @@ protected:
     // buffers past the first 64 are left, as if the socket accepted no more)
     static size_t send_now(native_handle_type descriptor, const std::vector<boost::asio::const_buffer>& buffers,
                            boost::system::error_code& ec);
+
+    // readable_now() of a plain stream socket: polled with no timeout (true if the poll fails)
+    static bool poll_readable(native_handle_type descriptor);
 
     boost::asio::io_context &io_context_;
     static std::atomic<unsigned long> connections;

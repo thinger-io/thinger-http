@@ -156,6 +156,11 @@ bool unix_socket::is_secure() const {
     return false;
 }
 
+bool unix_socket::readable_now() const {
+    return socket_.is_open() &&
+           poll_readable(const_cast<boost::asio::local::stream_protocol::socket&>(socket_).native_handle());
+}
+
 size_t unix_socket::available() const {
     boost::system::error_code ec;
     auto size = socket_.available(ec);

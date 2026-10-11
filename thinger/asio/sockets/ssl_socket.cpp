@@ -167,6 +167,12 @@ awaitable<bool> ssl_socket::peer_closed() {
     co_return true;
 }
 
+bool ssl_socket::readable_now() const {
+    if (!read_ahead_.empty()) return true;
+    if (SSL_pending(const_cast<ssl_socket*>(this)->ssl_stream_.native_handle()) > 0) return true;
+    return tcp_socket::readable_now();
+}
+
 bool ssl_socket::is_secure() const {
     return true;
 }
