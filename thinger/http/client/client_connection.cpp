@@ -2,6 +2,7 @@
 #include "client_error.hpp"
 #include "../../util/logger.hpp"
 #include "../../util/compression.hpp"
+#include <boost/asio/ssl/error.hpp>
 
 namespace thinger::http {
 
@@ -79,9 +80,12 @@ awaitable<boost::system::error_code> client_connection::ensure_connected(const h
         LOG_ERROR("error while connecting (attempt #{}): {} ({}) ({})",
                   retry + 1, ec.message(), ec.value(), ec.category().name());
 
-        // Don't retry for certain errors
+        // Don't retry for certain errors, nor a failed TLS handshake (e.g. a certificate
+        // that cannot be verified): it would fail the same way
         if (ec == boost::asio::error::operation_aborted ||
-            ec == boost::asio::error::host_not_found) {
+            ec == boost::asio::error::host_not_found ||
+            ec.category() == boost::asio::error::get_ssl_category() ||
+            ec.category() == boost::asio::ssl::error::get_stream_category()) {
             co_return ec;
         }
 
