@@ -138,29 +138,8 @@ namespace {
                "\nbeast:  " + fuzz::describe(beast);
     }
 
-    // Occurrences of each class of some event, printed at exit (and the input of the first
-    // one of each class when it is seen): informational only
-    class class_counter {
-    public:
-        explicit class_counter(const char* title) : title_(title) {}
-
-        ~class_counter() {
-            if (counts_.empty()) return;
-            std::fprintf(stderr, "\n%s:\n", title_);
-            for (auto& [what, count] : counts_) std::fprintf(stderr, "  %10llu  %s\n", static_cast<unsigned long long>(count), what.c_str());
-        }
-
-        void add(const std::string& what, const std::string& detail) {
-            if (counts_[what]++ == 0) std::fprintf(stderr, "\nINFO first of: %s: %s\n%s\n", title_, what.c_str(), detail.c_str());
-        }
-
-    private:
-        const char* title_;
-        std::map<std::string, uint64_t> counts_;
-    };
-
-    class_counter beast_disagreements("Beast vs llhttp disagreements");
-    class_counter known_discrepancies("Known discrepancies where we accept what llhttp rejects (normalized)");
+    fuzz::class_counter beast_disagreements("Beast vs llhttp disagreements");
+    fuzz::class_counter known_discrepancies("Known discrepancies where we accept what llhttp rejects (normalized)");
 
     // Compare Beast with llhttp, only to count their disagreements
     void compare_beast(std::string_view input, const fuzz::server_result& ours, const llhttp_result& llhttp,
@@ -180,32 +159,6 @@ namespace {
             else if (beast.version != llhttp.major * 10 + llhttp.minor) what = "both accept, different version";
         }
         if (!what.empty()) beast_disagreements.add(what, describe_all(input, ours, llhttp, beast));
-    }
-
-    // Remove the chunk extensions with whitespace (BWS) of the chunked body starting at
-    // `begin`, in a request we accepted (so every chunk line follows the grammar, ends at the
-    // first CRLF, and the sizes fit). Returns whether there was any.
-    bool remove_chunk_extensions_with_bws(std::string& input, size_t begin) {
-        bool found = false;
-        size_t pos = begin;
-        while (pos < input.size()) {
-            uint64_t chunk_size = 0;
-            size_t size_end = pos;
-            for (; size_end < input.size() && std::isxdigit(static_cast<unsigned char>(input[size_end])); size_end++) {
-                char c = static_cast<char>(std::tolower(static_cast<unsigned char>(input[size_end])));
-                chunk_size = chunk_size * 16 + static_cast<uint64_t>(c <= '9' ? c - '0' : c - 'a' + 10);
-            }
-            size_t line_end = input.find("\r\n", size_end);
-            if (line_end == std::string::npos) break;
-            if (input.find_first_of(" \t", size_end) < line_end) {
-                input.erase(size_end, line_end - size_end);
-                line_end = size_end;
-                found = true;
-            }
-            if (chunk_size == 0) break;  // the trailer section follows
-            pos = line_end + 2 + chunk_size + 2;
-        }
-        return found;
     }
 
     /**
@@ -250,7 +203,7 @@ namespace {
             // Whitespace in chunk extensions: the grammar allows BWS before and after ";" and
             // "=" (RFC 9112 section 7.1.1), llhttp does not. They are skipped, after the size
             if (theirs.reason.find("chunk extension") != std::string::npos &&
-                remove_chunk_extensions_with_bws(input, ours.header_end)) {
+                fuzz::remove_chunk_extensions_with_bws(input, ours.header_end)) {
                 return "whitespace in a chunk extension";
             }
 

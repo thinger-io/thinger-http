@@ -6,6 +6,7 @@ function(add_fuzz_target name source)
 endfunction()
 
 add_fuzz_target(fuzz_http_request_parser fuzz_http_request_parser.cpp)
+add_fuzz_target(fuzz_http_response_parser fuzz_http_response_parser.cpp)
 add_fuzz_target(fuzz_chunked_decoder fuzz_chunked_decoder.cpp)
 # Differential against Boost.Beast (header-only, used only by the fuzz targets as a reference)
 add_fuzz_target(fuzz_http_differential fuzz_http_differential.cpp)
@@ -34,6 +35,9 @@ add_library(fuzz_llhttp STATIC
 )
 target_include_directories(fuzz_llhttp SYSTEM PUBLIC ${llhttp_SOURCE_DIR}/include)
 
-# Three-way differential: llhttp as the reference, Beast as a third opinion
+# Three-way differentials: llhttp as the reference, Beast as a third opinion (requests, and
+# responses as the client reads them)
 add_fuzz_target(fuzz_http_differential3 fuzz_http_differential3.cpp)
 target_link_libraries(fuzz_http_differential3 PRIVATE fuzz_llhttp)
+add_fuzz_target(fuzz_http_response_differential fuzz_http_response_differential.cpp)
+target_link_libraries(fuzz_http_response_differential PRIVATE fuzz_llhttp)

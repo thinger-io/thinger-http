@@ -1,0 +1,10 @@
+HTTP/1.1 150 Interim
+Content-Length: 5
+Transfer-Encoding: chunked
+
+0
+
+HTTP/1.1 200 OK
+Content-Length: 8
+
+smuggled

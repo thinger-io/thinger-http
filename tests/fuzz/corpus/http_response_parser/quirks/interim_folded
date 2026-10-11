@@ -1,0 +1,8 @@
+HTTP/1.1 103 Early Hints
+Link: </a>
+ </b>
+
+HTTP/1.1 200 OK
+Content-Length: 2
+
+ok

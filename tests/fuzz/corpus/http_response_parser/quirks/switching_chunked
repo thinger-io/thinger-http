@@ -1,0 +1,7 @@
+HTTP/1.1 101 Switching Protocols
+Transfer-Encoding: chunked
+Upgrade: x
+Connection: upgrade
+
+0
+

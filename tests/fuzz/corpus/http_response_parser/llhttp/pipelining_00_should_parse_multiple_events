@@ -1,0 +1,12 @@
+HTTP/1.1 200 OK
+Content-Length: 3
+
+AAA
+HTTP/1.1 201 Created
+Content-Length: 4
+
+BBBB
+HTTP/1.1 202 Accepted
+Content-Length: 5
+
+CCCC

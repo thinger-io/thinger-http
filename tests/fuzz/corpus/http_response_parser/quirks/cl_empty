@@ -1,0 +1,7 @@
+HTTP/1.1 200 OK
+Content-Length: 
+
+helloHTTP/1.1 200 OK
+Content-Length: 8
+
+smuggled

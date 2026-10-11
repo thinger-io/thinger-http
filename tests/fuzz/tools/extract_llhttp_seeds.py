@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Extract the raw requests of llhttp's test suite (test/request/*.md, MIT) as fuzz seeds.
+"""Extract the raw requests and responses of llhttp's test suite (test/request/*.md and
+test/response/*.md, MIT) as fuzz seeds.
 
 Each test in those files is an ```http block (with a <!-- meta={"type": "request..."} -->
-comment) followed by the expected ```log. The block is turned into bytes as llhttp's
+or "response..." comment) followed by the expected ```log. The block is turned into bytes as llhttp's
 test/md-test.ts does: trailing newline removed, escaped newlines joined, every newline
 made CRLF, then \\r \\n \\t \\f \\xHH and octal escapes expanded.
 
 Writes one seed per request into <out>/http_request_parser/llhttp/ and, for the chunked
 ones, the bytes after the header section (followed by another request, as the other seeds)
-into <out>/chunked_decoder/llhttp/. Seeds already present anywhere under <out> (same
+into <out>/chunked_decoder/llhttp/; one seed per response into
+<out>/http_response_parser/llhttp/. Seeds already present anywhere under <out> (same
 bytes) and seeds over 4096 bytes (the -max_len used by CI) are skipped.
 
 Usage: extract_llhttp_seeds.py <llhttp source dir> <tests/fuzz/corpus>
@@ -42,8 +44,8 @@ def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")[:48] or "test"
 
 
-def tests(md: pathlib.Path):
-    """(heading, meta, input bytes) of each request test of a llhttp .md file."""
+def tests(md: pathlib.Path, kind: str = "request"):
+    """(heading, meta, input bytes) of each `kind` test (request or response) of a llhttp .md file."""
     heading, meta = "", None
     lines = md.read_text(encoding="utf-8").split("\n")
     i = 0
@@ -59,7 +61,7 @@ def tests(md: pathlib.Path):
             while not lines[i].startswith("```"):
                 block.append(lines[i])
                 i += 1
-            if meta.get("type", "").startswith("request"):
+            if meta.get("type", "").startswith(kind):
                 yield heading, meta, to_bytes("\n".join(block) + "\n")
             meta = None
         i += 1
@@ -80,25 +82,34 @@ def main():
     llhttp, corpus = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
     out_request = corpus / "http_request_parser" / "llhttp"
     out_chunked = corpus / "chunked_decoder" / "llhttp"
-    known = {hashlib.sha1(p.read_bytes()).digest() for p in corpus.rglob("*") if p.is_file() and p.parent not in (out_request, out_chunked)}
-    for out in (out_request, out_chunked):
+    out_response = corpus / "http_response_parser" / "llhttp"
+    outputs = (out_request, out_chunked, out_response)
+    known = {hashlib.sha1(p.read_bytes()).digest() for p in corpus.rglob("*") if p.is_file() and p.parent not in outputs}
+    for out in outputs:
         out.mkdir(parents=True, exist_ok=True)
         for old in out.iterdir():
             old.unlink()
 
-    written = {out_request: 0, out_chunked: 0}
+    written = dict.fromkeys(outputs, 0)
+
+    def write(out, name, seed):
+        if seed is None or len(seed) > MAX_SIZE:
+            return
+        digest = hashlib.sha1(seed).digest()
+        if digest in known:
+            return
+        known.add(digest)
+        (out / name).write_bytes(seed)
+        written[out] += 1
+
     for md in sorted((llhttp / "test" / "request").glob("*.md")):
         for n, (heading, meta, data) in enumerate(tests(md)):
             name = f"{md.stem}_{n:02d}_{slug(heading)}"
-            for out, seed in ((out_request, data), (out_chunked, chunked_body(data))):
-                if seed is None or len(seed) > MAX_SIZE:
-                    continue
-                digest = hashlib.sha1(seed).digest()
-                if digest in known:
-                    continue
-                known.add(digest)
-                (out / name).write_bytes(seed)
-                written[out] += 1
+            write(out_request, name, data)
+            write(out_chunked, name, chunked_body(data))
+    for md in sorted((llhttp / "test" / "response").glob("*.md")):
+        for n, (heading, meta, data) in enumerate(tests(md, "response")):
+            write(out_response, f"{md.stem}_{n:02d}_{slug(heading)}", data)
     for out, count in written.items():
         print(f"{out}: {count} seeds")
 
