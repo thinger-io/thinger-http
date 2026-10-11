@@ -133,6 +133,12 @@ awaitable<boost::system::error_code> client_connection::connect_socket(const std
 
         if (!ec) {
             LOG_TRACE("connection established");
+            // Each request is written at once: with Nagle, a write while the previous one is
+            // unacknowledged waits for the delayed ACK of the server (40 ms), as happens on a
+            // reused connection. Go, Node and curl disable it too
+            if (auto tcp = std::dynamic_pointer_cast<thinger::asio::tcp_socket>(socket_)) {
+                tcp->enable_tcp_no_delay();
+            }
             co_return ec;
         }
 
