@@ -15,7 +15,7 @@ env:
 
 jobs:
   build-examples:
-    runs-on: self-hosted
+    runs-on: [self-hosted, Linux, X64]
     container:
       image: thinger/compiler:mold-latest
       options: --memory=36g --memory-swap=36g
