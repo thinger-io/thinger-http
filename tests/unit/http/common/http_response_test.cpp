@@ -275,11 +275,13 @@ TEST_CASE("HTTP Response status line formatting", "[http][response][unit]") {
             return full_response.substr(0, full_response.find("\r\n"));
         };
         REQUIRE(status_line(418, "I'm a teapot") == "HTTP/1.1 418 I'm a teapot");
-        REQUIRE(status_line(206, "") == "HTTP/1.1 206 ");
+        REQUIRE(status_line(226, "") == "HTTP/1.1 226 ");
         // a reason that could end the line is not sent
         REQUIRE(status_line(299, "Bad\r\nX-Injected: 1") == "HTTP/1.1 299 ");
         // standard statuses keep their standard reason
         REQUIRE(status_line(404, "Gone Away") == "HTTP/1.1 404 Not Found");
+        REQUIRE(status_line(206, "") == "HTTP/1.1 206 Partial Content");
+        REQUIRE(status_line(416, "") == "HTTP/1.1 416 Range Not Satisfiable");
     }
 }
 

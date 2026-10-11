@@ -2,6 +2,7 @@
 #include "request.hpp"
 #include "mime_types.hpp"
 #include "body_decoders.hpp"
+#include "file_server/file_info.hpp"
 #include "../../util/logger.hpp"
 #include "../../util/base64.hpp"
 #include "../../util/sha1.hpp"
@@ -180,8 +181,8 @@ void response::compress_if_needed(http_response& response) const {
     }
 }
 
-void response::send_message(std::shared_ptr<http_response> message) {
-    compress_if_needed(*message);
+void response::send_message(std::shared_ptr<http_response> message, bool compress) {
+    if (compress) compress_if_needed(*message);
     if (!mark_responded()) return;
     state_->sink->send(std::move(message));
 }
@@ -273,53 +274,95 @@ void response::redirect(const std::string& url, http::http_response::status redi
     send_message(std::move(response));
 }
 
-// File sending implementation
+// File sending: the whole file, a byte range of it, or 304 if the client has it already
 void response::send_file(const std::filesystem::path& path, bool force_download) {
     if (!ensure_not_responded()) return;
-    
-    // For now, we'll implement basic file sending here
-    // TODO: Integrate with simple_file_handler when it's updated to work with response
-    
-    if (!std::filesystem::exists(path)) {
+
+    // One stat for the checks, the length and the validators
+    auto file = file_info::of(path);
+    if (!file) {
         error(http_response::status::not_found, "File not found");
         return;
     }
-    
-    if (!std::filesystem::is_regular_file(path)) {
+    if (!file->regular) {
         error(http_response::status::forbidden, "Not a regular file");
         return;
     }
-    
-    // Read file content
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        error(http_response::status::internal_server_error, "Failed to open file");
+
+    const auto& request = *state_->request;
+    bool head = request.get_method() == method::HEAD;
+    bool get = request.get_method() == method::GET;
+    const auto& content_type = mime_types::extension_to_type(path.extension().string());
+
+    // Headers of the 200 and 304 answers alike: the validators, and how to cache them.
+    // Without a Cache-Control of the handler, caches store the file but revalidate it on
+    // every use (else they could reuse it for a while, guessing from Last-Modified).
+    auto message = new_response();
+    if (!message->has_header(header::cache_control)) message->add_header(header::cache_control, "no-cache");
+    message->set_header("ETag", file->etag);
+    message->set_header("Last-Modified", file->last_modified);
+    // a text file may be sent compressed (see compress_if_needed): another representation
+    if (file->size >= 200 && is_compressible_content_type(content_type)) message->add_header("Vary", "Accept-Encoding");
+
+    // Conditional request for a file the client has: no body, nor the length of the file
+    if ((get || head) && file->not_modified(request)) {
+        message->set_status(http_response::status::not_modified);
+        send_message(std::move(message), false);
         return;
     }
-    
-    // Get file size
-    file.seekg(0, std::ios::end);
-    auto file_size = file.tellg();
-    file.seekg(0, std::ios::beg);
-    
-    // Read file content
-    std::string content(file_size, '\0');
-    file.read(&content[0], file_size);
-    
-    // Determine content type using mime_types
-    std::string content_type = mime_types::extension_to_type(path.extension().string());
-    
-    // Create response
-    auto response = new_response();
-    response->set_status(http_response::status::ok);
-    response->set_content(std::move(content), content_type);
-    
-    // Add Content-Disposition header if force_download is true
+
+    message->set_status(http_response::status::ok);
+    message->set_content_type(content_type);
+    message->add_header("Accept-Ranges", "bytes");
     if (force_download) {
-        response->add_header("Content-Disposition", "attachment; filename=\"" + path.filename().string() + "\"");
+        message->add_header("Content-Disposition", "attachment; filename=\"" + path.filename().string() + "\"");
     }
-    
-    send_message(std::move(response));
+
+    // HEAD: the headers of the GET answer (with the length of the file, uncompressed), no body
+    if (head) {
+        message->set_content_length(file->size);
+        send_message(std::move(message), false);
+        return;
+    }
+
+    // A single byte range of a GET request (RFC 9110, 14.2), unless If-Range asks for the
+    // whole file once it changed: only the date can match, as the entity tag is weak
+    std::optional<byte_range> range;
+    const auto& range_header = request.get_header("Range");
+    if (get && !range_header.empty()) {
+        const auto& if_range = request.get_header("If-Range");
+        if (if_range.empty() || if_range == file->last_modified) range = parse_byte_range(range_header, file->size);
+    }
+    if (range && range->length == 0) {
+        auto unsatisfiable = new_response();
+        unsatisfiable->set_status(http_response::status::range_not_satisfiable);
+        unsatisfiable->add_header("Content-Range", "bytes */" + std::to_string(file->size));
+        format_error(state_->formatter.get(), {http_response::status::range_not_satisfiable,
+                                               "Range not satisfiable", nullptr}, *unsatisfiable);
+        send_message(std::move(unsatisfiable));
+        return;
+    }
+
+    uint64_t first = range ? range->first : 0;
+    uint64_t length = range ? range->length : file->size;
+    std::ifstream stream(path, std::ios::binary);
+    std::string content(length, '\0');
+    if (!stream || !stream.seekg(static_cast<std::streamoff>(first)) ||
+        !stream.read(content.data(), static_cast<std::streamsize>(length))) {
+        error(http_response::status::internal_server_error, "Failed to read file");
+        return;
+    }
+    message->set_content(std::move(content));
+
+    // A range is sent as is: compressing it would change the bytes it refers to
+    if (range) {
+        message->set_status(http_response::status::partial_content);
+        message->add_header("Content-Range", "bytes " + std::to_string(first) + "-" +
+                                             std::to_string(first + length - 1) + "/" + std::to_string(file->size));
+        send_message(std::move(message), false);
+        return;
+    }
+    send_message(std::move(message));
 }
 
 namespace {

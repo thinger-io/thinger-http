@@ -16,6 +16,17 @@ namespace thinger::http {
 
 class route_group;
 
+// How serve_static() serves the files of a directory
+struct static_options {
+    // File served for a directory (its own one), and for the paths without a file (the one
+    // of the root directory, for single page applications); empty: 404 for both
+    std::string fallback = "index.html";
+    // Cache-Control of the files. By default, caches keep them but revalidate them on every
+    // use: answered with 304 Not Modified (no body) while they do not change. Assets with a
+    // hash in their names can be reused without asking: "public, max-age=31536000, immutable".
+    std::string cache_control = "no-cache";
+};
+
 // Set of routes served for a host name (see http_application::host). The application
 // itself is the default virtual host: its routes answer the requests for hosts not registered.
 class virtual_host : public route_registrar<virtual_host> {
@@ -46,10 +57,15 @@ public:
     // {"$ref": "#/components/schemas/<name>"}. Register it before the routes using it.
     void schema_component(const std::string& name, nlohmann::json schema);
 
-    // Static file serving
+    // Static files of `directory` served under `url_prefix` (GET and HEAD), as
+    // response::send_file does: with ETag and Last-Modified, answering conditional requests
+    // with 304 and single byte ranges with 206.
     void serve_static(const std::string& url_prefix,
                       const std::string& directory,
                       const std::string& fallback = "index.html");
+    void serve_static(const std::string& url_prefix,
+                      const std::string& directory,
+                      static_options options);
 
     // Fallback handler, called instead of answering 404/405 when no route matches: takes
     // (request&, response&) or (response&), synchronous or coroutine. nullptr (or an empty

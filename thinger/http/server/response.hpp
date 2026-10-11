@@ -129,9 +129,16 @@ public:
     // response was pending), the handler is not called, only released.
     void take_over(takeover_handler handler);
 
-    // File sending
+    // File response, with the media type of its extension. It carries a weak ETag and a
+    // Last-Modified from the size and modification time of the file, and Cache-Control:
+    // no-cache unless one was set before (header()): caches keep the file, but check it on
+    // every use. GET and HEAD requests with If-None-Match (or else If-Modified-Since) are
+    // answered with 304 Not Modified while it does not change; a GET with a single byte range
+    // (Range, and If-Range with the Last-Modified date) with 206 Partial Content, or 416 if
+    // it starts past the end. 404 if the file does not exist, 403 if it is not a regular file.
+    // With force_download, Content-Disposition: attachment.
     void send_file(const std::filesystem::path& path, bool force_download = false);
-    
+
     // Redirect response
     void redirect(const std::string& url, http::http_response::status redirect_type = http::http_response::status::moved_temporarily);
     
@@ -199,8 +206,9 @@ private:
     void compress_if_needed(http_response& response) const;
     // Mark the response as sent; false (and nothing must be sent) if it already was
     bool mark_responded();
-    // Send a message, unless another answer was sent first
-    void send_message(std::shared_ptr<http_response> message);
+    // Send a message (compressed if the client accepts it, see compress_if_needed), unless
+    // another answer was sent first
+    void send_message(std::shared_ptr<http_response> message, bool compress = true);
     // Send a message and take the connection over, unless another answer was sent first
     void take_over(std::shared_ptr<http_response> message, takeover_handler handler);
     // Answers 501 if the connection cannot be taken over (in-memory requests)

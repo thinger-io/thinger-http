@@ -106,6 +106,12 @@ void virtual_host::schema_component(const std::string& name, nlohmann::json sche
 void virtual_host::serve_static(const std::string& url_prefix,
                                 const std::string& directory,
                                 const std::string& fallback) {
+    serve_static(url_prefix, directory, static_options{.fallback = fallback});
+}
+
+void virtual_host::serve_static(const std::string& url_prefix,
+                                const std::string& directory,
+                                static_options options) {
     namespace fs = std::filesystem;
 
     // Normalize route: avoid double slash when prefix is "/"
@@ -113,18 +119,24 @@ void virtual_host::serve_static(const std::string& url_prefix,
     if (!route.empty() && route.back() == '/') route.pop_back();
     route += "/:path(.*)";
 
-    auto& static_route = get(route, [directory, fallback](request& req, response& res) {
+    auto handler = [directory, options = std::move(options)](request& req, response& res) {
         std::string path = req["path"];
+        const auto& fallback = options.fallback;
 
         auto canonical_dir = fs::canonical(directory);
         bool has_fallback = !fallback.empty();
+
+        auto send = [&](const fs::path& file) {
+            if (!options.cache_control.empty()) res.header(header::cache_control, options.cache_control);
+            res.send_file(file);
+        };
 
         // Empty path means root request — try fallback file directly
         if (path.empty()) {
             if (has_fallback) {
                 auto fallback_file = canonical_dir / fallback;
                 if (fs::exists(fallback_file) && fs::is_regular_file(fallback_file)) {
-                    res.send_file(fallback_file);
+                    send(fallback_file);
                     return;
                 }
             }
@@ -145,13 +157,13 @@ void virtual_host::serve_static(const std::string& url_prefix,
         // Serve file if it exists
         if (fs::exists(canonical_file)) {
             if (fs::is_regular_file(canonical_file)) {
-                res.send_file(canonical_file);
+                send(canonical_file);
                 return;
             }
             if (fs::is_directory(canonical_file) && has_fallback) {
                 auto fallback_file = canonical_file / fallback;
                 if (fs::exists(fallback_file) && fs::is_regular_file(fallback_file)) {
-                    res.send_file(fallback_file);
+                    send(fallback_file);
                     return;
                 }
             }
@@ -161,14 +173,15 @@ void virtual_host::serve_static(const std::string& url_prefix,
         if (has_fallback) {
             auto fallback_file = canonical_dir / fallback;
             if (fs::exists(fallback_file) && fs::is_regular_file(fallback_file)) {
-                res.send_file(fallback_file);
+                send(fallback_file);
                 return;
             }
         }
 
         res.error(http_response::status::not_found, "Not found");
-    });
-    static_route.hidden();
+    };
+    get(route, handler).hidden();
+    head(route, std::move(handler)).hidden();
 }
 
 } // namespace thinger::http

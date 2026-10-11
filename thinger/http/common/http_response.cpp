@@ -18,6 +18,8 @@ namespace thinger::http{
                 "HTTP/1.1 202 Accepted";
         const std::string no_content =
                 "HTTP/1.1 204 No Content";
+        const std::string partial_content =
+                "HTTP/1.1 206 Partial Content";
         const std::string multiple_choices =
                 "HTTP/1.1 300 Multiple Choices";
         const std::string moved_permanently =
@@ -64,6 +66,8 @@ namespace thinger::http{
                 "HTTP/1.1 413 Payload Too Large";
         const std::string unsupported_media_type =
                 "HTTP/1.1 415 Unsupported Media Type";
+        const std::string range_not_satisfiable =
+                "HTTP/1.1 416 Range Not Satisfiable";
         const std::string request_header_fields_too_large =
                 "HTTP/1.1 431 Request Header Fields Too Large";
         const std::string unknown =
@@ -79,6 +83,8 @@ namespace thinger::http{
                     return accepted;
                 case http_response::status::no_content:
                     return no_content;
+                case http_response::status::partial_content:
+                    return partial_content;
                 case http_response::status::multiple_choices:
                     return multiple_choices;
                 case http_response::status::moved_permanently:
@@ -125,6 +131,8 @@ namespace thinger::http{
                     return payload_too_large;
                 case http_response::status::unsupported_media_type:
                     return unsupported_media_type;
+                case http_response::status::range_not_satisfiable:
+                    return range_not_satisfiable;
                 case http_response::status::request_header_fields_too_large:
                     return request_header_fields_too_large;
                 default:

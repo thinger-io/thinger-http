@@ -303,7 +303,7 @@ res.json({{"status", "ok"}, {"count", 42}});
 // HTML
 res.html("<h1>Welcome</h1>");
 
-// File
+// File (with ETag and Last-Modified: see Static Files)
 res.send_file("/path/to/file.pdf");
 
 // Custom status and headers
@@ -329,6 +329,31 @@ server.serve_static("/app", "/var/www/app", "app.html");
 
 // Without fallback (returns 404 for non-existent files)
 server.serve_static("/assets", "/var/www/assets", "");
+
+// Options: fallback file and Cache-Control (here, assets with a hash in their names)
+server.serve_static("/assets", "/var/www/app/assets", {
+    .fallback = "",
+    .cache_control = "public, max-age=31536000, immutable"
+});
+```
+
+`serve_static()` answers `GET` and `HEAD` requests. The fallback file is served for a directory (its own one), and for the paths without a file (the one of the root directory, as single page applications expect).
+
+Files are served with validators, so that browsers download them once and only check them afterwards:
+
+- A weak `ETag` from the size and modification time of the file (`W/"<size>-<mtime in ns>"`, in hex; the content is not hashed), and `Last-Modified`.
+- `Cache-Control: no-cache` by default: caches keep the file, but revalidate it on every use. Set another policy with `cache_control` (e.g. `max-age` for hashed assets).
+- Conditional requests are answered with `304 Not Modified`, without body, while the file does not change: `If-None-Match` with `*` or a list of entity tags (weak comparison, `W/` ignored), or else `If-Modified-Since` (ignored when there is an `If-None-Match`, or when it is not a valid date) with a date not earlier than the modification time. The `304` carries the validators and the `Cache-Control`.
+- `Accept-Ranges: bytes`: a `GET` with a single byte range (`Range: bytes=0-99`, `bytes=100-`, `bytes=-100`) gets `206 Partial Content`, or `416` if it starts past the end. Several ranges, or an invalid one, get the whole file; so does a range with an `If-Range` other than the `Last-Modified` date (the weak `ETag` never matches it).
+- Text files of 200 bytes or more are compressed for clients accepting gzip (`Vary: Accept-Encoding`); ranges are sent as they are. A `HEAD` gets the headers of the `GET` with the length of the file, without reading it.
+
+`res.send_file()` does the same in a handler. Its `Cache-Control` is `no-cache` unless the handler set one before (`res.header("Cache-Control", ...)`):
+
+```cpp
+server.get("/report", [](http::response& res) {
+    res.header("Cache-Control", "private, max-age=60");
+    res.send_file("/data/report.pdf");   // 304 while it does not change
+});
 ```
 
 ### JSON Schema Validation
