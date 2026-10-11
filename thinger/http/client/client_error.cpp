@@ -23,6 +23,7 @@ namespace thinger::http {
                     case client_error::incomplete_response: return "connection closed before the end of the response";
                     case client_error::unexpected_upgrade: return "unexpected protocol switch (101) without Upgrade in the request";
                     case client_error::aborted: return "download aborted";
+                    case client_error::invalid_ca_certificate: return "a CA certificate could not be loaded";
                 }
                 return "unknown client error";
             }

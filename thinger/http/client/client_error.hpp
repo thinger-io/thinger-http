@@ -6,8 +6,8 @@
 
 namespace thinger::http {
 
-    /// Why a response could not be read (client_response::error_code(), stream_result::error).
-    /// The connection is never reused after any of them.
+    /// Why a response could not be read, or a request not sent (client_response::error_code(),
+    /// stream_result::error). The connection is never reused after any of them.
     enum class client_error {
         none = 0,
         invalid_status_line,        // not "HTTP/1.DIGIT SP 3DIGIT [SP reason] CRLF", or a status out of 100-599
@@ -18,7 +18,8 @@ namespace thinger::http {
         body_too_large,             // over the maximum content size of a buffered response
         incomplete_response,        // the connection ended before the end of the response
         unexpected_upgrade,         // 101 Switching Protocols for a request without Upgrade
-        aborted                     // the streaming callback stopped the download
+        aborted,                    // the streaming callback stopped the download
+        invalid_ca_certificate      // a CA certificate (file or PEM) could not be loaded
     };
 
     const boost::system::error_category& client_error_category();

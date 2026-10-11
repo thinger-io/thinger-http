@@ -21,12 +21,14 @@ private:
         uint16_t port;
         bool ssl;
         std::string unix_socket_path;  // Empty for TCP connections
+        std::string route;             // How the origin is reached (proxy, trusted CAs); empty for direct
         std::weak_ptr<client_connection> connection;
-        
-        connection_entry(const std::string& h, uint16_t p, bool s, 
+
+        connection_entry(const std::string& h, uint16_t p, bool s,
                         const std::string& unix_path,
+                        const std::string& r,
                         std::shared_ptr<client_connection> conn)
-            : host(h), port(p), ssl(s), unix_socket_path(unix_path), connection(conn) {}
+            : host(h), port(p), ssl(s), unix_socket_path(unix_path), route(r), connection(conn) {}
     };
     
     // Tags for multi_index_container
@@ -37,7 +39,7 @@ private:
     using connection_container = boost::multi_index_container<
         connection_entry,
         boost::multi_index::indexed_by<
-            // Hashed index by composite key (host, port, ssl, unix_socket_path)
+            // Hashed index by composite key (host, port, ssl, unix_socket_path, route)
             boost::multi_index::hashed_unique<
                 boost::multi_index::tag<by_key>,
                 boost::multi_index::composite_key<
@@ -45,7 +47,8 @@ private:
                     boost::multi_index::member<connection_entry, std::string, &connection_entry::host>,
                     boost::multi_index::member<connection_entry, uint16_t, &connection_entry::port>,
                     boost::multi_index::member<connection_entry, bool, &connection_entry::ssl>,
-                    boost::multi_index::member<connection_entry, std::string, &connection_entry::unix_socket_path>
+                    boost::multi_index::member<connection_entry, std::string, &connection_entry::unix_socket_path>,
+                    boost::multi_index::member<connection_entry, std::string, &connection_entry::route>
                 >
             >,
             // Sequenced index for LRU-style access if needed in future
@@ -62,19 +65,23 @@ public:
     connection_pool() = default;
     ~connection_pool();
     
-    // Get a connection from the pool (returns nullptr if not found or expired)
-    std::shared_ptr<client_connection> get_connection(const std::string& host, 
-                                                     uint16_t port, 
-                                                     bool ssl);
+    // Get a connection from the pool (returns nullptr if not found or expired). `route` tells
+    // how the connection reaches the origin (e.g. through which proxy): connections are only
+    // shared by requests with the same one
+    std::shared_ptr<client_connection> get_connection(const std::string& host,
+                                                     uint16_t port,
+                                                     bool ssl,
+                                                     const std::string& route = {});
     
     // Get a unix socket connection from the pool
     std::shared_ptr<client_connection> get_unix_connection(const std::string& unix_path);
     
     // Store a connection in the pool
-    void store_connection(const std::string& host, 
-                         uint16_t port, 
+    void store_connection(const std::string& host,
+                         uint16_t port,
                          bool ssl,
-                         std::shared_ptr<client_connection> connection);
+                         std::shared_ptr<client_connection> connection,
+                         const std::string& route = {});
     
     // Store a unix socket connection in the pool
     void store_unix_connection(const std::string& unix_path,
@@ -94,12 +101,14 @@ private:
     std::shared_ptr<client_connection> get_connection_impl(const std::string& host,
                                                           uint16_t port,
                                                           bool ssl,
-                                                          const std::string& unix_path);
-    
+                                                          const std::string& unix_path,
+                                                          const std::string& route);
+
     void store_connection_impl(const std::string& host,
                               uint16_t port,
                               bool ssl,
                               const std::string& unix_path,
+                              const std::string& route,
                               std::shared_ptr<client_connection> connection);
 };
 

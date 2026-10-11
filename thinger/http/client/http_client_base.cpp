@@ -1,4 +1,5 @@
 #include "http_client_base.hpp"
+#include "client_error.hpp"
 #include "websocket_util.hpp"
 #include "../../util/logger.hpp"
 #include "../../asio/sockets/ssl_socket.hpp"
@@ -6,6 +7,7 @@
 #include "../../asio/sockets/websocket.hpp"
 
 #include <algorithm>
+#include <filesystem>
 #include <boost/algorithm/string.hpp>
 
 namespace thinger::http {
@@ -43,67 +45,137 @@ void http_client_base::apply_default_headers(const std::shared_ptr<http_request>
     }
 }
 
-std::shared_ptr<client_connection> http_client_base::get_or_create_connection(
-    const std::shared_ptr<http_request>& request) {
+std::shared_ptr<boost::asio::ssl::context> http_client_base::tls_context(
+    const http_request& request, uint64_t& id, boost::system::error_code& ec) {
 
+    // What the context trusts identifies it: files by path, modification time and size, so a
+    // file changed in place is loaded again
+    std::vector<const std::string*> files;
+    std::vector<const std::string*> pems;
+    std::string key = "none";
+    if (verify_ssl_) {
+        for (const auto& file : ca_files_) files.push_back(&file);
+        for (const auto& file : request.get_ca_files()) files.push_back(&file);
+        for (const auto& pem : ca_pems_) pems.push_back(&pem);
+        for (const auto& pem : request.get_ca_pems()) pems.push_back(&pem);
+        key = system_ca_ ? "system" : "custom";
+        for (const auto* file : files) {
+            std::error_code time_ec, size_ec;
+            auto time = std::filesystem::last_write_time(*file, time_ec);
+            auto size = std::filesystem::file_size(*file, size_ec);
+            key += "\nfile:" + *file + ":" + (time_ec ? "-" : std::to_string(time.time_since_epoch().count())) +
+                   ":" + (size_ec ? "-" : std::to_string(size));
+        }
+        for (const auto* pem : pems) key += "\npem:" + *pem;
+    }
+
+    std::lock_guard lock(tls_mutex_);
+    if (auto it = tls_contexts_.find(key); it != tls_contexts_.end()) {
+        id = it->second.id;
+        return it->second.context;
+    }
+
+    auto context = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::sslv23_client);
+    if (!verify_ssl_) {
+        context->set_verify_mode(boost::asio::ssl::verify_none);
+    } else {
+        context->set_verify_mode(boost::asio::ssl::verify_peer);
+        boost::system::error_code load_ec;
+        if (system_ca_) {
+            context->set_default_verify_paths(load_ec);
+            if (load_ec) LOG_WARNING("cannot load the system CAs: {}", load_ec.message());
+        }
+        for (const auto* file : files) {
+            context->load_verify_file(*file, load_ec);
+            if (load_ec) {
+                LOG_ERROR("cannot load the CA file {}: {}", *file, load_ec.message());
+                ec = client_error::invalid_ca_certificate;
+                return nullptr;
+            }
+        }
+        for (const auto* pem : pems) {
+            context->add_certificate_authority(boost::asio::buffer(*pem), load_ec);
+            if (load_ec) {
+                LOG_ERROR("cannot load a CA certificate (PEM): {}", load_ec.message());
+                ec = client_error::invalid_ca_certificate;
+                return nullptr;
+            }
+        }
+    }
+
+    // Bounded: CAs that change (or many per-request sets) would grow it forever. The
+    // connections keep the contexts they use
+    if (tls_contexts_.size() >= MAX_TLS_CONTEXTS) tls_contexts_.clear();
+    id = ++next_tls_id_;
+    tls_contexts_.emplace(std::move(key), tls_entry{id, context});
+    return context;
+}
+
+http_client_base::connection_plan http_client_base::plan_connection(const http_request& request,
+                                                                     boost::system::error_code& ec) {
+    connection_plan plan;
+    uint64_t tls_id = 0;
+    if (request.is_ssl()) {
+        plan.tls = tls_context(request, tls_id, ec);
+        if (ec) return plan;
+    }
+
+    // Connections are shared only by requests trusting the same CAs
+    plan.key = "tls:" + std::to_string(tls_id);
+    return plan;
+}
+
+std::shared_ptr<client_connection> http_client_base::make_connection(const connection_plan& plan) {
     auto& io_context = get_io_context();
+    std::shared_ptr<thinger::asio::socket> sock;
+    if (plan.tls) {
+        sock = std::make_shared<thinger::asio::ssl_socket>("http_client", io_context, plan.tls);
+    } else {
+        sock = std::make_shared<thinger::asio::tcp_socket>("http_client", io_context);
+    }
+    auto connection = std::make_shared<client_connection>(sock, timeout_);
+    connection->set_max_content_size(max_content_size_);
+    return connection;
+}
+
+std::shared_ptr<client_connection> http_client_base::get_or_create_connection(
+    const std::shared_ptr<http_request>& request, boost::system::error_code& ec) {
+
+    ec = {};
     const std::string& socket_path = request->get_unix_socket();
 
-    // Try to get existing connection from pool
-    std::shared_ptr<client_connection> connection;
-    if (socket_path.empty()) {
-        connection = pool_.get_connection(request->get_host(),
-                                          std::stoi(request->get_port()),
-                                          request->is_ssl());
-    } else {
-        connection = pool_.get_unix_connection(socket_path);
+    if (!socket_path.empty()) {
+        auto connection = pool_.get_unix_connection(socket_path);
+        if (connection && connection->claim() && connection->is_open()) {
+            LOG_DEBUG("Reusing connection from pool for {}", socket_path);
+            connection->set_max_content_size(max_content_size_);
+            return connection;
+        }
+        auto sock = std::make_shared<thinger::asio::unix_socket>("http_client", get_io_context());
+        connection = std::make_shared<client_connection>(sock, socket_path, timeout_);
+        connection->set_max_content_size(max_content_size_);
+        connection->claim();
+        pool_.store_unix_connection(socket_path, connection);
+        return connection;
     }
+
+    auto plan = plan_connection(*request, ec);
+    if (ec) return nullptr;
+    auto port = static_cast<uint16_t>(std::stoi(request->get_port()));
 
     // Reuse it if no other request is using it (never touching its socket otherwise) and it
     // is still open. A closed one stays claimed: it is replaced in the pool below
+    auto connection = pool_.get_connection(request->get_host(), port, request->is_ssl(), plan.key);
     if (connection && connection->claim() && connection->is_open()) {
         LOG_DEBUG("Reusing connection from pool for {}", request->get_host());
         connection->set_max_content_size(max_content_size_);
         return connection;
     }
 
-    // Create new connection
     LOG_DEBUG("Creating new connection for {}", request->get_host());
-
-    if (socket_path.empty()) {
-        std::shared_ptr<thinger::asio::socket> sock;
-        if (!request->is_ssl()) {
-            sock = std::make_shared<thinger::asio::tcp_socket>("http_client", io_context);
-        } else {
-            auto ssl_context = std::make_shared<boost::asio::ssl::context>(
-                boost::asio::ssl::context::sslv23_client);
-            ssl_context->set_default_verify_paths();
-            if (verify_ssl_) {
-                ssl_context->set_verify_mode(boost::asio::ssl::verify_peer);
-            } else {
-                ssl_context->set_verify_mode(boost::asio::ssl::verify_none);
-            }
-            sock = std::make_shared<thinger::asio::ssl_socket>("http_client", io_context, ssl_context);
-        }
-        connection = std::make_shared<client_connection>(sock, timeout_);
-        connection->set_max_content_size(max_content_size_);
-        connection->claim();
-
-        // Store in pool for reuse
-        pool_.store_connection(request->get_host(),
-                              std::stoi(request->get_port()),
-                              request->is_ssl(),
-                              connection);
-    } else {
-        auto sock = std::make_shared<thinger::asio::unix_socket>("http_client", io_context);
-        connection = std::make_shared<client_connection>(sock, socket_path, timeout_);
-        connection->set_max_content_size(max_content_size_);
-        connection->claim();
-
-        // Store in pool for reuse
-        pool_.store_unix_connection(socket_path, connection);
-    }
-
+    connection = make_connection(plan);
+    connection->claim();
+    pool_.store_connection(request->get_host(), port, request->is_ssl(), connection, plan.key);
     return connection;
 }
 
@@ -181,7 +253,9 @@ awaitable<client_response> http_client_base::options(const std::string& url, hea
 }
 
 awaitable<client_response> http_client_base::send(std::shared_ptr<http_request> request) {
-    auto connection = get_or_create_connection(request);
+    boost::system::error_code ec;
+    auto connection = get_or_create_connection(request, ec);
+    if (!connection) co_return client_response(ec, nullptr);
     co_return co_await send_with_redirects(std::move(request), connection, 0);
 }
 
@@ -193,13 +267,21 @@ awaitable<stream_result> http_client_base::send_streaming(std::shared_ptr<http_r
         request->add_header("Accept-Encoding", "identity");
     }
     apply_default_headers(request);
-    auto connection = get_or_create_connection(request);
+    boost::system::error_code ec;
+    auto connection = get_or_create_connection(request, ec);
+    if (!connection) {
+        stream_result result;
+        result.error = ec.message();
+        co_return result;
+    }
     co_return co_await connection->send_request_streaming(std::move(request), std::move(callback));
 }
 
 awaitable<std::pair<client_response, std::shared_ptr<client_connection>>>
 http_client_base::send_with_connection(std::shared_ptr<http_request> request) {
-    auto connection = get_or_create_connection(request);
+    boost::system::error_code ec;
+    auto connection = get_or_create_connection(request, ec);
+    if (!connection) co_return std::make_pair(client_response(ec, nullptr), connection);
     auto response = co_await send_with_redirects(request, connection, 0);
     co_return std::make_pair(std::move(response), connection);
 }
@@ -267,8 +349,14 @@ awaitable<client_response> http_client_base::send_with_redirects(
             redirect_request->set_header(header::cookie, request->get_cookie_store().get_cookie_string());
         }
 
+        // The CAs of the request apply to every hop
+        for (const auto& file : request->get_ca_files()) redirect_request->add_ca_file(file);
+        for (const auto& pem : request->get_ca_pems()) redirect_request->add_ca_pem(pem);
+
         // Get connection for redirect (may be different host)
-        auto redirect_connection = get_or_create_connection(redirect_request);
+        boost::system::error_code ec;
+        auto redirect_connection = get_or_create_connection(redirect_request, ec);
+        if (!redirect_connection) co_return client_response(ec, nullptr);
 
         co_return co_await send_with_redirects(redirect_request, redirect_connection, redirect_count + 1);
     }
@@ -308,34 +396,6 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
         }
     }
 
-    auto& io_context = get_io_context();
-
-    // Create socket based on scheme
-    std::shared_ptr<asio::socket> socket;
-    if (components->secure) {
-        auto ssl_context = std::make_shared<boost::asio::ssl::context>(
-            boost::asio::ssl::context::sslv23_client);
-        ssl_context->set_default_verify_paths();
-        if (verify_ssl_) {
-            ssl_context->set_verify_mode(boost::asio::ssl::verify_peer);
-        } else {
-            ssl_context->set_verify_mode(boost::asio::ssl::verify_none);
-        }
-        socket = std::make_shared<asio::ssl_socket>("wss_client", io_context, ssl_context);
-    } else {
-        socket = std::make_shared<asio::tcp_socket>("ws_client", io_context);
-    }
-
-    // Connect
-    auto ec = co_await socket->connect(components->host, components->port, timeout_);
-    if (ec) {
-        LOG_ERROR("WebSocket connect error: {}", ec.message());
-        co_return std::nullopt;
-    }
-
-    // Create connection for HTTP upgrade
-    auto connection = std::make_shared<client_connection>(socket, timeout_);
-
     // Set correct URL in request
     std::string http_url = (components->secure ? "https://" : "http://")
                           + components->host + ":" + components->port + components->path;
@@ -356,10 +416,22 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
 
     apply_default_headers(request);
 
+    // A connection of its own, never pooled: it becomes the WebSocket
+    boost::system::error_code ec;
+    auto plan = plan_connection(*request, ec);
+    if (ec) {
+        LOG_ERROR("WebSocket connect error: {}", ec.message());
+        co_return std::nullopt;
+    }
+    auto connection = make_connection(plan);
+
     // Send upgrade request
     auto response = co_await connection->send_request(request);
 
     if (!response || response->get_status_code() != 101) {
+        if (!response) {
+            LOG_ERROR("WebSocket connect error: {}", connection->last_error().message());
+        }
         LOG_ERROR("WebSocket upgrade failed: {}",
                  response ? std::to_string(response->get_status_code()) : "no response");
         co_return std::nullopt;

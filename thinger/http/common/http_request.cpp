@@ -316,7 +316,7 @@ namespace thinger::http {
         uri_ = uri;
     }
 
-    const std::string& http_request::get_unix_socket(){
+    const std::string& http_request::get_unix_socket() const{
         return unix_socket_;
     }
 

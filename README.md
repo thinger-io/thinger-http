@@ -904,6 +904,22 @@ client.verify_ssl(false);  // Disable SSL verification
 client.unix_socket("/path/to/socket");  // Unix domain socket
 ```
 
+### Trusted CAs
+
+Servers are verified against the system CAs by default (`verify_ssl(true)`). Private CAs (an internal PKI, or a TLS-inspecting proxy re-signing traffic) can be trusted on top of them, per client or per request, from a PEM file (one or more certificates) or PEM text:
+
+```cpp
+client.add_ca_file("/etc/ssl/private-ca.pem");   // besides the system CAs
+client.add_ca_pem(pem_text);
+client.use_system_ca(false);                     // only the CAs added
+
+auto res = client.request("https://kubernetes.default.svc/api")
+    .ca_file("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")   // this request only
+    .get();
+```
+
+The certificate is still verified for the host of the URL. A CA that cannot be loaded fails the requests needing it (`client_error::invalid_ca_certificate`). TLS contexts are built once per set of trusted CAs and shared by the connections of the client; a CA file is loaded again when it changes (its modification time or size).
+
 ### Request Builder (Fluent API)
 
 For complex requests with custom headers, body, and other options:

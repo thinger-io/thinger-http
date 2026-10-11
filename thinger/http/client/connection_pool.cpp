@@ -9,26 +9,28 @@ connection_pool::~connection_pool() {
     clear();
 }
 
-std::shared_ptr<client_connection> connection_pool::get_connection(const std::string& host, 
-                                                                   uint16_t port, 
-                                                                   bool ssl) {
-    return get_connection_impl(host, port, ssl, "");
+std::shared_ptr<client_connection> connection_pool::get_connection(const std::string& host,
+                                                                   uint16_t port,
+                                                                   bool ssl,
+                                                                   const std::string& route) {
+    return get_connection_impl(host, port, ssl, "", route);
 }
 
 std::shared_ptr<client_connection> connection_pool::get_unix_connection(const std::string& unix_path) {
-    return get_connection_impl("", 0, false, unix_path);
+    return get_connection_impl("", 0, false, unix_path, "");
 }
 
-void connection_pool::store_connection(const std::string& host, 
-                                      uint16_t port, 
+void connection_pool::store_connection(const std::string& host,
+                                      uint16_t port,
                                       bool ssl,
-                                      std::shared_ptr<client_connection> connection) {
-    store_connection_impl(host, port, ssl, "", connection);
+                                      std::shared_ptr<client_connection> connection,
+                                      const std::string& route) {
+    store_connection_impl(host, port, ssl, "", route, connection);
 }
 
 void connection_pool::store_unix_connection(const std::string& unix_path,
                                            std::shared_ptr<client_connection> connection) {
-    store_connection_impl("", 0, false, unix_path, connection);
+    store_connection_impl("", 0, false, unix_path, "", connection);
 }
 
 size_t connection_pool::cleanup_expired() {
@@ -72,13 +74,14 @@ void connection_pool::clear() {
 std::shared_ptr<client_connection> connection_pool::get_connection_impl(const std::string& host,
                                                                        uint16_t port,
                                                                        bool ssl,
-                                                                       const std::string& unix_path) {
+                                                                       const std::string& unix_path,
+                                                                       const std::string& route) {
     // First try with shared lock for reading
     {
         std::shared_lock<std::shared_mutex> lock(mutex_);
         auto& key_index = connections_.get<by_key>();
-        auto it = key_index.find(std::make_tuple(host, port, ssl, unix_path));
-        
+        auto it = key_index.find(std::make_tuple(host, port, ssl, unix_path, route));
+
         if (it != key_index.end()) {
             // Try to convert weak_ptr to shared_ptr
             if (auto conn = it->connection.lock()) {
@@ -95,8 +98,8 @@ std::shared_ptr<client_connection> connection_pool::get_connection_impl(const st
     // Only take write lock if we need to remove an expired connection
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto& key_index = connections_.get<by_key>();
-    auto it = key_index.find(std::make_tuple(host, port, ssl, unix_path));
-    
+    auto it = key_index.find(std::make_tuple(host, port, ssl, unix_path, route));
+
     if (it != key_index.end() && it->connection.expired()) {
         key_index.erase(it);
     }
@@ -108,6 +111,7 @@ void connection_pool::store_connection_impl(const std::string& host,
                                            uint16_t port,
                                            bool ssl,
                                            const std::string& unix_path,
+                                           const std::string& route,
                                            std::shared_ptr<client_connection> connection) {
     if (!connection) return;
     
@@ -115,13 +119,13 @@ void connection_pool::store_connection_impl(const std::string& host,
     
     // Remove any existing entry with the same key
     auto& key_index = connections_.get<by_key>();
-    auto it = key_index.find(std::make_tuple(host, port, ssl, unix_path));
+    auto it = key_index.find(std::make_tuple(host, port, ssl, unix_path, route));
     if (it != key_index.end()) {
         key_index.erase(it);
     }
-    
+
     // Insert the new connection
-    connections_.emplace(host, port, ssl, unix_path, connection);
+    connections_.emplace(host, port, ssl, unix_path, route, connection);
 }
 
 } // namespace thinger::http

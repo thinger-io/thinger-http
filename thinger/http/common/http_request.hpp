@@ -74,7 +74,7 @@ public:
     std::string get_path() const;
     std::string& get_uri();
     const std::string& get_uri() const;
-    const std::string& get_unix_socket();
+    const std::string& get_unix_socket() const;
     const std::string& get_protocol() const;
     bool is_default_port() const;
     const std::string &get_port() const;
@@ -105,6 +105,13 @@ public:
     // chunked callbacks
     std::function<void(int, const std::string&)> get_chunked_callback();
     void set_chunked_callback(std::function<void(int, const std::string&)> callback);
+
+    // client side: CAs trusted to verify the server of this request, besides those of the
+    // client (see http_client_base::add_ca_file()): a PEM file, or PEM text
+    void add_ca_file(std::string path) { ca_files_.push_back(std::move(path)); }
+    void add_ca_pem(std::string pem) { ca_pems_.push_back(std::move(pem)); }
+    const std::vector<std::string>& get_ca_files() const { return ca_files_; }
+    const std::vector<std::string>& get_ca_pems() const { return ca_pems_; }
 
     // stream related
     bool end_stream() override;
@@ -145,6 +152,8 @@ private:
     std::string unix_socket_;
     cookie_store cookie_store_;
     std::function<void(int, const std::string&)> on_chunked_;
+    std::vector<std::string> ca_files_;
+    std::vector<std::string> ca_pems_;
 
 };
 

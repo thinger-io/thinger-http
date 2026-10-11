@@ -77,6 +77,18 @@ public:
         return *this;
     }
 
+    // CAs trusted to verify the server of this request, besides those of the client: a PEM
+    // file, or PEM text
+    request_builder& ca_file(std::string path) {
+        request_->add_ca_file(std::move(path));
+        return *this;
+    }
+
+    request_builder& ca_pem(std::string pem) {
+        request_->add_ca_pem(std::move(pem));
+        return *this;
+    }
+
     request_builder& protocol(std::string proto) {
         protocol_ = std::move(proto);
         return *this;

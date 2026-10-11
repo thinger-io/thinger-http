@@ -14,7 +14,10 @@
 #include <string>
 #include <chrono>
 #include <map>
+#include <mutex>
 #include <optional>
+#include <vector>
+#include <boost/asio/ssl/context.hpp>
 
 namespace thinger::http {
 
@@ -32,6 +35,11 @@ protected:
     std::string unix_socket_;
     size_t max_content_size_{8 * 1048576};  // 8 MB default; buffered-mode responses above this are rejected
 
+    // CAs trusted besides (or instead of) the system ones
+    std::vector<std::string> ca_files_;
+    std::vector<std::string> ca_pems_;
+    bool system_ca_{true};
+
     // Connection pool for keep-alive
     connection_pool pool_;
 
@@ -41,8 +49,10 @@ protected:
     // Apply default headers
     void apply_default_headers(const std::shared_ptr<http_request>& request);
 
-    // Create or get connection for request
-    std::shared_ptr<client_connection> get_or_create_connection(const std::shared_ptr<http_request>& request);
+    // Create or get connection for request (null, and why in `ec`, if its CAs cannot be
+    // loaded)
+    std::shared_ptr<client_connection> get_or_create_connection(const std::shared_ptr<http_request>& request,
+                                                                boost::system::error_code& ec);
 
 public:
     http_client_base() = default;
@@ -57,6 +67,13 @@ public:
     http_client_base& verify_ssl(bool verify) { verify_ssl_ = verify; return *this; }
     http_client_base& unix_socket(const std::string& path) { unix_socket_ = path; return *this; }
     http_client_base& max_content_size(size_t size) { max_content_size_ = size; return *this; }
+
+    // CAs trusted to verify servers, besides the system ones: a PEM file (one or more
+    // certificates), or PEM text. Loaded when first needed, again if the file changes
+    http_client_base& add_ca_file(const std::string& path) { ca_files_.push_back(path); return *this; }
+    http_client_base& add_ca_pem(const std::string& pem) { ca_pems_.push_back(pem); return *this; }
+    // Trust the system CAs (the default); false trusts only those added
+    http_client_base& use_system_ca(bool enabled) { system_ca_ = enabled; return *this; }
 
     // Configuration getters
     std::chrono::seconds get_timeout() const { return timeout_; }
@@ -109,6 +126,30 @@ public:
     size_t pool_size() const { return pool_.size(); }
 
 private:
+    // How a connection reaches the origin of a request: with which TLS context, and the key
+    // of connections that can be shared
+    struct connection_plan {
+        std::shared_ptr<boost::asio::ssl::context> tls;
+        std::string key;
+    };
+
+    // TLS contexts by what they trust, shared by the connections (and their id)
+    struct tls_entry {
+        uint64_t id;
+        std::shared_ptr<boost::asio::ssl::context> context;
+    };
+    static constexpr size_t MAX_TLS_CONTEXTS = 32;
+    std::mutex tls_mutex_;
+    std::map<std::string, tls_entry> tls_contexts_;
+    uint64_t next_tls_id_{0};
+
+    // The TLS context of a request, from the CAs of the client and the request
+    std::shared_ptr<boost::asio::ssl::context> tls_context(const http_request& request, uint64_t& id,
+                                                           boost::system::error_code& ec);
+
+    connection_plan plan_connection(const http_request& request, boost::system::error_code& ec);
+    std::shared_ptr<client_connection> make_connection(const connection_plan& plan);
+
     // Internal send with redirect handling
     awaitable<client_response> send_with_redirects(std::shared_ptr<http_request> request,
                                                    std::shared_ptr<client_connection> connection,

@@ -166,6 +166,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/client_response_framing_test.c
     add_thinger_test(test_integration_client_response_framing integration/client_response_framing_test.cpp)
 endif()
 
+# Integration tests - CAs trusted by the client
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/client_ca_test.cpp)
+    add_thinger_test(test_integration_client_ca integration/client_ca_test.cpp)
+endif()
+
 # Integration tests - Server
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/server_basic_test.cpp)
     add_thinger_test(test_integration_server_basic integration/server_basic_test.cpp)
