@@ -6,6 +6,7 @@
 #include <thinger/http/client/async_client.hpp>          // async_client class (for async with worker threads)
 #include <thinger/http/client/websocket_client.hpp>     // websocket_client class (returned by client.websocket())
 #include <thinger/http/client/client_response.hpp>
+#include <thinger/http/client/client_error.hpp>         // client_error: why a response could not be read
 #include <thinger/http/client/form.hpp>                 // form class for form data POST
 #include <thinger/http/client/stream_types.hpp>         // stream_info, stream_result for streaming downloads
 #include <thinger/http/client/request_builder.hpp>      // request_builder for fluent API

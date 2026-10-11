@@ -1,8 +1,32 @@
 #include "client_connection.hpp"
+#include "client_error.hpp"
 #include "../../util/logger.hpp"
 #include "../../util/compression.hpp"
 
 namespace thinger::http {
+
+namespace {
+
+// Decode a gzip or deflate Content-Encoding (the body is kept as it is if it fails)
+void decompress(http_response& response) {
+    std::string encoding = response.get_header("Content-Encoding");
+    std::optional<std::string> decoded;
+    if (encoding == "gzip") {
+        decoded = ::thinger::util::gzip::decompress(response.get_content());
+    } else if (encoding == "deflate") {
+        decoded = ::thinger::util::deflate::decompress(response.get_content());
+    } else {
+        return;
+    }
+    if (!decoded) {
+        LOG_ERROR("Failed to decompress {} response", encoding);
+        return;
+    }
+    response.set_content(std::move(*decoded));
+    response.remove_header("Content-Encoding");
+}
+
+}
 
 std::atomic<unsigned long> client_connection::connections(0);
 
@@ -31,15 +55,15 @@ client_connection::~client_connection() {
     LOG_TRACE("releasing http client connection. total: {}", connections.load());
 }
 
-awaitable<void> client_connection::ensure_connected(const http_request& request) {
+awaitable<boost::system::error_code> client_connection::ensure_connected(const http_request& request) {
+    boost::system::error_code ec;
     if (socket_->is_open()) {
-        co_return;
+        co_return ec;
     }
 
     LOG_TRACE("connecting to: {}:{}", request.get_host(), request.get_port());
 
     for (unsigned retry = 0; retry < MAX_RETRIES; ++retry) {
-        boost::system::error_code ec;
         if (socket_path_.empty()) {
             ec = co_await socket_->connect(request.get_host(), request.get_port(), CONNECT_TIMEOUT);
         } else {
@@ -49,7 +73,7 @@ awaitable<void> client_connection::ensure_connected(const http_request& request)
 
         if (!ec) {
             LOG_TRACE("connection established");
-            co_return;
+            co_return ec;
         }
 
         LOG_ERROR("error while connecting (attempt #{}): {} ({}) ({})",
@@ -58,109 +82,122 @@ awaitable<void> client_connection::ensure_connected(const http_request& request)
         // Don't retry for certain errors
         if (ec == boost::asio::error::operation_aborted ||
             ec == boost::asio::error::host_not_found) {
-            co_return;
+            co_return ec;
         }
 
         if (retry + 1 >= MAX_RETRIES) {
-            co_return;
+            co_return ec;
         }
 
         // Close and retry
         socket_->close();
     }
+    co_return ec;
 }
 
-awaitable<std::shared_ptr<http_response>> client_connection::read_response(bool head_request) {
-    response_parser_.reset();
-
+awaitable<std::shared_ptr<http_response>> client_connection::read_response(const http_request& request) {
     while (true) {
         auto [ec, bytes] = co_await socket_->read_some(buffer_, MAX_BUFFER_SIZE);
 
-        if (ec) {
-            co_return nullptr;
-        }
-
         uint8_t* begin = buffer_;
         uint8_t* end = buffer_ + bytes;
-        boost::tribool result = response_parser_.parse_some(begin, end, head_request);
-
-        if (result) {
-            // Successfully parsed response; keep what followed it (e.g. data sent right
-            // after a protocol upgrade)
-            buffered_.assign(reinterpret_cast<const char*>(begin), static_cast<size_t>(end - begin));
-            auto response = response_parser_.consume_response();
-
-            // Decompress if needed
-            if (response && response->has_header("Content-Encoding")) {
-                std::string encoding = response->get_header("Content-Encoding");
-                if (encoding == "gzip") {
-                    auto decompressed = ::thinger::util::gzip::decompress(response->get_content());
-                    if (decompressed) {
-                        response->set_content(std::move(*decompressed));
-                        response->remove_header("Content-Encoding");
-                    } else {
-                        LOG_ERROR("Failed to decompress gzip response");
-                    }
-                } else if (encoding == "deflate") {
-                    auto decompressed = ::thinger::util::deflate::decompress(response->get_content());
-                    if (decompressed) {
-                        response->set_content(std::move(*decompressed));
-                        response->remove_header("Content-Encoding");
-                    } else {
-                        LOG_ERROR("Failed to decompress deflate response");
-                    }
-                }
+        boost::tribool result = boost::indeterminate;
+        if (begin != end) {
+            result = response_parser_.parse_some(begin, end);
+        }
+        if (boost::indeterminate(result) && ec) {
+            // The end of the connection ends a body delimited by it, and nothing else
+            if (ec != boost::asio::error::eof) {
+                error_ = ec;
+                co_return nullptr;
             }
-
-            co_return response;
-        } else if (!result) {
-            // Parse error
+            result = response_parser_.end_of_stream();
+        }
+        if (!result) {
+            error_ = response_parser_.error();
+            LOG_WARNING("invalid response from {}: {}", request.get_host(), error_.message());
             co_return nullptr;
         }
-        // else: indeterminate, keep reading
+        if (boost::indeterminate(result)) continue;
+
+        // Data past the response, other than that of a switched protocol (another response
+        // than the one requested, or garbage), leaves the connection out of sync
+        bool reusable = response_parser_.keep_alive() && begin == end;
+        auto response = response_parser_.consume_response();
+        if (response->get_status_code() == 101) {
+            if (!request.has_header(header::upgrade)) {
+                error_ = client_error::unexpected_upgrade;
+                co_return nullptr;
+            }
+            // What followed the response belongs to the new protocol (e.g. WebSocket frames)
+            buffered_.assign(reinterpret_cast<const char*>(begin), static_cast<size_t>(end - begin));
+        } else if (!reusable) {
+            socket_->close();
+        }
+
+        // A streamed body is handed as received
+        if (!response_parser_.is_streaming()) decompress(*response);
+
+        co_return response;
     }
 }
 
-awaitable<std::shared_ptr<http_response>> client_connection::send_request(
-    std::shared_ptr<http_request> request) {
-
+awaitable<std::shared_ptr<http_response>> client_connection::exchange(std::shared_ptr<http_request> request) {
     std::shared_ptr<http_response> response;
+    bool timed_out = false;
+    error_ = {};
+    buffered_.clear();
 
     // Timeout timer
     boost::asio::steady_timer timer(socket_->get_io_context());
     timer.expires_after(timeout_);
 
     auto do_request = [&]() -> awaitable<void> {
-        co_await ensure_connected(*request);
-        if (!socket_->is_open()) co_return;
+        if (auto ec = co_await ensure_connected(*request)) {
+            error_ = ec;
+            co_return;
+        }
+        if (!socket_->is_open()) {
+            error_ = boost::asio::error::not_connected;
+            co_return;
+        }
 
         request->log("CLIENT->", 0);
-        response_parser_.setOnChunked(request->get_chunked_callback());
-
         co_await request->to_socket(socket_);
-
-        bool is_head = request->get_method() == http::method::HEAD;
-        response = co_await read_response(is_head);
-
-        if (response && !response->keep_alive()) {
-            socket_->close();
-        }
+        response = co_await read_response(*request);
     };
 
     auto do_timeout = [&]() -> awaitable<void> {
         auto [ec] = co_await timer.async_wait(use_nothrow_awaitable);
         if (!ec) {
             LOG_ERROR("Request timeout after {} seconds", timeout_.count());
+            timed_out = true;
             socket_->close();
         }
     };
 
     co_await (do_request() || do_timeout());
 
-    // The response is read: the connection may serve another request now
-    claimed_ = false;
+    if (timed_out) {
+        response.reset();
+        error_ = boost::asio::error::timed_out;
+    }
+    // Never reused after an error: where the next response would start is unknown
+    if (!response) close();
+
+    // The response is read: the connection may serve another request now, unless it
+    // switched protocols (then it is never handed out again)
+    if (!response || response->get_status_code() != 101) claimed_ = false;
 
     co_return response;
+}
+
+awaitable<std::shared_ptr<http_response>> client_connection::send_request(
+    std::shared_ptr<http_request> request) {
+    response_parser_.reset();
+    response_parser_.set_request_method(request->get_method());
+    response_parser_.setOnChunked(request->get_chunked_callback());
+    co_return co_await exchange(std::move(request));
 }
 
 awaitable<stream_result> client_connection::send_request_streaming(
@@ -169,86 +206,30 @@ awaitable<stream_result> client_connection::send_request_streaming(
 
     stream_result result;
 
-    // Timeout timer
-    boost::asio::steady_timer timer(socket_->get_io_context());
-    timer.expires_after(timeout_);
-
-    auto do_request = [&]() -> awaitable<void> {
-        co_await ensure_connected(*request);
-
-        if (!socket_->is_open()) {
-            result.error = "Failed to connect";
-            co_return;
-        }
-
-        request->log("CLIENT->", 0);
-        response_parser_.reset();
-
-        // Set up streaming callback
-        response_parser_.setOnStreaming(
-            [&callback, &result, this](
-                const std::string_view& data, size_t downloaded, size_t total) -> bool {
-                if (result.status_code == 0) {
-                    result.status_code = response_parser_.get_status_code();
-                }
-                result.bytes_transferred = downloaded;
-
-                stream_info info{data, downloaded, total, result.status_code};
-                return callback(info);
-            });
-
-        co_await request->to_socket(socket_);
-
-        // Read response with streaming
-        while (true) {
-            auto [ec, bytes] = co_await socket_->read_some(buffer_, MAX_BUFFER_SIZE);
-
-            if (ec) {
-                result.error = "Connection closed: " + ec.message();
-                co_return;
-            }
-
-            bool is_head = request->get_method() == http::method::HEAD;
-            boost::tribool parse_result = response_parser_.parse(
-                buffer_, buffer_ + bytes, is_head);
-
+    response_parser_.reset();
+    response_parser_.set_request_method(request->get_method());
+    response_parser_.setOnStreaming(
+        [&callback, &result, this](
+            const std::string_view& data, size_t downloaded, size_t total) -> bool {
             if (result.status_code == 0) {
                 result.status_code = response_parser_.get_status_code();
             }
+            result.bytes_transferred = downloaded;
 
-            if (parse_result) {
-                auto response = response_parser_.consume_response();
-                if (response) {
-                    result.status_code = response->get_status_code();
-                    if (result.bytes_transferred == 0) {
-                        result.bytes_transferred = response->get_content_size();
-                    }
-                    if (!response->keep_alive()) {
-                        socket_->close();
-                    }
-                }
-                co_return;
-            } else if (!parse_result) {
-                result.error = "Parse error or download aborted";
-                co_return;
-            }
-        }
-    };
+            stream_info info{data, downloaded, total, result.status_code};
+            return callback(info);
+        });
 
-    auto do_timeout = [&]() -> awaitable<void> {
-        auto [ec] = co_await timer.async_wait(use_nothrow_awaitable);
-        if (!ec) {
-            LOG_ERROR("Streaming request timeout after {} seconds", timeout_.count());
-            socket_->close();
-            result.error = "Request timeout";
-        }
-    };
+    auto response = co_await exchange(std::move(request));
+    if (!response) {
+        result.error = error_.message();
+        co_return result;
+    }
 
-    co_await (do_request() || do_timeout());
-
-    // The response is read: the connection may serve another request now
-    claimed_ = false;
-
+    result.status_code = response->get_status_code();
+    if (result.bytes_transferred == 0) {
+        result.bytes_transferred = response->get_content_size();
+    }
     co_return result;
 }
 

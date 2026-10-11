@@ -213,7 +213,8 @@ awaitable<client_response> http_client_base::send_with_redirects(
     auto response = co_await connection->send_request(request);
 
     if (!response) {
-        co_return client_response(boost::asio::error::invalid_argument, nullptr);
+        auto ec = connection->last_error();
+        co_return client_response(ec ? ec : boost::asio::error::invalid_argument, nullptr);
     }
 
     // Handle redirects

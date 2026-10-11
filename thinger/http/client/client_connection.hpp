@@ -36,7 +36,7 @@ public:
 
     virtual ~client_connection();
 
-    // Main operation - send request and get response
+    // Main operation - send request and get response (null on error: see last_error())
     awaitable<std::shared_ptr<http_response>> send_request(std::shared_ptr<http_request> request);
 
     // Streaming operation - send request and stream response through callback
@@ -47,6 +47,10 @@ public:
     // Connection management
     void close();
     std::shared_ptr<thinger::asio::socket> release_socket();
+
+    // Why the last request failed: connection, timeout, or an invalid response
+    // (client_error). The connection is closed after any of them
+    const boost::system::error_code& last_error() const { return error_; }
 
     // Bytes received after the last response, read along with it (e.g. data the server
     // sent right after a protocol upgrade response): they come before anything read from
@@ -64,8 +68,9 @@ public:
 
 private:
     // Internal helpers
-    awaitable<void> ensure_connected(const http_request& request);
-    awaitable<std::shared_ptr<http_response>> read_response(bool head_request);
+    awaitable<boost::system::error_code> ensure_connected(const http_request& request);
+    awaitable<std::shared_ptr<http_response>> exchange(std::shared_ptr<http_request> request);
+    awaitable<std::shared_ptr<http_response>> read_response(const http_request& request);
 
     std::shared_ptr<thinger::asio::socket> socket_;
     std::string socket_path_;
@@ -73,6 +78,7 @@ private:
     uint8_t buffer_[MAX_BUFFER_SIZE];
     std::string buffered_;
     response_factory response_parser_;
+    boost::system::error_code error_;
     std::atomic<bool> claimed_{false};
 };
 

@@ -762,7 +762,7 @@ The proxy never changes the end-to-end headers of the target by itself: frame pr
 - **Cookies**: dropping `Domain` keeps them on the proxy host. Forcing `SameSite=None; Secure` sends them on requests from other sites too, widening the exposure to CSRF: only for a console on another site.
 - **Redirects**: a `Location` pointing to the device (its host, or an absolute path) is rewritten under the proxy path, parsing the URL (scheme, userinfo, host) instead of matching substrings; other hosts are left alone.
 
-Framing is never forwarded as received, to avoid request smuggling between the proxy and the target. The request body is framed again from what the strict server parser accepted (requests with ambiguous framing are rejected before reaching the handler): its `Content-Length`, or chunked again without extensions or trailers, and never past its end, so a pipelined request is never sent as part of it. The response of the target is parsed strictly too: a status line other than `HTTP/1.x` with a three-digit code, obsolete line folding, `Transfer-Encoding` other than a single `chunked`, `Content-Length` together with it or invalid (or repeated with different values) are answered with `502`; its body is decoded and framed again for the client (chunked, or ended by closing the connection for HTTP/1.0 clients), and anything the target sends after its end is dropped. Each request uses a new connection to the target, closed after the response; reusing them is left to a connection pool.
+Framing is never forwarded as received, to avoid request smuggling between the proxy and the target. The request body is framed again from what the strict server parser accepted (requests with ambiguous framing are rejected before reaching the handler): its `Content-Length`, or chunked again without extensions or trailers, and never past its end, so a pipelined request is never sent as part of it. The response of the target is parsed strictly too, by the parser of the [HTTP client](#response-parsing): a status line other than `HTTP/1.x` with a three-digit code, obsolete line folding, `Transfer-Encoding` other than a single `chunked`, `Content-Length` together with it or invalid (or repeated with different values) are answered with `502`; its body is decoded and framed again for the client (chunked, or ended by closing the connection for HTTP/1.0 clients), and anything the target sends after its end is dropped. Each request uses a new connection to the target, closed after the response; reusing them is left to a connection pool.
 
 The flow control comes from `res.start_stream(head, content_length)`, `co_await res.write_stream(data)` and `co_await res.end_stream()`, available to any handler: each write completes once the data is written to the connection, the framing is chosen by the response (`Content-Length` if given, chunked, or closing the connection for HTTP/1.0 clients), and a body that does not match its `Content-Length` closes the connection instead of desynchronizing it. See `examples/http_server/reverse_proxy_example.cpp`.
 
@@ -959,6 +959,22 @@ if (res) {  // or res.ok()
     std::string error = res.error();
 }
 ```
+
+When there is no response, `res.error_code()` tells why: the error of the connection (`connect`, `timed_out`...) or a `thinger::http::client_error` for a response that could not be read (`res.error()` and, when streaming, `stream_result::error` have its message):
+
+```cpp
+if (res.error_code() == http::client_error::invalid_framing) { /* ... */ }
+```
+
+### Response Parsing
+
+Responses are parsed as strictly as the server parses requests, so a response is never read past its end, nor the next one on a connection taken from its body (RFC 9112). Anything else fails the request, and the connection is closed:
+
+- **Status line**: `HTTP/1.x` (a higher minor version is handled as 1.1) and a three-digit status from 100 to 599 (`invalid_status_line`).
+- **Header lines**: CRLF line endings, a token as name, no obsolete line folding nor control characters (`invalid_header`); the whitespace around a value is not part of it. At most 100 lines and 16 KB (`header_section_too_large`).
+- **Body**: none for responses to `HEAD`, 1xx, 204 and 304, whatever their headers. Otherwise `Transfer-Encoding: chunked` (decoded strictly, trailers dropped: `malformed_body`), `Content-Length`, or else until the server closes the connection. `Transfer-Encoding` other than a single `chunked` (no other coding is supported), in an HTTP/1.0 response or together with `Content-Length`, and a `Content-Length` other than digits, or repeated with different values, are `invalid_framing`. A response cut by the end of the connection is `incomplete_response`; one larger than `max_content_size()` (8 MB) is `body_too_large`, unless streamed.
+- **Interim responses** (`100 Continue`, `103 Early Hints`) are skipped. `101 Switching Protocols` ends the response, and is accepted only for a request with `Upgrade` (`unexpected_upgrade`).
+- **Connection reuse**: only after a response delimited by its length or chunked, kept alive, and with nothing received past its end.
 
 ### Async Client (async_client)
 

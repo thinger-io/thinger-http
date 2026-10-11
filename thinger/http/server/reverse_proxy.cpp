@@ -36,9 +36,6 @@ namespace {
     // Interim responses (1xx) skipped before giving up on a target
     constexpr unsigned max_interim_responses = 16;
 
-    // Longest status line accepted from a target
-    constexpr size_t max_status_line = 8192;
-
     // Path and query sent in the request line: an absolute path, without whitespace,
     // control characters or a fragment
     bool is_request_target(std::string_view target) {
@@ -133,23 +130,6 @@ namespace {
             quoted += c;
         }
         return quoted + "\"";
-    }
-
-    // Status line of a target: "HTTP/1.x DDD [reason]\r\n"; its status code, or 0 if it is
-    // not valid. The response parser reads it too, but would truncate longer status codes.
-    int parse_status_line(std::string_view line) {
-        if (line.size() < 15 || !line.starts_with("HTTP/1.") || (line[7] != '0' && line[7] != '1') ||
-            line[8] != ' ' || !line.ends_with("\r\n")) {
-            return 0;
-        }
-        int code = 0;
-        for (size_t i = 9; i < 12; ++i) {
-            if (line[i] < '0' || line[i] > '9') return 0;
-            code = code * 10 + (line[i] - '0');
-        }
-        if (line[12] != ' ' || code < 100 || code > 599) return 0;
-        auto reason = line.substr(13, line.size() - 15);
-        return syntax::is_field_value(reason) ? code : 0;
     }
 
     // Whether a read from the target ended at the end of its stream (not an error). A TLS
@@ -279,6 +259,7 @@ namespace {
         // Response head of the target
         std::shared_ptr<http_response> head_;
         int status_code_ = 0;
+        response_factory::body_framing body_framing_ = response_factory::body_framing::none;
 
         bool response_started_ = false;
         // The whole response is queued: the connection may close after it (not the client leaving)
@@ -695,9 +676,12 @@ namespace {
     awaitable<bool> proxy_exchange::read_head() {
         std::vector<uint8_t> buffer(buffer_size);
         for (unsigned interim = 0; ; ++interim) {
+            // The head alone: the body is relayed as it is read. Its framing depends on the
+            // request the target got (the head for the client, on the request of the
+            // client: see response::start_stream())
             response_factory parser;
-            std::string status_line;
-            bool line_complete = false;
+            parser.set_headers_only(true);
+            parser.set_request_method(outgoing_method_);
 
             while (true) {
                 if (pending_.empty()) {
@@ -711,36 +695,20 @@ namespace {
                     pending_.assign(reinterpret_cast<const char*>(buffer.data()), bytes);
                 }
 
-                // the status line, to check it as it is
-                if (!line_complete) {
-                    auto newline = pending_.find('\n');
-                    status_line.append(pending_, 0, newline == std::string::npos ? pending_.size() : newline + 1);
-                    line_complete = newline != std::string::npos;
-                    if (status_line.size() > max_status_line) {
-                        fail(http_response::status::bad_gateway, "Invalid response from the target",
-                             "status line too long");
-                        co_return false;
-                    }
-                }
-
                 const char* begin = pending_.data();
                 const char* end = begin + pending_.size();
-                boost::tribool parsed = parser.parse_some(begin, end, true);
+                boost::tribool parsed = parser.parse_some(begin, end);
                 pending_.erase(0, static_cast<size_t>(begin - pending_.data()));
                 if (parsed) break;
                 if (!parsed) {
                     fail(http_response::status::bad_gateway, "Invalid response from the target",
-                         "invalid response head");
+                         make_error_code(parser.error()).message());
                     co_return false;
                 }
             }
 
             auto head = parser.consume_response();
-            int code = parse_status_line(status_line);
-            if (!head || code == 0) {
-                fail(http_response::status::bad_gateway, "Invalid response from the target", "invalid status line");
-                co_return false;
-            }
+            int code = head->get_status_code();
 
             // Interim responses (100 Continue, 103 Early Hints...) are not relayed
             if (code < 200 && code != 101) {
@@ -754,6 +722,7 @@ namespace {
 
             head_ = std::move(head);
             status_code_ = code;
+            body_framing_ = parser.get_body_framing();
             co_return true;
         }
     }
@@ -840,31 +809,13 @@ namespace {
     awaitable<void> proxy_exchange::relay_response() {
         const auto& head = *head_;
         int code = status_code_;
-        // Whether the target sends a body depends on the request it got (the head for the
-        // client, on the request of the client: see response::start_stream())
         bool head_request = outgoing_method_ == method::HEAD;
-        bool no_body = head_request || code < 200 || code == 204 || code == 304;
-
-        // The framing of the target must be unambiguous: a valid Content-Length, or
-        // "Transfer-Encoding: chunked" alone, or neither (the body ends with the connection)
-        auto transfer_encoding = head.get_headers_with_key(header::transfer_encoding);
-        bool chunked = false;
-        if (!transfer_encoding.empty()) {
-            if (transfer_encoding.size() != 1 || !ascii::iequals(syntax::trim(transfer_encoding.front()), "chunked") ||
-                head.has_content_length_header()) {
-                fail(http_response::status::bad_gateway, "Invalid response from the target",
-                     "ambiguous response framing (Transfer-Encoding)");
-                co_return;
-            }
-            chunked = true;
-        }
-        if (head.has_invalid_content_length()) {
-            fail(http_response::status::bad_gateway, "Invalid response from the target",
-                 "invalid Content-Length in the response");
-            co_return;
-        }
+        // The framing of the target is unambiguous (the parser rejected anything else): a
+        // valid Content-Length, or "Transfer-Encoding: chunked" alone, or neither (the body
+        // ends with the connection)
+        bool no_body = body_framing_ == response_factory::body_framing::none;
         std::optional<size_t> length;
-        if (!chunked && head.has_content_length_header()) length = head.get_content_length();
+        if (!head.is_chunked_transfer() && head.has_content_length_header()) length = head.get_content_length();
 
         // Head for the client: the status and end-to-end headers of the target
         http_response out;
@@ -893,14 +844,18 @@ namespace {
         result_.from_target = true;
 
         bool relayed = true;
-        if (!no_body) {
-            if (chunked) {
+        switch (body_framing_) {
+            case response_factory::body_framing::chunked:
                 relayed = co_await relay_chunked();
-            } else if (length) {
+                break;
+            case response_factory::body_framing::content_length:
                 relayed = co_await relay_length(*length);
-            } else {
+                break;
+            case response_factory::body_framing::until_close:
                 relayed = co_await relay_until_close();
-            }
+                break;
+            case response_factory::body_framing::none:
+                break;
         }
         if (!relayed) {
             // the client sees the response incomplete (no last chunk, or connection closed)
