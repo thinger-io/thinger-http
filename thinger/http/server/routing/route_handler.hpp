@@ -25,9 +25,13 @@ public:
     // and its path parameters on the request. Routes are matched by path segments, by
     // priority: static segments, then segments with a regex constraint, then parameters,
     // then parameters that may match '/' (see route_tree), whatever their registration order.
+    // A HEAD request matching no HEAD route is matched with the GET routes (the response
+    // drops the body), so an explicit HEAD route wins.
     const route* find_route(std::shared_ptr<request> req);
 
-    // Handle an unmatched request (fallback handler, or 404/405) through the response
+    // Handle an unmatched request through the response: the fallback handler, else 404 for
+    // a method with routes (HEAD has those of GET), or 405 for a method without any, with the
+    // methods of the routes matching the path in its Allow header (HEAD wherever GET)
     thinger::awaitable<void> handle_unmatched(std::shared_ptr<request> req, response& res);
 
     // Enable CORS support: answer preflight OPTIONS requests on any path
@@ -59,6 +63,13 @@ private:
     std::map<method, route_tree> trees_;
     nlohmann::json schema_components_ = nlohmann::json::object();
     fallback_handler fallback_handler_;
+
+    // Route of a method matching a path, appending its parameters to `captures`; null if none
+    const route_tree::leaf* match(method http_method, std::string_view path,
+                                  detail::route_captures& captures) const {
+        auto tree = trees_.find(http_method);
+        return tree != trees_.end() ? tree->second.find(path, captures) : nullptr;
+    }
     
     // Friend class to allow route_builder to access routes_
     friend class route_builder;

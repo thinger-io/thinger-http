@@ -191,8 +191,8 @@ void virtual_host::serve_static(const std::string& url_prefix,
 
         res.error(http_response::status::not_found, "Not found");
     };
-    get(route, handler).hidden();
-    head(route, std::move(handler)).hidden();
+    // (HEAD requests reach it too, unless a HEAD route matches them)
+    get(route, std::move(handler)).hidden();
 }
 
 } // namespace thinger::http

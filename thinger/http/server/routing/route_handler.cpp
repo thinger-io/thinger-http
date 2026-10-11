@@ -37,16 +37,16 @@ const route* route_handler::find_route(std::shared_ptr<request> req) {
 
     LOG_DEBUG("Finding route for {} {}", get_method(request_method), path);
 
-    auto tree = trees_.find(request_method);
-    if (tree == trees_.end()) {
-        LOG_DEBUG("No routes registered for method {}", get_method(request_method));
-        return nullptr;
-    }
-
     detail::route_captures captures;
-    const auto* found = tree->second.find(path, captures);
+    const auto* found = match(request_method, path, captures);
+    // HEAD is answered by the GET route of the path when no HEAD route matches it (the
+    // response drops the body): only searched once HEAD missed, so GET pays nothing for it
+    if (!found && request_method == method::HEAD) {
+        captures.clear();
+        found = match(method::GET, path, captures);
+    }
     if (!found) {
-        LOG_DEBUG("No matching route found for {}", path);
+        LOG_DEBUG("No matching route found for {} {}", get_method(request_method), path);
         return nullptr;
     }
     LOG_DEBUG("Matched route: {}", found->target->get_pattern());
@@ -68,11 +68,30 @@ thinger::awaitable<void> route_handler::handle_unmatched(std::shared_ptr<request
         co_return;
     }
 
-    // Check if the method has no routes at all → 405, otherwise 404
-    const auto& request_method = req->get_http_request()->get_method();
-    auto status = routes_.contains(request_method) ? http_response::status::not_found
-                                                   : http_response::status::not_allowed;
-    res.error(status);
+    // A method with routes (HEAD has those of GET too) → 404
+    auto http_request = req->get_http_request();
+    const auto& request_method = http_request->get_method();
+    if (routes_.contains(request_method) || (request_method == method::HEAD && routes_.contains(method::GET))) {
+        res.error(http_response::status::not_found);
+        co_return;
+    }
+
+    // A method without routes at all → 405, with the methods of the routes matching the path
+    // (RFC 9110, 15.5.6), HEAD wherever GET: empty if none does
+    std::string_view path = http_request->get_uri();
+    path = path.substr(0, path.find('?'));
+    std::string allowed;
+    for (auto candidate : {method::GET, method::HEAD, method::POST, method::PUT, method::DELETE,
+                           method::TRACE, method::OPTIONS, method::CONNECT, method::PATCH}) {
+        detail::route_captures captures;
+        if (!match(candidate, path, captures) && !(candidate == method::HEAD && match(method::GET, path, captures))) {
+            continue;
+        }
+        if (!allowed.empty()) allowed += ", ";
+        allowed += get_method(candidate);
+    }
+    res.header("Allow", allowed);
+    res.error(http_response::status::not_allowed);
 }
 
 } // namespace thinger::http
