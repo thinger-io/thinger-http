@@ -117,6 +117,7 @@ bool response::answer_timeout(http::http_response::status status) {
     format_error(state_->formatter.get(), {status, "No response within the timeout", nullptr}, *message);
     if (!state_->responded.exchange(true)) {
         if (state_->on_start) state_->on_start();
+        prepare_body(*message, false);
         state_->sink->send(std::move(message));
         return true;
     }
@@ -181,8 +182,23 @@ void response::compress_if_needed(http_response& response) const {
     }
 }
 
+bool response::head_request() const {
+    return state_->request->get_method() == method::HEAD;
+}
+
+void response::prepare_body(http_response& message, bool compress) const {
+    if (head_request()) {
+        // The headers of the answer to GET, Content-Length included, without its body: the
+        // client reads none (RFC 9110, 9.3.2), so it would be taken as the next response.
+        // Not compressed (like Express): its length is the one of the identity body.
+        message.get_content().clear();
+    } else if (compress) {
+        compress_if_needed(message);
+    }
+}
+
 void response::send_message(std::shared_ptr<http_response> message, bool compress) {
-    if (compress) compress_if_needed(*message);
+    prepare_body(*message, compress);
     if (!mark_responded()) return;
     state_->sink->send(std::move(message));
 }
@@ -535,7 +551,7 @@ void response::take_over(takeover_handler handler) {
 }
 
 void response::take_over(std::shared_ptr<http_response> message, takeover_handler handler) {
-    compress_if_needed(*message);
+    prepare_body(*message, true);
     if (!mark_responded()) return;
     state_->sink->take_over(std::move(message), std::move(handler));
 }
@@ -552,7 +568,14 @@ void response::start_sse(std::function<void(std::shared_ptr<sse_connection>)> ha
     response->add_header("Cache-Control", "no-cache");
     response->add_header("Connection", "keep-alive");
     response->add_header("X-Accel-Buffering", "no"); // Disable nginx buffering
-    
+
+    // HEAD: the headers of the event stream alone, as a whole response (no events, nor
+    // handler), so the connection goes on with the next request
+    if (head_request()) {
+        send_message(std::move(response), false);
+        return;
+    }
+
     // Send the SSE headers and take over the connection (anything the client sends
     // afterwards is not part of the event stream)
     take_over(std::move(response), [handler = std::move(handler)](std::shared_ptr<asio::socket> socket, std::string) {
@@ -568,7 +591,8 @@ void response::start_sse(std::function<void(std::shared_ptr<sse_connection>)> ha
 }
 
 // Chunked response support: the sink writes the headers, then each chunk. Chunks are
-// written in order (the lock), only once the headers are queued and until the end
+// written in order (the lock), only once the headers are queued and until the end. A
+// response to HEAD is the headers alone, as a whole response: its chunks are dropped
 bool response::start_chunked(const std::string& content_type, http::http_response::status status) {
     if (!ensure_not_responded()) return false;
     auto response = new_response();
@@ -577,7 +601,12 @@ bool response::start_chunked(const std::string& content_type, http::http_respons
     if (!mark_responded()) return false;
 
     std::lock_guard lock(state_->chunked_mutex);
-    if (!state_->sink->begin(std::move(response))) return false;
+    if (head_request()) {
+        // (without Transfer-Encoding, as start_stream() does)
+        state_->sink->send(std::move(response));
+    } else if (!state_->sink->begin(std::move(response))) {
+        return false;
+    }
     state_->chunked = state::chunked_phase::open;
     return true;
 }
@@ -588,6 +617,7 @@ bool response::write_chunk(const std::string& data) {
         log_late_answer("Chunks can only be written between start_chunked() and end_chunked()");
         return false;
     }
+    if (head_request()) return true;
     return state_->sink->append(data);
 }
 
@@ -598,6 +628,7 @@ bool response::end_chunked() {
         return false;
     }
     state_->chunked = state::chunked_phase::ended;
+    if (head_request()) return true;
     return state_->sink->finish();
 }
 

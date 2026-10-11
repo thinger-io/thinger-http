@@ -53,6 +53,9 @@ using websocket_stream_handler = std::function<void(std::shared_ptr<asio::websoc
 // dropped, even when they run at the same time from several threads. Setting the status or
 // headers before answering (status(), header()) is not thread-safe: do it from the thread
 // running the handler, before any answer (a route timeout answers with the headers set so far).
+// A response to a HEAD request is the one to GET without its body: every answer sends its
+// headers, Content-Length included (of the body uncompressed: HEAD is never compressed), and
+// drops the body; chunks and streamed data are dropped too, and SSE sends its headers alone.
 class response {
 public:
     response(const std::shared_ptr<server_connection>& connection,
@@ -118,7 +121,7 @@ public:
         upgrade_websocket_stream(websocket_options{}, std::move(handler));
     }
 
-    // Server-Sent Events
+    // Server-Sent Events (for a HEAD request, the headers alone: the handler is not called)
     void start_sse(std::function<void(std::shared_ptr<sse_connection>)> handler);
 
     // Take over the connection (e.g. for a custom protocol upgrade or a tunnel): sends
@@ -146,7 +149,8 @@ public:
     // first, or the connection is gone), then write_chunk() each chunk and end_chunked() the
     // last one. Chunks are only written on a response started with start_chunked(), once it
     // returned true (from any copy, any thread) and until end_chunked(): otherwise they
-    // return false and write nothing.
+    // return false and write nothing. For a HEAD request, start_chunked() sends the headers
+    // (without Transfer-Encoding) as a whole response, and the chunks are dropped.
     bool start_chunked(const std::string& content_type, http::http_response::status status = http::http_response::status::ok);
     bool write_chunk(const std::string& data);
     bool end_chunked();
@@ -204,10 +208,14 @@ private:
     // New message to answer with: a copy of the draft, if any
     std::shared_ptr<http_response> new_response() const;
     void compress_if_needed(http_response& response) const;
+    // Whether the request is HEAD: its response has no body
+    bool head_request() const;
+    // Body of a message about to be sent: dropped for HEAD (keeping its Content-Length),
+    // else compressed if `compress` and the client accepts it (see compress_if_needed)
+    void prepare_body(http_response& message, bool compress) const;
     // Mark the response as sent; false (and nothing must be sent) if it already was
     bool mark_responded();
-    // Send a message (compressed if the client accepts it, see compress_if_needed), unless
-    // another answer was sent first
+    // Send a message (see prepare_body), unless another answer was sent first
     void send_message(std::shared_ptr<http_response> message, bool compress = true);
     // Send a message and take the connection over, unless another answer was sent first
     void take_over(std::shared_ptr<http_response> message, takeover_handler handler);
