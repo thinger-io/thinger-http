@@ -78,6 +78,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/trusted_proxies_test.cpp)
     add_thinger_test(test_trusted_proxies unit/http/server/trusted_proxies_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/file_info_test.cpp)
+    add_thinger_test(test_file_info unit/http/server/file_info_test.cpp)
+endif()
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/body_reader_test.cpp)
     add_thinger_test(test_body_reader unit/http/server/body_reader_test.cpp)
 endif()
@@ -106,6 +110,10 @@ endif()
 # Unit tests - URL utilities
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/util/url_test.cpp)
     add_thinger_test(test_url unit/http/util/url_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/util/http_date_test.cpp)
+    add_thinger_test(test_http_date unit/http/util/http_date_test.cpp)
 endif()
 
 # Unit tests - ASIO
@@ -263,6 +271,11 @@ endif()
 # Integration tests - Route hardening (schemas, coroutine handlers, route storage, responses)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/route_hardening_test.cpp)
     add_thinger_test(test_integration_route_hardening integration/route_hardening_test.cpp)
+endif()
+
+# Integration tests - Static files (validators, conditional requests, ranges)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/static_files_test.cpp)
+    add_thinger_test(test_integration_static_files integration/static_files_test.cpp)
 endif()
 
 # Integration tests - Reverse proxy
