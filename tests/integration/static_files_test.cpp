@@ -293,6 +293,18 @@ TEST_CASE("Static files keep the SPA fallback and stay inside their directory", 
         REQUIRE(response.header("ETag") == docs.etag);
     }
 
+    SECTION("A symlink to a sibling directory sharing the name as a prefix is not served") {
+        // (it resolves to ".../www-secret/secret.txt", which starts with ".../www")
+        fs::create_symlink(site.base / "www-secret" / "secret.txt", site.root / "link.txt");
+        auto response = get(site.port, "/static/link.txt");
+        REQUIRE(response.status == 403);
+        REQUIRE(response.body.find("top secret") == std::string::npos);
+        REQUIRE(send_request(site.port, "HEAD", "/static/link.txt").status == 403);
+
+        fs::create_directory_symlink(site.base / "www-secret", site.root / "linked");
+        REQUIRE(get(site.port, "/static/linked/secret.txt").status == 403);
+    }
+
     SECTION("A symlink to a file inside the directory is served") {
         fs::create_symlink(site.root / "app.js", site.root / "link.js");
         auto response = get(site.port, "/static/link.js");

@@ -337,7 +337,7 @@ server.serve_static("/assets", "/var/www/app/assets", {
 });
 ```
 
-`serve_static()` answers `GET` and `HEAD` requests. The fallback file is served for a directory (its own one), and for the paths without a file (the one of the root directory, as single page applications expect).
+`serve_static()` answers `GET` and `HEAD` requests. The fallback file is served for a directory (its own one), and for the paths without a file (the one of the root directory, as single page applications expect). Paths resolving outside the directory (through symlinks; request targets with `..` are already rejected with `400`) are answered with `403`.
 
 Files are served with validators, so that browsers download them once and only check them afterwards:
 

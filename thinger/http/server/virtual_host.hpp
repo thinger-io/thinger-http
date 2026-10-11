@@ -59,7 +59,8 @@ public:
 
     // Static files of `directory` served under `url_prefix` (GET and HEAD), as
     // response::send_file does: with ETag and Last-Modified, answering conditional requests
-    // with 304 and single byte ranges with 206.
+    // with 304 and single byte ranges with 206. Paths resolving outside the directory
+    // (through symlinks) are answered with 403.
     void serve_static(const std::string& url_prefix,
                       const std::string& directory,
                       const std::string& fallback = "index.html");

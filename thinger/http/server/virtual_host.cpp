@@ -102,6 +102,17 @@ void virtual_host::schema_component(const std::string& name, nlohmann::json sche
     router_.add_schema_component(name, std::move(schema));
 }
 
+namespace {
+
+    // Whether `file` is `directory` or inside it (both canonical), by whole path components:
+    // a sibling sharing its name as a prefix ("/srv/www-secret" next to "/srv/www") is outside
+    bool is_within(const std::filesystem::path& file, const std::filesystem::path& directory) {
+        auto relative = file.lexically_relative(directory);
+        return !relative.empty() && *relative.begin() != "..";
+    }
+
+}
+
 // Static file serving
 void virtual_host::serve_static(const std::string& url_prefix,
                                 const std::string& directory,
@@ -149,7 +160,7 @@ void virtual_host::serve_static(const std::string& url_prefix,
         auto canonical_file = fs::weakly_canonical(file_path);
 
         // Security: ensure the resolved path is within the directory
-        if (!canonical_file.string().starts_with(canonical_dir.string())) {
+        if (!is_within(canonical_file, canonical_dir)) {
             res.error(http_response::status::forbidden, "Access denied");
             return;
         }
