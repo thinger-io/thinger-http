@@ -75,19 +75,19 @@ namespace {
         limited_dom_builder(json& root, size_t max_depth, size_t max_values, bool check_utf8)
             : root_(root), max_depth_(max_depth), max_values_(max_values), check_utf8_(check_utf8) {}
 
-        bool null() { return add(nullptr) != nullptr; }
-        bool boolean(bool value) { return add(value) != nullptr; }
-        bool number_integer(json::number_integer_t value) { return add(value) != nullptr; }
-        bool number_unsigned(json::number_unsigned_t value) { return add(value) != nullptr; }
-        bool number_float(json::number_float_t value, const json::string_t&) { return add(value) != nullptr; }
+        bool null() { return add(nullptr); }
+        bool boolean(bool value) { return add(value); }
+        bool number_integer(json::number_integer_t value) { return add(value); }
+        bool number_unsigned(json::number_unsigned_t value) { return add(value); }
+        bool number_float(json::number_float_t value, const json::string_t&) { return add(value); }
 
         bool string(json::string_t& value) {
             if (check_utf8_ && !valid_utf8(value)) return fail(failure::utf8);
-            return add(std::move(value)) != nullptr;
+            return add(std::move(value));
         }
 
         bool binary(json::binary_t& value) {
-            return add(json(std::move(value))) != nullptr;
+            return add(std::move(value));
         }
 
         bool start_object(std::size_t) { return open(json::value_t::object); }
@@ -95,7 +95,7 @@ namespace {
         bool key(json::string_t& value) {
             if (check_utf8_ && !valid_utf8(value)) return fail(failure::utf8);
             // a repeated key keeps the last value, as json::parse() does
-            element_ = &(*stack_.back())[value];
+            element_ = &stack_.back()->get_ref<json::object_t&>()[value];
             return true;
         }
 
@@ -117,36 +117,35 @@ namespace {
 
         bool open(json::value_t type) {
             if (stack_.size() >= max_depth_) return fail(failure::depth);
-            json* container = add(json(type));
-            if (!container) return false;
-            stack_.push_back(container);
+            if (!add(type)) return false;
+            stack_.push_back(last_);
             return true;
         }
 
         // Add a value where it goes (the root, the open array, or the last key of the open
-        // object); null if over the limit of values. Pointers to open containers stay valid:
-        // their parents get no other element while they are open.
-        json* add(json&& value) {
-            if (++values_ > max_values_) {
-                fail(failure::values);
-                return nullptr;
-            }
+        // object), built there from the parsed value; false if over the limit of values.
+        // Pointers to open containers stay valid: their parents get no other element while
+        // they are open.
+        template<typename Value>
+        bool add(Value&& value) {
+            if (++values_ > max_values_) return fail(failure::values);
             if (stack_.empty()) {
-                root_ = std::move(value);
-                return &root_;
+                root_ = json(std::forward<Value>(value));
+                last_ = &root_;
+            } else if (auto* array = stack_.back()->template get_ptr<json::array_t*>()) {
+                last_ = &array->emplace_back(std::forward<Value>(value));
+            } else {
+                *element_ = json(std::forward<Value>(value));
+                last_ = element_;
             }
-            if (stack_.back()->is_array()) {
-                auto& array = stack_.back()->get_ref<json::array_t&>();
-                array.push_back(std::move(value));
-                return &array.back();
-            }
-            *element_ = std::move(value);
-            return element_;
+            return true;
         }
 
         json& root_;
         std::vector<json*> stack_;
         json* element_ = nullptr;
+        // the value added last
+        json* last_ = nullptr;
         size_t max_depth_;
         size_t max_values_;
         size_t values_ = 0;
@@ -155,7 +154,7 @@ namespace {
     };
 
     json decode_with_limits(std::string_view body, json::input_format_t format, const body_limits& limits,
-                            const std::string& name) {
+                            const char* name) {
         json result;
         limited_dom_builder builder(result, limits.max_depth, body.size(), format != json::input_format_t::json);
         bool decoded = false;
@@ -169,14 +168,14 @@ namespace {
 
         switch (builder.get_failure()) {
             case limited_dom_builder::failure::depth:
-                throw body_decode_error("Invalid " + name + ": nested deeper than " +
+                throw body_decode_error(std::string("Invalid ") + name + ": nested deeper than " +
                                         std::to_string(limits.max_depth) + " levels");
             case limited_dom_builder::failure::values:
-                throw body_decode_error("Invalid " + name + ": more values than bytes");
+                throw body_decode_error(std::string("Invalid ") + name + ": more values than bytes");
             case limited_dom_builder::failure::utf8:
-                throw body_decode_error("Invalid " + name + ": string not valid UTF-8");
+                throw body_decode_error(std::string("Invalid ") + name + ": string not valid UTF-8");
             default:
-                throw body_decode_error("Invalid " + name);
+                throw body_decode_error(std::string("Invalid ") + name);
         }
     }
 
