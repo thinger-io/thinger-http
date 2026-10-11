@@ -331,12 +331,31 @@ body_decoder_registry& body_decoder_registry::add(const std::string& name, std::
     } else {
         formats_.push_back(std::move(format));
     }
+    index_plain_media_types();
     return *this;
 }
 
 bool body_decoder_registry::remove(const std::string& name) {
     auto key = lowercase(name);
-    return std::erase_if(formats_, [&](const body_format& f) { return f.name == key; }) > 0;
+    if (std::erase_if(formats_, [&](const body_format& f) { return f.name == key; }) == 0) return false;
+    index_plain_media_types();
+    return true;
+}
+
+void body_decoder_registry::index_plain_media_types() {
+    plain_media_types_.clear();
+    for (size_t i = 0; i < formats_.size(); ++i) {
+        for (const auto& type : formats_[i].media_types) {
+            if (is_plain_media_type(type)) plain_media_types_.emplace_back(media_type{type, {}}, i);
+        }
+    }
+}
+
+std::pair<const media_type*, const body_format*> body_decoder_registry::find_plain_media_type(std::string_view type) const {
+    for (const auto& [parsed, index] : plain_media_types_) {
+        if (parsed.type == type) return {&parsed, &formats_[index]};
+    }
+    return {nullptr, nullptr};
 }
 
 const body_format* body_decoder_registry::find(std::string_view name) const {

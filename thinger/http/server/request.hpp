@@ -233,10 +233,15 @@ namespace thinger::http{
         /// Body decoders, accepted types and limits of the application (null: defaults)
         const body_settings* body_settings_ = nullptr;
 
-        /// Body parsed as JSON by the matched route, for callbacks taking it, and the type
-        /// of the body it accepted (matched before the body is read)
+        /// Body parsed as JSON by the matched route, for callbacks taking it
         friend class route;
         nlohmann::json json_body_;
+
+        /// Type of the body the matched route accepted (matched before the body is read):
+        /// its media type (null until matched) and decoder (null if none). They point to the
+        /// decoder registry for the media types its decoders list, else to body_type_.
+        const media_type* body_media_type_ = nullptr;
+        const body_format* body_format_ = nullptr;
         std::optional<body_type_match> body_type_;
     };
 

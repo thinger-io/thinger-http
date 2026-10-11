@@ -387,8 +387,8 @@ private:
     }
 
     // Type of the request body against the accepted types (matched once per request, and
-    // kept in it): null, after answering 415, if it is not accepted
-    const body_type_match* match_body_type(request& req, response& res) const;
+    // kept in it): false, after answering 415, if it is not accepted
+    bool match_body_type(request& req, response& res) const;
 
     // Decode the request body and validate it against the schema; responds with an error
     // and returns false if it cannot be decoded or is not valid

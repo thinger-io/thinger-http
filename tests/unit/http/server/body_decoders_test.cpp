@@ -161,6 +161,34 @@ TEST_CASE("Body decoder registry", "[body][unit]") {
         REQUIRE(registry.find_media_type("text/csv") == nullptr);
         REQUIRE(registry.find_media_type("application/csv")->name == "csv");
     }
+
+    SECTION("Plain media types as decoders list them, parsed once") {
+        auto [type, format] = registry.find_plain_media_type("application/json");
+        REQUIRE(type != nullptr);
+        REQUIRE(type->type == "application/json");
+        REQUIRE(type->parameters.empty());
+        REQUIRE(format->name == "json");
+        REQUIRE(registry.find_plain_media_type("application/x-msgpack").second->name == "msgpack");
+
+        // Anything else is parsed
+        for (const char* value : {"", "Application/JSON", "application/json; charset=utf-8", " application/json",
+                                  "application/problem+json", "image/png"}) {
+            INFO(value);
+            REQUIRE(registry.find_plain_media_type(value).first == nullptr);
+        }
+
+        // Kept up to date as decoders are added and removed, also in copies
+        registry.add("csv", {"Text/CSV"}, body_decoder_registry::decode_text);
+        registry.add("html", {"text/html", "text/plain"}, body_decoder_registry::decode_text);
+        REQUIRE(registry.remove("json"));
+        body_decoder_registry copy = registry;
+        for (const auto* decoders : {&registry, &copy}) {
+            REQUIRE(decoders->find_plain_media_type("application/json").first == nullptr);
+            REQUIRE(decoders->find_plain_media_type("text/csv").second == decoders->find("csv"));
+            REQUIRE(decoders->find_plain_media_type("text/plain").second == decoders->find("html"));
+            REQUIRE(decoders->find_plain_media_type("application/cbor").second == decoders->find("cbor"));
+        }
+    }
 }
 
 TEST_CASE("The same object decodes the same from every format", "[body][unit]") {

@@ -112,6 +112,12 @@ public:
     // its suffix; null if none
     const body_format* find_media_type(std::string_view type) const;
 
+    // A media type exactly as a decoder lists it, without parameters (as most clients send
+    // their Content-Type, e.g. "application/json"): that media type, parsed when the decoder
+    // was added, and its decoder; {null, null} if it is not one. A Content-Type found here
+    // needs no parsing on each request.
+    std::pair<const media_type*, const body_format*> find_plain_media_type(std::string_view type) const;
+
     const std::vector<body_format>& formats() const { return formats_; }
 
     // The built-in decoders, to reuse in custom ones
@@ -124,7 +130,13 @@ public:
     static nlohmann::json decode_binary(std::string_view body, const media_type& type, const body_limits& limits);
 
 private:
+    // Index the plain media types of the decoders (after adding or removing one)
+    void index_plain_media_types();
+
     std::vector<body_format> formats_;
+    // The media types of the decoders that are plain (lowercase "type/subtype"), parsed,
+    // with the index of their decoder in formats_
+    std::vector<std::pair<media_type, size_t>> plain_media_types_;
 };
 
 // How the bodies of the routes are decoded: the application settings (see

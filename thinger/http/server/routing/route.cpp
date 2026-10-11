@@ -141,12 +141,13 @@ bool route::matches(const std::string& path, std::smatch& matches) const {
     return std::regex_match(path, matches, regex_);
 }
 
-const body_type_match* route::match_body_type(request& req, response& res) const {
+bool route::match_body_type(request& req, response& res) const {
     // Matched once per request: before its body is read, then to decode it
-    if (req.body_type_) return &*req.body_type_;
+    if (req.body_media_type_) return true;
 
     const auto& settings = req.get_body_settings();
     const auto& http_request = *req.get_http_request();
+    const auto& accepted = accepted_types_.empty() ? settings.accepted : accepted_types_;
 
     // Content-Type is a single value: repeated with different values, the type is ambiguous
     const std::string* content_type = nullptr;
@@ -156,13 +157,23 @@ const body_type_match* route::match_body_type(request& req, response& res) const
             content_type = &value;
         } else if (value != *content_type) {
             res.error(http_response::status::unsupported_media_type, "Multiple Content-Type values");
-            return nullptr;
+            return false;
         }
     }
 
-    auto& match = req.body_type_.emplace(http::match_body_type(
-        settings.decoders, accepted_types_.empty() ? settings.accepted : accepted_types_,
-        content_type ? std::string_view(*content_type) : std::string_view{}));
+    // A media type as a decoder lists it (the usual "application/json", also assumed without
+    // Content-Type) is accepted as http::match_body_type() would, without parsing it again
+    std::string_view value = content_type ? std::string_view(*content_type) : std::string_view{};
+    auto [type, format] = settings.decoders.find_plain_media_type(value.empty() ? default_body_media_type : value);
+    if (type && std::any_of(accepted.begin(), accepted.end(), [&](const std::string& entry) {
+            return entry == type->type || entry == format->name;
+        })) {
+        req.body_media_type_ = type;
+        req.body_format_ = format;
+        return true;
+    }
+
+    auto& match = req.body_type_.emplace(http::match_body_type(settings.decoders, accepted, value));
     if (match.accepted && !match.format && takes_json_body_) {
         // Listed by accepts(), but no decoder can give it to the callback
         LOG_WARNING("Route {} accepts {}, but there is no body decoder for it", pattern_, match.type.type);
@@ -172,37 +183,38 @@ const body_type_match* route::match_body_type(request& req, response& res) const
     if (!match.accepted) {
         res.error(http_response::status::unsupported_media_type, match.error);
         req.body_type_.reset();
-        return nullptr;
+        return false;
     }
-    return &match;
+    req.body_media_type_ = &match.type;
+    req.body_format_ = match.format;
+    return true;
 }
 
 bool route::accepts_body(request& req, response& res) const {
     // Routes reading the body themselves accept any type unless they list theirs
     if (!takes_json_body_ && accepted_types_.empty()) return true;
     if (!req.has_pending_body() && req.get_http_request()->get_body().empty()) return true;
-    return match_body_type(req, res) != nullptr;
+    return match_body_type(req, res);
 }
 
 bool route::decode_body(request& req, response& res, nlohmann::json& json) const {
     // An empty body is null, whatever its type (the schema decides whether it is valid)
     const auto& body = req.get_http_request()->get_body();
     if (!body.empty()) {
-        const auto* match = match_body_type(req, res);
-        if (!match) return false;
+        if (!match_body_type(req, res)) return false;
         try {
             // Limits of the route, else of its virtual host, else of the application
             const auto* host = req.get_virtual_host();
             const auto& limits = decode_limits_ ? *decode_limits_
                                : host && host->get_decode_limits() ? *host->get_decode_limits()
                                : req.get_body_settings().limits;
-            json = match->format->decode(body, match->type, limits);
+            json = req.body_format_->decode(body, *req.body_media_type_, limits);
         } catch (const body_decode_error& e) {
             res.error(e.status(), e.what());
             return false;
         } catch (const std::exception& e) {
-            LOG_DEBUG("Body decoder {} failed on route {}: {}", match->format->name, pattern_, e.what());
-            res.error(http_response::status::bad_request, "Invalid " + match->format->name + " body");
+            LOG_DEBUG("Body decoder {} failed on route {}: {}", req.body_format_->name, pattern_, e.what());
+            res.error(http_response::status::bad_request, "Invalid " + req.body_format_->name + " body");
             return false;
         }
     }
