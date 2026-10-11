@@ -15,8 +15,8 @@ int main(int argc, char* argv[]) {
 
     http::server server;
 
-    // Configure maximum body size (16 MB for this example)
-    server.set_max_body_size(16 * 1024 * 1024);
+    // Maximum body size of every route (the upload route sets its own, 16 MB)
+    server.set_max_body_size(64 * 1024);
 
     // Serve the upload page
     server.get("/", [](http::response& res) {
@@ -167,7 +167,7 @@ function uploadFile(file) {
             {"size_formatted", format_size(body.size())},
             {"xor_checksum", checksum}
         });
-    });
+    }).max_body_size(16 * 1024 * 1024);   // only this route accepts large bodies
 
     // Get port from command line or use default
     uint16_t port = 8090;

@@ -212,7 +212,7 @@ server.post("/api/data", [](auto& req, auto& res) {
 });
 ```
 
-The server reads the body before calling the handler, decompressing it if it has `Content-Encoding: gzip` or `deflate`. Bodies larger than `set_max_body_size()` (8 MB by default, also once decompressed) are answered with `413 Payload Too Large`; a `Content-Length` over the limit is rejected before reading anything.
+The server reads the body before calling the handler, decompressing it if it has `Content-Encoding: gzip` or `deflate`. Bodies larger than `set_max_body_size()` (8 MB by default, also once decompressed), or the limit of the route (see [Limits and Timeouts per Route](#limits-and-timeouts-per-route)), are answered with `413 Payload Too Large`; a `Content-Length` over the limit is rejected before reading anything.
 
 Request framing is strict, as a lenient parser could read a request differently than a proxy in front of it (request smuggling). These requests are answered with `400` and the connection is closed:
 
@@ -263,10 +263,10 @@ server.post("/upload", [](http::request& req, http::response& res) -> thinger::a
 });
 ```
 
-Reads never go past the end of the body. Whatever the handler leaves unread is discarded after it returns, so it is never parsed as the next request on a keep-alive connection; if it exceeds `set_max_body_size()`, the connection is closed instead.
+Reads never go past the end of the body, nor past the maximum body size of the route (`set_max_body_size()` unless the route sets its own): a larger body fails reading (`too_large`), a `Content-Length` one at the first read, without reading it. Whatever the handler leaves unread is discarded after it returns, so it is never parsed as the next request on a keep-alive connection; if it exceeds `set_max_body_size()` (or the route limit, if smaller), the connection is closed instead.
 
 - Do not read the body straight from `req.get_socket()`: use `read()`/`read_some()`, or take over the connection (below).
-- `co_await req.read_body()` loads the remaining body into `req.body()`, up to `set_max_body_size()` (it fails without reading a larger `Content-Length` body). Do not mix it with `read()`/`read_some()` on the same request: the stored body would miss the part already read (and fail to decompress if the request is compressed).
+- `co_await req.read_body()` loads the remaining body into `req.body()`, up to the maximum body size (it fails without reading a larger `Content-Length` body). Do not mix it with `read()`/`read_some()` on the same request: the stored body would miss the part already read (and fail to decompress if the request is compressed).
 - `read()`/`read_some()` return 0 at the end of the body, and also if reading it fails: `req.get_body_error()` tells why (`too_large`, `malformed` framing, `incomplete` if the connection ended first, or `bad_encoding`). A request whose body fails is answered with `400` (`413` if too large) unless the handler responded, and its connection is closed.
 
 ### Taking Over the Connection
@@ -509,6 +509,48 @@ devices.group("/:device/resources").tag("Resources").get("/:resource", get_resou
 
 All routes, with their documentation and metadata, are available from `server.router().get_routes()`. Registered routes are never moved, so the `route&` returned by a registration method stays valid while more routes are added. See `examples/http_server/route_metadata_example.cpp`.
 
+### Limits and Timeouts per Route
+
+Routes and groups can set their own maximum body size, request timeout and [decode limits](#body-types), instead of the application ones:
+
+```cpp
+server.set_max_body_size(1024 * 1024);   // 1 MB for every route that does not set its own
+
+// Imports: large bodies, and time to process them
+auto imports = server.group("/v1/imports").max_body_size(512 * 1024 * 1024).timeout(10min);
+imports.post("/devices", import_devices);
+imports.post("/preview", preview_import).max_body_size(1024 * 1024).timeout(10s);  // overrides the group
+
+// A call answered by a device: fail fast if it does not answer
+server.post("/v1/devices/:device/call", call_device)
+    .max_body_size(16 * 1024)
+    .timeout(5s)                                                        // 504 Gateway Timeout
+    .decode_limits({.max_depth = 16});
+
+// Another status for the timeout
+server.get("/v1/reports/:id", get_report).timeout(30s, http::http_response::status::service_unavailable);
+```
+
+Group limits are copied to each route as it is registered, so set them on the group first; a route overrides them with its own (`.timeout(0ms)` removes the timeout of its group).
+
+**Maximum body size** (`.max_body_size(bytes)`, `set_max_body_size()` if unset, `std::numeric_limits<size_t>::max()` for none) bounds every way the body is read, with `413 Payload Too Large` answered through the [error formatter](#error-format) and the connection closed:
+
+- Bodies the server reads (handlers taking the body decoded, synchronous handlers, `.deferred_body(false)`): a `Content-Length` over the limit is rejected before reading anything; a chunked body, as soon as it goes past it; a compressed body, also once decompressed.
+- Coroutines reading the body themselves (`read_body()`, `read()`, `read_some()`): reading a larger body fails (`req.get_body_error()` is `too_large`, a `Content-Length` one at the first read, without reading it), and the server answers `413` unless the handler did. **Behavior change**: these reads had no limit before; now they are bounded by `set_max_body_size()` (8 MB by default) unless the route sets its own: give routes receiving files or other large uploads the limit they need.
+- The [reverse proxy](#reverse-proxy): the request body it streams is bounded by the route limit and by `proxy_options::max_body_size`, whichever is smaller. The not-found handler of a host (a proxy for a whole host) has no route: the application limit applies.
+- [In-memory dispatch](#in-memory-dispatch): the same, from the body of the request.
+- A body left unread by the handler (e.g. a middleware answered `401` before it was read) is discarded only up to the smaller of `set_max_body_size()` and the route limit; a larger one closes the connection instead of being read, so a route accepting large bodies does not make the server read them for nothing.
+
+**Timeout** (`.timeout(duration, status = 504)`, none by default) is the maximum time from the dispatch of a request (its headers received and its route matched) until its response **starts**, middlewares and body reading included. If no answer has started by then, the request is answered with `504 Gateway Timeout` (or the status given, e.g. `503 Service Unavailable`) through the [error formatter](#error-format), with the message `No response within the timeout` and the headers set on the response so far (e.g. CORS headers of a middleware).
+
+- **Handlers are not cancelled**: a coroutine goes on until it ends, and anything it sends afterwards (or a copy of the response, from another thread) is dropped: `has_responded()` is `true` for every copy, and late answers are logged at debug level only. Keep handlers bounded on their own (their own timeouts on what they wait for).
+- **Started responses are never cut**: once the response starts (`send()`, `json()`, `start_stream()`, `start_chunked()`, `start_sse()`, WebSocket upgrades, `take_over()`), the timer is cancelled and the response takes as long as it needs.
+- **The connection**: if the body was read whole, the connection stays alive and serves the next request right away, while the handler may still run. If part of the body is still unread (the handler may be reading it), the response closes the connection, as nothing else can tell where the body ends; the handler then sees the body incomplete.
+- **Connection timeout**: while a request waits for its response within its own timeout, the connection timeout (`set_connection_timeout()`, 120 s) does not close the connection, so a route can wait longer than it; it applies again to the idle connection afterwards, and uploads extend it as before.
+- **In-memory dispatch** applies the route timeout too; `dispatch_options::timeout` still bounds the whole call (and cancels the handler), whichever expires first.
+
+The [OpenAPI](#openapi) document shows the limits set on a route (or its group) as `x-max-body-size` (bytes) and `x-timeout-ms` extensions of its operation.
+
 ### OpenAPI
 
 The server builds an OpenAPI 3.1 document from its routes: paths and path parameters from the route patterns (including the regex of `:param(regex)`), request bodies from the validation schemas (one entry per [body type](#body-types) accepted), and summaries, tags, parameters, responses and examples from the route documentation. Hidden routes (`.hidden()`), static files and the document itself are left out.
@@ -598,7 +640,7 @@ For HTTPS, the certificate is chosen per domain before any request is read, thro
 
 ### Error Format
 
-Errors sent with `res.error(status, message)`, and the ones the server generates itself (`400` for bodies that cannot be decoded, schema validation and invalid request framing or bodies, `401` of basic auth, `404`/`405`, `413`, `415` for body types not accepted, `500` from middlewares, handlers and invalid route schemas, and `501`/`504` of in-memory dispatch) go through an error formatter. By default the message is sent as `text/plain`, and errors with details (schema validation) as JSON `{"error": {"message": ..., "context": [...]}}`. A formatter changes it for all of them:
+Errors sent with `res.error(status, message)`, and the ones the server generates itself (`400` for bodies that cannot be decoded, schema validation and invalid request framing or bodies, `401` of basic auth, `404`/`405`, `413`, `415` for body types not accepted, `500` from middlewares, handlers and invalid route schemas, `504` (or the status set) of [route timeouts](#limits-and-timeouts-per-route), and `501`/`504` of in-memory dispatch) go through an error formatter. By default the message is sent as `text/plain`, and errors with details (schema validation) as JSON `{"error": {"message": ..., "context": [...]}}`. A formatter changes it for all of them:
 
 ```cpp
 server.set_error_formatter([](const http::http_error& error, http::http_response& response) {
@@ -667,7 +709,7 @@ device.tls.ca_file = "/etc/ssl/private-ca.pem";  // trusted instead of the syste
 - **Target**: `proxy_target::from_url()` (`http://`, `https://`, `ws://`, `wss://`, with a base path prepended to every request) or `proxy_target::unix_socket()`. TLS targets are verified by default (chain and name), against the system CAs or only `ca_file`/`ca_pem` if set; `verify = false` is for testing only.
 - **Request**: method, path and query, and the end-to-end headers. The path can be replaced (`options.path`), and the `Host` header is the target's unless `preserve_host` or `host` are set. Hop-by-hop headers are removed: `Connection` and the headers it lists, `Keep-Alive`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade` (except on upgrades), `Proxy-*`, and `Expect`. `TRACE`, `CONNECT` and unknown methods are not forwarded.
 - **Forwarding headers**: `X-Forwarded-For`, `-Proto` and `-Host` by default, `Forwarded` (RFC 7239) or none (`options.forwarding`). They agree with `req.get_request_ip()`: the ones received from a [trusted proxy](#client-ip-behind-proxies) (the header it sets) are kept and extended with the peer; from any other peer they are dropped, as the client could forge them.
-- **Bodies** are streamed with flow control both ways: the request body goes to the target as the client sends it, and the response to the client as the target sends it (chunked responses and event streams included), each part read only once the previous one was written, so neither is ever held whole. `max_body_size` limits the request body (413).
+- **Bodies** are streamed with flow control both ways: the request body goes to the target as the client sends it, and the response to the client as the target sends it (chunked responses and event streams included), each part read only once the previous one was written, so neither is ever held whole. `max_body_size` limits the request body (413), as does the [maximum body size of the route](#limits-and-timeouts-per-route): the smaller one wins.
 - **Upgrades**: a request with `Connection: upgrade` (WebSocket or any other protocol) gets the `101` of the target, then the connection becomes a byte tunnel to it, starting with whatever either side sent right after the handshake. `allow_upgrade = false` forwards them as plain requests.
 - **Errors**, through the [error formatter](#error-format): `502` if the target cannot be reached (connection refused, TLS verification) or its response is invalid, `504` if it times out. `connect_timeout` (10 s) covers the connection and TLS handshake, `idle_timeout` (60 s, `0` disables it, e.g. for event streams) the time without data in either direction, and `total_timeout` (none by default) the whole exchange. Once the response has started, a failure closes the connection with the client without ending the body, so it sees it incomplete.
 - **Hooks**: `on_request` changes the request for the target (method, path, headers), `on_response` the status and headers of its response (also of a `101`), before the body is relayed: they get the incoming request too, and can edit, remove or add any header, repeated ones included (each `Set-Cookie` is a header of its own in `get_headers()`). Headers they add with invalid characters fail the request (`500`) instead of being sent.
