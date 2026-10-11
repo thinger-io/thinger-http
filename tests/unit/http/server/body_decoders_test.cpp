@@ -86,6 +86,17 @@ TEST_CASE("Media types are parsed as RFC 9110 defines them", "[body][unit]") {
         REQUIRE(type->parameter("format") == "a\"b; c");
     }
 
+    SECTION("Lowercase types without parameters are read as they are") {
+        for (const char* value : {"application/json", "application/vnd.api+json", "text/plain",
+                                  "application/x-www-form-urlencoded", "x-custom/a.b_c~1"}) {
+            INFO(value);
+            auto type = media_type::parse(value);
+            REQUIRE(type);
+            REQUIRE(type->type == value);
+            REQUIRE(type->parameters.empty());
+        }
+    }
+
     SECTION("Media ranges") {
         REQUIRE(media_type::parse("*/*")->type == "*/*");
         REQUIRE(media_type::parse("application/*;q=0.5")->type == "application/*");
@@ -95,7 +106,8 @@ TEST_CASE("Media types are parsed as RFC 9110 defines them", "[body][unit]") {
         for (const char* value : {"", "json", "application/", "/json", "application/json x", "application/json; charset",
                                   "application/json; charset=", "application/json; charset=\"utf-8",
                                   "application/json; =utf-8", "*/json", "appli cation/json", "application/js\"on",
-                                  "application/json, text/plain"}) {
+                                  "application/json, text/plain", "/", "application//json", "application/json/",
+                                  "a/b/c", "application/j\xc3\xa9son"}) {
             INFO(value);
             REQUIRE_FALSE(media_type::parse(value));
         }

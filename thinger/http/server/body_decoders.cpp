@@ -12,16 +12,33 @@ namespace {
 
     using json = nlohmann::json;
 
-    // RFC 9110, 5.6.2: token characters
+    // RFC 9110, 5.6.2: token characters (bit 1), in a table, as media types are parsed on
+    // every request with a body. Bit 2: those of a plain media type (see is_plain_media_type),
+    // all but uppercase letters and '*'.
+    constexpr std::array<uint8_t, 256> token_table = [] {
+        std::array<uint8_t, 256> table{};
+        for (int c = '0'; c <= '9'; ++c) table[c] = 3;
+        for (int c = 'a'; c <= 'z'; ++c) table[c] = 3;
+        for (int c = 'A'; c <= 'Z'; ++c) table[c] = 1;
+        for (unsigned char c : std::string_view("!#$%&'+-.^_`|~")) table[c] = 3;
+        table['*'] = 1;
+        return table;
+    }();
+
     bool is_tchar(char c) {
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return true;
-        switch (c) {
-            case '!': case '#': case '$': case '%': case '&': case '\'': case '*': case '+':
-            case '-': case '.': case '^': case '_': case '`': case '|': case '~':
-                return true;
-            default:
-                return false;
+        return token_table[static_cast<unsigned char>(c)] & 1;
+    }
+
+    // "type/subtype" of token characters in lowercase, without wildcards, whitespace nor
+    // parameters (as most clients send it): media_type::parse() reads it as it is
+    bool is_plain_media_type(std::string_view value) {
+        size_t slash = 0;   // (none: a slash first is not valid either)
+        for (size_t i = 0; i < value.size(); ++i) {
+            if (token_table[static_cast<unsigned char>(value[i])] & 2) continue;
+            if (value[i] != '/' || i == 0 || slash) return false;
+            slash = i;
         }
+        return slash > 0 && slash + 1 < value.size();
     }
 
     bool is_ows(char c) {
@@ -199,6 +216,10 @@ namespace {
 // --- media_type ---
 
 std::optional<media_type> media_type::parse(std::string_view value) {
+    // (parsed on every request with a body: the usual value, such as "application/json",
+    // needs neither a copy in lowercase nor a parameter list)
+    if (is_plain_media_type(value)) return media_type{std::string(value), {}};
+
     size_t i = 0;
     const size_t n = value.size();
     auto skip_ows = [&]() { while (i < n && is_ows(value[i])) ++i; };
@@ -209,6 +230,7 @@ std::optional<media_type> media_type::parse(std::string_view value) {
     };
 
     skip_ows();
+    size_t start = i;
     auto type = token();
     if (type.empty() || i >= n || value[i] != '/') return std::nullopt;
     ++i;
@@ -217,10 +239,10 @@ std::optional<media_type> media_type::parse(std::string_view value) {
     // "*/subtype" is not a media range
     if (type == "*" && subtype != "*") return std::nullopt;
 
+    // "type/subtype" as sent, lowercase
     media_type result;
-    result.type = lowercase(type);
-    result.type += '/';
-    result.type += lowercase(subtype);
+    result.type.assign(value.substr(start, i - start));
+    ::thinger::util::ascii::to_lower(result.type);
 
     skip_ows();
     while (i < n) {
