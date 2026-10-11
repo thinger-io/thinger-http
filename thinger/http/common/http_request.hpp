@@ -67,7 +67,8 @@ public:
     const std::string& get_uri_parameter(const std::string& key) const;
     const std::multimap<std::string, std::string>& get_uri_parameters() const;
     bool has_content() const;
-    method get_method() const;
+    // (inline: checked on every request and response)
+    method get_method() const { return method_; }
     const std::string& get_method_string() const;
     std::string get_query_string() const;
     std::string get_path() const;

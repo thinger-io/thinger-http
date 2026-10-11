@@ -253,10 +253,6 @@ namespace thinger::http {
         return http::get_method(method_);
     }
 
-    method http_request::get_method() const{
-        return method_;
-    }
-
     void http_request::set_method(http::method method){
         // set method
         method_ = method;
