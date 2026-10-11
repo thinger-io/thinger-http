@@ -5,6 +5,7 @@
 #include "trusted_proxies.hpp"
 #include "connection_tracker.hpp"
 #include "../client/response_factory.hpp"
+#include "../common/syntax.hpp"
 #include "../../asio/socket_pipe.hpp"
 #include "../../asio/sockets/ssl_socket.hpp"
 #include "../../asio/sockets/tcp_socket.hpp"
@@ -38,29 +39,6 @@ namespace {
     // Longest status line accepted from a target
     constexpr size_t max_status_line = 8192;
 
-    // tchar (RFC 9110, section 5.6.2)
-    bool is_token_char(unsigned char c) {
-        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return true;
-        switch (c) {
-            case '!': case '#': case '$': case '%': case '&': case '\'': case '*': case '+':
-            case '-': case '.': case '^': case '_': case '`': case '|': case '~':
-                return true;
-            default:
-                return false;
-        }
-    }
-
-    bool is_token(std::string_view value) {
-        return !value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char c) { return is_token_char(c); });
-    }
-
-    // field-value: visible characters, spaces and tabs (and obs-text), never CR, LF or NUL
-    bool is_field_value(std::string_view value) {
-        return std::all_of(value.begin(), value.end(), [](unsigned char c) {
-            return c == '\t' || (c >= 0x20 && c != 0x7f);
-        });
-    }
-
     // Path and query sent in the request line: an absolute path, without whitespace,
     // control characters or a fragment
     bool is_request_target(std::string_view target) {
@@ -73,15 +51,8 @@ namespace {
     // Headers that can be sent as they are: valid names and values
     bool has_valid_headers(const headers& message) {
         return std::all_of(message.get_headers().begin(), message.get_headers().end(), [](const auto& header) {
-            return is_token(header.first) && is_field_value(header.second);
+            return syntax::is_token(header.first) && syntax::is_field_value(header.second);
         });
-    }
-
-    std::string_view trim(std::string_view value) {
-        constexpr std::string_view whitespace = " \t";
-        auto first = value.find_first_not_of(whitespace);
-        if (first == std::string_view::npos) return {};
-        return value.substr(first, value.find_last_not_of(whitespace) - first + 1);
     }
 
     // Hop-by-hop headers (RFC 9110, section 7.6.1), meaningful only for a single connection,
@@ -103,7 +74,7 @@ namespace {
             std::string_view list = value;
             while (!list.empty()) {
                 auto comma = list.find(',');
-                auto option = trim(list.substr(0, comma));
+                auto option = syntax::trim(list.substr(0, comma));
                 if (!option.empty()) options.emplace_back(option);
                 if (comma == std::string_view::npos) break;
                 list.remove_prefix(comma + 1);
@@ -132,7 +103,7 @@ namespace {
     std::string joined(const headers& message, std::string_view name) {
         std::string list;
         for (const auto& value : message.get_headers_with_key(name)) {
-            auto item = trim(value);
+            auto item = syntax::trim(value);
             if (item.empty()) continue;
             if (!list.empty()) list += ", ";
             list += item;
@@ -155,7 +126,7 @@ namespace {
 
     // Parameter value of the Forwarded header: a token, or a quoted string
     std::string forwarded_value(std::string_view value) {
-        if (is_token(value)) return std::string(value);
+        if (syntax::is_token(value)) return std::string(value);
         std::string quoted = "\"";
         for (char c : value) {
             if (c == '"' || c == '\\') quoted += '\\';
@@ -178,7 +149,7 @@ namespace {
         }
         if (line[12] != ' ' || code < 100 || code > 599) return 0;
         auto reason = line.substr(13, line.size() - 15);
-        return is_field_value(reason) ? code : 0;
+        return syntax::is_field_value(reason) ? code : 0;
     }
 
     // Whether a read from the target ended at the end of its stream (not an error). A TLS
@@ -879,7 +850,7 @@ namespace {
         auto transfer_encoding = head.get_headers_with_key(header::transfer_encoding);
         bool chunked = false;
         if (!transfer_encoding.empty()) {
-            if (transfer_encoding.size() != 1 || !ascii::iequals(trim(transfer_encoding.front()), "chunked") ||
+            if (transfer_encoding.size() != 1 || !ascii::iequals(syntax::trim(transfer_encoding.front()), "chunked") ||
                 head.has_content_length_header()) {
                 fail(http_response::status::bad_gateway, "Invalid response from the target",
                      "ambiguous response framing (Transfer-Encoding)");
