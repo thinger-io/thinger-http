@@ -518,6 +518,7 @@ void response::upgrade_websocket(std::function<void(std::shared_ptr<websocket_co
         // Create WebSocket from the socket
         auto websocket = std::make_shared<asio::websocket>(socket, true, true); // binary=true, server=true
         websocket->set_protocol(protocol);
+        wrap_connection(*socket, *websocket, connection_type::websocket);
         auto ws_connection = std::make_shared<websocket_connection>(websocket);
 
         // Call user handler
@@ -537,7 +538,9 @@ void response::upgrade_websocket_stream(const websocket_options& options, websoc
     if (!response) return;
 
     take_over(std::move(response), [handler = std::move(handler), options, protocol](std::shared_ptr<asio::socket> socket, std::string buffered) {
-        auto websocket = std::make_shared<asio::websocket>(std::move(socket), options.binary, true);
+        auto websocket = std::make_shared<asio::websocket>(socket, options.binary, true);
+        // (the handler may ask to be told of a shutdown on the websocket: see on_server_shutdown())
+        wrap_connection(*socket, *websocket, connection_type::websocket);
         websocket->set_protocol(protocol);
         // Frames the client sent right after its request, without waiting for the response
         if (!buffered.empty()) websocket->set_read_ahead(std::move(buffered));

@@ -7,20 +7,32 @@
 
 namespace thinger::http{
 
-    std::atomic<unsigned long> websocket_connection::connections(0);
-
     websocket_connection::websocket_connection(std::shared_ptr<asio::websocket> socket) :
         ws_(std::move(socket))
     {
-        connections++;
-        LOG_LEVEL(2, "websocket connection created. current: {}", (unsigned long) connections);
-
+        LOG_LEVEL(2, "websocket connection created");
     }
 
     websocket_connection::~websocket_connection()
     {
-        connections--;
-        LOG_LEVEL(1, "releasing websocket connection. current: {}", (unsigned long) connections);
+        LOG_LEVEL(1, "releasing websocket connection");
+    }
+
+    void websocket_connection::on_shutdown(std::function<void()> callback){
+        on_shutdown_callback_ = std::move(callback);
+    }
+
+    void websocket_connection::server_shutdown(){
+        if(on_shutdown_callback_){
+            on_shutdown_callback_();
+            return;
+        }
+        LOG_LEVEL(1, "closing websocket: the server shuts down");
+        co_spawn(ws_->get_io_context(),
+            [this, self = shared_from_this()]() -> awaitable<void> {
+                co_await ws_->close_graceful(asio::websocket::CLOSE_GOING_AWAY);
+            },
+            detached);
     }
 
     void websocket_connection::on_message(std::function<void(std::string, bool binary)> callback){
@@ -36,9 +48,14 @@ namespace thinger::http{
                 // teardown). This breaks shared_ptr cycles that occur when the
                 // user captures shared_ptr<websocket_connection> in the callback.
                 struct cycle_guard {
-                    std::function<void(std::string, bool)>& ref;
-                    ~cycle_guard() { ref = nullptr; }
-                } guard{on_frame_callback_};
+                    websocket_connection& connection;
+                    ~cycle_guard() {
+                        connection.on_frame_callback_ = nullptr;
+                        connection.on_shutdown_callback_ = nullptr;
+                        // closed: no longer counts for the server
+                        if (connection.tracking_) connection.tracking_->closed();
+                    }
+                } guard{*this};
 
                 co_await read_loop();
             },
@@ -147,6 +164,15 @@ namespace thinger::http{
     }
 
     void websocket_connection::start(){
+        // Taken over from a server: told when it shuts down
+        tracking_ = taken_over_connection::of(*ws_);
+        if(tracking_){
+            tracking_->set_type(connection_type::websocket);
+            tracking_->on_shutdown([weak = weak_from_this()]{
+                if(auto self = weak.lock()) self->server_shutdown();
+            });
+        }
+
         // handle timeout on websocket
         ws_->start_timeout();
 

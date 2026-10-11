@@ -11,9 +11,15 @@ server::server() {
 
 server::~server() {
     LOG_DEBUG("Destroying standalone HTTP server");
-    if (running_) {
-        stop();
-    }
+    stop();
+}
+
+boost::asio::io_context* server::shutdown_context() {
+    return running_ ? &io_context_ : nullptr;
+}
+
+bool server::in_server_thread() {
+    return io_context_.get_executor().running_in_this_thread();
 }
 
 
@@ -130,6 +136,8 @@ void server::wait() {
 }
 
 bool server::stop() {
+    // (a shutdown in progress ends first)
+    end_shutdown();
     if (!running_) {
         return false;
     }

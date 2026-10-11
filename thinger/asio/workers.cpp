@@ -195,6 +195,12 @@ namespace thinger::asio{
         return worker_threads_.begin()->get()->get_io_context();
 	}
 
+    bool workers::in_worker_thread()
+    {
+        std::scoped_lock<std::mutex> lock(mutex_);
+        return workers_threads_map_.contains(std::this_thread::get_id());
+    }
+
     // Client management implementation
     void workers::register_client(worker_client* client) {
         if (!client) return;

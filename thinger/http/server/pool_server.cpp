@@ -50,6 +50,15 @@ std::unique_ptr<asio::unix_socket_server> pool_server::create_unix_socket_server
     return server;
 }
 
+boost::asio::io_context* pool_server::shutdown_context() {
+    auto& workers = asio::get_workers();
+    return workers.running() ? &workers.get_thread_io_context() : nullptr;
+}
+
+bool pool_server::in_server_thread() {
+    return asio::get_workers().in_worker_thread();
+}
+
 bool pool_server::stop() {
     // Stop the socket server
     bool result = http_server_base::stop();

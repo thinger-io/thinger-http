@@ -70,6 +70,11 @@ namespace thinger::http {
             return headers_only_;
         }
 
+        /// Whether no part of a request was parsed since the last one
+        bool idle() const {
+            return state_ == method_start;
+        }
+
         /// Whether the last parse failed for exceeding the header section limits
         bool header_section_too_large() const {
             return header_section_too_large_;

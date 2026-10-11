@@ -4,6 +4,7 @@
 
 #include <mutex>
 #include <map>
+#include <memory>
 #include <string_view>
 
 #include <boost/asio.hpp>
@@ -13,6 +14,12 @@
 #include "../../util/types.hpp"
 
 namespace thinger::asio {
+
+// Something kept as long as a socket (see socket::set_attachment())
+class socket_attachment {
+public:
+    virtual ~socket_attachment() = default;
+};
 
 // Byte stream socket: TCP, TLS, Unix, a WebSocket (see websocket.hpp), or a socket defined by
 // the application (e.g. a virtual stream multiplexed inside another connection), all used the
@@ -108,6 +115,11 @@ public:
     // other methods
     boost::asio::io_context &get_io_context() const;
 
+    // Keep `attachment` as long as the socket: e.g. the server tracking a connection taken
+    // over from it (see http::on_server_shutdown()). One at a time
+    void set_attachment(std::shared_ptr<socket_attachment> attachment) { attachment_ = std::move(attachment); }
+    const std::shared_ptr<socket_attachment>& get_attachment() const { return attachment_; }
+
 protected:
     using native_handle_type = boost::asio::ip::tcp::socket::native_handle_type;
 
@@ -118,6 +130,9 @@ protected:
 
     boost::asio::io_context &io_context_;
     static std::atomic<unsigned long> connections;
+
+private:
+    std::shared_ptr<socket_attachment> attachment_;
 };
 
 }

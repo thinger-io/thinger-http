@@ -4,23 +4,30 @@
 
 namespace thinger::http {
 
-std::atomic<unsigned long> server_connection::connections(0);
-
 server_connection::server_connection(std::shared_ptr<asio::socket> socket)
     : socket_(std::move(socket))
     , timeout_timer_(socket_->get_io_context())
     , response_started_(socket_->get_io_context()) {
-    ++connections;
-    LOG_DEBUG("created http server connection total: {}", static_cast<unsigned>(connections));
+    LOG_DEBUG("created http server connection");
 }
 
 server_connection::~server_connection() {
-    --connections;
-    LOG_DEBUG("releasing http server connection. total: {}", static_cast<unsigned>(connections));
+    LOG_DEBUG("releasing http server connection");
+}
+
+void server_connection::track(const std::shared_ptr<connection_tracker>& tracker) {
+    tracked_connection::track(tracker, weak_from_this(), socket_->get_io_context(), connection_type::http);
 }
 
 void server_connection::start(std::chrono::seconds timeout) {
     if (running_) return;
+    // Accepted while the server shuts down (e.g. it was in a TLS handshake): nothing is
+    // waiting for it yet
+    if (tracked() && tracker()->current_phase() != connection_tracker::phase::serving) {
+        untrack();
+        socket_->close();
+        return;
+    }
     running_ = true;
     timeout_ = timeout;
 
@@ -78,6 +85,8 @@ void server_connection::close() {
     cancel_timeout();
     response_started_.cancel();
     socket_->close();
+    // Nothing left to drain, even if the connection is still referenced
+    untrack();
 }
 
 awaitable<void> server_connection::read_loop() {
@@ -91,6 +100,7 @@ awaitable<void> server_connection::read_loop() {
     while (running_ && socket_->is_open()) {
         // If no buffered data, read from socket
         if (buffered == 0) {
+            in_progress_ = nullptr;
             auto [ec, bytes] = co_await socket_->read_some(buffer_, MAX_BUFFER_SIZE);
             if (ec) break;
             reset_timeout();
@@ -111,6 +121,7 @@ awaitable<void> server_connection::read_loop() {
             size_t content_length = http_req->get_content_length();
 
             auto stream = std::make_shared<http_stream>(++request_id_, http_req->keep_alive());
+            in_progress_ = stream.get();
 
             // Add to queue for pipelining
             request_queue_.push(stream);
@@ -143,6 +154,7 @@ awaitable<void> server_connection::read_loop() {
             if (stream->takes_over()) {
                 auto leftover = req->take_read_ahead();
                 stream->takeover_reader_stopped(std::string(leftover.begin(), leftover.end()));
+                in_progress_ = nullptr;
                 complete_takeover(*stream);
                 co_return;
             }
@@ -189,7 +201,12 @@ awaitable<void> server_connection::read_loop() {
     // Connection ended, without being taken over
     running_ = false;
     reader_stopped_ = true;
+    in_progress_ = nullptr;
     cancel_timeout();
+
+    // Draining, with every response written: done now, even if something still holds the
+    // connection (e.g. a copy of the request)
+    if ((frame_watch_ & watch_draining) && request_queue_.empty()) close();
 }
 
 awaitable<void> server_connection::wait_response(const http_stream& stream) {
@@ -198,7 +215,7 @@ awaitable<void> server_connection::wait_response(const http_stream& stream) {
     // connection timeout. Nothing the client sends is lost: it stays readable from the
     // socket for the next request or a takeover
     bool watch_peer = true;
-    waiting_response_ = true;
+    frame_watch_ |= watch_response_start;
     while (!stream.responded() && running_ && socket_->is_open()) {
         response_started_.expires_at(boost::asio::steady_timer::time_point::max());
         if (!watch_peer) {
@@ -210,7 +227,7 @@ awaitable<void> server_connection::wait_response(const http_stream& stream) {
 
         if (std::get<1>(result) == peer_state::closed) {
             LOG_DEBUG("http client left while waiting for a response");
-            waiting_response_ = false;
+            frame_watch_ &= ~watch_response_start;
             close();
             co_return;
         }
@@ -219,7 +236,7 @@ awaitable<void> server_connection::wait_response(const http_stream& stream) {
         // socket cannot be watched: the response is waited for alone
         watch_peer = false;
     }
-    waiting_response_ = false;
+    frame_watch_ &= ~watch_response_start;
 }
 
 awaitable<server_connection::peer_state> server_connection::wait_peer_closed() {
@@ -314,8 +331,8 @@ void server_connection::process_output_queue() {
 }
 
 void server_connection::queue_frame(const std::shared_ptr<http_stream>& stream, std::shared_ptr<http_frame> frame) {
+    if (frame_watch_) [[unlikely]] watch_frame(stream, frame);
     stream->add_frame(std::move(frame));
-    if (waiting_response_) response_started_.cancel();
 
     if (request_queue_.empty()) {
         LOG_ERROR("trying to send response without a pending request!");
@@ -326,6 +343,46 @@ void server_connection::queue_frame(const std::shared_ptr<http_stream>& stream, 
     if (request_queue_.front()->id() == stream->id()) {
         process_output_queue();
     }
+}
+
+void server_connection::watch_frame(const std::shared_ptr<http_stream>& stream,
+                                    const std::shared_ptr<http_frame>& frame) {
+    // (the waiter wakes up once this call returns, with the frame queued)
+    if (frame_watch_ & watch_response_start) response_started_.cancel();
+
+    // A response starting while the connection drains is the last one: it tells the client
+    if ((frame_watch_ & watch_draining) && !stream->responded() && !stream->takes_over()) {
+        stream->set_keep_alive(false);
+        if (auto* head = dynamic_cast<headers*>(frame.get())) head->set_keep_alive(false);
+    }
+}
+
+void server_connection::shutdown_drain() {
+    if (!tracked() || (frame_watch_ & watch_draining)) return;
+    frame_watch_ |= watch_draining;
+    if (!running_) return;
+
+    // Handling a request: the connection is closed after its response (whose head tells the
+    // client unless it already started), and the read loop stops after it
+    if (in_progress_) {
+        in_progress_->set_keep_alive(false);
+        return;
+    }
+
+    // Waiting for a request with nothing to write: idle
+    if (request_queue_.empty() && request_parser_.idle()) {
+        LOG_DEBUG("closing an idle http server connection: the server shuts down");
+        close();
+        return;
+    }
+
+    // A response still being written (the read loop went on to the next request): the
+    // connection is closed after it. Or part of a request arrived: its response closes it
+    if (!request_queue_.empty()) request_queue_.back()->set_keep_alive(false);
+}
+
+void server_connection::shutdown_close() {
+    if (tracked()) close();
 }
 
 void server_connection::handle_stream(std::shared_ptr<http_stream> stream,
@@ -370,6 +427,8 @@ void server_connection::handle_stock_error(std::shared_ptr<http_stream> stream,
 }
 
 std::shared_ptr<asio::socket> server_connection::release_socket() {
+    // The socket belongs to someone else from now on: the server neither drains nor closes it
+    untrack();
     running_ = false;
     socket_->cancel();
     cancel_timeout();
@@ -380,8 +439,23 @@ void server_connection::complete_takeover(http_stream& stream) {
     // Both the response must be written and the read loop stopped, in either order
     auto [handler, buffered] = stream.release_takeover();
     if (!handler) return;
+
+    // From now on the connection counts as taken over, while its socket lives. Tracked before
+    // this one leaves, so a shutdown never sees the server without connections meanwhile
+    std::shared_ptr<taken_over_connection> taken_over;
+    if (tracked()) {
+        if (tracker()->current_phase() == connection_tracker::phase::closing) {
+            LOG_WARNING("connection closed before it could be taken over: the server shuts down");
+            close();
+            return;
+        }
+        taken_over = taken_over_connection::track(tracker(), socket_);
+    }
     auto socket = release_socket();
     handler(std::move(socket), std::move(buffered));
+    // Told now if the server started shutting down meanwhile (the handler may have set what
+    // to do then)
+    if (taken_over) taken_over->handed_over();
 }
 
 void server_connection::release() {

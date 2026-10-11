@@ -31,6 +31,9 @@ protected:
     // Create Unix socket server with our io_context
     std::unique_ptr<asio::unix_socket_server> create_unix_socket_server(
         const std::string& unix_path) override;
+
+    boost::asio::io_context* shutdown_context() override;
+    bool in_server_thread() override;
     
 public:
     // Constructor - single threaded server

@@ -8,24 +8,28 @@
 #include "../common/http_request.hpp"
 #include "../common/http_response.hpp"
 #include "http_stream.hpp"
+#include "connection_tracker.hpp"
 #include "../../util/types.hpp"
 
 namespace thinger::http {
 
 class request;
 
-class server_connection : public std::enable_shared_from_this<server_connection>, public boost::noncopyable {
+class server_connection : public std::enable_shared_from_this<server_connection>, public tracked_connection {
 
     static constexpr size_t MAX_BUFFER_SIZE = 4096;
     static constexpr auto DEFAULT_TIMEOUT = std::chrono::seconds{120};
 
 public:
-    static std::atomic<unsigned long> connections;
-
     explicit server_connection(std::shared_ptr<asio::socket> socket);
     virtual ~server_connection();
 
-    // Start processing requests (spawns the read loop coroutine)
+    // Count the connection among those of a server (its statistics, and its shutdown), before
+    // start(). A connection taken over then counts as such, while its socket lives
+    void track(const std::shared_ptr<connection_tracker>& tracker);
+
+    // Start processing requests (spawns the read loop coroutine). Closed right away if the
+    // server it is tracked by shuts down
     void start(std::chrono::seconds timeout = DEFAULT_TIMEOUT);
 
     // Release the socket for upgrades (WebSocket, etc.)
@@ -68,6 +72,16 @@ public:
 private:
     // Main read loop coroutine
     awaitable<void> read_loop();
+
+    // The server shuts down: close once idle, or after the response in progress (which tells
+    // the client); or close right away
+    void shutdown_drain() override;
+    void shutdown_close() override;
+
+    // A frame is queued while frame_watch_ is set. Kept out of queue_frame(), which only tests
+    // the flags on the way of every frame
+    [[gnu::noinline, gnu::cold]] void watch_frame(const std::shared_ptr<http_stream>& stream,
+                                                  const std::shared_ptr<http_frame>& frame);
 
     // Wait until the response of a stream has started, or the connection is closed
     awaitable<void> wait_response(const http_stream& stream);
@@ -118,7 +132,14 @@ private:
 
     // Cancelled when a response starts, waking the read loop waiting for it
     boost::asio::steady_timer response_started_;
-    bool waiting_response_{false};
+
+    // Rare cases where a queued frame is looked at, all tested at once on the way of every
+    // frame: the read loop waits for a response to start, or the connection drains
+    enum : uint8_t { watch_response_start = 1, watch_draining = 2 };
+    uint8_t frame_watch_{0};
+
+    // Stream of the request the read loop is handling, none while it waits for a request
+    http_stream* in_progress_{nullptr};
     std::chrono::seconds timeout_{DEFAULT_TIMEOUT};
 
     uint8_t buffer_[MAX_BUFFER_SIZE];

@@ -3,6 +3,7 @@
 #include "response.hpp"
 #include "body_reader.hpp"
 #include "trusted_proxies.hpp"
+#include "connection_tracker.hpp"
 #include "../client/response_factory.hpp"
 #include "../../asio/socket_pipe.hpp"
 #include "../../asio/sockets/ssl_socket.hpp"
@@ -977,6 +978,7 @@ namespace {
         // starting with what each one sent past its head
         auto target = std::exchange(target_socket_, nullptr);
         res_.take_over([target, early = std::exchange(pending_, {})](std::shared_ptr<asio::socket> client, std::string buffered) {
+            set_connection_type(*client, connection_type::tunnel);
             co_spawn(client->get_io_context(), run_tunnel(client, target, early, std::move(buffered)), detached);
         });
         result_.status = 101;

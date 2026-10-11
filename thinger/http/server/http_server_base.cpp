@@ -20,6 +20,7 @@ void http_server_base::set_max_listening_attempts(int attempts) {
 
 // Server control
 bool http_server_base::listen(const std::string& host, uint16_t port) {
+    reset_shutdown();
     host_ = host;
     port_ = std::to_string(port);
     use_unix_socket_ = false;
@@ -42,6 +43,7 @@ bool http_server_base::listen(const std::string& host, uint16_t port) {
 }
 
 bool http_server_base::listen_unix(const std::string& unix_path) {
+    reset_shutdown();
     unix_path_ = unix_path;
     use_unix_socket_ = true;
     
@@ -101,6 +103,11 @@ bool http_server_base::start_unix(const std::string& unix_path, const std::funct
 }
 
 bool http_server_base::stop() {
+    end_shutdown();
+    return stop_listening();
+}
+
+bool http_server_base::stop_listening() {
     if (socket_server_) {
         bool result = socket_server_->stop();
         socket_server_.reset();
@@ -122,6 +129,7 @@ uint16_t http_server_base::local_port() const {
 void http_server_base::setup_connection_handler() {
     socket_server_->set_handler([this](std::shared_ptr<asio::socket> socket) {
         auto connection = std::make_shared<server_connection>(socket);
+        connection->track(connections_);
 
         connection->set_handler([this](std::shared_ptr<request> req) {
             auto sink = std::make_shared<connection_sink>(*req);

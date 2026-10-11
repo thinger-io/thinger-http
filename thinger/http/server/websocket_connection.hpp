@@ -8,6 +8,7 @@
 #include "../../asio/sockets/socket.hpp"
 #include "../data/out_data.hpp"
 #include "../../util/types.hpp"
+#include "connection_tracker.hpp"
 
 namespace thinger::http{
 
@@ -29,11 +30,6 @@ public:
     static constexpr int MAX_OUTPUT_MESSAGES = 100;
 
     /**
-     * Parameter for controlling the number of live http client connections
-     */
-    static std::atomic<unsigned long> connections;
-
-    /**
      * Constructor that requires a socket
      * @param socket
      */
@@ -49,6 +45,15 @@ public:
      * @param callback
      */
     void on_message(std::function<void(std::string, bool binary)> callback);
+
+    /**
+     * Set what to do when the server shuts down gracefully (see http_server_base::shutdown()),
+     * on the websocket thread: e.g. send a last message and stop(). By default the websocket
+     * is closed with 1001 (Going Away). Whatever is open at the end of the grace period is
+     * closed anyway
+     * @param callback
+     */
+    void on_shutdown(std::function<void()> callback);
 
     /**
      * Set a message handler
@@ -118,6 +123,11 @@ private:
      */
     void process_out_queue();
 
+    /**
+     * The server shuts down (on the websocket thread)
+     */
+    void server_shutdown();
+
 private:
 
     /// Socket being used for the websocket connection
@@ -137,6 +147,12 @@ private:
 
     /// Text frame callback
     std::function<void(std::string, bool)> on_frame_callback_;
+
+    /// Server shutdown callback
+    std::function<void()> on_shutdown_callback_;
+
+    /// The server tracking this connection, if any (see connection_tracker.hpp)
+    std::shared_ptr<taken_over_connection> tracking_;
 
     bool writing_ = false;
 };

@@ -9,6 +9,7 @@
 #include "../data/out_string.hpp"
 #include "../../util/logger.hpp"
 #include "../../util/types.hpp"
+#include "connection_tracker.hpp"
 
 namespace thinger::http{
 
@@ -22,24 +23,17 @@ public:
      */
     static const int MAX_OUTPUT_MESSAGES = 100;
 
-    /**
-     * Parameter for controlling the number of live sse connections
-     */
-    static std::atomic<unsigned long> connections;
-
     sse_connection(std::shared_ptr<asio::socket> socket) :
             socket_(socket),
             timer_(socket->get_io_context()),
             idle_(false)
     {
-        connections++;
-        LOG_DEBUG("created sse connection total: {}", unsigned(connections));
+        LOG_DEBUG("created sse connection");
     }
 
     virtual ~sse_connection()
     {
-        connections--;
-        LOG_DEBUG("releasing sse connection. total: {}", unsigned(connections));
+        LOG_DEBUG("releasing sse connection");
     }
 
 private:
@@ -55,7 +49,7 @@ private:
                     handle_timeout();
                 }else if(idle_){
                     // will terminate any pending async reads or writes
-                    socket_->close();
+                    close();
                 }
             }
         );
@@ -84,7 +78,11 @@ private:
                         }
 
                         auto [write_ec, write_bytes] = co_await socket_->write(buffers);
-                        if (write_ec) break;
+                        if (write_ec) {
+                            // nothing else can be sent
+                            close();
+                            break;
+                        }
                         idle_ = false;
                         out_queue_.pop();
                     }
@@ -93,17 +91,33 @@ private:
             detached);
     }
 
+    // Close the connection (on its thread)
+    void close();
+
+    // Taken over from a server: told when it shuts down
+    void track_shutdown();
+
 public:
 
     void start(){
+        track_shutdown();
         handle_timeout();
     }
 
     void stop(){
         boost::asio::dispatch(socket_->get_io_context(), [this, self = shared_from_this()](){
-            timer_.cancel();
-            socket_->close();
+            close();
         });
+    }
+
+    /**
+     * Set what to do when the server shuts down gracefully (see http_server_base::shutdown()),
+     * on the connection thread: e.g. send a last event and stop(). By default the connection
+     * is closed (clients reconnect). Whatever is open at the end of the grace period is closed
+     * anyway
+     */
+    void on_shutdown(std::function<void()> callback){
+        on_shutdown_callback_ = std::move(callback);
     }
 
     void send_retry(unsigned long millis){
@@ -140,6 +154,12 @@ private:
     boost::asio::steady_timer timer_;
 
     bool idle_;
+
+    /// Server shutdown callback
+    std::function<void()> on_shutdown_callback_;
+
+    /// The server tracking this connection, if any (see connection_tracker.hpp)
+    std::shared_ptr<taken_over_connection> tracking_;
 };
 
 }

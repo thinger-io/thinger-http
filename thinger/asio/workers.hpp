@@ -35,6 +35,9 @@ namespace thinger::asio {
         /// return the io_context associated with the caller thread
 		boost::asio::io_context& get_thread_io_context();
 
+        /// whether the caller thread is one of the workers (of the pool, or isolated)
+        bool in_worker_thread();
+
         // Client management
         /// Register a client that uses workers
         void register_client(worker_client* client);

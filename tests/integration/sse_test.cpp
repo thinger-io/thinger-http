@@ -327,7 +327,7 @@ TEST_CASE("SSE multiple data messages arrive in order", "[server][sse][integrati
 // SSE Connection Counter Tests
 // ============================================================================
 
-TEST_CASE("SSE connection counter increments and decrements", "[server][sse][integration]") {
+TEST_CASE("SSE connections are counted in the server statistics", "[server][sse][integration]") {
     SSETestFixture fixture;
 
     std::promise<void> sse_ready;
@@ -342,7 +342,7 @@ TEST_CASE("SSE connection counter increments and decrements", "[server][sse][int
 
     fixture.start_server();
 
-    auto initial_count = http::sse_connection::connections.load();
+    REQUIRE(fixture.server.stats().sse_connections == 0);
 
     boost::asio::io_context ioc;
     auto sock = raw_connect(ioc, fixture.port);
@@ -353,8 +353,11 @@ TEST_CASE("SSE connection counter increments and decrements", "[server][sse][int
 
     REQUIRE(sse_ready.get_future().wait_for(5s) == std::future_status::ready);
 
-    // Connection counter should have incremented
-    REQUIRE(http::sse_connection::connections.load() == initial_count + 1);
+    // Counted as an event stream, no longer as an HTTP connection
+    auto stats = fixture.server.stats();
+    REQUIRE(stats.sse_connections == 1);
+    REQUIRE(stats.http_connections == 0);
+    REQUIRE(stats.total_connections == 1);
 
     // Stop and release the SSE connection
     sse_conn->stop();
@@ -364,8 +367,9 @@ TEST_CASE("SSE connection counter increments and decrements", "[server][sse][int
     // Give time for cleanup
     std::this_thread::sleep_for(200ms);
 
-    // Connection counter should be back to initial
-    REQUIRE(http::sse_connection::connections.load() == initial_count);
+    // Not counted once stopped
+    REQUIRE(fixture.server.stats().sse_connections == 0);
+    REQUIRE(fixture.server.stats().active_connections() == 0);
 }
 
 // ============================================================================
