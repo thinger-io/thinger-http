@@ -138,11 +138,10 @@ TEST_CASE("The same object reaches the handler from every format", "[server][bod
     }
 
     SECTION("Over the network") {
-        uint16_t port = 0;
-        std::thread server_thread([&]() {
-            server.start("127.0.0.1", 0, [&]() { port = server.local_port(); });
-        });
-        while (port == 0) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        // Listening before the thread starts: the port is known here, without sharing it
+        REQUIRE(server.listen("127.0.0.1", 0));
+        uint16_t port = server.local_port();
+        std::thread server_thread([&]() { server.wait(); });
         std::string base_url = "http://127.0.0.1:" + std::to_string(port);
 
         http::client client;
