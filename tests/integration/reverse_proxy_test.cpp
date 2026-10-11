@@ -1360,6 +1360,8 @@ TEST_CASE("Reverse proxy relays responses sent before the end of the request bod
 
     http::reverse_proxy reverse_proxy;
     test_server proxy;
+    // (a body over the maximum body size would be rejected before reaching the target)
+    proxy.server.set_max_body_size(200 * 1000 * 1000);
     forward_all(proxy.server, reverse_proxy, target_of(acceptor.local_endpoint().port()));
     proxy.start();
 

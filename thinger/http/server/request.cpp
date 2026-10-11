@@ -23,6 +23,7 @@ namespace thinger::http{
         if (http_request_) {
             body_reader_.set_framing(http_request_->is_chunked_transfer(), http_request_->pending_body_size());
         }
+        body_reader_.set_limit(default_max_body_size);
         if (http_connection) {
             // (capturing only `this` fits in the function, without allocating)
             body_reader_.set_source([this](uint8_t* buffer, size_t size) -> thinger::awaitable<size_t> {
@@ -249,9 +250,9 @@ namespace thinger::http{
         // Nothing left to read (already read, or no body)
         if (!body_reader_.has_pending()) co_return body_reader_.error() == body_error::none;
 
-        if (!co_await body_reader_.read_all(http_request_->get_body(), max_body_size_)) co_return false;
+        if (!co_await body_reader_.read_all(http_request_->get_body(), body_reader_.limit())) co_return false;
 
-        auto error = decode_content_encoding(*http_request_, max_body_size_);
+        auto error = decode_content_encoding(*http_request_, body_reader_.limit());
         if (error != body_error::none) {
             body_reader_.set_error(error);
             co_return false;

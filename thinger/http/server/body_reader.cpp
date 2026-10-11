@@ -278,6 +278,7 @@ namespace thinger::http {
     void body_reader::set_framing(bool chunked, size_t content_length) {
         chunked_ = chunked;
         remaining_ = chunked ? 0 : content_length;
+        read_ = 0;
         decoder_ = {};
         error_ = body_error::none;
     }
@@ -372,8 +373,19 @@ namespace thinger::http {
 
     thinger::awaitable<size_t> body_reader::read_some(uint8_t* buffer, size_t max_size) {
         if (error_ != body_error::none || max_size == 0) co_return 0;
-        if (chunked_) co_return co_await read_some_chunked(buffer, max_size);
-        co_return co_await read_some_length(buffer, max_size);
+        // A Content-Length body over the limit fails before anything is read
+        if (!chunked_ && remaining_ > 0 && (remaining_ > limit_ || read_ > limit_ - remaining_)) {
+            error_ = body_error::too_large;
+            co_return 0;
+        }
+        size_t bytes = chunked_ ? co_await read_some_chunked(buffer, max_size)
+                                : co_await read_some_length(buffer, max_size);
+        read_ += bytes;
+        if (read_ > limit_) {
+            error_ = body_error::too_large;
+            co_return 0;
+        }
+        co_return bytes;
     }
 
     thinger::awaitable<size_t> body_reader::read(uint8_t* buffer, size_t size) {

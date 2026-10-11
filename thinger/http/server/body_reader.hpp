@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 #include "../../util/types.hpp"
@@ -104,6 +105,12 @@ namespace thinger::http {
         /// what is in the read-ahead)
         void set_source(source src) { source_ = std::move(src); }
 
+        /// Maximum body size (none by default): reading a larger body fails (too_large), a
+        /// Content-Length one at its first read, before reading anything, and a chunked one
+        /// once it exceeds the limit
+        void set_limit(size_t limit) { limit_ = limit; }
+        size_t limit() const { return limit_; }
+
         void set_read_ahead(const uint8_t* data, size_t size);
         size_t read_ahead_available() const;
 
@@ -135,6 +142,8 @@ namespace thinger::http {
         source source_;
         bool chunked_ = false;
         size_t remaining_ = 0;      // unread bytes of a Content-Length body
+        size_t read_ = 0;           // body bytes read
+        size_t limit_ = std::numeric_limits<size_t>::max();
         chunked_decoder decoder_;
         body_error error_ = body_error::none;
 

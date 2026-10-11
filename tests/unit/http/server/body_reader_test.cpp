@@ -397,3 +397,60 @@ TEST_CASE("Content-Length body reads", "[body_reader][unit]") {
         REQUIRE_FALSE(run(reader.discard(1024)));
     }
 }
+
+TEST_CASE("Body size limit of every read", "[body_reader][limit][unit]") {
+    uint8_t buffer[64];
+
+    SECTION("Content-Length over the limit: the first read fails before reading") {
+        fake_connection connection{std::string(100, 'x'), 100};
+        body_reader reader;
+        reader.set_framing(false, 100);
+        reader.set_limit(99);
+        reader.set_source(connection.source());
+
+        REQUIRE(run(reader.read_some(buffer, sizeof(buffer))) == 0);
+        REQUIRE(reader.error() == body_error::too_large);
+        REQUIRE(connection.reads == 0);
+        REQUIRE_FALSE(reader.has_pending());
+    }
+
+    SECTION("Content-Length within the limit") {
+        fake_connection connection{std::string(100, 'x'), 30};
+        body_reader reader;
+        reader.set_framing(false, 100);
+        reader.set_limit(100);
+        reader.set_source(connection.source());
+
+        size_t total = 0;
+        while (size_t bytes = run(reader.read_some(buffer, sizeof(buffer)))) total += bytes;
+        REQUIRE(total == 100);
+        REQUIRE(reader.error() == body_error::none);
+    }
+
+    SECTION("Chunked: fails once the body exceeds the limit") {
+        std::string body;
+        for (int i = 0; i < 10; ++i) body += "a\r\n0123456789\r\n";
+        fake_connection connection{body + "0\r\n\r\n", 7};
+        body_reader reader;
+        reader.set_framing(true, 0);
+        reader.set_limit(45);
+        reader.set_source(connection.source());
+
+        size_t total = 0;
+        while (size_t bytes = run(reader.read_some(buffer, sizeof(buffer)))) total += bytes;
+        REQUIRE(total <= 45);
+        REQUIRE(reader.error() == body_error::too_large);
+        REQUIRE_FALSE(run(reader.discard(1024)));
+    }
+
+    SECTION("Chunked within the limit, and discarded") {
+        fake_connection connection{"a\r\n0123456789\r\n0\r\n\r\n" + next_request, 5};
+        body_reader reader;
+        reader.set_framing(true, 0);
+        reader.set_limit(10);
+        reader.set_source(connection.source());
+
+        REQUIRE(run(reader.discard(1024)));
+        REQUIRE(reader.error() == body_error::none);
+    }
+}

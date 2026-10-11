@@ -16,6 +16,9 @@
 
 namespace thinger::http{
 
+    // Maximum request body size unless the application or the route set theirs
+    inline constexpr size_t default_max_body_size = 8 * 1024 * 1024;
+
     // Forward declarations
     class route;
     class virtual_host;
@@ -129,16 +132,17 @@ namespace thinger::http{
         void set_read_ahead(const uint8_t* data, size_t size);
 
         /// Read exactly `size` bytes (read-ahead first, then socket). TCP backpressure.
-        /// Returns less at the end of the body, or if it fails (see get_body_error()).
+        /// Returns less at the end of the body, or if it fails (see get_body_error()), e.g.
+        /// for a body over the maximum body size (a Content-Length one before reading it).
         thinger::awaitable<size_t> read(uint8_t* buffer, size_t size);
 
         /// Read up to `max_size` bytes (read-ahead first, then socket); 0 at the end of the
-        /// body, or if it fails (see get_body_error()).
+        /// body, or if it fails (see get_body_error()), as read().
         thinger::awaitable<size_t> read_some(uint8_t* buffer, size_t max_size);
 
         /// Read full body into http_request content (for non-deferred dispatch), decoding
         /// its Content-Encoding (gzip, deflate). Fails if the body exceeds the maximum body
-        /// size (set_max_body_size, the server limit), without reading it.
+        /// size (see get_max_body_size()), a Content-Length one without reading it.
         /// Only reads what is still pending: do not mix it with read()/read_some() on
         /// the same request, or the stored body will be incomplete (and fail to
         /// decompress if Content-Encoding is set).
@@ -167,8 +171,10 @@ namespace thinger::http{
         /// Remove and return the unconsumed read-ahead bytes (data following this request)
         std::vector<uint8_t> take_read_ahead();
 
-        /// Maximum body size accepted by read_body() (set by the server)
-        void set_max_body_size(size_t size) { max_body_size_ = size; }
+        /// Maximum body size of every read (read_body(), read(), read_some()), also once
+        /// decompressed: the one of the matched route, or of the application (set by the server)
+        void set_max_body_size(size_t size) { body_reader_.set_limit(size); }
+        size_t get_max_body_size() const { return body_reader_.limit(); }
 
         /// How the matched route decodes the body (set by the server; the defaults if not)
         void set_body_settings(const body_settings* settings) { body_settings_ = settings; }
@@ -221,9 +227,6 @@ namespace thinger::http{
 
         /// Body framing and reading: read-ahead bytes, then the connection
         body_reader body_reader_;
-
-        /// Max body size for read_body()
-        size_t max_body_size_ = 8 * 1024 * 1024;
 
         /// Body decoders, accepted types and limits of the application (null: defaults)
         const body_settings* body_settings_ = nullptr;
