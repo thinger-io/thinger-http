@@ -15,9 +15,6 @@
 #include <thinger/http/server/routing/route_builder.hpp>
 #include <thinger/http/server/openapi.hpp>
 
-// File server
-#include <thinger/http/server/file_server/file_server_handler.hpp>
-
 // WebSocket & SSE support
 #include <thinger/http/server/websocket_connection.hpp>
 #include <thinger/http/server/sse_connection.hpp>
