@@ -323,10 +323,18 @@ TEST_CASE("Route registration accepts every callback form on every method", "[se
 
     for (auto method : methods) {
         DYNAMIC_SECTION("Coroutines on " << http::get_method(method)) {
-            auto response = run_dispatch(server, make_request(method, "/coro"));
-            REQUIRE(response->get_content() == "coroutine " + http::get_method(method));
-            response = run_dispatch(server, make_request(method, "/group/json", R"({"value":"v"})"));
-            REQUIRE(response->get_content() == "json " + http::get_method(method) + " v");
+            // (a response to HEAD has no content, but the Content-Length of its body)
+            auto require_body = [method](const std::shared_ptr<http::http_response>& response, const std::string& body) {
+                if (method == http::method::HEAD) {
+                    REQUIRE(response->get_content().empty());
+                    REQUIRE(response->get_header("Content-Length") == std::to_string(body.size()));
+                } else {
+                    REQUIRE(response->get_content() == body);
+                }
+            };
+            require_body(run_dispatch(server, make_request(method, "/coro")), "coroutine " + http::get_method(method));
+            require_body(run_dispatch(server, make_request(method, "/group/json", R"({"value":"v"})")),
+                         "json " + http::get_method(method) + " v");
         }
     }
 

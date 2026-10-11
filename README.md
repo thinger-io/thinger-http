@@ -165,6 +165,10 @@ server.set_not_found_handler(handler);
 
 Every registration method, `set_not_found_handler()` included, also accepts coroutine handlers (see [Coroutine Handlers](#coroutine-handlers)). A handler that throws is answered with `500`; if it had already started its response, the connection is closed instead.
 
+`HEAD` requests are answered by the `GET` route of the path, as in Express, unless a `head()` route matches it (an explicit `HEAD` route wins). The response is the one to `GET` without its body: the same status and headers, `Content-Length` included, so the client reads the next response on the connection where it starts. Every answer drops the body of a response to `HEAD` (`send()`, `json()`, `error()`, `redirect()`, `send_file()`, chunked and streamed responses), also in `head()` routes. Responses to `HEAD` are not compressed, so their `Content-Length` is the length of the uncompressed body; `start_sse()` sends its headers alone (without calling its handler), and a WebSocket upgrade is rejected, as it requires `GET`.
+
+Unmatched requests get `404` when their method has routes (`HEAD` has those of `GET`), or else `405 Method Not Allowed`, with an `Allow` header listing the methods of the routes matching the path (`HEAD` wherever `GET`), empty if none does.
+
 ### Path Parameters
 
 ```cpp
@@ -337,7 +341,7 @@ server.serve_static("/assets", "/var/www/app/assets", {
 });
 ```
 
-`serve_static()` answers `GET` and `HEAD` requests. The fallback file is served for a directory (its own one), and for the paths without a file (the one of the root directory, as single page applications expect). Paths resolving outside the directory (through symlinks; request targets with `..` are already rejected with `400`) are answered with `403`.
+`serve_static()` answers `GET` requests, and `HEAD` requests through its `GET` route (so the `GET` routes of the paths it covers, such as an API next to `serve_static("/", ...)`, answer their `HEAD` requests too). The fallback file is served for a directory (its own one), and for the paths without a file (the one of the root directory, as single page applications expect). Paths resolving outside the directory (through symlinks; request targets with `..` are already rejected with `400`) are answered with `403`.
 
 Files are served with validators, so that browsers download them once and only check them afterwards:
 
@@ -639,7 +643,7 @@ auto response = co_await server.dispatch(request, {.remote_ip = "10.0.0.7", .tim
 server.dispatch(executor, request, [](std::shared_ptr<http::http_response> response) { /* ... */ });
 ```
 
-The server does not need to be listening. Chunked responses are collected whole. Handlers can keep a copy of the response and answer later. The timeout covers the whole request, handler included: if it expires the result is `504` and the handler is cancelled (its pending awaits are aborted). WebSockets, SSE and `take_over()` answer `501`, as there is no connection. The request is served by the [virtual host](#virtual-hosts) of its URL (or `Host` header). `remote_ip` is the peer address: `get_request_ip()` returns it (or the forwarded client address, if it is a [trusted proxy](#client-ip-behind-proxies)), and it is empty unless set: internal calls never pass as a trusted local address by default.
+The server does not need to be listening. Chunked responses are collected whole. A `HEAD` request gets the response it gets on a connection: no content, with the `Content-Length` of the body of `GET`. Handlers can keep a copy of the response and answer later. The timeout covers the whole request, handler included: if it expires the result is `504` and the handler is cancelled (its pending awaits are aborted). WebSockets, SSE and `take_over()` answer `501`, as there is no connection. The request is served by the [virtual host](#virtual-hosts) of its URL (or `Host` header). `remote_ip` is the peer address: `get_request_ip()` returns it (or the forwarded client address, if it is a [trusted proxy](#client-ip-behind-proxies)), and it is empty unless set: internal calls never pass as a trusted local address by default.
 
 Everything about routes, hosts, middlewares and request settings (error format, trusted proxies, body limit and decoders, CORS), `dispatch()` included, comes from `http::http_application`, which the server extends with its listeners, TLS and connection settings. An `http::http_application` can also be used on its own, without a server, only to dispatch requests in memory.
 
