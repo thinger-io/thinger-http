@@ -288,6 +288,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/head_requests_test.cpp)
     add_thinger_test(test_integration_head_requests integration/head_requests_test.cpp)
 endif()
 
+# Integration tests - Graceful shutdown and statistics
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/shutdown_test.cpp)
+    add_thinger_test(test_integration_shutdown integration/shutdown_test.cpp)
+endif()
+
 # ==================== ALL TESTS RUNNER ====================
 
 # Collect all test files
