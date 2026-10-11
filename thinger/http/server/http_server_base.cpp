@@ -124,7 +124,7 @@ void http_server_base::setup_connection_handler() {
         auto connection = std::make_shared<server_connection>(socket);
 
         connection->set_handler([this](std::shared_ptr<request> req) {
-            auto sink = std::make_shared<connection_sink>(req->get_http_connection(), req->get_http_stream());
+            auto sink = std::make_shared<connection_sink>(*req);
             return handle(std::move(req), std::move(sink));
         });
 

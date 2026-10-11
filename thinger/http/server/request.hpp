@@ -233,6 +233,8 @@ namespace thinger::http{
         /// Body decoders, accepted types and limits of the application (null: defaults)
         const body_settings* body_settings_ = nullptr;
 
+        friend class connection_sink;
+
         /// Body parsed as JSON by the matched route, for callbacks taking it
         friend class route;
         nlohmann::json json_body_;

@@ -1,4 +1,5 @@
 #include "response_sink.hpp"
+#include "request.hpp"
 #include "../common/http_data.hpp"
 #include "../data/out_chunk.hpp"
 #include "../data/out_string.hpp"
@@ -8,6 +9,9 @@
 #include <boost/asio/steady_timer.hpp>
 
 namespace thinger::http {
+
+connection_sink::connection_sink(const request& req)
+    : connection_(req.http_connection_), stream_(req.http_stream_) {}
 
 bool connection_sink::write(std::shared_ptr<http_frame> frame) {
     auto connection = connection_.lock();

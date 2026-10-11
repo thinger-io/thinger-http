@@ -10,6 +10,8 @@
 
 namespace thinger::http {
 
+class request;
+
 // How the body of a streamed response is delimited (see response::start_stream)
 enum class body_framing {
     none,       // no body (a response to HEAD, 1xx, 204, 304): the head alone
@@ -67,6 +69,10 @@ class connection_sink : public response_sink {
 public:
     connection_sink(const std::shared_ptr<server_connection>& connection, const std::shared_ptr<http_stream>& stream)
         : connection_(connection), stream_(stream) {}
+
+    // For a request read from a connection: the connection and stream it came from (copied as
+    // the request holds them, without locking them)
+    explicit connection_sink(const request& req);
 
     void send(std::shared_ptr<http_response> response) override;
     bool begin(std::shared_ptr<http_response> headers) override;
