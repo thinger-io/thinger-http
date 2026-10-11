@@ -6,6 +6,16 @@
 
 namespace thinger::asio {
 
+namespace {
+
+// Close a socket on its own io_context, as sockets are not thread-safe: right away when called
+// from a thread running it, otherwise once it gets there
+void close_on_own_context(const std::shared_ptr<socket>& sock) {
+    boost::asio::dispatch(sock->get_io_context(), [sock] { sock->close(); });
+}
+
+} // namespace
+
 socket_pipe::socket_pipe(std::shared_ptr<socket> source, std::shared_ptr<socket> target)
     : source_(std::move(source)), target_(std::move(target)) {
 }
@@ -23,6 +33,10 @@ awaitable<void> socket_pipe::run() {
         forward(target_, source_, bytes_t2s_)
     );
     cancel();
+    // Closed before returning, also when cancel() was called from another thread and has not
+    // closed them yet (a direction may see the flag and end first)
+    close_on_own_context(source_);
+    close_on_own_context(target_);
 }
 
 void socket_pipe::start() {
@@ -31,16 +45,6 @@ void socket_pipe::start() {
         co_await self->run();
     }, detached);
 }
-
-namespace {
-
-// Close a socket on its own io_context, as sockets are not thread-safe: right away when called
-// from a thread running it, otherwise once it gets there
-void close_on_own_context(const std::shared_ptr<socket>& sock) {
-    boost::asio::dispatch(sock->get_io_context(), [sock] { sock->close(); });
-}
-
-} // namespace
 
 void socket_pipe::cancel() {
     if (cancelled_.exchange(true)) return;
