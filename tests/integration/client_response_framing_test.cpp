@@ -158,11 +158,19 @@ TEST_CASE("HTTP client rejects malformed responses", "[http][client][framing][in
     };
 
     raw_server server;
+    // (set by this thread, read by the server's: what orders them is a socket, unseen by TSan)
+    std::mutex response_mutex;
     std::string response;
-    server.respond = [&](const std::string&) { return raw_server::reply{{response}, true}; };
+    server.respond = [&](const std::string&) {
+        std::lock_guard lock(response_mutex);
+        return raw_server::reply{{response}, true};
+    };
 
     for (const auto& [raw, error] : cases) {
-        response = raw;
+        {
+            std::lock_guard lock(response_mutex);
+            response = raw;
+        }
         INFO("response: " << raw);
         for (auto get : {sync_get, async_get}) {
             auto res = get(server.url("/"));
