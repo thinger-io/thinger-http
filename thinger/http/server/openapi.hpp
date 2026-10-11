@@ -13,7 +13,8 @@ namespace thinger::http {
 // Builds an OpenAPI 3.1 document from the routes of a router: paths and parameters from
 // the route patterns, and the rest from the route documentation (summary, tags, params,
 // responses, examples), its body schema and the body types it accepts (one entry of the
-// request body content per media type). Hidden routes are left out.
+// request body content per media type), and the limits set on the route as extensions
+// (x-max-body-size in bytes, x-timeout-ms). Hidden routes are left out.
 //
 // The library does not interpret route metadata: use the hooks to turn it into whatever
 // the application needs (x- extensions, security requirements...).

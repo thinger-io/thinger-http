@@ -26,6 +26,10 @@ struct response::state {
     std::atomic<bool> responded{false};
     bool cors_enabled = false;
 
+    // Request timeout: called once the response starts, and whether it was answered by it
+    std::function<void()> on_start;
+    std::atomic<bool> timed_out{false};
+
     // Chunked response: chunks are only written between its headers and its end
     enum class chunked_phase { none, open, ended };
     std::mutex chunked_mutex;
@@ -74,9 +78,17 @@ response::response(std::shared_ptr<response_sink> sink,
     state_->cors_enabled = cors_enabled;
 }
 
+void response::log_late_answer(const char* message) const {
+    if (state_->timed_out) {
+        LOG_DEBUG("{} (the request timed out)", message);
+    } else {
+        LOG_ERROR("{}", message);
+    }
+}
+
 bool response::ensure_not_responded() const {
     if (state_->responded) {
-        LOG_ERROR("Response already sent");
+        log_late_answer("Response already sent");
         return false;
     }
     return true;
@@ -84,10 +96,37 @@ bool response::ensure_not_responded() const {
 
 bool response::mark_responded() {
     if (state_->responded.exchange(true)) {
-        LOG_ERROR("Response already sent");
+        log_late_answer("Response already sent");
         return false;
     }
+    if (state_->on_start) state_->on_start();
     return true;
+}
+
+void response::on_start(std::function<void()> hook) {
+    state_->on_start = std::move(hook);
+}
+
+bool response::answer_timeout(http::http_response::status status) {
+    if (state_->responded) return false;
+    // (set before answering: whoever sees the response sent sees why)
+    state_->timed_out = true;
+    auto message = new_response();
+    message->set_status(status);
+    format_error(state_->formatter.get(), {status, "No response within the timeout", nullptr}, *message);
+    if (!state_->responded.exchange(true)) {
+        if (state_->on_start) state_->on_start();
+        state_->sink->send(std::move(message));
+        return true;
+    }
+    // Another answer started meanwhile: it was not late
+    state_->timed_out = false;
+    return false;
+}
+
+bool response::timed_out() const {
+    // (a handler may have moved the response away)
+    return state_ && state_->timed_out;
 }
 
 std::shared_ptr<http_response> response::new_response() const {
@@ -503,7 +542,7 @@ bool response::start_chunked(const std::string& content_type, http::http_respons
 bool response::write_chunk(const std::string& data) {
     std::lock_guard lock(state_->chunked_mutex);
     if (state_->chunked != state::chunked_phase::open) {
-        LOG_ERROR("Chunks can only be written between start_chunked() and end_chunked()");
+        log_late_answer("Chunks can only be written between start_chunked() and end_chunked()");
         return false;
     }
     return state_->sink->append(data);
@@ -512,7 +551,7 @@ bool response::write_chunk(const std::string& data) {
 bool response::end_chunked() {
     std::lock_guard lock(state_->chunked_mutex);
     if (state_->chunked != state::chunked_phase::open) {
-        LOG_ERROR("Only a response started with start_chunked() can be ended, once");
+        log_late_answer("Only a response started with start_chunked() can be ended, once");
         return false;
     }
     state_->chunked = state::chunked_phase::ended;
@@ -577,7 +616,7 @@ awaitable<bool> response::write_stream(std::string data) {
     {
         std::lock_guard lock(state_->chunked_mutex);
         if (state_->stream != state::chunked_phase::open) {
-            LOG_ERROR("Stream data can only be written between start_stream() and end_stream()");
+            log_late_answer("Stream data can only be written between start_stream() and end_stream()");
             co_return false;
         }
         if (state_->stream_framing == body_framing::none) {
@@ -601,7 +640,7 @@ awaitable<bool> response::end_stream() {
     {
         std::lock_guard lock(state_->chunked_mutex);
         if (state_->stream != state::chunked_phase::open) {
-            LOG_ERROR("Only a response started with start_stream() can be ended, once");
+            log_late_answer("Only a response started with start_stream() can be ended, once");
             co_return false;
         }
         state_->stream = state::chunked_phase::ended;

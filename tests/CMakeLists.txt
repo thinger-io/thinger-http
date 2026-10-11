@@ -251,6 +251,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/request_body_limits_test.cpp)
     add_thinger_test(test_integration_request_body_limits integration/request_body_limits_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/route_limits_test.cpp)
+    add_thinger_test(test_integration_route_limits integration/route_limits_test.cpp)
+endif()
+
 # Integration tests - Handler exceptions
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/handler_exceptions_test.cpp)
     add_thinger_test(test_integration_handler_exceptions integration/handler_exceptions_test.cpp)

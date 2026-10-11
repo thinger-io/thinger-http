@@ -243,19 +243,67 @@ awaitable<void> http_application::handle(std::shared_ptr<request> req, std::shar
         co_return;
     }
 
-    // Route matching, middlewares, body reading and handler; any exception is answered
-    // with 500 (or, if the response was already started, the connection is closed)
+    // Match the virtual host (by the Host header), then the route among its routes, whose
+    // limits apply from here
+    virtual_host* host = this;
+    const route* matched_route = nullptr;
+    try {
+        host = &resolve_host(*req);
+        matched_route = host->router().find_route(req);
+    } catch (const std::exception& e) {
+        LOG_ERROR("Exception matching {} {}: {}", get_method(http_request->get_method()), http_request->get_path(), e.what());
+        close_after_response(*req);
+        res.error(http_response::status::internal_server_error);
+        co_return;
+    }
+    if (matched_route) {
+        if (const auto& limit = matched_route->get_max_body_size()) req->set_max_body_size(*limit);
+        if (matched_route->get_timeout().count() > 0) {
+            co_await serve_with_timeout(std::move(req), std::move(res), *host, *matched_route);
+            co_return;
+        }
+    }
+    co_await serve(std::move(req), res, *host, matched_route);
+}
+
+awaitable<void> http_application::serve(std::shared_ptr<request> req, response& res, virtual_host& host,
+                                        const route* matched_route) {
+    // Middlewares, body reading and handler; any exception is answered with 500 (or, if
+    // the response was already started, the connection is closed)
     std::optional<std::string> failure;
     try {
-        co_await handle_request(req, res);
+        if (!middlewares_.empty() && !co_await run_middlewares(*req, res)) {
+            // STOPPED by a middleware, which answered (before reading the body)
+        } else if (!matched_route) {
+            // No route matched → fallback / 404
+            co_await host.router().handle_unmatched(req, res);
+        } else if (req->has_pending_body() && !matched_route->accepts_body(*req, res)) {
+            // UNSUPPORTED TYPE: answered 415 before reading the body (dropped afterwards)
+        } else if (matched_route->is_deferred_body() || !req->has_pending_body()) {
+            // DEFERRED: handler reads body at its discretion (bounded by the maximum body size
+            // in every read); or NO BODY: dispatch directly
+            co_await matched_route->handle_request_coro(*req, res);
+        } else if (co_await req->read_body()) {
+            // PENDING BODY: read (up to the maximum body size, or failing the request), then dispatch
+            co_await matched_route->handle_request_coro(*req, res);
+        }
     } catch (const std::exception& e) {
         failure = e.what();
     } catch (...) {
         failure = "unknown exception";
     }
+
+    auto http_request = req->get_http_request();
     if (failure) {
         LOG_ERROR("Exception handling {} {}: {}", get_method(http_request->get_method()),
                   http_request->get_path(), *failure);
+    }
+
+    // Answered by the request timeout, which already decided what happens to the connection:
+    // the handler is just late
+    if (res.timed_out()) co_return;
+
+    if (failure) {
         if (res.has_responded()) {
             // The response may be incomplete (e.g. a chunked response): do not reuse the connection
             close_after_response(*req);
@@ -282,28 +330,82 @@ awaitable<void> http_application::handle(std::shared_ptr<request> req, std::shar
     if (req->has_pending_body()) co_await discard_unread_body(*req);
 }
 
-awaitable<void> http_application::handle_request(std::shared_ptr<request> req, response& res) {
-    // 1. Match the virtual host (by the Host header), then the route among its routes
-    auto& host = resolve_host(*req);
-    auto* matched_route = host.router().find_route(req);
+namespace {
 
-    // 2. Run middlewares (before reading the body), sharing the handler response
-    if (!middlewares_.empty() && !co_await run_middlewares(*req, res)) co_return;
+    // Request timeout of a route (see route::timeout), shared by the request, its timer and
+    // its response. Everything happens on the executor of the request.
+    struct request_deadline {
+        explicit request_deadline(const boost::asio::any_io_executor& executor)
+            : timer(executor), wake(executor, boost::asio::steady_timer::time_point::max()) {}
 
-    // 3. Three-way dispatch
-    if (!matched_route) {
-        // No route matched → fallback / 404
-        co_await host.router().handle_unmatched(req, res);
-    } else if (req->has_pending_body() && !matched_route->accepts_body(*req, res)) {
-        // UNSUPPORTED TYPE: answered 415 before reading the body (dropped afterwards)
-        co_return;
-    } else if (matched_route->is_deferred_body() || !req->has_pending_body()) {
-        // DEFERRED: handler reads body at its discretion (bounded by the maximum body size
-        // in read_body()); or NO BODY: dispatch directly
-        co_await matched_route->handle_request_coro(*req, res);
-    } else if (co_await req->read_body()) {
-        // PENDING BODY: read (up to the maximum body size, or failing the request), then dispatch
-        co_await matched_route->handle_request_coro(*req, res);
+        // Expires at the deadline, unless cancelled once the response starts
+        boost::asio::steady_timer timer;
+        // Wakes the request once its handler ends, or it times out
+        boost::asio::steady_timer wake;
+        bool served = false;
+        bool expired = false;
+    };
+
+}
+
+awaitable<void> http_application::serve_with_timeout(std::shared_ptr<request> req, response res,
+                                                     virtual_host& host, const route& matched_route) {
+    auto executor = co_await boost::asio::this_coro::executor;
+    auto deadline = std::make_shared<request_deadline>(executor);
+    auto timeout = matched_route.get_timeout();
+
+    // The timer stops once the response starts, whatever thread starts it
+    res.on_start([weak = std::weak_ptr<request_deadline>(deadline)] {
+        auto state = weak.lock();
+        if (!state) return;
+        boost::asio::dispatch(state->timer.get_executor(), [state] { state->timer.cancel(); });
+    });
+
+    // The connection timeout does not close the connection while the request waits for
+    // its response within its own timeout
+    if (auto connection = req->get_http_connection()) {
+        connection->hold_until(std::chrono::steady_clock::now() + timeout);
+    }
+
+    // On expiry, the request is answered with an error. A body still unread may be being
+    // read by the handler, which goes on: the connection closes after the response
+    deadline->timer.expires_after(timeout);
+    deadline->timer.async_wait([deadline, req, res, status = matched_route.get_timeout_status()](
+                                   const boost::system::error_code& ec) mutable {
+        if (ec || res.has_responded()) return;
+        bool pending_body = req->has_pending_body();
+        if (pending_body) close_after_response(*req);
+        if (!res.answer_timeout(status)) return;
+        auto http_request = req->get_http_request();
+        LOG_WARNING("Request timed out: {} {}{}", get_method(http_request->get_method()), http_request->get_path(),
+                    pending_body ? " (body not read, closing the connection)" : "");
+        deadline->expired = true;
+        deadline->wake.cancel();
+    });
+
+    // The handler runs on its own coroutine, so the request can end before it does: it
+    // keeps a copy of the response, and the request (the coroutine keeps the cancellation
+    // signal alive while its slot is in use)
+    auto cancel = std::make_shared<boost::asio::cancellation_signal>();
+    co_spawn(executor,
+        [this, req, res, &host, &matched_route, deadline, cancel]() mutable -> awaitable<void> {
+            co_await serve(req, res, host, &matched_route);
+            deadline->served = true;
+            deadline->wake.cancel();
+        },
+        boost::asio::bind_cancellation_slot(cancel->slot(), boost::asio::detached));
+
+    // Wait until the handler ends (a response it sends later is still awaited by the
+    // connection, and the timer is still armed), or the request times out
+    while (!deadline->served && !deadline->expired) {
+        co_await deadline->wake.async_wait(use_nothrow_awaitable);
+        auto state = co_await boost::asio::this_coro::cancellation_state;
+        if (state.cancelled() != boost::asio::cancellation_type::none) {
+            // Cancelled (an in-memory dispatch timed out): so is the handler
+            deadline->timer.cancel();
+            cancel->emit(boost::asio::cancellation_type::terminal);
+            co_return;
+        }
     }
 }
 

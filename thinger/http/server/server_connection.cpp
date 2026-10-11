@@ -39,14 +39,14 @@ void server_connection::reset_timeout() {
     deadline_ = std::chrono::steady_clock::now() + timeout_;
     // A running timer checks the new deadline when it expires, unless it is earlier (the
     // timeout was shortened)
-    if (!timeout_armed_ || deadline_ < timeout_timer_.expiry()) {
+    if (!timeout_armed_ || std::max(deadline_, hold_) < timeout_timer_.expiry()) {
         arm_timeout();
     }
 }
 
 void server_connection::arm_timeout() {
     timeout_armed_ = true;
-    timeout_timer_.expires_at(deadline_);
+    timeout_timer_.expires_at(std::max(deadline_, hold_));
     // The timer does not keep the connection alive: once neither the read loop nor a write
     // holds it (e.g. the read loop stopped with a response left unfinished), it is released
     // and the socket closed
@@ -55,8 +55,9 @@ void server_connection::arm_timeout() {
         auto self = weak.lock();
         if (!self || !self->timeout_armed_) return; // Expired as it was cancelled
 
-        // Some activity moved the deadline meanwhile
-        if (std::chrono::steady_clock::now() < self->deadline_) {
+        // Some activity moved the deadline meanwhile, or a request holds the connection
+        auto now = std::chrono::steady_clock::now();
+        if (now < self->deadline_ || now < self->hold_) {
             self->arm_timeout();
             return;
         }
@@ -137,17 +138,25 @@ awaitable<void> server_connection::read_loop() {
 
             // Read-ahead bytes the request did not consume belong to whatever follows it
             // (they may come from later socket reads, e.g. after a chunked body)
-            auto leftover = req->take_read_ahead();
 
             // Connection taken over: stop reading and hand the leftover to the new owner
             if (stream->takes_over()) {
+                auto leftover = req->take_read_ahead();
                 stream->takeover_reader_stopped(std::string(leftover.begin(), leftover.end()));
                 complete_takeover(*stream);
                 co_return;
             }
 
+            // If not keep-alive, stop reading after this request. The leftover stays with
+            // the request: its handler may still be reading the body (e.g. the request was
+            // answered by its timeout)
+            if (!stream->keep_alive()) {
+                break;
+            }
+
             // Otherwise it is pipelined data for the next request. The leftover is at most
             // what was read at once: the connection buffer, or the body reader framing reads
+            auto leftover = req->take_read_ahead();
             static_assert(body_reader::framing_read_size <= MAX_BUFFER_SIZE,
                           "body framing reads must fit in the connection buffer, or the leftover is dropped");
             if (leftover.size() > MAX_BUFFER_SIZE) {
@@ -158,11 +167,6 @@ awaitable<void> server_connection::read_loop() {
                 std::memcpy(buffer_, leftover.data(), leftover.size());
             }
             buffered = leftover.size();
-
-            // If not keep-alive, stop reading after this request
-            if (!stream->keep_alive()) {
-                break;
-            }
         } else if (!result) {
             // Bad request, or a header section over the limits
             auto status = http_response::status::bad_request;
@@ -389,6 +393,11 @@ void server_connection::release() {
 
 void server_connection::extend_timeout() {
     if (running_) reset_timeout();
+}
+
+void server_connection::hold_until(std::chrono::steady_clock::time_point time) {
+    // A running timer checks the hold when it expires
+    hold_ = std::max(hold_, time);
 }
 
 std::shared_ptr<asio::socket> server_connection::get_socket() {

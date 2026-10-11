@@ -25,6 +25,7 @@ namespace thinger::http {
 // Forward declarations
 class websocket_connection;
 class sse_connection;
+class http_application;
 
 // WebSocket upgrade that hands out the WebSocket as a byte stream socket
 // (see response::upgrade_websocket_stream)
@@ -171,6 +172,24 @@ public:
 
 private:
     struct state;
+
+    // The request timeout of the route (see route::timeout) is run by the application
+    friend class http_application;
+
+    // Call `hook` once the response starts (the first answer), from the thread answering.
+    // Set before the response is handed to the handler.
+    void on_start(std::function<void()> hook);
+
+    // Answer the request as timed out, with an error of `status`, unless another answer
+    // started first (false then). Later answers are dropped quietly.
+    bool answer_timeout(http::http_response::status status);
+
+    // Whether the response was answered by answer_timeout()
+    bool timed_out() const;
+
+    // An answer arriving once the response was sent (or chunks out of place): logged as an
+    // error, unless the request timed out (then the handler is just late)
+    void log_late_answer(const char* message) const;
 
     bool ensure_not_responded() const;
     // Status and headers set before answering, created on first use

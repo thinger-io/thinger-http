@@ -106,6 +106,10 @@ nlohmann::json openapi_generator::build_operation(const route& r) const {
     if (responses.empty()) responses["200"] = {{"description", "Successful response"}};
     operation["responses"] = std::move(responses);
 
+    // Limits set on the route (or its group), as extensions
+    if (const auto& limit = r.get_max_body_size()) operation["x-max-body-size"] = *limit;
+    if (r.get_timeout().count() > 0) operation["x-timeout-ms"] = r.get_timeout().count();
+
     return operation;
 }
 

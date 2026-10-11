@@ -1,6 +1,7 @@
 #ifndef THINGER_HTTP_ROUTE_DESCRIPTOR_HPP
 #define THINGER_HTTP_ROUTE_DESCRIPTOR_HPP
 
+#include <chrono>
 #include <concepts>
 #include <type_traits>
 #include <map>
@@ -241,6 +242,41 @@ public:
     // Types set with accepts(), lowercase; empty if none (the application ones apply)
     const std::vector<std::string>& get_accepted_types() const { return accepted_types_; }
 
+    // --- Limits (a group sets them on its routes; a route can override them) ---
+
+    // Maximum request body size, instead of the application one (see
+    // http_application::set_max_body_size): a larger body is answered with 413 Payload Too
+    // Large, a Content-Length one before reading it, whether the server reads it (callbacks
+    // taking the body decoded, or deferred_body(false)) or the callback does (read_body(),
+    // read(), read_some(), a reverse proxy). Also once decompressed.
+    // std::numeric_limits<size_t>::max() for no limit.
+    route& max_body_size(size_t size);
+
+    // Maximum body size set for the route; nullopt if none (the application one applies)
+    const std::optional<size_t>& get_max_body_size() const { return max_body_size_; }
+
+    // Maximum time from the dispatch of a request (its headers received and the route
+    // matched) until its response starts, middlewares and body reading included. On expiry
+    // the request is answered with `status` (504 Gateway Timeout by default, or e.g. 503
+    // Service Unavailable) through the error formatter, and later answers from the callback
+    // are dropped; the callback is not cancelled: it goes on until it ends. Responses started
+    // in time (streams, chunked responses, SSE, WebSocket and other takeovers) are never cut.
+    // If the body was not read whole, the connection is closed after the response. Zero (the
+    // default) for no timeout.
+    route& timeout(std::chrono::milliseconds timeout,
+                   http_response::status status = http_response::status::gateway_timeout);
+
+    // Timeout set for the route (zero if none), and its status
+    std::chrono::milliseconds get_timeout() const { return timeout_; }
+    http_response::status get_timeout_status() const { return timeout_status_; }
+
+    // Limits of the body decoded for the callback, instead of the application ones (see
+    // http_application::set_body_limits)
+    route& decode_limits(body_limits limits);
+
+    // Decode limits set for the route; nullopt if none (the application ones apply)
+    const std::optional<body_limits>& get_decode_limits() const { return decode_limits_; }
+
     // --- API documentation (read by tools such as OpenAPI generators) ---
     route& summary(const std::string& text);
     route& description(const std::string& desc);
@@ -309,6 +345,12 @@ private:
     std::map<std::string, std::string> parameter_patterns_;
     nlohmann::json json_schema_;
     std::vector<std::string> accepted_types_;
+
+    // Limits (unset: the application ones)
+    std::optional<size_t> max_body_size_;
+    std::chrono::milliseconds timeout_{0};
+    http_response::status timeout_status_ = http_response::status::gateway_timeout;
+    std::optional<body_limits> decode_limits_;
 
     // Documentation and metadata
     std::string summary_;

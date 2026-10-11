@@ -104,8 +104,10 @@ struct proxy_options {
     // Maximum time for the whole exchange, connection included; zero for no limit
     std::chrono::milliseconds total_timeout{0};
 
-    // Maximum request body forwarded (413 if larger); zero for no limit. The body is never
-    // held whole: it is streamed to the target as it arrives.
+    // Maximum request body forwarded (413 if larger); zero for no limit. The maximum body
+    // size of the route (route::max_body_size, or the application one) applies too, as to
+    // any body read: the smaller one wins. The body is never held whole: it is streamed to
+    // the target as it arrives.
     size_t max_body_size = 0;
 
     // Forward protocol upgrades (WebSocket...) as a tunnel between the client and the target

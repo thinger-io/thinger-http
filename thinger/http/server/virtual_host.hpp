@@ -4,9 +4,11 @@
 #include "routing/route_handler.hpp"
 #include "routing/route.hpp"
 #include "routing/route_registrar.hpp"
+#include <chrono>
 #include <optional>
 #include <regex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace thinger::http {
@@ -95,8 +97,9 @@ private:
     std::vector<std::string> parameters_;
 };
 
-// Routes registered through a group get its path prefix, and inherit its tags and
-// metadata (a route can still override a metadata key with its own meta()).
+// Routes registered through a group get its path prefix, and inherit its tags, metadata
+// and limits (a route can still override a metadata key with its own meta(), or a limit).
+// They are applied as each route is registered: set them on the group first.
 class route_group : public route_registrar<route_group> {
 public:
     route_group(virtual_host& host, std::string prefix)
@@ -112,7 +115,25 @@ public:
         return *this;
     }
 
-    // Nested group: prefix appended, tags and metadata inherited
+    // Limits of the routes registered afterwards (see route::max_body_size, route::timeout
+    // and route::decode_limits)
+    route_group& max_body_size(size_t size) {
+        max_body_size_ = size;
+        return *this;
+    }
+
+    route_group& timeout(std::chrono::milliseconds timeout,
+                         http_response::status status = http_response::status::gateway_timeout) {
+        timeout_ = {timeout, status};
+        return *this;
+    }
+
+    route_group& decode_limits(body_limits limits) {
+        decode_limits_ = limits;
+        return *this;
+    }
+
+    // Nested group: prefix appended, tags, metadata and limits inherited
     route_group group(const std::string& prefix) const {
         route_group nested(*this);
         nested.prefix_ += prefix;
@@ -129,6 +150,9 @@ private:
         for (const auto& [key, value] : metadata_.items()) {
             r.meta(key, value);
         }
+        if (max_body_size_) r.max_body_size(*max_body_size_);
+        if (timeout_) r.timeout(timeout_->first, timeout_->second);
+        if (decode_limits_) r.decode_limits(*decode_limits_);
         return r;
     }
 
@@ -136,6 +160,9 @@ private:
     std::string prefix_;
     std::vector<std::string> tags_;
     nlohmann::json metadata_ = nlohmann::json::object();
+    std::optional<size_t> max_body_size_;
+    std::optional<std::pair<std::chrono::milliseconds, http_response::status>> timeout_;
+    std::optional<body_limits> decode_limits_;
 };
 
 inline route_group virtual_host::group(const std::string& prefix) {

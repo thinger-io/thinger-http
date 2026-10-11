@@ -55,6 +55,11 @@ public:
     // reading the request body (on the connection thread)
     void extend_timeout();
 
+    // Keep the connection open at least until `time`, whatever its activity: a request with
+    // a timeout of its own (see route::timeout) may wait for its response longer than the
+    // connection timeout (on the connection thread)
+    void hold_until(std::chrono::steady_clock::time_point time);
+
     // Set request handler (awaitable — dispatch coroutine)
     void set_handler(std::function<awaitable<void>(std::shared_ptr<request>)> handler) {
         handler_ = std::move(handler);
@@ -107,6 +112,8 @@ private:
     // the timer is not touched on every request, it only checks the deadline on expiry
     boost::asio::steady_timer timeout_timer_;
     std::chrono::steady_clock::time_point deadline_;
+    // Not closed before this time either (see hold_until)
+    std::chrono::steady_clock::time_point hold_{};
     bool timeout_armed_{false};
 
     // Cancelled when a response starts, waking the read loop waiting for it

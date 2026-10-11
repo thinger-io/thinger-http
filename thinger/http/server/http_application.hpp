@@ -115,8 +115,12 @@ public:
     // Add CORS headers to every response
     void enable_cors(bool enabled = true);
 
-    // Maximum allowed request body size
+    // Maximum request body size (8 MB by default), for the routes that do not set their own
+    // (route::max_body_size) and the requests matching no route: every read of a body is
+    // bounded by it (413 if larger), and an unread body larger than this is not discarded
+    // after the response: the connection is closed instead
     void set_max_body_size(size_t size);
+    size_t get_max_body_size() const { return max_body_size_; }
 
     // Decoders of request bodies by media type, for the routes taking the body decoded:
     // JSON, MessagePack, CBOR, UBJSON, urlencoded forms, text and binary are built in (see
@@ -129,7 +133,8 @@ public:
     void accept_body_types(std::vector<std::string> types);
     const std::vector<std::string>& get_body_types() const { return body_settings_.accepted; }
 
-    // Limits of decoded bodies (nesting depth); set before serving
+    // Limits of decoded bodies (nesting depth), for the routes that do not set their own
+    // (route::decode_limits); set before serving
     void set_body_limits(body_limits limits) { body_settings_.limits = limits; }
     const body_limits& get_body_limits() const { return body_settings_.limits; }
 
@@ -155,7 +160,11 @@ public:
 private:
     virtual_host& resolve_host(request& req);
     std::shared_ptr<http_response> make_error_response(http_response::status status, const std::string& message) const;
-    awaitable<void> handle_request(std::shared_ptr<request> req, response& res);
+    // Middlewares, body reading and handler of a matched request, then what is left of its body
+    awaitable<void> serve(std::shared_ptr<request> req, response& res, virtual_host& host, const route* matched_route);
+    // The same, within the timeout of the route
+    awaitable<void> serve_with_timeout(std::shared_ptr<request> req, response res, virtual_host& host,
+                                       const route& matched_route);
     awaitable<bool> run_middlewares(request& req, response& res);
     awaitable<void> discard_unread_body(request& req);
 
@@ -166,7 +175,7 @@ private:
     bool cors_enabled_{false};
 
     // Maximum allowed request body size
-    size_t max_body_size_{8 * 1024 * 1024}; // 8MB default
+    size_t max_body_size_{default_max_body_size};
 
     // Virtual hosts by exact name, and by pattern (in registration order)
     std::map<std::string, std::unique_ptr<virtual_host>> exact_hosts_;
