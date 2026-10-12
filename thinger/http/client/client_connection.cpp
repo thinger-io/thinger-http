@@ -331,7 +331,7 @@ awaitable<std::shared_ptr<http_response>> client_connection::read_response(const
         // A streamed body is handed as received. A body that cannot be decoded fails the
         // request, as one too large once decoded (and the connection is closed, as after any
         // error)
-        if (!response_parser_.is_streaming()) {
+        if (decompress_ && !response_parser_.is_streaming()) {
             if (auto error = decompress(*response, response_parser_.get_max_content_size()); error != client_error::none) {
                 error_ = error;
                 co_return nullptr;

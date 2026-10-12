@@ -199,6 +199,7 @@ std::shared_ptr<client_connection> http_client_base::make_connection(const conne
         connection = std::make_shared<client_connection>(sock, timeout_);
     }
     connection->set_max_content_size(max_content_size_);
+    connection->set_decompress(auto_decompress_);
     return connection;
 }
 
@@ -231,6 +232,7 @@ connection_pool::lease http_client_base::get_connection(const std::shared_ptr<ht
         if (auto lease = pool_.acquire(key)) {
             LOG_DEBUG("Reusing connection from pool for {}", origin);
             lease->set_max_content_size(max_content_size_);
+            lease->set_decompress(auto_decompress_);
             lease->set_timeout(timeout_);
             return lease;
         }
@@ -241,6 +243,7 @@ connection_pool::lease http_client_base::get_connection(const std::shared_ptr<ht
         auto sock = std::make_shared<thinger::asio::unix_socket>("http_client", get_io_context());
         connection = std::make_shared<client_connection>(sock, socket_path, timeout_);
         connection->set_max_content_size(max_content_size_);
+        connection->set_decompress(auto_decompress_);
     } else {
         LOG_DEBUG("Creating new connection for {}{}", request->get_host(),
                   plan.route.proxy ? " through the proxy " + plan.route.proxy->url() : std::string{});

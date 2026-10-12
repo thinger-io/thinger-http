@@ -267,6 +267,27 @@ TEST_CASE("Client does not reuse a connection after a compressed response fails"
     REQUIRE(stats.idle == 1);
 }
 
+TEST_CASE("Client keeps compressed responses as received without auto_decompress", "[http][client][compression][integration]") {
+    // The body is the one the server sent, within the limit, whatever it expands to
+    encoded_server server;
+    http::client client;
+    client.timeout(5s);
+    client.max_content_size(mib);
+    client.auto_decompress(false);
+    auto bomb = compression_bomb::zeros(format::gzip, 64);
+    server.set("bomb", "gzip", bomb);
+
+    auto res = client.request(server.url("bomb")).header("Accept-Encoding", "gzip").get();
+    REQUIRE(res.ok());
+    REQUIRE(res.body() == bomb);
+    REQUIRE(res.header("Content-Encoding") == "gzip");
+
+    // (nor does it ask for compressed bodies by itself)
+    res = client.get(server.url("bomb"));
+    REQUIRE(res.ok());
+    REQUIRE(server.received_accept_encodings() == std::vector<std::string>{"gzip", ""});
+}
+
 TEST_CASE("Client streams compressed responses as received", "[http][client][compression][integration]") {
     // A stream callback gets the body as it arrives: it is not decoded, so the client never
     // inflates it. The request asks for identity unless it sets its own Accept-Encoding

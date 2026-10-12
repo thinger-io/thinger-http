@@ -119,6 +119,8 @@ public:
     // decompressed too
     void set_max_content_size(size_t size) { response_parser_.set_max_content_size(size); }
     void set_timeout(std::chrono::seconds timeout) { timeout_ = timeout; }
+    // Decode gzip and deflate bodies (the default); otherwise they are kept as received
+    void set_decompress(bool decompress) { decompress_ = decompress; }
 
 private:
     // Internal helpers
@@ -144,6 +146,7 @@ private:
     bool request_unsent_ = false;
     bool response_started_ = false;
     bool reusable_ = false;
+    bool decompress_ = true;
     std::optional<std::chrono::seconds> keep_alive_timeout_;
     boost::asio::steady_timer idle_timer_;
 };

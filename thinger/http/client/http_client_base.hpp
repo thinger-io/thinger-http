@@ -69,6 +69,8 @@ public:
     http_client_base& max_redirects(unsigned int max) { max_redirects_ = max; return *this; }
     http_client_base& follow_redirects(bool follow) { follow_redirects_ = follow; return *this; }
     http_client_base& user_agent(const std::string& agent) { user_agent_ = agent; return *this; }
+    // Ask for gzip and deflate bodies, and decode them (the default); otherwise bodies are
+    // kept as received, with their Content-Encoding
     http_client_base& auto_decompress(bool decompress) { auto_decompress_ = decompress; return *this; }
     http_client_base& verify_ssl(bool verify) { verify_ssl_ = verify; return *this; }
     http_client_base& unix_socket(const std::string& path) { unix_socket_ = path; return *this; }
