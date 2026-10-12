@@ -121,6 +121,7 @@ namespace thinger::http {
          * not apply because the body is handed off chunk-by-chunk.
          */
         void set_max_content_size(size_t size) { max_content_size_ = size; }
+        size_t get_max_content_size() const { return max_content_size_; }
 
     private:
         enum class state {

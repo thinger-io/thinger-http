@@ -27,6 +27,7 @@ namespace thinger::http {
                     case client_error::proxy_authentication_required: return "proxy authentication required (407 to CONNECT)";
                     case client_error::proxy_tunnel_failed: return "the proxy did not open a tunnel to the origin (CONNECT)";
                     case client_error::invalid_proxy: return "invalid or unsupported proxy URL";
+                    case client_error::bad_content_encoding: return "the response body could not be decoded as its Content-Encoding says";
                 }
                 return "unknown client error";
             }

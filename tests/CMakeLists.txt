@@ -120,6 +120,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/util/http_date_test.cpp)
     add_thinger_test(test_http_date unit/http/util/http_date_test.cpp)
 endif()
 
+# Unit tests - Utilities
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/util/compression_test.cpp)
+    add_thinger_test(test_compression unit/util/compression_test.cpp)
+endif()
+
 # Unit tests - ASIO
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/asio/workers_test.cpp)
     add_thinger_test(test_workers unit/asio/workers_test.cpp)
@@ -181,6 +186,10 @@ endif()
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/client_keepalive_test.cpp)
     add_thinger_test(test_integration_client_keepalive integration/client_keepalive_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/client_decompression_test.cpp)
+    add_thinger_test(test_integration_client_decompression integration/client_decompression_test.cpp)
 endif()
 
 # Integration tests - Server

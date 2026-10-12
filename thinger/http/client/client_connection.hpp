@@ -115,7 +115,8 @@ public:
     // `timeout`. Calling it again replaces the previous wait (completed with an error)
     void expire_after(std::chrono::steady_clock::duration timeout, std::function<void()> on_expired);
 
-    // Forward max response size to the underlying parser.
+    // Forward max response size to the underlying parser. It bounds buffered bodies once
+    // decompressed too
     void set_max_content_size(size_t size) { response_parser_.set_max_content_size(size); }
     void set_timeout(std::chrono::seconds timeout) { timeout_ = timeout; }
 

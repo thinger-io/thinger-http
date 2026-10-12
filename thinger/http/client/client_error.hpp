@@ -15,14 +15,15 @@ namespace thinger::http {
         header_section_too_large,   // too many header lines, or too many bytes
         invalid_framing,            // invalid Content-Length, Transfer-Encoding other than chunked, or both
         malformed_body,             // invalid chunked framing
-        body_too_large,             // over the maximum content size of a buffered response
+        body_too_large,             // over the maximum content size of a buffered response, also once decompressed
         incomplete_response,        // the connection ended before the end of the response
         unexpected_upgrade,         // 101 Switching Protocols for a request without Upgrade
         aborted,                    // the streaming callback stopped the download
         invalid_ca_certificate,     // a CA certificate (file or PEM) could not be loaded
         proxy_authentication_required,  // the proxy answered CONNECT with 407 (see client_response::status())
         proxy_tunnel_failed,        // the proxy answered CONNECT with another status than 2xx, or sent data before the origin
-        invalid_proxy               // the proxy URL is invalid or not supported (only http:// proxies are)
+        invalid_proxy,              // the proxy URL is invalid or not supported (only http:// proxies are)
+        bad_content_encoding        // the body is not valid gzip or deflate, as its Content-Encoding says (corrupt or truncated)
     };
 
     const boost::system::error_category& client_error_category();

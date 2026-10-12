@@ -3,6 +3,7 @@
 #include <thinger/http/server/response.hpp>
 #include <thinger/util/types.hpp>
 #include <thinger/util/compression.hpp>
+#include "../fixtures/compression_bomb.hpp"
 #include <atomic>
 #include <chrono>
 
@@ -100,5 +101,31 @@ TEST_CASE("Compressed request bodies are validated and bounded", "[server][body]
         REQUIRE(bomb->size() < 64 * 1024);
         auto result = run_dispatch(server, compressed_request("gzip", *bomb), options);
         REQUIRE(result->get_status() == http::http_response::status::payload_too_large);
+    }
+
+    SECTION("Decompressed size exactly at the maximum body size, and one byte over") {
+        for (const std::string encoding : {"gzip", "deflate"}) {
+            CAPTURE(encoding);
+            auto compress = encoding == "gzip" ? util::gzip::compress : util::deflate::compress;
+            auto exact = compress(std::string(64 * 1024, 'a'));
+            auto over = compress(std::string(64 * 1024 + 1, 'a'));
+            auto result = run_dispatch(server, compressed_request(encoding, *exact), options);
+            REQUIRE(result->get_content() == std::to_string(64 * 1024));
+            result = run_dispatch(server, compressed_request(encoding, *over), options);
+            REQUIRE(result->get_status() == http::http_response::status::payload_too_large);
+        }
+    }
+
+    SECTION("A bomb of a few KB per MiB stops inflating at the limit") {
+        // Its broken checksum is at the end: past the limit it is too large, not invalid
+        for (auto format : {compression_bomb::format::gzip, compression_bomb::format::deflate}) {
+            auto bomb = compression_bomb::zeros(format, 32);
+            REQUIRE(bomb.size() < 64 * 1024);
+            bomb.back() = static_cast<char>(bomb.back() ^ 0x55);
+            auto encoding = format == compression_bomb::format::gzip ? "gzip" : "deflate";
+            CAPTURE(encoding);
+            auto result = run_dispatch(server, compressed_request(encoding, bomb), options);
+            REQUIRE(result->get_status() == http::http_response::status::payload_too_large);
+        }
     }
 }

@@ -11,23 +11,33 @@ namespace thinger::http {
 
 namespace {
 
-// Decode a gzip or deflate Content-Encoding (the body is kept as it is if it fails)
-void decompress(http_response& response) {
+// Decode a gzip or deflate Content-Encoding, up to `max_size` bytes once decoded: inflating
+// stops as soon as the body goes past them, so a small body expanding to gigabytes (a
+// decompression bomb) takes no more memory than the limit. Other codings, and empty bodies
+// (e.g. of responses to HEAD), are kept as they are
+client_error decompress(http_response& response, size_t max_size) {
+    if (response.get_content().empty()) return client_error::none;
     std::string encoding = response.get_header("Content-Encoding");
     std::optional<std::string> decoded;
+    bool too_large = false;
     if (encoding == "gzip") {
-        decoded = ::thinger::util::gzip::decompress(response.get_content());
+        decoded = ::thinger::util::gzip::decompress(response.get_content(), max_size, &too_large);
     } else if (encoding == "deflate") {
-        decoded = ::thinger::util::deflate::decompress(response.get_content());
+        decoded = ::thinger::util::deflate::decompress(response.get_content(), max_size, &too_large);
     } else {
-        return;
+        return client_error::none;
     }
     if (!decoded) {
+        if (too_large) {
+            LOG_ERROR("the decompressed {} response exceeds the maximum allowed size: {} max", encoding, max_size);
+            return client_error::body_too_large;
+        }
         LOG_ERROR("Failed to decompress {} response", encoding);
-        return;
+        return client_error::bad_content_encoding;
     }
     response.set_content(std::move(*decoded));
     response.remove_header("Content-Encoding");
+    return client_error::none;
 }
 
 std::string_view trim(std::string_view value) {
@@ -318,8 +328,15 @@ awaitable<std::shared_ptr<http_response>> client_connection::read_response(const
             socket_->close();
         }
 
-        // A streamed body is handed as received
-        if (!response_parser_.is_streaming()) decompress(*response);
+        // A streamed body is handed as received. A body that cannot be decoded fails the
+        // request, as one too large once decoded (and the connection is closed, as after any
+        // error)
+        if (!response_parser_.is_streaming()) {
+            if (auto error = decompress(*response, response_parser_.get_max_content_size()); error != client_error::none) {
+                error_ = error;
+                co_return nullptr;
+            }
+        }
 
         co_return response;
     }
