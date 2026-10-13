@@ -62,6 +62,41 @@ namespace {
             || content_type.starts_with("image/svg+xml");
     }
 
+    // Whether a comma-separated header (any of its values) holds `token`, case-insensitive
+    bool has_list_token(const http_response& message, std::string_view name, std::string_view token) {
+        for (const auto& value : message.get_headers_with_key(name)) {
+            std::string_view list = value;
+            while (!list.empty()) {
+                auto comma = list.find(',');
+                auto item = list.substr(0, comma);
+                list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+                auto first = item.find_first_not_of(" \t");
+                if (first == std::string_view::npos) continue;
+                item = item.substr(first, item.find_last_not_of(" \t") - first + 1);
+                if (boost::iequals(item, token)) return true;
+            }
+        }
+        return false;
+    }
+
+    // Add `field` to the Vary header (as the vary module of Express): appended to the one
+    // there, unless it has it or is "*"
+    void add_vary(http_response& message, std::string_view field) {
+        if (has_list_token(message, "Vary", field) || has_list_token(message, "Vary", "*")) return;
+        const auto& vary = message.get_header("Vary");
+        if (vary.empty()) {
+            message.add_header("Vary", std::string(field));
+        } else {
+            message.set_header("Vary", vary + ", " + std::string(field));
+        }
+    }
+
+    // Whether the response asks not to be transformed (Cache-Control: no-transform, RFC
+    // 9111, 5.2.2.6): no compression then, as Express
+    bool no_transform(const http_response& message) {
+        return message.has_header(header::cache_control) && has_list_token(message, header::cache_control, "no-transform");
+    }
+
 }
 
 response::response(const std::shared_ptr<server_connection>& connection,
@@ -150,35 +185,37 @@ http_response& response::draft() {
     return *state_->draft;
 }
 
+bool response::compressible(const http_response& response) {
+    // A body worth compressing, of a text-based type, that may be transformed
+    if (response.get_content().size() < compression_threshold) return false;
+    const auto& content_type = response.get_content_type();
+    return !content_type.empty() && is_compressible_content_type(content_type) && !no_transform(response);
+}
+
 void response::compress_if_needed(http_response& response) const {
+    if (!compressible(response)) return;
 
-    // Only compress if there's a body worth compressing
-    const auto& content = response.get_content();
-    if (content.size() < 200) return;
+    // Sent compressed or not depending on the request: caches must tell both apart
+    add_vary(response, "Accept-Encoding");
 
-    // Don't compress if already compressed
+    // Already compressed by the handler
     if (response.has_header("Content-Encoding")) return;
 
-    // Only compress text-based content types
-    const auto& ct = response.get_content_type();
-    if (ct.empty() || !is_compressible_content_type(ct)) return;
+    // What the client accepts (its Accept-Encoding headers make one list)
+    std::string accept_encoding;
+    for (const auto& value : state_->request->get_headers_with_key("Accept-Encoding")) {
+        if (!accept_encoding.empty()) accept_encoding += ", ";
+        accept_encoding += value;
+    }
+    auto coding = negotiate_content_coding(accept_encoding);
+    if (coding == content_coding::identity) return;
 
-    // Check what the client accepts
-    std::string accept_encoding = state_->request->get_header("Accept-Encoding");
-    if (accept_encoding.empty()) return;
-
-    if (accept_encoding.find("gzip") != std::string::npos) {
-        auto compressed = ::thinger::util::gzip::compress(content);
-        if (compressed) {
-            response.set_content(std::move(*compressed));
-            response.add_header("Content-Encoding", "gzip");
-        }
-    } else if (accept_encoding.find("deflate") != std::string::npos) {
-        auto compressed = ::thinger::util::deflate::compress(content);
-        if (compressed) {
-            response.set_content(std::move(*compressed));
-            response.add_header("Content-Encoding", "deflate");
-        }
+    const auto& content = response.get_content();
+    auto compressed = coding == content_coding::gzip ? ::thinger::util::gzip::compress(content)
+                                                     : ::thinger::util::deflate::compress(content);
+    if (compressed) {
+        response.set_content(std::move(*compressed));
+        response.add_header("Content-Encoding", coding == content_coding::gzip ? "gzip" : "deflate");
     }
 }
 
@@ -242,8 +279,9 @@ void response::prepare_body(http_response& message, bool compress) const {
         // The headers of the answer to GET, Content-Length included, without its body: the
         // client reads none (RFC 9110, 9.3.2), so it would be taken as the next response.
         // Not compressed (like Express): its length is the one of the identity body.
+        if (compress && compressible(message)) add_vary(message, "Accept-Encoding");
         message.get_content().clear();
-    } else if (compress) {
+    } else if (compress && message.get_content().size() >= compression_threshold) {
         compress_if_needed(message);
     }
 }
@@ -378,7 +416,9 @@ void response::send_file(const std::filesystem::path& path, bool force_download)
     message->set_header("ETag", file->etag);
     message->set_header("Last-Modified", file->last_modified);
     // a text file may be sent compressed (see compress_if_needed): another representation
-    if (file->size >= 200 && is_compressible_content_type(content_type)) message->add_header("Vary", "Accept-Encoding");
+    if (file->size >= compression_threshold && is_compressible_content_type(content_type) && !no_transform(*message)) {
+        add_vary(*message, "Accept-Encoding");
+    }
 
     // Conditional request for a file the client has: no body, nor the length of the file
     if ((get || head) && file->not_modified(request)) {

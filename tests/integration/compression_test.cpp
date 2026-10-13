@@ -9,6 +9,8 @@
 #include <thread>
 #include <future>
 
+#include "server_test_helpers.hpp"
+
 using namespace thinger;
 using namespace std::chrono_literals;
 
@@ -185,4 +187,69 @@ TEST_CASE("No Accept-Encoding means no compression", "[compression][integration]
     auto json = response.json();
     auto expected = make_large_json();
     REQUIRE(json == expected);
+}
+
+TEST_CASE("Compression is negotiated and announced with Vary", "[compression][integration]") {
+    http::server server;
+    server.get("/large", [](http::response& res) { res.json(make_large_json()); });
+    server.get("/small", [](http::response& res) { res.json({{"ok", true}}); });
+    server.get("/no-transform", [](http::response& res) {
+        res.header("Cache-Control", "no-transform");
+        res.json(make_large_json());
+    });
+    server.get("/encoded", [](http::response& res) {
+        res.encode(make_large_json());   // Vary: Accept
+    });
+    server_test::running_server running(server);
+
+    // The head of the answer to a raw request, lowercase
+    auto head = [&](const std::string& path, const std::string& headers, const std::string& method = "GET") {
+        auto result = server_test::raw_exchange(running.port, method + " " + path + " HTTP/1.1\r\nHost: x\r\n"
+                                                + headers + "Connection: close\r\n\r\n");
+        auto head = result.data.substr(0, result.data.find("\r\n\r\n") + 2);
+        for (auto& c : head) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        REQUIRE(head.starts_with("http/1.1 200"));
+        return head;
+    };
+    auto has = [](const std::string& head, const std::string& line) {
+        return head.find("\r\n" + line + "\r\n") != std::string::npos;
+    };
+
+    SECTION("Compressed or not, compressible responses vary on Accept-Encoding") {
+        auto compressed = head("/large", "Accept-Encoding: gzip\r\n");
+        REQUIRE(has(compressed, "content-encoding: gzip"));
+        REQUIRE(has(compressed, "vary: accept-encoding"));
+
+        auto identity = head("/large", "");
+        REQUIRE(identity.find("content-encoding") == std::string::npos);
+        REQUIRE(has(identity, "vary: accept-encoding"));
+
+        auto head_request = head("/large", "Accept-Encoding: gzip\r\n", "HEAD");
+        REQUIRE(head_request.find("content-encoding") == std::string::npos);
+        REQUIRE(has(head_request, "vary: accept-encoding"));
+
+        // too small to be compressed: one representation
+        REQUIRE(head("/small", "Accept-Encoding: gzip\r\n").find("vary") == std::string::npos);
+    }
+
+    SECTION("Codings and their quality") {
+        REQUIRE(has(head("/large", "Accept-Encoding: GZip\r\n"), "content-encoding: gzip"));
+        REQUIRE(has(head("/large", "Accept-Encoding: deflate, gzip\r\n"), "content-encoding: gzip"));
+        REQUIRE(has(head("/large", "Accept-Encoding: gzip;q=0, deflate\r\n"), "content-encoding: deflate"));
+        REQUIRE(has(head("/large", "Accept-Encoding: gzip;q=0.2, deflate;q=0.9\r\n"), "content-encoding: deflate"));
+        REQUIRE(has(head("/large", "Accept-Encoding: gzip;q=0\r\nAccept-Encoding: deflate\r\n"), "content-encoding: deflate"));
+        REQUIRE(head("/large", "Accept-Encoding: gzip;q=0\r\n").find("content-encoding") == std::string::npos);
+        REQUIRE(head("/large", "Accept-Encoding: br\r\n").find("content-encoding") == std::string::npos);
+        REQUIRE(head("/large", "Accept-Encoding: identity\r\n").find("content-encoding") == std::string::npos);
+    }
+
+    SECTION("Vary keeps the fields already there, and no-transform is respected") {
+        auto encoded = head("/encoded", "Accept-Encoding: gzip\r\n");
+        REQUIRE(has(encoded, "vary: accept, accept-encoding"));
+        REQUIRE(has(encoded, "content-encoding: gzip"));
+
+        auto no_transform = head("/no-transform", "Accept-Encoding: gzip\r\n");
+        REQUIRE(no_transform.find("content-encoding") == std::string::npos);
+        REQUIRE(no_transform.find("vary") == std::string::npos);
+    }
 }

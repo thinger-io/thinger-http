@@ -341,6 +341,8 @@ res.error(http::http_response::status::not_found, "Not found");
 
 Every response tells where its body ends with a `Content-Length` (also `send_response()` with a hand-built `http_response`: its content is its body, whatever `Content-Length` or `Transfer-Encoding` it carried), so the connection can carry the next request; `1xx`, `204` and `304` have no body, and `1xx` and `204` no `Content-Length`.
 
+Bodies of 200 bytes or more of a text-based type (`text/*`, JSON, XML, JavaScript, SVG) are compressed with gzip or deflate as the request's `Accept-Encoding` asks (RFC 9110: case-insensitive codings, `q` values, `q=0` as not acceptable, `*` and `identity`; gzip at equal quality), unless the response has `Content-Encoding` or `Cache-Control: no-transform`. They carry `Vary: Accept-Encoding` whether they were compressed or not, as with Express's `compression` middleware (which also adds it to smaller ones). Responses to `HEAD` are never compressed.
+
 ### Static Files
 
 ```cpp
@@ -368,7 +370,7 @@ Files are served with validators, so that browsers download them once and only c
 - `Cache-Control: no-cache` by default: caches keep the file, but revalidate it on every use. Set another policy with `cache_control` (e.g. `max-age` for hashed assets).
 - Conditional requests are answered with `304 Not Modified`, without body, while the file does not change: `If-None-Match` with `*` or a list of entity tags (weak comparison, `W/` ignored), or else `If-Modified-Since` (ignored when there is an `If-None-Match`, or when it is not a valid date) with a date not earlier than the modification time. The `304` carries the validators and the `Cache-Control`.
 - `Accept-Ranges: bytes`: a `GET` with a single byte range (`Range: bytes=0-99`, `bytes=100-`, `bytes=-100`) gets `206 Partial Content`, or `416` if it starts past the end. Several ranges, or an invalid one, get the whole file; so does a range with an `If-Range` other than the `Last-Modified` date (the weak `ETag` never matches it).
-- Text files of 200 bytes or more are compressed for clients accepting gzip (`Vary: Accept-Encoding`); ranges are sent as they are. A `HEAD` gets the headers of the `GET` with the length of the file, without reading it.
+- Text files of 200 bytes or more are compressed for clients accepting gzip or deflate (see [Response Types](#response-types), with `Vary: Accept-Encoding`); ranges are sent as they are. A `HEAD` gets the headers of the `GET` with the length of the file, without reading it.
 
 `res.send_file()` does the same in a handler. Its `Cache-Control` is `no-cache` unless the handler set one before (`res.header("Cache-Control", ...)`):
 

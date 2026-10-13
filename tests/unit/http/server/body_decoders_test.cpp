@@ -404,3 +404,47 @@ TEST_CASE("Response encoding follows the Accept header", "[body][unit]") {
     REQUIRE(json::from_cbor(encode_body(sample, "cbor")) == sample);
     REQUIRE(json::from_ubjson(encode_body(sample, "ubjson")) == sample);
 }
+
+TEST_CASE("Response compression follows the Accept-Encoding header", "[body][compression][unit]") {
+    using enum content_coding;
+    struct expectation {
+        std::string_view accept_encoding;
+        content_coding coding;
+    };
+    for (auto [accept_encoding, coding] : std::initializer_list<expectation>{
+             {"", identity},
+             {"gzip", gzip},
+             {"deflate", deflate},
+             {"gzip, deflate", gzip},
+             {"deflate, gzip", gzip},                    // gzip at equal quality
+             {"GZIP", gzip},                             // codings are case-insensitive
+             {"x-gzip", gzip},
+             {"br", identity},
+             {"gzip;q=0", identity},                     // not acceptable
+             {"gzip;q=0, deflate", deflate},
+             {"gzip;q=0.5, deflate;q=0.8", deflate},
+             {"gzip;q=0.8, deflate;q=0.5", gzip},
+             {"gzip ; Q=0.5", gzip},                     // spaces, and Q in uppercase
+             {"gzip;q=0.001", gzip},
+             {"*", gzip},
+             {"*;q=0", identity},
+             {"*;q=0.5, deflate;q=0.8", deflate},
+             {"*;q=0.8, deflate;q=0.5", gzip},           // gzip through "*"
+             {"gzip;q=0, *", deflate},
+             {"identity", identity},
+             {"gzip;q=0.5, identity", identity},         // identity preferred
+             {"gzip, identity;q=0.5", gzip},
+             {"gzip, identity", gzip},
+             {"gzip;q=0.3, *;q=0.5", deflate},           // deflate through "*"
+             {"gzip;q=0.3, deflate;q=0.3, *;q=0.5", identity},   // identity through "*"
+             {"gzip;q=1.5", identity},                   // invalid weights drop the coding
+             {"gzip;q=abc, deflate", deflate},
+             {"gzip;q=", identity},
+             {" , ,gzip,", gzip},
+             {"gzip;q=0, gzip", identity},               // the first one counts
+             {"gzipx, deflatex", identity},              // no substring matches
+         }) {
+        INFO(accept_encoding);
+        REQUIRE(negotiate_content_coding(accept_encoding) == coding);
+    }
+}

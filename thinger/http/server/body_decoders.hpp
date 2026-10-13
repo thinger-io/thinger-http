@@ -192,6 +192,14 @@ response_encoding negotiate_response_encoding(std::string_view accept);
 // Encode a value in a format of negotiate_response_encoding()
 std::string encode_body(const nlohmann::json& value, const std::string& format);
 
+// Content coding to compress a response with, as the Accept-Encoding header (RFC 9110,
+// 12.5.3; empty if missing) asks: gzip or deflate (codings are case-insensitive, x-gzip is
+// gzip), by the quality the client gives them, by name or else through "*" (0: not
+// acceptable); gzip at equal quality, as Express. Identity if the client accepts neither,
+// or gives identity (by name or through "*") a higher quality.
+enum class content_coding { identity, gzip, deflate };
+content_coding negotiate_content_coding(std::string_view accept_encoding);
+
 } // namespace thinger::http
 
 #endif // THINGER_HTTP_SERVER_BODY_DECODERS_HPP
