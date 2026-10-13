@@ -1,6 +1,7 @@
 #ifndef THINGER_ASIO_WORKERS
 #define THINGER_ASIO_WORKERS
 
+#include <atomic>
 #include <unordered_map>
 #include <set>
 #include <boost/asio.hpp>
@@ -29,7 +30,7 @@ namespace thinger::asio {
         /// return an isolated io_context not shared in the pool
         boost::asio::io_context& get_isolated_io_context(std::string thread_name);
 
-        /// return the next io_context (round-robin)
+        /// return the next io_context (round-robin); can be called from any thread
         boost::asio::io_context& get_next_io_context();
 
         /// return the io_context associated with the caller thread
@@ -72,8 +73,9 @@ namespace thinger::asio {
         /// flag for controlling if it is running
 		std::atomic<bool> running_{false};
 
-        /// index to control next io_context to use (in the round-robin)
-        unsigned next_io_context_   = 0;
+        /// index to control next io_context to use (in the round-robin): taken by any
+        /// thread accepting connections, so atomic (relaxed: it only spreads the load)
+        std::atomic<unsigned> next_io_context_{0};
 
 		/// worker threads used for general asio pool
 		std::vector<std::unique_ptr<worker_thread>> worker_threads_;

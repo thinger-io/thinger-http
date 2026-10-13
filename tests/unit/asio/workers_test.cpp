@@ -2,6 +2,8 @@
 #include <thinger/asio/workers.hpp>
 #include <thread>
 #include <chrono>
+#include <map>
+#include <vector>
 
 TEST_CASE("Workers initialization", "[asio][workers]") {
     SECTION("Workers can be started and stopped") {
@@ -43,4 +45,31 @@ TEST_CASE("Workers initialization", "[asio][workers]") {
         
         test_workers.stop();
     }
+}
+
+TEST_CASE("Workers hand out io_contexts round-robin from several threads", "[asio][workers]") {
+    // Connections accepted on several threads at once (several listeners) take the next
+    // io_context concurrently: every context still gets its share, without a data race
+    thinger::asio::workers test_workers;
+    REQUIRE(test_workers.start(4));
+
+    constexpr int threads = 8;
+    constexpr int calls = 10000;
+    std::vector<std::map<boost::asio::io_context*, int>> taken(threads);
+    std::vector<std::thread> callers;
+    for (int t = 0; t < threads; ++t) {
+        callers.emplace_back([&, t] {
+            for (int i = 0; i < calls; ++i) ++taken[t][&test_workers.get_next_io_context()];
+        });
+    }
+    for (auto& caller : callers) caller.join();
+
+    std::map<boost::asio::io_context*, int> total;
+    for (const auto& counts : taken) {
+        for (const auto& [context, count] : counts) total[context] += count;
+    }
+    REQUIRE(total.size() == 4);
+    for (const auto& [context, count] : total) REQUIRE(count == threads * calls / 4);
+
+    test_workers.stop();
 }

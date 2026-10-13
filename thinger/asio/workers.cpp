@@ -126,7 +126,7 @@ namespace thinger::asio{
         worker_threads_.clear();
         job_threads_.clear();
         workers_threads_map_.clear();
-        next_io_context_ = 0;
+        next_io_context_.store(0, std::memory_order_relaxed);
 
         // Cancel signals and stop wait_context
         LOG_INFO("stopping wait context");
@@ -173,7 +173,8 @@ namespace thinger::asio{
 
 	boost::asio::io_context& workers::get_next_io_context()
 	{
-        return worker_threads_[next_io_context_++%worker_threads_.size()]->get_io_context();
+        auto next = next_io_context_.fetch_add(1, std::memory_order_relaxed);
+        return worker_threads_[next % worker_threads_.size()]->get_io_context();
 	}
 
 	boost::asio::io_context& workers::get_thread_io_context()
