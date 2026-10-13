@@ -60,7 +60,8 @@ public:
 
     // Virtual hosts: the routes registered on the application itself answer any host,
     // unless the Host header (case-insensitive, port ignored) matches a host registered
-    // here: exact names first, then patterns in registration order. Register before serving.
+    // here: exact names first, then patterns in registration order. Register before serving
+    // (listen()): hosts are matched without locks.
     // name: exact ("api.example.com"), "*" (this default host), or a pattern where "*" is
     // one label and ":name" a label available as a request parameter (see virtual_host)
     virtual_host& host(const std::string& name);
@@ -151,14 +152,15 @@ public:
     // server generates (400 invalid body or schema validation, 404, 405, 413, 415, 500...).
     // By default the message is sent as text/plain, and errors with details (schema
     // validation) as JSON {"error": {"message": ..., "context": [...]}}. Set it before
-    // serving; it may be called concurrently from the worker threads.
+    // serving (listen()): it is read without locks, and may be called concurrently from the
+    // worker threads.
     void set_error_formatter(error_formatter formatter);
 
     // Proxies (IPs or CIDR ranges: "10.0.0.1", "10.0.0.0/8", "fd00::/8") whose forwarding
     // header gives the client address reported by request::get_request_ip(). The header
     // is ignored for any other peer, so only list proxies that overwrite or append to it.
-    // None by default; set before serving. Returns false if an entry is invalid (then no
-    // proxy is trusted).
+    // None by default; set before serving (listen()): they are read without locks. Returns
+    // false if an entry is invalid (then no proxy is trusted).
     bool set_trusted_proxies(const std::vector<std::string>& proxies,
                              forwarded_header header = forwarded_header::x_forwarded_for);
 

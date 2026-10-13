@@ -723,7 +723,7 @@ server.set_error_formatter([](const http::http_error& error, http::http_response
 res.error(http::http_response::status::forbidden, "Not allowed");   // {"error":{"message":"Not allowed"}}
 ```
 
-The formatter sets the body (and any header) of the response, whose status is already set. If it throws, the default format is used.
+The formatter sets the body (and any header) of the response, whose status is already set. If it throws, the default format is used. Set it before `listen()`: it is called from every worker thread, and replacing it while serving is a data race.
 
 ### Client IP Behind Proxies
 
@@ -737,7 +737,7 @@ server.set_trusted_proxies({"10.0.0.0/8", "127.0.0.1", "fd00::/8"});
 server.set_trusted_proxies({"10.0.0.1"}, http::forwarded_header::forwarded);
 ```
 
-No proxy is trusted by default, and the header of any other peer is ignored, so a client cannot change its address by sending it: code that trusts a local address (e.g. `127.0.0.1` to skip checks) stays safe. List only proxies that append to (or overwrite) the header, and only the header they set: the other one reaches the server as the client sent it.
+Set them before `listen()` (they are read by every request, without locks). No proxy is trusted by default, and the header of any other peer is ignored, so a client cannot change its address by sending it: code that trusts a local address (e.g. `127.0.0.1` to skip checks) stays safe. List only proxies that append to (or overwrite) the header, and only the header they set: the other one reaches the server as the client sent it.
 
 ### Reverse Proxy
 
@@ -831,6 +831,8 @@ server.stop();
 ```
 
 `stop()` stops listening right away and leaves the connections open as they are (on `http::server`, its io_context stops too). For a graceful stop, see below.
+
+Configure the server before `listen()`/`start()`: routes, [virtual hosts](#virtual-hosts), middlewares, the [error formatter](#error-format), [trusted proxies](#client-ip-behind-proxies), body size, decoders, types and limits, and CORS. Every request reads them, from any worker thread, without locks (they cost nothing per request), so changing them while the server is serving is a data race.
 
 ### Shutdown
 
