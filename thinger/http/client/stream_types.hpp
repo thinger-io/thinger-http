@@ -25,7 +25,10 @@ struct stream_info {
 struct stream_result {
     int status_code = 0;
     std::string error;                              // Empty if no connection error
-    std::map<std::string, std::string> headers;     // Response headers
+    // Response headers, as Node gives them: names in lowercase, and the values of a header
+    // repeated joined with ", ". Set once the head arrives (also when the stream callback
+    // stops the download), and for a proxy refusing the tunnel.
+    std::map<std::string, std::string> headers;
     size_t bytes_transferred = 0;
 
     /**

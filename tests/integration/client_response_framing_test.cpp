@@ -385,3 +385,36 @@ TEST_CASE("HTTP client streaming reports malformed responses", "[http][client][f
         REQUIRE(streamed == "hello");
     }
 }
+
+TEST_CASE("HTTP client streaming reports the response headers", "[http][client][streaming][integration]") {
+    raw_server server;
+    server.respond = [](const std::string& request_line) -> raw_server::reply {
+        if (path_of(request_line) == "/empty") return {{"HTTP/1.1 204 No Content\r\nX-Id: 7\r\n\r\n"}};
+        return {{"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Tag: a\r\nx-tag: b\r\nContent-Length: 11\r\n\r\n",
+                 "hello world"}};
+    };
+
+    http::client client;
+    client.timeout(5s);
+    auto request = [&](const std::string& path) {
+        return http::http_request::create_http_request(http::method::GET, server.url(path));
+    };
+
+    SECTION("Names in lowercase, repeated ones joined") {
+        auto result = client.send_streaming(request("/body"), [](const http::stream_info&) { return true; });
+        REQUIRE(result.ok());
+        REQUIRE(result.headers.at("content-type") == "text/plain");
+        REQUIRE(result.headers.at("x-tag") == "a, b");
+        REQUIRE(result.headers.at("content-length") == "11");
+    }
+    SECTION("Without body") {
+        auto result = client.send_streaming(request("/empty"), [](const http::stream_info&) { return true; });
+        REQUIRE(result.status_code == 204);
+        REQUIRE(result.headers.at("x-id") == "7");
+    }
+    SECTION("When the callback stops the download") {
+        auto result = client.send_streaming(request("/body"), [](const http::stream_info&) { return false; });
+        REQUIRE_FALSE(result.ok());
+        REQUIRE(result.headers.at("content-type") == "text/plain");
+    }
+}

@@ -11,6 +11,18 @@ namespace thinger::http {
 
 namespace {
 
+// Headers of a streamed response, as Node gives them: names in lowercase, and the values of
+// a header repeated joined with ", "
+void set_headers(stream_result& result, const http_response& response) {
+    result.headers.clear();
+    for (const auto& [name, value] : response.get_headers()) {
+        std::string key = name;
+        ::thinger::util::ascii::to_lower(key);
+        auto [header, inserted] = result.headers.emplace(std::move(key), value);
+        if (!inserted) header->second += ", " + value;
+    }
+}
+
 // Decode a gzip or deflate Content-Encoding, up to `max_size` bytes once decoded: inflating
 // stops as soon as the body goes past them, so a small body expanding to gigabytes (a
 // decompression bomb) takes no more memory than the limit. Other codings, and empty bodies
@@ -428,6 +440,8 @@ awaitable<stream_result> client_connection::send_request_streaming(
             const std::string_view& data, size_t downloaded, size_t total) -> bool {
             if (result.status_code == 0) {
                 result.status_code = response_parser_.get_status_code();
+                // (the head is parsed: the callback may stop the download before its end)
+                if (auto head = response_parser_.get_response()) set_headers(result, *head);
             }
             result.bytes_transferred = downloaded;
 
@@ -439,11 +453,15 @@ awaitable<stream_result> client_connection::send_request_streaming(
     if (!response) {
         result.error = error_.message();
         // (the status of a proxy refusing the tunnel, with its error)
-        if (proxy_response_) result.status_code = proxy_response_->get_status_code();
+        if (proxy_response_) {
+            result.status_code = proxy_response_->get_status_code();
+            set_headers(result, *proxy_response_);
+        }
         co_return result;
     }
 
     result.status_code = response->get_status_code();
+    set_headers(result, *response);
     if (result.bytes_transferred == 0) {
         result.bytes_transferred = response->get_content_size();
     }
