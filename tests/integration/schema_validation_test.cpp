@@ -4,7 +4,10 @@
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/client/client.hpp>
 #include <nlohmann/json.hpp>
+#include <atomic>
 #include <thread>
+
+#include "server_test_helpers.hpp"
 
 using namespace thinger;
 
@@ -284,5 +287,62 @@ TEST_CASE("Schema validation - PATCH with schema", "[server][schema]") {
         auto res = client.patch(fixture.base_url + "/api/users/123",
             R"({"name":789})", "application/json");
         REQUIRE(res.status_code() == 400);
+    }
+}
+
+TEST_CASE("Schema validation - callbacks not taking the JSON body", "[server][schema]") {
+    // .schema() validates the body whatever the signature of the callback: those reading it
+    // from the request get it read and validated first, with the same answers
+    const nlohmann::json schema = {
+        {"type", "object"},
+        {"required", {"name"}},
+        {"properties", {{"name", {{"type", "string"}}}}}
+    };
+    std::atomic<int> calls{0};
+    http::server server;
+    server.post("/sync", [&calls](http::request& req, http::response& res) {
+        ++calls;
+        res.json({{"name", nlohmann::json::parse(req.body())["name"]}});
+    }).schema(schema);
+    server.post("/sync-response", [&calls](http::response& res) {
+        ++calls;
+        res.json({{"called", true}});
+    }).schema(schema);
+    server.post("/coroutine", [&calls](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        ++calls;
+        // already read: read_body() has nothing left to read
+        co_await req.read_body();
+        res.json({{"name", nlohmann::json::parse(req.body())["name"]}});
+    }).schema(schema);
+    server.post("/coroutine-response", [&calls](http::response& res) -> thinger::awaitable<void> {
+        ++calls;
+        res.json({{"called", true}});
+        co_return;
+    }).schema(schema);
+    server.post("/json", [](nlohmann::json& body, http::response& res) { res.json(body); }).schema(schema);
+    server_test::running_server running(server);
+    auto base = "http://127.0.0.1:" + std::to_string(running.port);
+    http::client client;
+
+    // The answer of the route taking the JSON body, for the same body
+    auto invalid = client.post(base + "/json", R"({"name":42})", "application/json");
+    REQUIRE(invalid.status() == 400);
+
+    for (std::string path : {"/sync", "/sync-response", "/coroutine", "/coroutine-response"}) {
+        DYNAMIC_SECTION(path) {
+            auto valid = client.post(base + path, R"({"name":"Alice"})", "application/json");
+            REQUIRE(valid.status() == 200);
+            if (path == "/sync" || path == "/coroutine") REQUIRE(valid.json()["name"] == "Alice");
+            REQUIRE(calls == 1);
+
+            auto wrong_type = client.post(base + path, R"({"name":42})", "application/json");
+            REQUIRE(wrong_type.status() == 400);
+            REQUIRE(wrong_type.body() == invalid.body());
+
+            REQUIRE(client.post(base + path, R"({})", "application/json").status() == 400);
+            REQUIRE(client.post(base + path, R"({"name":)", "application/json").status() == 400);
+            REQUIRE(client.post(base + path, "name=Alice", "text/plain").status() == 415);
+            REQUIRE(calls == 1);
+        }
     }
 }

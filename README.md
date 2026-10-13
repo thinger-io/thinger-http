@@ -427,6 +427,8 @@ server.post("/api/status", [](nlohmann::json& json, auto& res) {
 
 Invalid bodies get `400` with the body `{"error": {"message": "...", "context": [...]}}`, where `context` is the location of the invalid value; the format can be changed with an [error formatter](#error-format).
 
+A schema always validates the body, whatever the signature of the handler: one taking only `(request&, response&)` or `(response&)`, coroutine or not, gets the body read, decoded and validated before it runs (in `req.body()`, as with `.deferred_body(false)`), with the same answers (`400`, `415` for a type that cannot be decoded).
+
 A schema that cannot be parsed (e.g. a `$ref` to a schema component not registered before the route) is logged as an error when it is set, and the route then answers every request with `500` instead of accepting bodies without validation.
 
 Valijson is enabled by default. Disable with `-DTHINGER_HTTP_ENABLE_VALIJSON=OFF`.

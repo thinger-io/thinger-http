@@ -174,7 +174,7 @@ bool route::match_body_type(request& req, response& res) const {
     }
 
     auto& match = req.body_type_.emplace(http::match_body_type(settings.decoders, accepted, value));
-    if (match.accepted && !match.format && takes_json_body_) {
+    if (match.accepted && !match.format && decodes_body_) {
         // Listed by accepts(), but no decoder can give it to the callback
         LOG_WARNING("Route {} accepts {}, but there is no body decoder for it", pattern_, match.type.type);
         match.accepted = false;
@@ -191,8 +191,9 @@ bool route::match_body_type(request& req, response& res) const {
 }
 
 bool route::accepts_body(request& req, response& res) const {
-    // Routes reading the body themselves accept any type unless they list theirs
-    if (!takes_json_body_ && accepted_types_.empty()) return true;
+    // Routes reading the body themselves accept any type unless they list theirs (or
+    // validate it against a schema: then it must be decoded)
+    if (!decodes_body_ && accepted_types_.empty()) return true;
     if (!req.has_pending_body() && req.get_http_request()->get_body().empty()) return true;
     return match_body_type(req, res);
 }
@@ -225,7 +226,7 @@ bool route::decode_body(request& req, response& res, nlohmann::json& json) const
 }
 
 thinger::awaitable<void> route::handle_request_coro(request& req, response& res) const {
-    if (takes_json_body_) {
+    if (decodes_body_) {
         req.json_body_ = nullptr;
         if (!decode_body(req, res, req.json_body_)) co_return;
     }
@@ -246,6 +247,8 @@ route& route::schema(const nlohmann::json& json_schema) {
     }
     schema_ = std::make_shared<valijson::Schema>();
     schema_error_.clear();
+    has_schema_ = true;
+    decodes_body_ = true;
     valijson::SchemaParser parser;
     valijson::adapters::NlohmannJsonAdapter adapter(root);
     try {

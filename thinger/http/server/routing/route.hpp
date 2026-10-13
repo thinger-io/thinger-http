@@ -199,6 +199,7 @@ public:
     template<route_callable F>
     route& operator=(F&& callback) {
         takes_json_body_ = !request_handler_callable<F>;
+        decodes_body_ = takes_json_body_ || has_schema_;
         auto adapted = [callback = std::forward<F>(callback)](request& req, response& res) mutable -> decltype(auto) {
             return invoke_callback(callback, req, res);
         };
@@ -217,12 +218,16 @@ public:
     }
 
     // Deferred body mode - handler reads body at its discretion. Ignored by handlers
-    // that take the JSON body, which always need it read first.
+    // that take the JSON body, and by routes with a schema, which always need it read first.
     route& deferred_body(bool enabled = true);
-    bool is_deferred_body() const { return deferred_body_ && !takes_json_body(); }
+    bool is_deferred_body() const { return deferred_body_ && !decodes_body_; }
 
-    // Set JSON Schema for request body validation. If it cannot be parsed (e.g. a $ref to
-    // a schema component not registered yet), requests to the route are answered with 500.
+    // Set JSON Schema for request body validation. The body is read, decoded and validated
+    // before the callback runs, whatever its signature: a callback taking only (request&,
+    // response&) or (response&) finds it in req.body(), already validated; one not valid is
+    // answered as for callbacks taking the JSON body (400, or 415 for a type that cannot be
+    // decoded). If it cannot be parsed (e.g. a $ref to a schema component not registered
+    // yet), requests to the route are answered with 500.
     route& schema(const nlohmann::json& json_schema);
 
     // Body types the route accepts: names of body decoders ("json", "msgpack", "cbor",
@@ -363,6 +368,9 @@ private:
     const nlohmann::json* schema_components_ = nullptr;
     bool deferred_body_ = false;
     bool takes_json_body_ = false;
+    bool has_schema_ = false;
+    // The body is decoded (and validated) before the callback: it takes it, or there is a schema
+    bool decodes_body_ = false;
     // The callback, either synchronous or coroutine (the other one is empty)
     route_callback_request_response sync_callback_;
     route_callback_awaitable callback_;
