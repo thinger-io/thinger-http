@@ -2,6 +2,8 @@
 #define THINGER_ASIO_WORKERS
 
 #include <atomic>
+#include <chrono>
+#include <optional>
 #include <unordered_map>
 #include <set>
 #include <boost/asio.hpp>
@@ -21,8 +23,14 @@ namespace thinger::asio {
         /// stop the asio workers and all their pending async operations
         bool stop();
 
-        /// keep the asio workers alive until a signal is received
+        /// keep the asio workers alive until a signal is received; then stop them (and their
+        /// clients, as the pool servers) at once
         void wait(const std::set<unsigned>& signals = {SIGINT, SIGTERM, SIGQUIT});
+
+        /// the same, stopping gracefully on the first signal: the clients finish what they
+        /// serve within `grace` (a pool_server shuts down, see http_server_base::shutdown()),
+        /// then the workers stop. A second signal meanwhile stops them at once.
+        void wait_graceful(std::chrono::milliseconds grace, const std::set<unsigned>& signals = {SIGINT, SIGTERM, SIGQUIT});
         
         /// check if workers are running
         bool running() const { return running_; }
@@ -58,6 +66,16 @@ namespace thinger::asio {
 	private:
         /// Internal method to perform the actual stop
         void do_stop();
+
+        /// wait for the signals, then stop at once (no grace) or gracefully
+        void wait_for_signals(const std::set<unsigned>& signals, std::optional<std::chrono::milliseconds> grace);
+
+        /// ask every client to stop gracefully, and stop once all of them did
+        void begin_graceful_stop(std::chrono::milliseconds grace);
+
+        /// the graceful stop in progress, if any (on the wait context)
+        struct graceful_stop_state;
+        std::shared_ptr<graceful_stop_state> graceful_stop_;
         
         /// mutex used for initializing threads and data structures
         std::mutex mutex_;

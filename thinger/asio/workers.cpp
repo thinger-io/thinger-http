@@ -31,7 +31,20 @@ namespace thinger::asio{
         }
     }
 
+    // A graceful stop: the clients that did not finish yet (plus one while they are asked)
+    struct workers::graceful_stop_state {
+        size_t pending = 1;
+    };
+
     void workers::wait(const std::set<unsigned>& signals) {
+        wait_for_signals(signals, std::nullopt);
+    }
+
+    void workers::wait_graceful(std::chrono::milliseconds grace, const std::set<unsigned>& signals) {
+        wait_for_signals(signals, grace);
+    }
+
+    void workers::wait_for_signals(const std::set<unsigned>& signals, std::optional<std::chrono::milliseconds> grace) {
         LOG_DEBUG("registering stop signals...");
         
         // Keep the wait_context_ running
@@ -42,18 +55,71 @@ namespace thinger::asio{
         }
 
         // wait for any signal to be received
-        signals_.async_wait([this](const boost::system::error_code& ec, int signal_number){
-            if(!ec){
-                LOG_INFO("received signal: {}", signal_number);
+        signals_.async_wait([this, grace](const boost::system::error_code& ec, int signal_number){
+            if(ec) return;
+            LOG_INFO("received signal: {}", signal_number);
+            if(!grace){
                 stop();
+                return;
             }
+            // A second signal does not wait for the graceful stop
+            signals_.async_wait([this](const boost::system::error_code& ec, int signal_number){
+                if(ec) return;
+                LOG_WARNING("received signal {} during the graceful stop: stopping now", signal_number);
+                stop();
+            });
+            begin_graceful_stop(*grace);
         });
 
-        // Run until stop() is called
+        // Run until stop() is called (if the workers were stopped before, they started again)
+        if (running_) wait_context_.restart();
         wait_context_.run();
-        
+
         // Clean up
         wait_work_.reset();
+    }
+
+    void workers::begin_graceful_stop(std::chrono::milliseconds grace) {
+        LOG_INFO("stopping gracefully, within {} ms (a second signal stops at once)", grace.count());
+        auto state = std::make_shared<graceful_stop_state>();
+        graceful_stop_ = state;
+
+        // Each client tells when it finished, from any thread: counted on the wait context,
+        // which stops the workers after the last one (unless they were stopped meanwhile)
+        auto done = [this, weak = std::weak_ptr<graceful_stop_state>(state)]() {
+            boost::asio::post(wait_context_, [this, weak]() {
+                auto state = weak.lock();
+                if (!state || state != graceful_stop_ || --state->pending > 0) return;
+                LOG_INFO("every worker client stopped gracefully");
+                stop();
+            });
+        };
+
+        // Clients are asked one at a time, outside the lock: one may unregister others (e.g.
+        // destroy an async_client from the shutdown callback of a server)
+        std::set<worker_client*> asked;
+        while (true) {
+            worker_client* client = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(clients_mutex_);
+                for (auto* candidate : clients_) {
+                    if (!asked.contains(candidate)) {
+                        client = candidate;
+                        break;
+                    }
+                }
+            }
+            if (!client) break;
+            asked.insert(client);
+            ++state->pending;
+            try {
+                client->graceful_stop(grace, done);
+            } catch (const std::exception& e) {
+                LOG_ERROR("Error stopping client {} gracefully: {}", client->get_service_name(), e.what());
+                done();
+            }
+        }
+        done();
     }
 
 
@@ -128,9 +194,11 @@ namespace thinger::asio{
         workers_threads_map_.clear();
         next_io_context_.store(0, std::memory_order_relaxed);
 
-        // Cancel signals and stop wait_context
+        // Cancel signals (and leave them to their default action) and stop wait_context
         LOG_INFO("stopping wait context");
+        graceful_stop_.reset();
         signals_.cancel();
+        signals_.clear();
         wait_work_.reset();
         wait_context_.stop();
         

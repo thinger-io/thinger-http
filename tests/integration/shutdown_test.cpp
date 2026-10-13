@@ -8,8 +8,11 @@
 #include "../fixtures/stream_test_helpers.hpp"
 
 #include <atomic>
+#include <csignal>
 #include <filesystem>
 #include <future>
+#include <optional>
+#include <signal.h>
 #include <unistd.h>
 
 // Graceful shutdown: the server stops listening at once, closes the idle connections, lets the
@@ -443,6 +446,98 @@ TEST_CASE("Shutdown of a pool server", "[server][shutdown][pool][integration]") 
     auto stats = server.stats();
     REQUIRE(stats.active_connections() == 0);
     REQUIRE(stats.total_connections == 9);
+}
+
+namespace {
+
+    // Wait for `signal` on the workers, on another thread (gracefully if `grace`), returning
+    // once they handle it: their handler replaced the one before
+    std::future<void> workers_waiting_for(int signal, std::optional<std::chrono::milliseconds> grace) {
+        struct sigaction before {};
+        ::sigaction(signal, nullptr, &before);
+        auto waiting = std::async(std::launch::async, [signal, grace] {
+            auto& workers = asio::get_workers();
+            if (grace) {
+                workers.wait_graceful(*grace, {unsigned(signal)});
+            } else {
+                workers.wait({unsigned(signal)});
+            }
+        });
+        REQUIRE(eventually([&] {
+            struct sigaction now {};
+            ::sigaction(signal, nullptr, &now);
+            return now.sa_handler != before.sa_handler;
+        }));
+        return waiting;
+    }
+
+    bool ready(std::future<void>& future, std::chrono::milliseconds timeout) {
+        return future.wait_for(timeout) == std::future_status::ready;
+    }
+
+}
+
+TEST_CASE("Workers shut pool servers down gracefully on a signal", "[server][shutdown][pool][signal][integration]") {
+    http::pool_server server;
+    std::promise<void> started;
+    slow_route(server, "/slow", 300ms, &started);
+    REQUIRE(server.listen("127.0.0.1", 0));
+    auto port = server.local_port();
+    auto waiting = workers_waiting_for(SIGUSR2, 5s);
+
+    raw_client busy(port);
+    busy.get("/slow");
+    REQUIRE(started.get_future().wait_for(3s) == std::future_status::ready);
+    auto signalled = clock::now();
+    ::kill(::getpid(), SIGUSR2);
+
+    // the request in flight finishes, and tells the client the connection closes
+    auto response = busy.rest();
+    REQUIRE(response.closed);
+    REQUIRE(response.data.find("Connection: Close") != std::string::npos);
+    REQUIRE(response.data.ends_with("done"));
+    REQUIRE_FALSE(can_connect(port));
+
+    // then the workers stop, well before the grace period ends
+    REQUIRE(ready(waiting, 3s));
+    REQUIRE(clock::now() - signalled < 4s);
+    REQUIRE_FALSE(asio::get_workers().running());
+}
+
+TEST_CASE("Workers stop at once on a second signal, or without a grace period",
+          "[server][shutdown][pool][signal][integration]") {
+    http::pool_server server;
+    std::promise<void> started;
+    slow_route(server, "/stuck", 60s, &started);
+    REQUIRE(server.listen("127.0.0.1", 0));
+    auto port = server.local_port();
+
+    SECTION("A second signal during the grace period") {
+        auto waiting = workers_waiting_for(SIGUSR2, 60s);
+        raw_client busy(port);
+        busy.get("/stuck");
+        REQUIRE(started.get_future().wait_for(3s) == std::future_status::ready);
+
+        ::kill(::getpid(), SIGUSR2);
+        REQUIRE(eventually([&] { return !can_connect(port); }));
+        // waiting for the request in flight
+        REQUIRE_FALSE(ready(waiting, 300ms));
+
+        ::kill(::getpid(), SIGUSR2);
+        REQUIRE(ready(waiting, 3s));
+        REQUIRE_FALSE(asio::get_workers().running());
+    }
+
+    SECTION("Without a grace period") {
+        auto waiting = workers_waiting_for(SIGUSR2, std::nullopt);
+        raw_client busy(port);
+        busy.get("/stuck");
+        REQUIRE(started.get_future().wait_for(3s) == std::future_status::ready);
+
+        ::kill(::getpid(), SIGUSR2);
+        REQUIRE(ready(waiting, 3s));
+        REQUIRE_FALSE(asio::get_workers().running());
+    }
 }
 
 TEST_CASE("Shutdown of a server on a Unix socket", "[server][shutdown][unix][integration]") {

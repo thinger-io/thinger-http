@@ -1,6 +1,8 @@
 #ifndef THINGER_ASIO_WORKER_CLIENT_HPP
 #define THINGER_ASIO_WORKER_CLIENT_HPP
 
+#include <chrono>
+#include <functional>
 #include <string>
 #include <mutex>
 #include <condition_variable>
@@ -47,6 +49,17 @@ public:
         return true;
     }
     
+    /**
+     * Graceful stop of the workers (see workers::wait_graceful()): finish what the client serves
+     * within `grace`, then call `done` (once, from any thread). The workers stop the client
+     * afterwards, with stop(). By default there is nothing to finish: `done` is called at
+     * once, and the client keeps working until the workers stop (e.g. an async_client used
+     * by the requests a server finishes meanwhile).
+     */
+    virtual void graceful_stop(std::chrono::milliseconds grace, std::function<void()> done) {
+        done();
+    }
+
     /**
      * Check if the client service is running
      * @return true if running

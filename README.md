@@ -864,6 +864,15 @@ res.upgrade_websocket([](std::shared_ptr<thinger::http::websocket_connection> ws
 });
 ```
 
+A `pool_server` can leave the signals to the workers: `wait_graceful(grace)` waits for `SIGINT`, `SIGTERM` or `SIGQUIT` (or the signals given), and on the first one shuts every `pool_server` down gracefully, as `begin_shutdown(grace)` (the other worker clients, as `async_client`, keep working meanwhile, for the requests that are finishing), then stops the workers and returns. A second signal during the grace period stops them at once, as the first one does with `wait()`.
+
+```cpp
+thinger::http::pool_server server;
+// ... routes ...
+server.listen("0.0.0.0", 8080);
+thinger::asio::get_workers().wait_graceful(std::chrono::seconds(30));  // on SIGINT, SIGTERM or SIGQUIT
+```
+
 Compared with Node.js: `server.close()` also stops listening, closes idle connections (since Node 19) and waits for the others, but has no grace period (that is `closeAllConnections()`, called by the application) and does not tell upgraded connections, which keep it waiting until they close. Here `shutdown(grace)` does `close()`, `closeIdleConnections()` and, once the grace period ends, `closeAllConnections()`, and new connections accepted meanwhile (e.g. in the middle of a TLS handshake) are closed at once.
 
 ### Statistics

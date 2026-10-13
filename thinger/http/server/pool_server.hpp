@@ -37,6 +37,10 @@ public:
     bool start() override { return true; } // Already started in listen()
     bool stop() override;
     void wait() override;
+
+    // Graceful stop of the workers on a signal (see workers::wait_graceful()): a shutdown of
+    // the server (see shutdown())
+    void graceful_stop(std::chrono::milliseconds grace, std::function<void()> done) override;
 };
 
 } // namespace thinger::http

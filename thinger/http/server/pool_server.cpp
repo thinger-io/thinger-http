@@ -69,6 +69,14 @@ bool pool_server::stop() {
     return result;
 }
 
+void pool_server::graceful_stop(std::chrono::milliseconds grace, std::function<void()> done) {
+    if (!is_running()) {
+        done();
+        return;
+    }
+    begin_shutdown(grace, [done = std::move(done)](bool) { done(); });
+}
+
 void pool_server::wait() {
     // Use worker_client's wait implementation
     worker_client::wait();
