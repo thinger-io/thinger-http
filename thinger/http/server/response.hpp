@@ -107,7 +107,10 @@ public:
     // Add a header to the response sent, whatever answer sends it (not thread-safe)
     void header(const std::string& key, const std::string& value);
 
-    // Send raw http_response object (for advanced use cases)
+    // Send raw http_response object (for advanced use cases). Its content is sent whole,
+    // framed by a Content-Length of its size (any Content-Length or Transfer-Encoding it
+    // carries is replaced, e.g. when copied from another response); 1xx, 204 and 304 are
+    // sent without body, and 1xx and 204 without Content-Length
     void send_response(const std::shared_ptr<http_response>& response);
 
     // WebSocket upgrade, with a message interface. With supported_protocols, the client must
@@ -148,7 +151,10 @@ public:
     // any bytes already read past this request. The handler fully owns the socket. If the
     // connection was closed before (e.g. the client closed or half-closed it while the
     // response was pending), the handler is not called, only released. A coroutine
-    // handler runs on the io_context of the socket.
+    // handler runs on the io_context of the socket. Unless it switches protocols (101, or
+    // 2xx to CONNECT) or has its own framing (Content-Length or Transfer-Encoding set with
+    // header()), the response says "Connection: close": what the handler writes is read as
+    // its body, until the connection closes.
     void take_over(takeover_handler handler);
     void take_over(takeover_coroutine handler);
 
@@ -230,9 +236,14 @@ private:
     void compress_if_needed(http_response& response) const;
     // Whether the request is HEAD: its response has no body
     bool head_request() const;
-    // Body of a message about to be sent: dropped for HEAD (keeping its Content-Length),
-    // else compressed if `compress` and the client accepts it (see compress_if_needed)
+    // Body of a message about to be sent: framed (see frame_message), dropped for HEAD
+    // (keeping its Content-Length), else compressed if `compress` and the client accepts it
+    // (see compress_if_needed)
     void prepare_body(http_response& message, bool compress) const;
+    // Framing of a message sent whole: its content is its body, with its Content-Length
+    [[gnu::noinline, gnu::cold]] void frame_message(http_response& message) const;
+    // Framing of the response of a connection taken over (see take_over)
+    void frame_takeover(http_response& message) const;
     // Mark the response as sent; false (and nothing must be sent) if it already was
     bool mark_responded();
     // Send a message (see prepare_body), unless another answer was sent first

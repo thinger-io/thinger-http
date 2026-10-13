@@ -186,7 +186,58 @@ bool response::head_request() const {
     return state_->request->get_method() == method::HEAD;
 }
 
+namespace {
+
+    // Whether a message sent whole is framed as response::frame_message() leaves it: with a
+    // Content-Length (set with its content) and no Transfer-Encoding, and a status with body
+    bool framed(const http_response& message) {
+        int code = message.get_status_code();
+        return message.has_content_length_header() && !message.has_transfer_encoding_header() &&
+               code >= 200 && code != 204 && code != 304;
+    }
+
+}
+
+void response::frame_message(http_response& message) const {
+    // As Node does, a message sent whole tells where its body ends, else the client would
+    // read it until the connection closes (RFC 9112, 6.3): its Content-Length, never
+    // Transfer-Encoding (its body is not chunked). 1xx, 204 and 304 never have a body, nor
+    // its length for 1xx and 204 (RFC 9110, 8.6); a 304 may tell the length of the
+    // representation. A response to HEAD gets the length of the content it was given, if
+    // any: it has no body anyway.
+    int code = message.get_status_code();
+    if (code < 200 || code == 204 || code == 304) {
+        message.get_content().clear();
+        if (message.has_transfer_encoding_header()) message.remove_headers(header::transfer_encoding);
+        if (code != 304 && message.has_content_length_header()) message.remove_headers(header::content_length);
+        return;
+    }
+    if (message.has_transfer_encoding_header()) message.remove_headers(header::transfer_encoding);
+    if (!message.has_content_length_header() && (!head_request() || !message.get_content().empty())) {
+        message.set_content_length(message.get_content().size());
+    }
+}
+
+void response::frame_takeover(http_response& message) const {
+    // What follows the response belongs to the handler. Switching protocols (101, or 2xx to
+    // CONNECT: a tunnel), nothing tells a body (RFC 9110, 9.3.6). Otherwise, unless the
+    // handler framed it, what the handler writes is the body, ending when the connection
+    // closes: the response says so, as Node does for a body of unknown length not chunked
+    int code = message.get_status_code();
+    bool tunnel = code == 101 || (state_->request->get_method() == method::CONNECT && code >= 200 && code < 300);
+    if (tunnel) {
+        message.remove_headers(header::content_length);
+        message.remove_headers(header::transfer_encoding);
+    } else if (!message.has_content_length_header() && !message.has_transfer_encoding_header()) {
+        message.set_keep_alive(false);
+    }
+}
+
 void response::prepare_body(http_response& message, bool compress) const {
+    // (the usual answer is framed already: its Content-Length was set with its content)
+    if (!framed(message)) [[unlikely]] {
+        frame_message(message);
+    }
     if (head_request()) {
         // The headers of the answer to GET, Content-Length included, without its body: the
         // client reads none (RFC 9110, 9.3.2), so it would be taken as the next response.
@@ -270,6 +321,13 @@ void response::send_response(const std::shared_ptr<http_response>& response) {
     if (!ensure_not_responded()) return;
     response->set_keep_alive(state_->request->keep_alive());
     if (state_->cors_enabled) add_cors_headers(*response);
+    // A message built by hand may carry the framing of another one (e.g. copied from a
+    // response whose body was decoded): its content is its body, sent whole (a response
+    // to HEAD keeps the length it tells)
+    int code = response->get_status_code();
+    if (!head_request() && code != 304 && response->has_content_length_header()) {
+        response->remove_headers(header::content_length);
+    }
     send_message(response);
 }
 
@@ -614,7 +672,7 @@ void response::take_over(takeover_coroutine handler) {
 }
 
 void response::take_over(std::shared_ptr<http_response> message, takeover_handler handler) {
-    prepare_body(*message, true);
+    frame_takeover(*message);
     if (!mark_responded()) return;
     state_->sink->take_over(std::move(message), std::move(handler));
 }
@@ -643,7 +701,6 @@ void response::accept_sse(std::function<void(std::shared_ptr<sse_connection>, as
     response->set_status(http_response::status::ok);
     response->set_content_type("text/event-stream");
     response->add_header("Cache-Control", "no-cache");
-    response->add_header("Connection", "keep-alive");
     response->add_header("X-Accel-Buffering", "no"); // Disable nginx buffering
 
     // HEAD: the headers of the event stream alone, as a whole response (no events, nor

@@ -283,7 +283,7 @@ Reads never go past the end of the body, nor past the maximum body size of the r
 
 ### Taking Over the Connection
 
-`res.take_over()` hands the connection to your code, for custom protocol upgrades or tunnels (WebSockets and SSE are built on it). The response set so far is sent first (200 by default); then the server stops reading from the connection and calls the handler with the socket and any bytes the client had already sent past the request. From then on the handler owns the socket. It can also be called later from a copy of the response: until the response starts, the server handles nothing else the client sends on that connection (it stays readable from the socket, for the handler), but it notices a client that closes or half-closes the connection meanwhile, over TLS too, and closes it. A `take_over()` arriving after that does not call its handler: it is released, and a warning logged.
+`res.take_over()` hands the connection to your code, for custom protocol upgrades or tunnels (WebSockets and SSE are built on it). The response set so far is sent first (200 by default; unless it is a `101`, a `2xx` to `CONNECT`, or carries a `Content-Length` or `Transfer-Encoding` set with `header()`, it says `Connection: close`, as what the handler writes is its body until the connection closes); then the server stops reading from the connection and calls the handler with the socket and any bytes the client had already sent past the request. From then on the handler owns the socket. It can also be called later from a copy of the response: until the response starts, the server handles nothing else the client sends on that connection (it stays readable from the socket, for the handler), but it notices a client that closes or half-closes the connection meanwhile, over TLS too, and closes it. A `take_over()` arriving after that does not call its handler: it is released, and a warning logged.
 
 ```cpp
 server.get("/tunnel", [](http::request& req, http::response& res) {
@@ -338,6 +338,8 @@ res.redirect("/new-location");
 // Error
 res.error(http::http_response::status::not_found, "Not found");
 ```
+
+Every response tells where its body ends with a `Content-Length` (also `send_response()` with a hand-built `http_response`: its content is its body, whatever `Content-Length` or `Transfer-Encoding` it carried), so the connection can carry the next request; `1xx`, `204` and `304` have no body, and `1xx` and `204` no `Content-Length`.
 
 ### Static Files
 

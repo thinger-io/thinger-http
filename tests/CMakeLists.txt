@@ -324,6 +324,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/shutdown_test.cpp)
     add_thinger_test(test_integration_shutdown integration/shutdown_test.cpp)
 endif()
 
+# Integration tests - Framing of the responses sent
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/response_framing_test.cpp)
+    add_thinger_test(test_integration_response_framing integration/response_framing_test.cpp)
+endif()
+
 # Integration tests - Callbacks given as coroutines
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/coroutine_callbacks_test.cpp)
     add_thinger_test(test_integration_coroutine_callbacks integration/coroutine_callbacks_test.cpp)
