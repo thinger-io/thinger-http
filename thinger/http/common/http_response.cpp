@@ -429,32 +429,12 @@ namespace thinger::http{
     }
 
 
-    http_response::status http_response::get_status() const{
-        return status_;
-    }
-
-    int http_response::get_status_code() const{
-        return static_cast<int>(status_);
-    }
-
     bool http_response::is_ok() const{
         return status_>=status::ok && status_<status::multiple_choices;
     }
 
     size_t http_response::get_size(){
         // Return the size of the content/payload
-        return content_.size();
-    }
-
-    const std::string& http_response::get_content() const{
-        return content_;
-    }
-
-    std::string& http_response::get_content(){
-        return content_;
-    }
-
-    size_t http_response::get_content_size() const{
         return content_.size();
     }
 

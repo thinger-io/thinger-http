@@ -70,13 +70,13 @@ public:
     // received from another server); only printable characters are sent
     void set_reason_phrase(const std::string& reason);
 
-    // some getters
-    const std::string& get_content() const;
-    std::string& get_content();
-    size_t get_content_size() const;
+    // some getters (inline: read on every response)
+    const std::string& get_content() const { return content_; }
+    std::string& get_content() { return content_; }
+    size_t get_content_size() const { return content_.size(); }
     size_t get_size() override;
-    status get_status() const;
-    int get_status_code() const;
+    status get_status() const { return status_; }
+    int get_status_code() const { return static_cast<int>(status_); }
     const std::string& get_reason() const { return reason_phrase_; }
     bool is_ok() const;
     bool is_redirect_response() const;
