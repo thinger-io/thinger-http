@@ -115,7 +115,7 @@ public:
     void get(const std::string& url, Callback&& callback, headers_map headers = {}) {
         run([this, url, cb = std::forward<Callback>(callback), h = std::move(headers)]() mutable -> awaitable<void> {
             auto response = co_await http_client_base::get(url, std::move(h));
-            cb(response);
+            co_await call_and_await(cb, response);
         });
     }
 
@@ -125,7 +125,7 @@ public:
         run([this, url, cb = std::forward<Callback>(callback), b = std::move(body),
              ct = std::move(content_type), h = std::move(headers)]() mutable -> awaitable<void> {
             auto response = co_await http_client_base::post(url, std::move(b), std::move(ct), std::move(h));
-            cb(response);
+            co_await call_and_await(cb, response);
         });
     }
 
@@ -134,7 +134,7 @@ public:
         run([this, url, cb = std::forward<Callback>(callback),
              f = form, h = std::move(headers)]() mutable -> awaitable<void> {
             auto response = co_await http_client_base::post(url, f, std::move(h));
-            cb(response);
+            co_await call_and_await(cb, response);
         });
     }
 
@@ -144,7 +144,7 @@ public:
         run([this, url, cb = std::forward<Callback>(callback), b = std::move(body),
              ct = std::move(content_type), h = std::move(headers)]() mutable -> awaitable<void> {
             auto response = co_await http_client_base::put(url, std::move(b), std::move(ct), std::move(h));
-            cb(response);
+            co_await call_and_await(cb, response);
         });
     }
 
@@ -154,7 +154,7 @@ public:
         run([this, url, cb = std::forward<Callback>(callback), b = std::move(body),
              ct = std::move(content_type), h = std::move(headers)]() mutable -> awaitable<void> {
             auto response = co_await http_client_base::patch(url, std::move(b), std::move(ct), std::move(h));
-            cb(response);
+            co_await call_and_await(cb, response);
         });
     }
 
@@ -162,7 +162,7 @@ public:
     void del(const std::string& url, Callback&& callback, headers_map headers = {}) {
         run([this, url, cb = std::forward<Callback>(callback), h = std::move(headers)]() mutable -> awaitable<void> {
             auto response = co_await http_client_base::del(url, std::move(h));
-            cb(response);
+            co_await call_and_await(cb, response);
         });
     }
 
@@ -170,7 +170,7 @@ public:
     void head(const std::string& url, Callback&& callback, headers_map headers = {}) {
         run([this, url, cb = std::forward<Callback>(callback), h = std::move(headers)]() mutable -> awaitable<void> {
             auto response = co_await http_client_base::head(url, std::move(h));
-            cb(response);
+            co_await call_and_await(cb, response);
         });
     }
 
@@ -178,7 +178,7 @@ public:
     void options(const std::string& url, Callback&& callback, headers_map headers = {}) {
         run([this, url, cb = std::forward<Callback>(callback), h = std::move(headers)]() mutable -> awaitable<void> {
             auto response = co_await http_client_base::options(url, std::move(h));
-            cb(response);
+            co_await call_and_await(cb, response);
         });
     }
 
@@ -199,7 +199,7 @@ public:
         run([this, req = std::move(request), scb = std::move(stream_cb),
              rcb = std::forward<Callback>(result_cb)]() mutable -> awaitable<void> {
             auto result = co_await http_client_base::send_streaming(std::move(req), std::move(scb));
-            rcb(result);
+            co_await call_and_await(rcb, result);
         });
     }
 
@@ -230,7 +230,7 @@ public:
             if (!file) {
                 stream_result result;
                 result.error = "Cannot open file for writing: " + path.string();
-                rcb(result);
+                co_await call_and_await(rcb, result);
                 co_return;
             }
 
@@ -249,7 +249,7 @@ public:
                     return true;
                 });
 
-            rcb(result);
+            co_await call_and_await(rcb, result);
         });
     }
 
@@ -315,9 +315,9 @@ public:
             auto result = co_await upgrade_websocket(url, proto);
             if (result) {
                 auto ws = std::make_shared<websocket_client>(std::move(*result));
-                cb(ws);
+                co_await call_and_await(cb, ws);
             } else {
-                cb(std::shared_ptr<websocket_client>{});
+                co_await call_and_await(cb, std::shared_ptr<websocket_client>{});
             }
         });
     }

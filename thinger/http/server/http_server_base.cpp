@@ -68,7 +68,7 @@ bool http_server_base::start(uint16_t port) {
     return start("0.0.0.0", port);
 }
 
-bool http_server_base::start(uint16_t port, const std::function<void()> &on_listening) {
+bool http_server_base::start(uint16_t port, const sync_callback<void()> &on_listening) {
     return start("0.0.0.0", port, on_listening);
 }
 
@@ -76,7 +76,7 @@ bool http_server_base::start(const std::string& host, uint16_t port) {
     return start(host, port, nullptr);
 }
 
-bool http_server_base::start(const std::string& host, uint16_t port, const std::function<void()> &on_listening) {
+bool http_server_base::start(const std::string& host, uint16_t port, const sync_callback<void()> &on_listening) {
     if (!listen(host, port)) {
         return false;
     }
@@ -91,7 +91,7 @@ bool http_server_base::start_unix(const std::string& unix_path) {
     return start_unix(unix_path, nullptr);
 }
 
-bool http_server_base::start_unix(const std::string& unix_path, const std::function<void()> &on_listening) {
+bool http_server_base::start_unix(const std::string& unix_path, const sync_callback<void()> &on_listening) {
     if (!listen_unix(unix_path)) {
         return false;
     }

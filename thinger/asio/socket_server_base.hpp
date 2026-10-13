@@ -3,6 +3,7 @@
 
 #include "sockets/socket.hpp"
 #include "../util/logger.hpp"
+#include "../util/types.hpp"
 
 #include <atomic>
 #include <memory>
@@ -29,7 +30,7 @@ public:
 
     // Configuration
     void set_max_listening_attempts(int attempts);
-    void set_handler(std::function<void(std::shared_ptr<socket>)> handler);
+    void set_handler(sync_callback<void(std::shared_ptr<socket>)> handler);
     void set_allowed_remotes(std::set<std::string> allowed);
     void set_forbidden_remotes(std::set<std::string> forbidden);
 
@@ -52,7 +53,7 @@ protected:
     bool is_remote_allowed(const std::string& remote_ip) const;
 
 protected:
-    std::function<void(std::shared_ptr<socket>)> handler_;
+    sync_callback<void(std::shared_ptr<socket>)> handler_;
     std::set<std::string> allowed_remotes_;
     std::set<std::string> forbidden_remotes_;
     int max_listening_attempts_;

@@ -116,12 +116,12 @@ struct proxy_options {
     // Change the request sent to the target before it is sent: its method, path (get_uri())
     // and headers, e.g. to add credentials or remove the Authorization of the client. The
     // body framing headers are set by the proxy afterwards.
-    std::function<void(request& incoming, http_request& outgoing)> on_request;
+    sync_callback<void(request& incoming, http_request& outgoing)> on_request;
 
     // Change the response of the target before it is sent to the client: its status and
     // headers (the framing headers are set by the proxy afterwards). Also called for the
     // response of a protocol upgrade (101).
-    std::function<void(request& incoming, http_response& response)> on_response;
+    sync_callback<void(request& incoming, http_response& response)> on_response;
 };
 
 // What happened to a forwarded request

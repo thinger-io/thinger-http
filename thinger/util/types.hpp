@@ -1,7 +1,9 @@
 #ifndef THINGER_TYPES
 #define THINGER_TYPES
 
+#include <concepts>
 #include <functional>
+#include <type_traits>
 #include <boost/asio.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/use_awaitable.hpp>
@@ -30,6 +32,51 @@ namespace thinger {
 
     // Awaitable operators for combining coroutines (||, &&)
     using namespace boost::asio::experimental::awaitable_operators;
+
+    // Whether T is what a coroutine returns
+    template<typename T>
+    inline constexpr bool is_awaitable_v = false;
+
+    template<typename T, typename Executor>
+    inline constexpr bool is_awaitable_v<boost::asio::awaitable<T, Executor>> = true;
+
+    // A callable that is not a coroutine when called with Args. A std::function<void(...)>
+    // takes any callable, coroutines too: it would call a coroutine lambda only to drop the
+    // awaitable it returns, so the coroutine would never run
+    template<typename F, typename... Args>
+    concept not_a_coroutine = !is_awaitable_v<std::invoke_result_t<F&, Args...>>;
+
+    // A coroutine taking Args (returning awaitable<void>)
+    template<typename F, typename... Args>
+    concept coroutine_callable = std::same_as<std::invoke_result_t<F&, Args...>, awaitable<void>>;
+
+    // Call a callback that may be a coroutine, awaiting it if it is
+    template<typename F, typename... Args>
+    awaitable<void> call_and_await(F& callback, Args&&... args) {
+        if constexpr (is_awaitable_v<std::invoke_result_t<F&, Args...>>) {
+            co_await std::invoke(callback, std::forward<Args>(args)...);
+        } else {
+            std::invoke(callback, std::forward<Args>(args)...);
+        }
+    }
+
+    // A std::function for callbacks that are called, never awaited: it does not take a
+    // coroutine (see not_a_coroutine), which then fails to compile instead of never running
+    template<typename Signature>
+    class sync_callback;
+
+    template<typename R, typename... Args>
+    class sync_callback<R(Args...)> : public std::function<R(Args...)> {
+    public:
+        sync_callback() noexcept = default;
+        sync_callback(std::nullptr_t) noexcept {}
+
+        template<typename F>
+            requires (!std::same_as<std::remove_cvref_t<F>, sync_callback>) &&
+                     std::constructible_from<std::function<R(Args...)>, F> &&
+                     not_a_coroutine<std::remove_cvref_t<F>, Args...>
+        sync_callback(F&& callback) : std::function<R(Args...)>(std::forward<F>(callback)) {}
+    };
 
 }
 

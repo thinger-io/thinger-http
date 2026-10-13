@@ -5,6 +5,7 @@
 #include <string_view>
 #include <functional>
 #include <map>
+#include "../../util/types.hpp"
 
 namespace thinger::http {
 
@@ -70,7 +71,7 @@ using stream_callback = std::function<bool(const stream_info&)>;
  * @param downloaded Bytes downloaded so far
  * @param total Total bytes expected (0 if unknown)
  */
-using progress_callback = std::function<void(size_t downloaded, size_t total)>;
+using progress_callback = sync_callback<void(size_t downloaded, size_t total)>;
 
 } // namespace thinger::http
 

@@ -193,7 +193,7 @@ void wrap_connection(const asio::socket& socket, asio::socket& wrapper, connecti
     wrapper.set_attachment(std::move(connection));
 }
 
-void on_server_shutdown(asio::socket& socket, std::function<void()> callback) {
+void on_server_shutdown(asio::socket& socket, sync_callback<void()> callback) {
     if (auto connection = taken_over_connection::of(socket)) connection->on_shutdown(std::move(callback));
 }
 

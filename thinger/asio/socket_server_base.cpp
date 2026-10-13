@@ -18,7 +18,7 @@ void socket_server_base::set_max_listening_attempts(int attempts) {
     max_listening_attempts_ = attempts;
 }
 
-void socket_server_base::set_handler(std::function<void(std::shared_ptr<socket>)> handler) {
+void socket_server_base::set_handler(sync_callback<void(std::shared_ptr<socket>)> handler) {
     handler_ = std::move(handler);
 }
 

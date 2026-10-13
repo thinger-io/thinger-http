@@ -18,7 +18,7 @@ namespace thinger::http{
         LOG_LEVEL(1, "releasing websocket connection");
     }
 
-    void websocket_connection::on_shutdown(std::function<void()> callback){
+    void websocket_connection::on_shutdown(sync_callback<void()> callback){
         on_shutdown_callback_ = std::move(callback);
     }
 
@@ -35,7 +35,7 @@ namespace thinger::http{
             detached);
     }
 
-    void websocket_connection::on_message(std::function<void(std::string, bool binary)> callback){
+    void websocket_connection::on_message(sync_callback<void(std::string, bool binary)> callback){
         on_frame_callback_ = std::move(callback);
     }
 

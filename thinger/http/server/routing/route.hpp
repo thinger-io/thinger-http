@@ -117,11 +117,7 @@ concept awaitable_json_handler = json_callback<F> && returns_awaitable<F, nlohma
 
 namespace detail {
 
-    template<typename T>
-    inline constexpr bool is_awaitable_v = false;
-
-    template<typename T, typename Executor>
-    inline constexpr bool is_awaitable_v<boost::asio::awaitable<T, Executor>> = true;
+    using thinger::is_awaitable_v;
 
     template<typename T>
     inline constexpr bool is_std_function_v = false;

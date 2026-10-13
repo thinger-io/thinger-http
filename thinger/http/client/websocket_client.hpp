@@ -32,9 +32,9 @@ public:
     // Largest message received (as the server side, websocket_connection)
     static constexpr size_t MAX_MESSAGE_SIZE = 16 * 1024 * 1024;
 
-    using message_callback = std::function<void(const std::string&, bool)>;
-    using close_callback = std::function<void()>;
-    using error_callback = std::function<void(const std::string&)>;
+    using message_callback = sync_callback<void(const std::string&, bool)>;
+    using close_callback = sync_callback<void()>;
+    using error_callback = sync_callback<void(const std::string&)>;
 
     /**
      * Construct from an established WebSocket.

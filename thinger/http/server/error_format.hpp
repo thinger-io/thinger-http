@@ -3,6 +3,7 @@
 
 #include "../common/http_response.hpp"
 #include "../../util/logger.hpp"
+#include "../../util/types.hpp"
 #include <nlohmann/json.hpp>
 #include <functional>
 #include <string>
@@ -25,7 +26,7 @@ struct http_error {
 
 // Writes the body of an error response (content, content type and any extra header);
 // the status is already set
-using error_formatter = std::function<void(const http_error& error, http_response& response)>;
+using error_formatter = sync_callback<void(const http_error& error, http_response& response)>;
 
 // Default format: the message as text/plain, or, for errors with details, the JSON object
 // {"error": {"message": <message>, <details>...}}

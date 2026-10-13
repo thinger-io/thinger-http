@@ -296,6 +296,22 @@ server.get("/tunnel", [](http::request& req, http::response& res) {
 });
 ```
 
+The handlers of `take_over()`, `upgrade_websocket()`, `upgrade_websocket_stream()` and `start_sse()` can be coroutines: they run on the io_context of the connection, detached (what they throw is logged); `upgrade_websocket()` starts reading messages once its coroutine completes. So can the middlewares with `next()` and the callbacks of the async client. Callbacks that are called and not awaited (`on_message()`, `on_shutdown()`, `begin_shutdown()`'s `on_done`, the error formatter, the reverse proxy `on_request`/`on_response` hooks, the OpenAPI hooks...) take only synchronous functions: a coroutine lambda there does not compile, instead of being dropped without running; `co_spawn()` the work from them instead.
+
+```cpp
+server.get("/feed", [](http::request& req, http::response& res) {
+    res.start_sse([](std::shared_ptr<http::sse_connection> sse) -> thinger::awaitable<void> {
+        boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor);
+        for (int i = 0; i < 10; ++i) {
+            sse->send_data(std::to_string(i));
+            timer.expires_after(std::chrono::seconds(1));
+            co_await timer.async_wait(thinger::use_awaitable);
+        }
+        sse->stop();
+    });
+});
+```
+
 ### Response Types
 
 ```cpp
@@ -490,12 +506,17 @@ server.use([&tokens](http::request& req, http::response& res) -> thinger::awaita
 });
 ```
 
-Synchronous middlewares with a `next()` callback are still supported; `next()` must be called before returning:
+Middlewares with a `next()` callback are supported too, synchronous (`next()` must be called before returning) or coroutines (`next()` must be called before the coroutine completes):
 
 ```cpp
 server.use([](http::request& req, http::response& res, std::function<void()> next) {
     res.header("X-Powered-By", "thinger-http");
     next();
+});
+
+server.use([&tokens](http::request& req, http::response& res, std::function<void()> next) -> thinger::awaitable<void> {
+    if (co_await tokens.validate(req.header("Authorization"))) next();
+    else res.error(http::http_response::status::unauthorized);
 });
 ```
 

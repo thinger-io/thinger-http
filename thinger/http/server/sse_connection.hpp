@@ -116,7 +116,7 @@ public:
      * is closed (clients reconnect). Whatever is open at the end of the grace period is closed
      * anyway
      */
-    void on_shutdown(std::function<void()> callback){
+    void on_shutdown(sync_callback<void()> callback){
         on_shutdown_callback_ = std::move(callback);
     }
 
@@ -156,7 +156,7 @@ private:
     bool idle_;
 
     /// Server shutdown callback
-    std::function<void()> on_shutdown_callback_;
+    sync_callback<void()> on_shutdown_callback_;
 
     /// The server tracking this connection, if any (see connection_tracker.hpp)
     std::shared_ptr<taken_over_connection> tracking_;

@@ -42,7 +42,11 @@ using async_middleware_function = std::function<thinger::awaitable<bool>(request
 
 // Synchronous middleware: call next() before returning to continue the chain, or
 // respond through the response to stop it. next() must not be called asynchronously.
-using middleware_function = std::function<void(request&, response&, std::function<void()>)>;
+using middleware_function = sync_callback<void(request&, response&, std::function<void()>)>;
+
+// The same, as a coroutine (as an async Express middleware): call next() before it
+// completes to continue the chain
+using coroutine_middleware_function = std::function<thinger::awaitable<void>(request&, response&, std::function<void()>)>;
 
 // What a server serves: the virtual hosts and their routes, the middlewares, and how
 // requests are processed (error format, trusted proxies, limits). The application is the
@@ -83,7 +87,7 @@ public:
     // Same, calling `callback` with the response; runs on `executor`
     void dispatch(const boost::asio::any_io_executor& executor,
                   std::shared_ptr<http_request> request,
-                  std::function<void(std::shared_ptr<http_response>)> callback,
+                  sync_callback<void(std::shared_ptr<http_response>)> callback,
                   dispatch_options options = {});
 
     // Handle a request received by a server, answering through `sink`
@@ -92,6 +96,7 @@ public:
     // Middleware (register before serving, executed in registration order)
     void use(async_middleware_function middleware);
     void use(middleware_function middleware);
+    void use(coroutine_middleware_function middleware);
 
     // Basic Auth helpers
     using auth_verify_function = std::function<bool(const std::string& username, const std::string& password)>;

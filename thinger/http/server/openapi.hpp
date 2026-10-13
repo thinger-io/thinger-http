@@ -3,6 +3,7 @@
 
 #include "routing/route_handler.hpp"
 #include "body_decoders.hpp"
+#include "../../util/types.hpp"
 #include <nlohmann/json.hpp>
 #include <functional>
 #include <string>
@@ -22,10 +23,10 @@ class openapi_generator {
 public:
     // Called for each operation with its route, HTTP method (lowercase) and the operation
     // object already filled, so it can be completed or changed
-    using operation_hook = std::function<void(const route&, const std::string& method, nlohmann::json& operation)>;
+    using operation_hook = sync_callback<void(const route&, const std::string& method, nlohmann::json& operation)>;
 
     // Called with the whole document once built (e.g. to add securitySchemes)
-    using document_hook = std::function<void(nlohmann::json& document)>;
+    using document_hook = sync_callback<void(nlohmann::json& document)>;
 
     // `bodies`: the body decoders and the types accepted by default (those of the
     // application, see http_application::body_decoders); the defaults if null

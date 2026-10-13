@@ -6,6 +6,7 @@
 #include <atomic>
 
 #include "sockets/socket.hpp"
+#include "../util/types.hpp"
 
 namespace thinger::asio {
 
@@ -37,7 +38,7 @@ public:
     void cancel();
 
     /// Completion callback (called from destructor).
-    void set_on_end(std::function<void()> listener);
+    void set_on_end(sync_callback<void()> listener);
 
     /// Transfer stats (safe to read from any thread after run() completes).
     size_t bytes_source_to_target() const;
@@ -56,7 +57,7 @@ private:
 
     std::shared_ptr<socket> source_;
     std::shared_ptr<socket> target_;
-    std::function<void()> on_end_;
+    sync_callback<void()> on_end_;
     std::atomic<bool> cancelled_{false};
     std::atomic<size_t> bytes_s2t_{0};
     std::atomic<size_t> bytes_t2s_{0};

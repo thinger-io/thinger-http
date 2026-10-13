@@ -24,6 +24,14 @@ void http_application::use(middleware_function middleware) {
     });
 }
 
+void http_application::use(coroutine_middleware_function middleware) {
+    use([middleware = std::move(middleware)](request& req, response& res) -> awaitable<bool> {
+        auto passed = std::make_shared<bool>(false);
+        co_await middleware(req, res, [passed]() { *passed = true; });
+        co_return *passed;
+    });
+}
+
 // Basic Auth helpers
 void http_application::set_basic_auth(const std::string& path_prefix, 
                                  const std::string& realm,
@@ -462,7 +470,7 @@ awaitable<std::shared_ptr<http_response>> http_application::dispatch(std::shared
 
 void http_application::dispatch(const boost::asio::any_io_executor& executor,
                                 std::shared_ptr<http_request> request,
-                                std::function<void(std::shared_ptr<http_response>)> callback,
+                                sync_callback<void(std::shared_ptr<http_response>)> callback,
                                 dispatch_options options) {
     co_spawn(executor, dispatch(std::move(request), std::move(options)),
         [this, callback = std::move(callback)](std::exception_ptr error, std::shared_ptr<http_response> result) {

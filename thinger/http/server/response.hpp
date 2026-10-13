@@ -46,7 +46,14 @@ struct websocket_options {
 };
 
 // Receives the WebSocket and the subprotocol negotiated (empty if none)
-using websocket_stream_handler = std::function<void(std::shared_ptr<asio::websocket> socket, std::string protocol)>;
+using websocket_stream_handler = sync_callback<void(std::shared_ptr<asio::websocket> socket, std::string protocol)>;
+using websocket_stream_coroutine = std::function<awaitable<void>(std::shared_ptr<asio::websocket> socket, std::string protocol)>;
+
+// Receive a WebSocket with a message interface, and an event stream
+using websocket_handler = sync_callback<void(std::shared_ptr<websocket_connection>)>;
+using websocket_coroutine = std::function<awaitable<void>(std::shared_ptr<websocket_connection>)>;
+using sse_handler = sync_callback<void(std::shared_ptr<sse_connection>)>;
+using sse_coroutine = std::function<awaitable<void>(std::shared_ptr<sse_connection>)>;
 
 // Response to a request. It is a handle: copies share the response, so a handler may keep
 // a copy and answer later, from any thread. Only the first answer is sent: the others are
@@ -105,9 +112,12 @@ public:
 
     // WebSocket upgrade, with a message interface. With supported_protocols, the client must
     // offer one of them (400 otherwise), and the first one it offers is accepted; without, a
-    // client offering a subprotocol is rejected with 400
-    void upgrade_websocket(std::function<void(std::shared_ptr<websocket_connection>)> handler,
-                          const std::set<std::string>& supported_protocols = {});
+    // client offering a subprotocol is rejected with 400. The handler is called on the
+    // io_context of the connection, before the WebSocket starts reading (set its callbacks
+    // there). A coroutine handler runs on that io_context too: the WebSocket starts reading
+    // once it completes.
+    void upgrade_websocket(websocket_handler handler, const std::set<std::string>& supported_protocols = {});
+    void upgrade_websocket(websocket_coroutine handler, const std::set<std::string>& supported_protocols = {});
 
     // WebSocket upgrade handing out the WebSocket as a byte stream socket, for a protocol
     // running on it (MQTT, a custom one...) or a tunnel (socket_pipe): binary messages by
@@ -115,22 +125,32 @@ public:
     // the io_context of the socket once the handshake response is written, with the WebSocket
     // (holding any frames the client sent right after its request) and the subprotocol
     // negotiated (see websocket_options). Rejected with 426 if the request is not a
-    // WebSocket upgrade, or 400 if its key is missing or no subprotocol matches.
+    // WebSocket upgrade, or 400 if its key is missing or no subprotocol matches. The handler
+    // can be a coroutine, run on that io_context.
     void upgrade_websocket_stream(const websocket_options& options, websocket_stream_handler handler);
+    void upgrade_websocket_stream(const websocket_options& options, websocket_stream_coroutine handler);
     void upgrade_websocket_stream(websocket_stream_handler handler) {
         upgrade_websocket_stream(websocket_options{}, std::move(handler));
     }
+    void upgrade_websocket_stream(websocket_stream_coroutine handler) {
+        upgrade_websocket_stream(websocket_options{}, std::move(handler));
+    }
 
-    // Server-Sent Events (for a HEAD request, the headers alone: the handler is not called)
-    void start_sse(std::function<void(std::shared_ptr<sse_connection>)> handler);
+    // Server-Sent Events (for a HEAD request, the headers alone: the handler is not called).
+    // The handler is called on the io_context of the connection once the event stream
+    // started; a coroutine handler runs on that io_context.
+    void start_sse(sse_handler handler);
+    void start_sse(sse_coroutine handler);
 
     // Take over the connection (e.g. for a custom protocol upgrade or a tunnel): sends
     // this response (status and headers set so far, 200 by default), then the server
     // stops handling the connection and passes the socket to `handler`, together with
     // any bytes already read past this request. The handler fully owns the socket. If the
     // connection was closed before (e.g. the client closed or half-closed it while the
-    // response was pending), the handler is not called, only released.
+    // response was pending), the handler is not called, only released. A coroutine
+    // handler runs on the io_context of the socket.
     void take_over(takeover_handler handler);
+    void take_over(takeover_coroutine handler);
 
     // File response, with the media type of its extension. It carries a weak ETag and a
     // Last-Modified from the size and modification time of the file, and Cache-Control:
@@ -221,6 +241,11 @@ private:
     void take_over(std::shared_ptr<http_response> message, takeover_handler handler);
     // Answers 501 if the connection cannot be taken over (in-memory requests)
     bool reject_takeover(const char* feature);
+    // Upgrade to a WebSocket with a message interface, and to an event stream: `deliver`
+    // receives the connection, and the socket it runs on (its io_context runs `deliver`)
+    void accept_websocket(const std::set<std::string>& supported_protocols,
+                          std::function<void(std::shared_ptr<websocket_connection>, asio::socket&)> deliver);
+    void accept_sse(std::function<void(std::shared_ptr<sse_connection>, asio::socket&)> deliver);
     // Checks of a WebSocket upgrade request and the subprotocol negotiated: the 101 response
     // to send, or null if the request was answered with an error
     std::shared_ptr<http_response> websocket_handshake(const std::vector<std::string>& protocols,

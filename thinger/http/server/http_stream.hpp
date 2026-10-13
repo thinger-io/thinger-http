@@ -9,6 +9,7 @@
 #include <string>
 #include <utility>
 #include "../common/http_frame.hpp"
+#include "../../util/types.hpp"
 
 namespace thinger::asio {
     class socket;
@@ -20,7 +21,9 @@ namespace thinger::http {
 
     // Receives a connection taken over from the HTTP server: the socket, and any bytes the
     // server had already read past the request that took it over
-    using takeover_handler = std::function<void(std::shared_ptr<asio::socket>, std::string buffered)>;
+    using takeover_handler = sync_callback<void(std::shared_ptr<asio::socket>, std::string buffered)>;
+    // The same, as a coroutine (run on the io_context of the socket)
+    using takeover_coroutine = std::function<awaitable<void>(std::shared_ptr<asio::socket>, std::string buffered)>;
 
     /**
      * A HTTP stream represents a communication channel inside a single HTTP connection. As a

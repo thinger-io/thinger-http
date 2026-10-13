@@ -55,13 +55,13 @@ public:
 
     // Start methods with automatic wait()
     bool start(uint16_t port);
-    bool start(uint16_t port, const std::function<void()> &on_listening);
+    bool start(uint16_t port, const sync_callback<void()> &on_listening);
     bool start(const std::string& host, uint16_t port);
-    bool start(const std::string& host, uint16_t port, const std::function<void()> &on_listening);
+    bool start(const std::string& host, uint16_t port, const sync_callback<void()> &on_listening);
     
     // Unix socket start methods
     bool start_unix(const std::string& unix_path);
-    bool start_unix(const std::string& unix_path, const std::function<void()> &on_listening);
+    bool start_unix(const std::string& unix_path, const sync_callback<void()> &on_listening);
 
     // Stop listening right away. Connections open are left as they are (see shutdown())
     virtual bool stop();
@@ -88,12 +88,12 @@ public:
     // ends it at once.
     bool shutdown(std::chrono::milliseconds grace = std::chrono::seconds(30));
     void begin_shutdown(std::chrono::milliseconds grace = std::chrono::seconds(30),
-                        std::function<void(bool)> on_done = {});
+                        sync_callback<void(bool)> on_done = {});
 
     // Called once when a graceful shutdown starts, on the thread starting it, once the server
     // stopped listening: for the application to finish what it runs on connections taken over
     // (or anything else)
-    void on_shutdown(std::function<void()> callback);
+    void on_shutdown(sync_callback<void()> callback);
 
     // Connections open by what they serve, and served since the server was created. It locks
     // each list the connections are kept in (by io_context): meant to be read now and then (e.g.
@@ -140,7 +140,7 @@ private:
     static void finish_shutdown(const std::shared_ptr<shutdown_state>& state, bool clean);
     static void complete_shutdown(const std::shared_ptr<shutdown_state>& state, bool clean);
 
-    std::function<void()> on_shutdown_;
+    sync_callback<void()> on_shutdown_;
     // The last shutdown (guarded by its mutex)
     mutable std::mutex shutdown_mutex_;
     std::shared_ptr<shutdown_state> shutdown_;

@@ -10,6 +10,7 @@
 #include <vector>
 #include <boost/asio/io_context.hpp>
 #include "../../asio/sockets/socket.hpp"
+#include "../../util/types.hpp"
 
 namespace thinger::http {
 
@@ -158,7 +159,7 @@ public:
 
     // On the thread of the socket
     void set_type(connection_type type) { tracked_connection::set_type(type); }
-    void on_shutdown(std::function<void()> callback) { on_shutdown_ = std::move(callback); }
+    void on_shutdown(sync_callback<void()> callback) { on_shutdown_ = std::move(callback); }
     // The new owner closed the connection: it no longer counts
     void closed() {
         on_shutdown_ = nullptr;
@@ -172,7 +173,7 @@ private:
     void shutdown_close() override;
 
     std::weak_ptr<asio::socket> socket_;
-    std::function<void()> on_shutdown_;
+    sync_callback<void()> on_shutdown_;
     bool notified_ = false;
 };
 
@@ -191,7 +192,7 @@ void wrap_connection(const asio::socket& socket, asio::socket& wrapper, connecti
 // close it (e.g. with a WebSocket close 1001 Going Away). Whatever is still open at the end of
 // the grace period is closed. Nothing happens for a socket that does not come from a server.
 // On the thread of the socket.
-void on_server_shutdown(asio::socket& socket, std::function<void()> callback);
+void on_server_shutdown(asio::socket& socket, sync_callback<void()> callback);
 
 }
 

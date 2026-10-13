@@ -28,7 +28,7 @@ struct http_server_base::shutdown_state {
     std::thread::id finishing;            // the thread stopping the server at the end
     bool done = false;
     bool clean = false;                   // every connection finished in time
-    std::vector<std::function<void(bool)>> callbacks;
+    std::vector<sync_callback<void(bool)>> callbacks;
 
     // Set once when it starts
     std::shared_ptr<connection_tracker> connections;
@@ -51,7 +51,7 @@ void http_server_base::reset_shutdown() {
     connections_->set_phase(connection_tracker::phase::serving);
 }
 
-void http_server_base::on_shutdown(std::function<void()> callback) {
+void http_server_base::on_shutdown(sync_callback<void()> callback) {
     on_shutdown_ = std::move(callback);
 }
 
@@ -77,7 +77,7 @@ bool http_server_base::shutdown(std::chrono::milliseconds grace) {
     return state->clean;
 }
 
-void http_server_base::begin_shutdown(std::chrono::milliseconds grace, std::function<void(bool)> on_done) {
+void http_server_base::begin_shutdown(std::chrono::milliseconds grace, sync_callback<void(bool)> on_done) {
     std::shared_ptr<shutdown_state> state;
     std::optional<bool> ended;   // the result of a shutdown that already ended
     {
@@ -177,7 +177,7 @@ void http_server_base::finish_shutdown(const std::shared_ptr<shutdown_state>& st
 }
 
 void http_server_base::complete_shutdown(const std::shared_ptr<shutdown_state>& state, bool clean) {
-    std::vector<std::function<void(bool)>> callbacks;
+    std::vector<sync_callback<void(bool)>> callbacks;
     {
         std::scoped_lock lock(state->mutex);
         if (state->done) return;

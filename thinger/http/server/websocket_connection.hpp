@@ -44,7 +44,7 @@ public:
      * Set a callbback to listen for text frames received
      * @param callback
      */
-    void on_message(std::function<void(std::string, bool binary)> callback);
+    void on_message(sync_callback<void(std::string, bool binary)> callback);
 
     /**
      * Set what to do when the server shuts down gracefully (see http_server_base::shutdown()),
@@ -53,7 +53,7 @@ public:
      * closed anyway
      * @param callback
      */
-    void on_shutdown(std::function<void()> callback);
+    void on_shutdown(sync_callback<void()> callback);
 
     /**
      * Set a message handler
@@ -66,7 +66,7 @@ public:
      * Execute actions on the websocket thread
      * @param callback
      */
-    inline void execute(std::function<void()> callback){
+    inline void execute(sync_callback<void()> callback){
         boost::asio::dispatch(ws_->get_io_context(), [self = shared_from_this(), callback = std::move(callback)](){
             callback();
         });
@@ -146,10 +146,10 @@ private:
     //std::shared_ptr<messages::stream_handler> stream_handler_;
 
     /// Text frame callback
-    std::function<void(std::string, bool)> on_frame_callback_;
+    sync_callback<void(std::string, bool)> on_frame_callback_;
 
     /// Server shutdown callback
-    std::function<void()> on_shutdown_callback_;
+    sync_callback<void()> on_shutdown_callback_;
 
     /// The server tracking this connection, if any (see connection_tracker.hpp)
     std::shared_ptr<taken_over_connection> tracking_;

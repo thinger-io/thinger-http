@@ -52,7 +52,7 @@ void socket_pipe::cancel() {
     close_on_own_context(target_);
 }
 
-void socket_pipe::set_on_end(std::function<void()> listener) {
+void socket_pipe::set_on_end(sync_callback<void()> listener) {
     on_end_ = std::move(listener);
 }
 

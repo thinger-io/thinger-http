@@ -98,7 +98,7 @@ namespace {
 struct connection_setup {
     std::shared_ptr<boost::asio::ssl::context> ssl_context; // none without TLS
     bool tcp_no_delay;
-    std::function<void(std::shared_ptr<socket>)> handler;
+    sync_callback<void(std::shared_ptr<socket>)> handler;
 };
 
 std::shared_ptr<tcp_socket> make_socket(boost::asio::io_context& io_context, const connection_setup& setup) {

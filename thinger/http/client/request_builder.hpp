@@ -264,9 +264,9 @@ public:
             auto result = co_await client->http_client_base::upgrade_websocket(std::move(req), proto);
             if (result) {
                 auto ws = std::make_shared<websocket_client>(std::move(*result));
-                cb(ws);
+                co_await call_and_await(cb, ws);
             } else {
-                cb(std::shared_ptr<websocket_client>{});
+                co_await call_and_await(cb, std::shared_ptr<websocket_client>{});
             }
         });
     }
@@ -303,7 +303,7 @@ private:
         auto req = request_;
         client_->run([client = client_, req, cb = std::forward<Callback>(callback)]() mutable -> awaitable<void> {
             auto response = co_await client->http_client_base::send(std::move(req));
-            cb(response);
+            co_await call_and_await(cb, response);
         });
     }
 };
