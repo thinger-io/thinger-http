@@ -13,7 +13,8 @@ using namespace thinger;
 
 struct SchemaTestFixture {
     http::server server;
-    uint16_t port = 0;
+    // Set by the server thread once listening, before the test reads base_url
+    std::atomic<uint16_t> port{0};
     std::string base_url;
     std::thread server_thread;
 
@@ -115,11 +116,12 @@ private:
     void start_server() {
         server_thread = std::thread([this]() {
             server.start("127.0.0.1", 0, [this]() {
-                port = server.local_port();
-                base_url = "http://127.0.0.1:" + std::to_string(port);
+                auto listening = server.local_port();
+                base_url = "http://127.0.0.1:" + std::to_string(listening);
+                port.store(listening, std::memory_order_release);
             });
         });
-        while (port == 0) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        while (port.load(std::memory_order_acquire) == 0) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 };
 
