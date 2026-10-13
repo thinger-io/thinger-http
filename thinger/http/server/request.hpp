@@ -139,7 +139,8 @@ namespace thinger::http{
         thinger::awaitable<size_t> read(uint8_t* buffer, size_t size);
 
         /// Read up to `max_size` bytes (read-ahead first, then socket); 0 at the end of the
-        /// body, or if it fails (see get_body_error()), as read().
+        /// body, or if it fails (see get_body_error()), as read(). A read cancelled (e.g. by
+        /// `read_some() || timer`) returns 0 too, without failing: the body is still pending.
         thinger::awaitable<size_t> read_some(uint8_t* buffer, size_t max_size);
 
         /// Read full body into http_request content (for non-deferred dispatch), decoding

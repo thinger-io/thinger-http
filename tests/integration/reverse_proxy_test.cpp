@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <thinger/http/server/server_standalone.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
@@ -1337,7 +1338,13 @@ TEST_CASE("Reverse proxy closes the target when the client leaves a silent excha
 }
 
 TEST_CASE("Reverse proxy relays responses sent before the end of the request body", "[proxy][integration]") {
-    // a target that answers once it has the head, without reading the body
+    // The client sends part of the body, and waits. A target answers once it has the head,
+    // without reading the body; or once it has what the client sent, so the proxy is
+    // waiting for more of the body when the response arrives
+    constexpr size_t sent = 65536;
+    bool after_body = GENERATE(false, true);
+    INFO((after_body ? "answered once the body sent arrived" : "answered once the head arrived"));
+
     boost::asio::io_context ioc;
     boost::asio::ip::tcp::acceptor acceptor(ioc, {boost::asio::ip::make_address("127.0.0.1"), 0});
     std::atomic<bool> done{false};
@@ -1348,10 +1355,17 @@ TEST_CASE("Reverse proxy relays responses sent before the end of the request bod
         std::string request;
         char buffer[4096];
         boost::system::error_code ec;
-        while (!ec && request.find("\r\n\r\n") == std::string::npos) {
+        auto received = [&] {
+            auto head_end = request.find("\r\n\r\n");
+            if (head_end == std::string::npos) return false;
+            return !after_body || request.size() - (head_end + 4) >= sent;
+        };
+        while (!ec && !received()) {
             auto bytes = socket.read_some(boost::asio::buffer(buffer), ec);
             request.append(buffer, bytes);
         }
+        // (the proxy is reading the client meanwhile)
+        if (after_body) std::this_thread::sleep_for(50ms);
         boost::asio::write(socket, boost::asio::buffer(std::string(
             "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 8\r\n\r\ntoo much")), ec);
         // the connection stays open, the body unread
@@ -1366,7 +1380,7 @@ TEST_CASE("Reverse proxy relays responses sent before the end of the request bod
     proxy.start();
 
     raw_connection connection(proxy.port);
-    connection.send("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 100000000\r\n\r\n" + std::string(65536, 'a'));
+    connection.send("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 100000000\r\n\r\n" + std::string(sent, 'a'));
     auto res = connection.read_response(false, 3s);
     done = true;
     REQUIRE(res.status == 413);

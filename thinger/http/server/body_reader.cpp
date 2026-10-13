@@ -2,8 +2,21 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <boost/asio/this_coro.hpp>
 
 namespace thinger::http {
+
+    namespace {
+
+        // Whether the coroutine reading was cancelled (e.g. the other side of a `||` ended
+        // first): its read ended without taking anything, so the body is not incomplete,
+        // just not read yet
+        thinger::awaitable<bool> cancelled() {
+            auto state = co_await boost::asio::this_coro::cancellation_state;
+            co_return state.cancelled() != boost::asio::cancellation_type::none;
+        }
+
+    }
 
     void body_reader::set_framing(bool chunked, size_t content_length) {
         chunked_ = chunked;
@@ -61,7 +74,7 @@ namespace thinger::http {
         if (to_read == 0) co_return 0;
         size_t bytes = co_await read_raw(buffer, to_read);
         if (bytes == 0) {
-            error_ = body_error::incomplete;
+            if (!co_await cancelled()) error_ = body_error::incomplete;
             co_return 0;
         }
         remaining_ -= bytes;
@@ -75,7 +88,7 @@ namespace thinger::http {
                 if (size_t pending = decoder_.data_pending()) {
                     size_t bytes = source_ ? co_await source_(buffer, std::min(pending, max_size)) : 0;
                     if (bytes == 0) {
-                        error_ = body_error::incomplete;
+                        if (!co_await cancelled()) error_ = body_error::incomplete;
                         co_return 0;
                     }
                     decoder_.data_consumed(bytes);
@@ -84,7 +97,7 @@ namespace thinger::http {
                 // Framing: decode it from the read-ahead, where anything read past the end
                 // of the body stays for the next request
                 if (!co_await fill_read_ahead()) {
-                    error_ = body_error::incomplete;
+                    if (!co_await cancelled()) error_ = body_error::incomplete;
                     co_return 0;
                 }
             }

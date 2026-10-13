@@ -651,6 +651,10 @@ namespace {
             target_open = co_await write_target(buffers);
         }
 
+        // Cancelled once the response head arrived: the rest of the body is not relayed
+        auto state = co_await boost::asio::this_coro::cancellation_state;
+        if (state.cancelled() != boost::asio::cancellation_type::none) co_return;
+
         // A body the client did not send whole (or malformed, too large): the server answers
         // it and closes the connection; the target never gets its end
         if (req_.get_body_error() != body_error::none) {

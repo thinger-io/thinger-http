@@ -454,3 +454,93 @@ TEST_CASE("Body size limit of every read", "[body_reader][limit][unit]") {
         REQUIRE(reader.error() == body_error::none);
     }
 }
+
+TEST_CASE("Cancelled body reads leave the body pending", "[body_reader][cancellation][unit]") {
+    // A connection whose data has not arrived yet: a read waits until it is cancelled (0
+    // bytes, as a socket read cancelled), then data arrives
+    boost::asio::io_context ioc;
+    std::string data;
+    auto source = [&](uint8_t* buffer, size_t size) -> thinger::awaitable<size_t> {
+        if (data.empty()) {
+            boost::asio::steady_timer never(ioc, std::chrono::steady_clock::time_point::max());
+            co_await never.async_wait(thinger::use_nothrow_awaitable);
+            co_return 0;
+        }
+        size_t bytes = std::min(size, data.size());
+        std::memcpy(buffer, data.data(), bytes);
+        data.erase(0, bytes);
+        co_return bytes;
+    };
+
+    // Reads with a timeout, as a handler or the reverse proxy do (the read loses the race)
+    auto read_with_timeout = [&](body_reader& reader) {
+        auto read = [&]() -> thinger::awaitable<size_t> {
+            uint8_t buffer[64];
+            boost::asio::steady_timer timer(ioc, std::chrono::milliseconds(10));
+            auto result = co_await (reader.read_some(buffer, sizeof(buffer)) ||
+                                    timer.async_wait(thinger::use_nothrow_awaitable));
+            co_return result.index() == 0 ? std::get<0>(result) : 0;
+        };
+        auto result = co_spawn(ioc, read(), boost::asio::use_future);
+        ioc.restart();
+        ioc.run();
+        return result.get();
+    };
+
+    uint8_t buffer[64];
+
+    SECTION("Content-Length") {
+        body_reader reader;
+        reader.set_framing(false, 5);
+        reader.set_source(source);
+
+        REQUIRE(read_with_timeout(reader) == 0);
+        REQUIRE(reader.error() == body_error::none);
+        REQUIRE(reader.has_pending());
+
+        data = "hello";
+        REQUIRE(run(reader.read(buffer, sizeof(buffer))) == 5);
+        REQUIRE_FALSE(reader.has_pending());
+    }
+
+    SECTION("Chunked, waiting for the framing") {
+        body_reader reader;
+        reader.set_framing(true, 0);
+        reader.set_source(source);
+
+        REQUIRE(read_with_timeout(reader) == 0);
+        REQUIRE(reader.error() == body_error::none);
+        REQUIRE(reader.has_pending());
+
+        data = "5\r\nhello\r\n0\r\n\r\n";
+        std::string body;
+        REQUIRE(run(reader.read_all(body, 1024)));
+        REQUIRE(body == "hello");
+    }
+
+    SECTION("Chunked, waiting for chunk data") {
+        body_reader reader;
+        reader.set_framing(true, 0);
+        std::string ahead = "5\r\n";
+        reader.set_read_ahead(reinterpret_cast<const uint8_t*>(ahead.data()), ahead.size());
+        reader.set_source(source);
+
+        REQUIRE(read_with_timeout(reader) == 0);
+        REQUIRE(reader.error() == body_error::none);
+        REQUIRE(reader.has_pending());
+
+        data = "hello\r\n0\r\n\r\n";
+        std::string body;
+        REQUIRE(run(reader.read_all(body, 1024)));
+        REQUIRE(body == "hello");
+    }
+
+    SECTION("A connection that ends is still an incomplete body") {
+        body_reader reader;
+        reader.set_framing(false, 5);
+        reader.set_source([](uint8_t*, size_t) -> thinger::awaitable<size_t> { co_return 0; });
+
+        REQUIRE(run(reader.read_some(buffer, sizeof(buffer))) == 0);
+        REQUIRE(reader.error() == body_error::incomplete);
+    }
+}
