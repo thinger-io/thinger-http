@@ -99,6 +99,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/common/headers_test.cpp)
     add_thinger_test(test_headers unit/http/common/headers_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/common/multipart_parser_test.cpp)
+    add_thinger_test(test_multipart_parser unit/http/common/multipart_parser_test.cpp)
+endif()
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/common/http_request_test.cpp)
     add_thinger_test(test_http_request unit/http/common/http_request_test.cpp)
 endif()
