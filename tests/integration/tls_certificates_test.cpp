@@ -254,6 +254,14 @@ TEST_CASE("HTTPS server handshakes while the certificates are replaced",
     std::atomic<int> wrong{0};
     std::atomic<int> served{0};
 
+    // OpenSSL fills caches of its own on the first handshakes, with lock-free (RCU) lookups
+    // that TSan, without OpenSSL instrumented, takes for data races: fill them before
+    for (const auto& name : names) {
+        tls_connection connection(https.port, name);
+        REQUIRE_FALSE(connection.error);
+        REQUIRE(connection.hello() == "hello");
+    }
+
     rotation.start();
     std::vector<std::thread> threads;
     for (int client = 0; client < clients; ++client) {
