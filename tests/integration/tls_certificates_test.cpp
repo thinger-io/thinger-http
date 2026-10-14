@@ -2,6 +2,7 @@
 #include <thinger/http/server/pool_server.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
+#include <thinger/http/server/server_standalone.hpp>
 #include <thinger/asio/ssl/certificate_manager.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/read_until.hpp>
@@ -276,4 +277,52 @@ TEST_CASE("HTTPS server handshakes while the certificates are replaced",
     CHECK(wrong == 0);
     CHECK(served == clients * ((handshakes + 4) / 5));
     CHECK(rotation.rotations > 0);
+}
+
+TEST_CASE("HTTPS server selects certificates by SNI with a default context given",
+          "[ssl][tls][certificate][integration]") {
+    http::test::test_ca ca;
+    saved_default_certificate saved;
+    auto fallback = ca.issue("given.test");
+    auto host_certificate = ca.issue("host.test");
+    // a context the manager did not create: it installs its SNI callback on it
+    auto given = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
+    given->use_certificate_chain(boost::asio::buffer(fallback.first));
+    given->use_private_key(boost::asio::buffer(fallback.second), boost::asio::ssl::context::pem);
+    asio::certificate_manager::instance().set_default_certificate(given);
+    http::test::server_certificate host("host.test", host_certificate);
+    https_server https;
+
+    REQUIRE(handshake(https.port) == id_of(fallback));
+    REQUIRE(handshake(https.port, "host.test") == id_of(host_certificate));
+}
+
+TEST_CASE("HTTPS servers start listening while others handshake",
+          "[ssl][tls][certificate][integration]") {
+    http::test::test_ca ca;
+    saved_default_certificate saved;
+    auto certificate = ca.issue("shared.test");
+    set_default(certificate);
+    https_server https;
+
+    // servers on the same default context start listening while the first one handshakes
+    std::atomic<bool> stopping{false};
+    std::atomic<int> started{0};
+    std::thread listeners([&] {
+        while (!stopping) {
+            http::server other;
+            other.enable_ssl(true);
+            if (other.listen("127.0.0.1", 0)) ++started;
+        }
+    });
+    int failed = 0;
+    for (int i = 0; i < 40; ++i) {
+        tls_connection connection(https.port, i % 2 ? "shared.test" : "");
+        if (connection.error || connection.peer() != id_of(certificate)) ++failed;
+    }
+    stopping = true;
+    listeners.join();
+
+    CHECK(failed == 0);
+    CHECK(started > 0);
 }

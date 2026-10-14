@@ -34,8 +34,8 @@ std::unique_ptr<asio::socket_server> pool_server::create_socket_server(
             return nullptr;
         }
 
+        // It has the SNI callback of the manager already
         server->set_ssl_context(default_ctx);
-        server->set_sni_callback(asio::certificate_manager::sni_callback);
     }
 
     return server;

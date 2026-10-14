@@ -11,11 +11,13 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 - `certificate_manager::set_default_certificate(certificate, key)` returns `bool`, and keeps the current default certificate when they are not valid, instead of removing it.
 - `certificate_manager::get_default_host()` returns a copy (`std::string`), as the reference returned could change while it was read.
+- The manager installs its SNI callback on the contexts it creates, and on those given to `set_default_certificate()` and `set_certificate()`, when they are created or set. The servers no longer install it as they start listening (`tcp_socket_server::set_sni_callback()` is still there for other contexts).
 
 ### Fixed
 
 - TLS: replacing the default certificate (`certificate_manager::set_default_certificate()`) while a server listens applies to the next handshakes without SNI or with a host name without a certificate, as Node's `setSecureContext()` and Go's `GetCertificate` do. They got the default certificate of when the server started listening until a restart (e.g. after an ACME renewal). Connections keep the certificate they took.
 - `certificate_manager`: certificates created while the cipher list or the legacy protocols were being changed read those settings without the lock.
+- TLS: a server starting to listen wrote the SNI callback into the default context, shared with the servers already handshaking on it (a data race).
 
 ## [0.2.0] - 2026-10-14
 

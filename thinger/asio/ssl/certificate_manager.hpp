@@ -34,6 +34,10 @@ private:
         bool legacy_protocols = false;
     };
 
+    // Install the server name callback (see sni_callback()) on a context, before any
+    // handshake uses it: listeners do not write it into contexts shared with running servers
+    static void install_sni_callback(boost::asio::ssl::context& context);
+
     // Create base SSL context with common settings
     static std::shared_ptr<boost::asio::ssl::context> create_base_ssl_context(const tls_settings& settings);
     
@@ -99,9 +103,10 @@ public:
     void set_server_ciphers(const std::string& ciphers, bool prefer_server_ciphers);
     void enable_legacy_protocols(bool enable);
     
-    // Server name callback of the handshakes (installed on the context of the listener):
-    // switches to the certificate of the host name, or to the default certificate when it is
-    // not the one the listener was created with. OpenSSL calls it with or without SNI
+    // Server name callback of the handshakes, installed on every context the manager creates
+    // or is given: switches to the certificate of the host name, or to the default certificate
+    // when it is not the one the listener was created with. OpenSSL calls it with or without
+    // SNI, from the context of the listener
     static int sni_callback(SSL* ssl, int* al, void* arg);
 };
 

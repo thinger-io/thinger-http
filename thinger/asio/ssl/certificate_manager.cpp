@@ -14,9 +14,14 @@ certificate_manager& certificate_manager::instance() {
     return instance;
 }
 
+void certificate_manager::install_sni_callback(boost::asio::ssl::context& context) {
+    SSL_CTX_set_tlsext_servername_callback(context.native_handle(), sni_callback);
+}
+
 std::shared_ptr<boost::asio::ssl::context> certificate_manager::create_base_ssl_context(const tls_settings& settings) {
     auto context = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
     context->set_options(boost::asio::ssl::context::single_dh_use);
+    install_sni_callback(*context);
     
     // Enable older TLS versions if configured
     if (settings.legacy_protocols) {
@@ -76,6 +81,8 @@ bool certificate_manager::set_certificate(const std::string& hostname,
     if (hostname.empty() || !ssl_context) {
         return false;
     }
+    // It may become the default one (default host)
+    install_sni_callback(*ssl_context);
     
     std::lock_guard<std::mutex> lock(mutex_);
     
@@ -128,6 +135,7 @@ bool certificate_manager::remove_certificate(const std::string& hostname) {
 
 void certificate_manager::set_default_certificate(std::shared_ptr<boost::asio::ssl::context> ssl_context) {
     LOG_INFO("Setting default SSL certificate");
+    if (ssl_context) install_sni_callback(*ssl_context);
     std::lock_guard<std::mutex> lock(mutex_);
     default_context_ = ssl_context;
 }
