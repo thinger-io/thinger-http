@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.14)
 project(thinger_http 
-    VERSION 1.0.0
+    VERSION 0.1.0
     DESCRIPTION "Thinger HTTP Library - ASIO, HTTP and utilities"
     LANGUAGES CXX C
 )

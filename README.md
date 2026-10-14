@@ -9,7 +9,7 @@
 A modern C++20 HTTP/WebSocket library built on Boost.ASIO with coroutine support.
 
 > [!WARNING]
-> This library is under active development and is not yet recommended for production use. APIs and interfaces may change without notice between versions. Feedback and contributions are welcome.
+> This library is under active development and is not yet recommended for production use. While its version is 0.x, a minor version may change the API: see [Versioning](#versioning) and the [changelog](CHANGELOG.md). Feedback and contributions are welcome.
 
 ## Performance
 
@@ -114,12 +114,21 @@ include(FetchContent)
 FetchContent_Declare(
     thinger-http
     GIT_REPOSITORY https://github.com/thinger-io/thinger-http.git
-    GIT_TAG main
+    GIT_TAG v0.1.0
 )
 FetchContent_MakeAvailable(thinger-http)
 
 target_link_libraries(your_target PRIVATE thinger::http)
 ```
+
+### Versioning
+
+Releases are tagged `vMAJOR.MINOR.PATCH` and follow [Semantic Versioning](https://semver.org/). Pin a tag rather than `main`, which changes often. While the version is 0.x:
+
+- a patch version (0.1.x) only fixes bugs, without changing the API;
+- a minor version (0.x.0) may add features and change the API or the behaviour. Every change that can break or alter existing code is listed in [CHANGELOG.md](CHANGELOG.md), under **Changed**, with how to adapt.
+
+From 1.0.0 on, only a major version changes the API in an incompatible way.
 
 ### Build from Source
 

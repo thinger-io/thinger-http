@@ -1,0 +1,66 @@
+# Changelog
+
+All notable changes to thinger-http are documented in this file. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html), as described in
+[Versioning](README.md#versioning).
+
+## [Unreleased]
+
+## [0.1.0] - 2026-10-14
+
+First tagged release. Until now the library was used from `main`.
+
+### Server
+
+- HTTP/1.1 server on Boost.Asio coroutines, served on a pool of worker threads or standalone, over TCP, TLS (with per-domain certificates through SNI) and Unix sockets.
+- Routing on a tree of path segments: path parameters with constraints, query parameters, route groups, and documentation fields and free metadata per route.
+- Synchronous and coroutine handlers. Handlers can take the JSON body already parsed and validated against a JSON Schema.
+- Request bodies decoded by `Content-Type` (JSON, msgpack, CBOR, UBJSON, forms), with limits on size, nesting and values. Bodies can be read whole, deferred or streamed.
+- Middlewares, synchronous or coroutines, Express style.
+- Body size, decoding limits and timeout per route, group and virtual host.
+- OpenAPI 3.1 documents generated from the routes.
+- In-memory request dispatch, without a socket, with a timeout that cancels the handler.
+- Virtual hosts, a configurable error format, and the client IP behind trusted proxies.
+- Static files with `ETag`, `Last-Modified`, `304 Not Modified`, byte ranges (`206`, `416`), `Cache-Control` and an SPA fallback.
+- `HEAD` answered by the `GET` routes, without a body. `405 Method Not Allowed` with `Allow`.
+- Response compression (gzip, deflate) negotiated as RFC 9110 says (q-values, `identity`, `*`), with `Vary: Accept-Encoding`, as Express's `compression` does.
+- Streaming responses with flow control, chunked responses, Server-Sent Events, WebSocket, and taking a connection over (also per stream).
+- WebSocket as a byte stream socket, for tunnels and other protocols over it.
+- Reverse proxy to HTTP, HTTPS and Unix socket targets, streaming bodies both ways and tunneling WebSockets.
+- Graceful shutdown: stop accepting, drain the requests in progress within a grace period and notify WebSocket and SSE connections. `workers::wait_graceful()` does it on `SIGINT`/`SIGTERM`, and stops at once on a second signal.
+- Connection statistics by kind (HTTP, WebSocket, SSE, tunnels, taken over).
+
+### Client
+
+- Synchronous `client` and `async_client` (callbacks or coroutines), with a fluent request builder, redirects, streaming and file downloads, Unix sockets and WebSocket.
+- Keep-alive connection pool: idle connections reused per origin, bounded per host and in total, closed after an idle timeout (shortened to the server's `Keep-Alive: timeout`), checked before reuse, and requests retried once on a new connection when that is safe (as Go does).
+- HTTP proxies: absolute-form for `http://`, `CONNECT` tunnels for `https://`, `ws://` and `wss://`, Basic proxy authentication, and the `http_proxy`, `https_proxy`, `all_proxy` and `no_proxy` variables (uppercase too, except `HTTP_PROXY`, never read, as curl does, against httpoxy).
+- Additional trusted CAs (files or PEM), with or without the system ones.
+- Responses parsed as strictly as requests, with an error code for each way a response can be wrong (`client_error`).
+- gzip and deflate bodies decoded within the maximum content size (no decompression bombs); a body that cannot be decoded fails with `bad_content_encoding`.
+- `TCP_NODELAY` on client connections.
+
+### Robustness
+
+- Strict request parsing and framing (RFC 9112): `Content-Length` and `Transfer-Encoding` rules, no obsolete line folding, ASCII request targets, bounded header sections and bodies.
+- Fuzzing with libFuzzer of the request and response parsers, the chunked decoder, the body decoders, URL decoding and gzip/deflate decoding, and differential fuzzing against llhttp and Boost.Beast.
+- Test suite run in CI in Release and with AddressSanitizer, UndefinedBehaviorSanitizer and ThreadSanitizer, plus CodeQL and coverage.
+
+### Changed (for users tracking `main` before 0.1.0)
+
+These changes of the last weeks can be noticed by code written against an earlier `main`:
+
+- A coroutine lambda passed to a callback that is only called, never awaited (`sync_callback`, e.g. `on_message`, `on_shutdown`, error formatters, hooks), no longer compiles. Before, it compiled and never ran. `use()`, `take_over()`, `upgrade_websocket()`, `start_sse()` and the client callbacks now run coroutines.
+- A route with `.schema()` validates the body whatever the handler signature (400 when invalid, 415 when its type cannot be decoded). Before, a handler taking `(request&, response&)` skipped the validation.
+- Responses sent whole always carry the `Content-Length` of their content and never `Transfer-Encoding`. 1xx and 204 have no body nor `Content-Length`, and 304 has no body.
+- Responses of `take_over()` that are not framed, and event streams, say `Connection: close`.
+- `Vary: Accept-Encoding` is added to compressible responses even when they are not compressed. `Accept-Encoding: gzip;q=0` is honoured, and `Cache-Control: no-transform` disables compression.
+- The reverse proxy answers 504 instead of 400 when its timeout ends while it streams the request body.
+- Client: `auto_decompress(false)` keeps bodies as received; before, a compressed body was decoded anyway. A body that cannot be decoded fails with `client_error::bad_content_encoding` instead of being returned undecoded.
+- Client: streamed requests (`send_streaming()`, `download()`) ask for `Accept-Encoding: identity` and are never decoded. `stream_result::headers` is filled (names in lowercase).
+- Client: connections are kept alive between requests (see the README to tune or disable the pool).
+- The unused `request_handler` interface was removed.
+
+[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/thinger-io/thinger-http/releases/tag/v0.1.0
