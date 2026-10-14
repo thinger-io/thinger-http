@@ -146,6 +146,12 @@ public:
         return get_content_length() > content_.size() ? get_content_length() - content_.size() : 0;
     }
 
+    // Expectation of a received request (Expect header, RFC 9110 section 10.1.1): none (also
+    // for HTTP/1.0 requests, which must ignore it), 100-continue (the client may wait for a
+    // 100 Continue before sending the body), or another one, which cannot be met
+    enum class expectation : uint8_t { none, continue_100, unsupported };
+    expectation get_expectation() const { return expectation_; }
+
     // other
     void refresh_uri();
 
@@ -165,6 +171,10 @@ private:
     std::optional<proxy_config> proxy_config_;
     std::vector<std::string> ca_files_;
     std::vector<std::string> ca_pems_;
+    expectation expectation_ = expectation::none;
+
+    // Keep track of the expectation of a received Expect header
+    void process_expect_header(std::string_view value);
 
 };
 

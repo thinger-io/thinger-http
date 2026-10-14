@@ -251,6 +251,14 @@ awaitable<void> http_application::handle(std::shared_ptr<request> req, std::shar
         co_return;
     }
 
+    // An expectation other than 100-continue cannot be met (RFC 9110 section 10.1.1): 417, as
+    // Node and Go answer. Its body, sent or not, is not read: the connection is not reused then
+    if (http_request->get_expectation() == http_request::expectation::unsupported) [[unlikely]] {
+        if (req->has_pending_body()) close_after_response(*req);
+        res.error(http_response::status::expectation_failed, "Expectation Failed");
+        co_return;
+    }
+
     // Match the virtual host (by the Host header), then the route among its routes, whose
     // limits apply from here
     virtual_host* host = this;

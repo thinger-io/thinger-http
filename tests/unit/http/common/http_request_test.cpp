@@ -416,3 +416,31 @@ TEST_CASE("HTTP Request URI parsing matches the regex it replaced", "[http][requ
         }
     }
 }
+
+TEST_CASE("HTTP Request Expect header", "[http][request][expect][unit]") {
+    auto expectation_of = [](std::vector<std::string> values, uint8_t minor = 1) {
+        http_request request;
+        request.set_http_version_minor(minor);
+        for (auto& value : values) request.process_header("Expect", value);
+        return request.get_expectation();
+    };
+    using expectation = http_request::expectation;
+
+    REQUIRE(http_request{}.get_expectation() == expectation::none);
+    REQUIRE(expectation_of({"100-continue"}) == expectation::continue_100);
+    REQUIRE(expectation_of({"100-Continue"}) == expectation::continue_100);
+    REQUIRE(expectation_of({" 100-continue\t"}) == expectation::continue_100);
+    REQUIRE(expectation_of({"100-continue, foo"}) == expectation::continue_100);
+    REQUIRE(expectation_of({"foo", "100-continue"}) == expectation::continue_100);
+    REQUIRE(expectation_of({"foo"}) == expectation::unsupported);
+    REQUIRE(expectation_of({"100-continue=1"}) == expectation::unsupported);
+    REQUIRE(expectation_of({""}) == expectation::none);
+    REQUIRE(expectation_of({" , "}) == expectation::none);
+    // HTTP/1.0 requests ignore it
+    REQUIRE(expectation_of({"100-continue"}, 0) == expectation::none);
+    REQUIRE(expectation_of({"foo"}, 0) == expectation::none);
+    // The header name is case-insensitive
+    http_request request;
+    request.process_header("expect", "100-continue");
+    REQUIRE(request.get_expectation() == expectation::continue_100);
+}

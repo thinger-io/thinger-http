@@ -68,6 +68,8 @@ namespace thinger::http{
                 "HTTP/1.1 415 Unsupported Media Type";
         const std::string range_not_satisfiable =
                 "HTTP/1.1 416 Range Not Satisfiable";
+        const std::string expectation_failed =
+                "HTTP/1.1 417 Expectation Failed";
         const std::string request_header_fields_too_large =
                 "HTTP/1.1 431 Request Header Fields Too Large";
         const std::string unknown =
@@ -133,6 +135,8 @@ namespace thinger::http{
                     return unsupported_media_type;
                 case http_response::status::range_not_satisfiable:
                     return range_not_satisfiable;
+                case http_response::status::expectation_failed:
+                    return expectation_failed;
                 case http_response::status::request_header_fields_too_large:
                     return request_header_fields_too_large;
                 default:
@@ -331,6 +335,12 @@ namespace thinger::http{
                 "<body><h1>415 Unsupported Media Type</h1></body>"
                 "</html>");
 
+        static const std::string expectation_failed(
+                "<html>"
+                "<head><title>Expectation Failed</title></head>"
+                "<body><h1>417 Expectation Failed</h1></body>"
+                "</html>");
+
         static const std::string request_header_fields_too_large(
                 "<html>"
                 "<head><title>Request Header Fields Too Large</title></head>"
@@ -385,6 +395,8 @@ namespace thinger::http{
                     return payload_too_large;
                 case http_response::status::unsupported_media_type:
                     return unsupported_media_type;
+                case http_response::status::expectation_failed:
+                    return expectation_failed;
                 case http_response::status::request_header_fields_too_large:
                     return request_header_fields_too_large;
                 default:

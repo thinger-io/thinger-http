@@ -391,8 +391,33 @@ namespace thinger::http {
         if(::thinger::util::ascii::iequals(key, http::header::host)){
             set_host(std::move(value));
         }else{
+            if(::thinger::util::ascii::iequals(key, "Expect")){
+                process_expect_header(value);
+            }
             // handle header by parent
             headers::process_header(std::move(key), std::move(value));
+        }
+    }
+
+    void http_request::process_expect_header(std::string_view value){
+        // A list of expectations, case-insensitive: 100-continue is the only one defined.
+        // Ignored in HTTP/1.0 requests (they predate it), and empty values, as Go does
+        if(http_version_major_ == 1 && http_version_minor_ == 0) return;
+        static constexpr std::string_view whitespace = " \t";
+        while(!value.empty()){
+            auto comma = value.find(',');
+            auto item = value.substr(0, comma);
+            auto first = item.find_first_not_of(whitespace);
+            if(first != std::string_view::npos){
+                item = item.substr(first, item.find_last_not_of(whitespace) - first + 1);
+                if(::thinger::util::ascii::iequals(item, "100-continue")){
+                    expectation_ = expectation::continue_100;
+                }else if(expectation_ == expectation::none){
+                    expectation_ = expectation::unsupported;
+                }
+            }
+            if(comma == std::string_view::npos) break;
+            value.remove_prefix(comma + 1);
         }
     }
 
