@@ -2,6 +2,7 @@
 #include "request.hpp"
 #include "mime_types.hpp"
 #include "body_decoders.hpp"
+#include "response_compression.hpp"
 #include "file_server/file_info.hpp"
 #include "../../util/logger.hpp"
 #include "../../util/base64.hpp"
@@ -50,51 +51,6 @@ namespace {
         response.add_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH");
         response.add_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
         response.add_header("Access-Control-Allow-Credentials", "true");
-    }
-
-    bool is_compressible_content_type(const std::string& content_type) {
-        // Only compress text-based content types
-        return content_type.starts_with("text/")
-            || content_type.starts_with("application/json")
-            || content_type.starts_with("application/xml")
-            || content_type.starts_with("application/javascript")
-            || content_type.starts_with("application/x-javascript")
-            || content_type.starts_with("image/svg+xml");
-    }
-
-    // Whether a comma-separated header (any of its values) holds `token`, case-insensitive
-    bool has_list_token(const http_response& message, std::string_view name, std::string_view token) {
-        for (const auto& value : message.get_headers_with_key(name)) {
-            std::string_view list = value;
-            while (!list.empty()) {
-                auto comma = list.find(',');
-                auto item = list.substr(0, comma);
-                list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
-                auto first = item.find_first_not_of(" \t");
-                if (first == std::string_view::npos) continue;
-                item = item.substr(first, item.find_last_not_of(" \t") - first + 1);
-                if (boost::iequals(item, token)) return true;
-            }
-        }
-        return false;
-    }
-
-    // Add `field` to the Vary header (as the vary module of Express): appended to the one
-    // there, unless it has it or is "*"
-    void add_vary(http_response& message, std::string_view field) {
-        if (has_list_token(message, "Vary", field) || has_list_token(message, "Vary", "*")) return;
-        const auto& vary = message.get_header("Vary");
-        if (vary.empty()) {
-            message.add_header("Vary", std::string(field));
-        } else {
-            message.set_header("Vary", vary + ", " + std::string(field));
-        }
-    }
-
-    // Whether the response asks not to be transformed (Cache-Control: no-transform, RFC
-    // 9111, 5.2.2.6): no compression then, as Express
-    bool no_transform(const http_response& message) {
-        return message.has_header(header::cache_control) && has_list_token(message, header::cache_control, "no-transform");
     }
 
 }
@@ -185,40 +141,6 @@ http_response& response::draft() {
     return *state_->draft;
 }
 
-bool response::compressible(const http_response& response) {
-    // A body worth compressing, of a text-based type, that may be transformed
-    if (response.get_content().size() < compression_threshold) return false;
-    const auto& content_type = response.get_content_type();
-    return !content_type.empty() && is_compressible_content_type(content_type) && !no_transform(response);
-}
-
-void response::compress_if_needed(http_response& response) const {
-    if (!compressible(response)) return;
-
-    // Sent compressed or not depending on the request: caches must tell both apart
-    add_vary(response, "Accept-Encoding");
-
-    // Already compressed by the handler
-    if (response.has_header("Content-Encoding")) return;
-
-    // What the client accepts (its Accept-Encoding headers make one list)
-    std::string accept_encoding;
-    for (const auto& value : state_->request->get_headers_with_key("Accept-Encoding")) {
-        if (!accept_encoding.empty()) accept_encoding += ", ";
-        accept_encoding += value;
-    }
-    auto coding = negotiate_content_coding(accept_encoding);
-    if (coding == content_coding::identity) return;
-
-    const auto& content = response.get_content();
-    auto compressed = coding == content_coding::gzip ? ::thinger::util::gzip::compress(content)
-                                                     : ::thinger::util::deflate::compress(content);
-    if (compressed) {
-        response.set_content(std::move(*compressed));
-        response.add_header("Content-Encoding", coding == content_coding::gzip ? "gzip" : "deflate");
-    }
-}
-
 bool response::head_request() const {
     return state_->request->get_method() == method::HEAD;
 }
@@ -279,10 +201,10 @@ void response::prepare_body(http_response& message, bool compress) const {
         // The headers of the answer to GET, Content-Length included, without its body: the
         // client reads none (RFC 9110, 9.3.2), so it would be taken as the next response.
         // Not compressed (like Express): its length is the one of the identity body.
-        if (compress && compressible(message)) add_vary(message, "Accept-Encoding");
+        if (compress && compression::compressible(message)) compression::add_vary(message, "Accept-Encoding");
         message.get_content().clear();
-    } else if (compress && message.get_content().size() >= compression_threshold) {
-        compress_if_needed(message);
+    } else if (compress && message.get_content().size() >= compression::threshold) {
+        compression::compress(message, *state_->request);
     }
 }
 
@@ -419,10 +341,9 @@ void response::send_file(const std::filesystem::path& path, const file_info& fil
     message->set_header("ETag", file.etag);
     message->set_header("Last-Modified", file.last_modified);
     // A precompressed file is sent depending on Accept-Encoding, and a text file may be sent
-    // compressed (see compress_if_needed): another representation either way
-    if (!encoding.empty() ||
-        (file.size >= compression_threshold && is_compressible_content_type(content_type) && !no_transform(*message))) {
-        add_vary(*message, "Accept-Encoding");
+    // compressed: another representation either way
+    if (!encoding.empty() || compression::compressible(*message, file.size, content_type)) {
+        compression::add_vary(*message, "Accept-Encoding");
     }
 
     // Conditional request for a file the client has: no body, nor the length of the file

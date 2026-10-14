@@ -2,6 +2,7 @@
 #define THINGER_HTTP_SERVER_BODY_DECODERS_HPP
 
 #include "../common/http_response.hpp"
+#include "response_compression.hpp"     // Accept-Encoding negotiation, declared here before
 #include <nlohmann/json.hpp>
 #include <cstddef>
 #include <functional>
@@ -194,25 +195,6 @@ response_encoding negotiate_response_encoding(std::string_view accept);
 
 // Encode a value in a format of negotiate_response_encoding()
 std::string encode_body(const nlohmann::json& value, const std::string& format);
-
-// Qualities an Accept-Encoding header (RFC 9110, 12.5.3; empty if missing) gives the content
-// codings, in thousandths: by name (case-insensitive, x-gzip is gzip) or else through "*";
-// 0 if not acceptable, -1 if not listed (identity is still acceptable then, as the last
-// choice). An invalid weight drops the coding from the list.
-struct accepted_codings {
-    int gzip;
-    int deflate;
-    int br;
-    int identity;
-};
-accepted_codings parse_accept_encoding(std::string_view accept_encoding);
-
-// Content coding to compress a response with, as the Accept-Encoding header asks (see
-// parse_accept_encoding): gzip or deflate, by the quality the client gives them; gzip at
-// equal quality, as Express. Identity if the client accepts neither, or gives identity a
-// higher quality.
-enum class content_coding { identity, gzip, deflate };
-content_coding negotiate_content_coding(std::string_view accept_encoding);
 
 } // namespace thinger::http
 

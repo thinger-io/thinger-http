@@ -633,68 +633,6 @@ response_encoding negotiate_response_encoding(std::string_view accept) {
     return result;
 }
 
-// --- content coding ---
-
-accepted_codings parse_accept_encoding(std::string_view accept_encoding) {
-    using ::thinger::util::ascii::iequals;
-    // Qualities in thousandths, -1 if not listed
-    accepted_codings listed{-1, -1, -1, -1};
-    int any = -1;
-    size_t position = 0;
-    while (position < accept_encoding.size()) {
-        size_t end = accept_encoding.find(',', position);
-        if (end == std::string_view::npos) end = accept_encoding.size();
-        auto element = accept_encoding.substr(position, end - position);
-        position = end + 1;
-
-        auto semicolon = element.find(';');
-        auto coding = trim(element.substr(0, semicolon));
-        if (coding.empty()) continue;
-        // The weight (";q="), the only parameter defined; an invalid one drops the coding
-        int quality = 1000;
-        auto parameters = semicolon == std::string_view::npos ? std::string_view{} : element.substr(semicolon + 1);
-        while (!parameters.empty() && quality >= 0) {
-            auto next = parameters.find(';');
-            auto parameter = parameters.substr(0, next);
-            parameters = next == std::string_view::npos ? std::string_view{} : parameters.substr(next + 1);
-            auto equals = parameter.find('=');
-            if (equals != std::string_view::npos && iequals(trim(parameter.substr(0, equals)), "q")) {
-                quality = parse_quality(trim(parameter.substr(equals + 1)));
-            }
-        }
-        if (quality < 0) continue;
-
-        // (the first time a coding is listed counts)
-        int* entry = nullptr;
-        if (iequals(coding, "gzip") || iequals(coding, "x-gzip")) {
-            entry = &listed.gzip;
-        } else if (iequals(coding, "deflate")) {
-            entry = &listed.deflate;
-        } else if (iequals(coding, "br")) {
-            entry = &listed.br;
-        } else if (iequals(coding, "identity")) {
-            entry = &listed.identity;
-        } else if (coding == "*") {
-            entry = &any;
-        }
-        if (entry && *entry < 0) *entry = quality;
-    }
-
-    // "*" stands for the codings not listed; identity not listed nor excluded is still
-    // acceptable, as the last choice
-    for (int* quality : {&listed.gzip, &listed.deflate, &listed.br, &listed.identity}) {
-        if (*quality < 0) *quality = any;
-    }
-    return listed;
-}
-
-content_coding negotiate_content_coding(std::string_view accept_encoding) {
-    auto accepted = parse_accept_encoding(accept_encoding);
-    int best = std::max(accepted.gzip, accepted.deflate);
-    if (best <= 0 || accepted.identity > best) return content_coding::identity;
-    return accepted.gzip >= accepted.deflate ? content_coding::gzip : content_coding::deflate;
-}
-
 std::string encode_body(const nlohmann::json& value, const std::string& format) {
     std::vector<uint8_t> encoded;
     if (format == "msgpack") {

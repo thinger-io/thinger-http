@@ -243,18 +243,11 @@ private:
     http_response& draft();
     // New message to answer with: a copy of the draft, if any
     std::shared_ptr<http_response> new_response() const;
-    // Responses of at least this size, of a text-based type, are compressed for the clients
-    // accepting it (gzip or deflate), unless Cache-Control says no-transform
-    static constexpr size_t compression_threshold = 200;
-    static bool compressible(const http_response& response);
-    // Compress a response that is compressible if the client accepts it, adding
-    // "Vary: Accept-Encoding" either way (as the compression middleware of Express)
-    void compress_if_needed(http_response& response) const;
     // Whether the request is HEAD: its response has no body
     bool head_request() const;
     // Body of a message about to be sent: framed (see frame_message), dropped for HEAD
     // (keeping its Content-Length), else compressed if `compress` and the client accepts it
-    // (see compress_if_needed)
+    // (see compression::compress)
     void prepare_body(http_response& message, bool compress) const;
     // Framing of a message sent whole: its content is its body, with its Content-Length
     [[gnu::noinline, gnu::cold]] void frame_message(http_response& message) const;
