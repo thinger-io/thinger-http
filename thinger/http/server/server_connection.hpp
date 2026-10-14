@@ -75,8 +75,25 @@ public:
     }
 
 private:
-    // Main read loop coroutine
+    // Read requests, one after another, and hand each to the handler
     awaitable<void> read_loop();
+
+    // The parsed request, queued for its response, with the bytes read past its headers
+    std::pair<std::shared_ptr<http_stream>, std::shared_ptr<request>> start_request(
+        const std::shared_ptr<server_connection>& self, const uint8_t* read_ahead, size_t read_ahead_size);
+
+    // Answer a request that cannot be parsed, or whose header section is too large
+    void reject_request();
+
+    // The request took the connection over: stop reading, and hand it what was read past it
+    void hand_over_reader(http_stream& stream, request& req);
+
+    // Move what was read past the request to the buffer, for the next request; false if it
+    // does not fit
+    bool keep_pipelined(request& req, size_t& buffered);
+
+    // The connection ended without being taken over
+    void stop_reading();
 
     // The server shuts down: close once idle, or after the response in progress (which tells
     // the client); or close right away

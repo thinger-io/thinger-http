@@ -52,10 +52,8 @@ void server_connection::start(std::chrono::seconds timeout) {
     running_ = true;
     timeout_ = timeout;
 
-    // Start timeout timer
     reset_timeout();
 
-    // Spawn the read loop coroutine
     co_spawn(socket_->get_io_context(),
         [self = shared_from_this()]() -> awaitable<void> {
             co_await self->read_loop();
@@ -113,13 +111,12 @@ void server_connection::close() {
 awaitable<void> server_connection::read_loop() {
     auto self = shared_from_this();
 
-    // Parse headers only; body reading is managed by the handler layer
+    // Headers only: the handler layer reads the body
     request_parser_.set_headers_only(true);
 
     size_t buffered = 0; // bytes of valid data in buffer_
 
     while (running_ && socket_->is_open()) {
-        // If no buffered data, read from socket
         if (buffered == 0) {
             in_progress_ = nullptr;
             auto [ec, bytes] = co_await socket_->read_some(buffer_, MAX_BUFFER_SIZE);
@@ -128,106 +125,50 @@ awaitable<void> server_connection::read_loop() {
             buffered = bytes;
         }
 
-        // Parse available data
         uint8_t* begin = buffer_;
         uint8_t* end = buffer_ + buffered;
         boost::tribool result = request_parser_.parse(begin, end);
-        size_t unconsumed = static_cast<size_t>(end - begin);
-
-        if (result) {
-            // Successfully parsed headers
-            auto http_req = request_parser_.consume_request();
-            http_req->set_ssl(socket_->is_secure());
-
-            size_t content_length = http_req->get_content_length();
-
-            auto stream = std::make_shared<http_stream>(++request_id_, http_req->keep_alive());
-            in_progress_ = stream.get();
-
-            // The client may wait for 100 Continue before sending the body: sent once the
-            // body is read, unless the client already started sending it
-            if (http_req->get_expectation() == http_request::expectation::continue_100 &&
-                http_req->has_pending_body() && unconsumed == 0) [[unlikely]] {
-                stream->set_continue(http_stream::continue_state::pending);
-                frame_watch_ |= watch_continue;
-            }
-
-            // Add to queue for pipelining
-            request_queue_.push(stream);
-
-            // Log the request
-            http_req->log("SERVER REQUEST", 0);
-
-            // Create request and store read-ahead data
-            auto req = std::make_shared<request>(self, stream, http_req);
-            if (unconsumed > 0) {
-                req->set_read_ahead(begin, unconsumed);
-            }
-
-            // Dispatch to handler (awaitable — handler decides body reading strategy)
-            if (handler_) {
-                co_await handler_(req);
-                // Not once the response closed the connection (or it was taken over): the
-                // timer would be armed just to be cancelled
-                if (running_) reset_timeout();
-            }
-
-            // A response sent later, from a copy of the response, may still take over the
-            // connection: wait for it to start before reading what follows this request
-            if (!stream->responded()) co_await wait_response(*stream);
-
-            // Read-ahead bytes the request did not consume belong to whatever follows it
-            // (they may come from later socket reads, e.g. after a chunked body)
-
-            // Connection taken over: stop reading and hand the leftover to the new owner
-            if (stream->takes_over()) {
-                auto leftover = req->take_read_ahead();
-                stream->takeover_reader_stopped(std::string(leftover.begin(), leftover.end()));
-                in_progress_ = nullptr;
-                complete_takeover(*stream);
-                co_return;
-            }
-
-            // If not keep-alive, stop reading after this request. The leftover stays with
-            // the request: its handler may still be reading the body (e.g. the request was
-            // answered by its timeout)
-            if (!stream->keep_alive()) {
-                break;
-            }
-
-            // Otherwise it is pipelined data for the next request. The leftover is at most
-            // what was read at once: the connection buffer, or the body reader framing reads
-            auto leftover = req->take_read_ahead();
-            static_assert(body_reader::framing_read_size <= MAX_BUFFER_SIZE,
-                          "body framing reads must fit in the connection buffer, or the leftover is dropped");
-            if (leftover.size() > MAX_BUFFER_SIZE) {
-                LOG_ERROR("pipelined data exceeds the connection buffer");
-                break;
-            }
-            if (!leftover.empty()) {
-                std::memcpy(buffer_, leftover.data(), leftover.size());
-            }
-            buffered = leftover.size();
-        } else if (!result) {
-            // Bad request, or a header section over the limits
-            auto status = http_response::status::bad_request;
-            if (request_parser_.header_section_too_large()) {
-                LOG_ERROR("http request header section too large");
-                status = http_response::status::request_header_fields_too_large;
-            } else {
-                LOG_ERROR("invalid http request");
-            }
-            auto stream = std::make_shared<http_stream>(++request_id_, false);
-            request_queue_.push(stream);
-            handle_stock_error(stream, status);
-            break;
-        } else {
-            // Indeterminate — all data consumed by parser, need more
+        if (boost::indeterminate(result)) {
+            // Every byte went to the parser: more are needed
             buffered = 0;
+            continue;
         }
+        if (!result) {
+            reject_request();
+            break;
+        }
+
+        auto [stream, req] = start_request(self, begin, static_cast<size_t>(end - begin));
+
+        // The handler decides how to read the body
+        if (handler_) {
+            co_await handler_(req);
+            // Not once the response closed the connection (or it was taken over): the
+            // timer would be armed just to be cancelled
+            if (running_) reset_timeout();
+        }
+
+        // A response sent later, from a copy of the response, may still take over the
+        // connection: wait for it to start before reading what follows this request
+        if (!stream->responded()) co_await wait_response(*stream);
+
+        // Read-ahead bytes the request did not consume belong to whatever follows it (they
+        // may come from later socket reads, e.g. after a chunked body)
+        if (stream->takes_over()) {
+            hand_over_reader(*stream, *req);
+            co_return;
+        }
+
+        // Without keep-alive, reading stops after this request. The leftover stays with the
+        // request: its handler may still be reading the body (e.g. the request was answered
+        // by its timeout)
+        if (!stream->keep_alive() || !keep_pipelined(*req, buffered)) break;
     }
 
-    // Connection ended, without being taken over
+    stop_reading();
+}
+
+void server_connection::stop_reading() {
     running_ = false;
     reader_stopped_ = true;
     in_progress_ = nullptr;
@@ -236,6 +177,72 @@ awaitable<void> server_connection::read_loop() {
     // Draining, with every response written: done now, even if something still holds the
     // connection (e.g. a copy of the request)
     if ((frame_watch_ & watch_draining) && request_queue_.empty()) close();
+}
+
+std::pair<std::shared_ptr<http_stream>, std::shared_ptr<request>> server_connection::start_request(
+    const std::shared_ptr<server_connection>& self, const uint8_t* read_ahead, size_t read_ahead_size) {
+    auto http_req = request_parser_.consume_request();
+    http_req->set_ssl(socket_->is_secure());
+
+    auto stream = std::make_shared<http_stream>(++request_id_, http_req->keep_alive());
+    in_progress_ = stream.get();
+
+    // The client may wait for 100 Continue before sending the body: sent once the body is
+    // read, unless the client already started sending it
+    if (http_req->get_expectation() == http_request::expectation::continue_100 &&
+        http_req->has_pending_body() && read_ahead_size == 0) [[unlikely]] {
+        stream->set_continue(http_stream::continue_state::pending);
+        frame_watch_ |= watch_continue;
+    }
+
+    // Queued in order, for pipelining
+    request_queue_.push(stream);
+
+    http_req->log("SERVER REQUEST", 0);
+
+    auto req = std::make_shared<request>(self, stream, std::move(http_req));
+    if (read_ahead_size > 0) {
+        req->set_read_ahead(read_ahead, read_ahead_size);
+    }
+    return {std::move(stream), std::move(req)};
+}
+
+void server_connection::reject_request() {
+    // Bad request, or a header section over the limits
+    auto status = http_response::status::bad_request;
+    if (request_parser_.header_section_too_large()) {
+        LOG_ERROR("http request header section too large");
+        status = http_response::status::request_header_fields_too_large;
+    } else {
+        LOG_ERROR("invalid http request");
+    }
+    auto stream = std::make_shared<http_stream>(++request_id_, false);
+    request_queue_.push(stream);
+    handle_stock_error(stream, status);
+}
+
+void server_connection::hand_over_reader(http_stream& stream, request& req) {
+    auto leftover = req.take_read_ahead();
+    stream.takeover_reader_stopped(std::string(leftover.begin(), leftover.end()));
+    in_progress_ = nullptr;
+    complete_takeover(stream);
+}
+
+bool server_connection::keep_pipelined(request& req, size_t& buffered) {
+    // The leftover is at most what was read at once: the connection buffer, or the body
+    // reader framing reads
+    auto leftover = req.take_read_ahead();
+    static_assert(body_reader::framing_read_size <= MAX_BUFFER_SIZE,
+                  "body framing reads must fit in the connection buffer, or the leftover is dropped");
+    if (leftover.size() > MAX_BUFFER_SIZE) {
+        LOG_ERROR("pipelined data exceeds the connection buffer");
+        return false;
+    }
+    if (!leftover.empty()) {
+        std::memcpy(buffer_, leftover.data(), leftover.size());
+    }
+    buffered = leftover.size();
+    return true;
 }
 
 awaitable<void> server_connection::wait_response(const http_stream& stream) {
@@ -285,7 +292,6 @@ void server_connection::frame_written(http_stream& stream, const std::shared_ptr
     // from detached code after the handler returned) loses the connection then
     reset_timeout();
 
-    // Check if stream is complete
     if (frame->end_stream()) {
         // Response of a request taking over the connection: the socket may now belong to
         // someone else, never close it from here
@@ -298,7 +304,6 @@ void server_connection::frame_written(http_stream& stream, const std::shared_ptr
         if (!stream.keep_alive()) {
             close();
         } else {
-            // Remove completed stream from queue
             if (!request_queue_.empty()) {
                 request_queue_.pop();
             }
@@ -315,7 +320,6 @@ void server_connection::process_output_queue() {
         auto frame = stream->current_frame();
         stream->pop_frame();
 
-        // Log response
         frame->log("SERVER RESPONSE", 0);
 
         auto& buffers = write_buffers_;
@@ -352,7 +356,6 @@ void server_connection::process_output_queue() {
                 frame_written(*stream, frame, !ec);
                 writing_ = false;
 
-                // Process more frames if available
                 process_output_queue();
             },
             detached);
@@ -368,7 +371,7 @@ void server_connection::queue_frame(const std::shared_ptr<http_stream>& stream, 
         return;
     }
 
-    // Only process if this is the front stream (for pipelining order)
+    // Only the front stream writes: responses go in the order of their requests
     if (request_queue_.front()->id() == stream->id()) {
         process_output_queue();
     }
@@ -376,7 +379,7 @@ void server_connection::queue_frame(const std::shared_ptr<http_stream>& stream, 
 
 void server_connection::watch_frame(const std::shared_ptr<http_stream>& stream,
                                     const std::shared_ptr<http_frame>& frame) {
-    // (the waiter wakes up once this call returns, with the frame queued)
+    // The waiter wakes up once this call returns, with the frame queued
     if (frame_watch_ & watch_response_start) response_started_.cancel();
 
     // A response starting while the connection drains is the last one: it tells the client
