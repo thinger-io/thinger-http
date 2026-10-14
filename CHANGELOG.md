@@ -7,6 +7,10 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- Request context: typed values a middleware stores in the request for the route handler, such as the authenticated principal (`req.context().set(key, value)`, `req.context().get(key)`), as Express `res.locals`, Go `context.WithValue` or Rust `http::Extensions`. Values live under `http::context_key<T>` keys, told apart by their address, so two values of the same type do not collide; move-only values are supported, and they are destroyed with the request. Every kind of middleware and route callback sees them, and in-memory dispatch too, which seeds them with `dispatch_options::context`. A request storing nothing allocates nothing for it. See [Request Context](README.md#request-context).
+
 ### Changed
 
 - `certificate_manager::set_default_certificate(certificate, key)` returns `bool`, and keeps the current default certificate when they are not valid, instead of removing it.

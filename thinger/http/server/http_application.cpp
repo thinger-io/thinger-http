@@ -447,6 +447,7 @@ awaitable<std::shared_ptr<http_response>> http_application::dispatch(std::shared
 
     auto req = std::make_shared<request>(nullptr, nullptr, http_request);
     req->set_peer_ip(options.remote_ip);
+    req->context() = std::move(options.context);
     if (!body.empty()) {
         req->set_read_ahead(reinterpret_cast<const uint8_t*>(body.data()), body.size());
     }

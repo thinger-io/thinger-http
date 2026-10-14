@@ -7,6 +7,7 @@
 #include "openapi.hpp"
 #include "body_decoders.hpp"
 #include "response_sink.hpp"
+#include "request_context.hpp"
 #include "../../util/types.hpp"
 #include <chrono>
 #include <functional>
@@ -30,6 +31,11 @@ struct dispatch_options {
     // Maximum time to wait for the response, handler execution included; 504 Gateway
     // Timeout if exceeded (the handler is then cancelled: its pending awaits are aborted)
     std::chrono::milliseconds timeout{30000};
+
+    // Initial values of the request context (see request::context()), seen by the
+    // middlewares and the handler, e.g. a trace id; they may replace them. Empty by default:
+    // nothing is carried over from the request being served by the caller.
+    request_context context;
 };
 
 // Middlewares run after route matching (request::get_matched_route() is set, or null

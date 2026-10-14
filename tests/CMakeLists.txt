@@ -94,6 +94,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/body_decoders_test.cpp)
     add_thinger_test(test_body_decoders unit/http/server/body_decoders_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/request_context_test.cpp)
+    add_thinger_test(test_request_context unit/http/server/request_context_test.cpp)
+endif()
+
 # Unit tests - HTTP Common
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/common/headers_test.cpp)
     add_thinger_test(test_headers unit/http/common/headers_test.cpp)
@@ -234,6 +238,10 @@ endif()
 # Integration tests - Unix Socket Server
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/memory_dispatch_test.cpp)
     add_thinger_test(test_integration_memory_dispatch integration/memory_dispatch_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/request_context_test.cpp)
+    add_thinger_test(test_integration_request_context integration/request_context_test.cpp)
 endif()
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/unix_socket_server_test.cpp)

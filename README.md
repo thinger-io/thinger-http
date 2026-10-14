@@ -623,6 +623,48 @@ Notes:
 
 `set_basic_auth()` is a ready-made middleware for HTTP Basic authentication on a path prefix (see `examples/http_server/server_auth_example.cpp`).
 
+### Request Context
+
+A middleware passes values of its own types to the route handler through the request context, `req.context()`: e.g. the principal (user, token, permissions) an authentication middleware resolves. Each value is stored under a key, a `http::context_key<T>` that fixes its type, so the handler reads it with that type, without casts:
+
+```cpp
+struct principal {
+    std::string user;
+    std::vector<std::string> scopes;
+};
+
+// One key per value, with static storage duration (a namespace-scope constant)
+inline constexpr http::context_key<principal> principal_key{"principal"};
+
+server.use([&tokens](http::request& req, http::response& res) -> thinger::awaitable<bool> {
+    auto user = co_await tokens.validate(req.header("Authorization"));
+    if (!user) {
+        res.error(http::http_response::status::unauthorized, "Invalid token");
+        co_return false;
+    }
+    req.context().set(principal_key, principal{user->name, user->scopes});
+    co_return true;
+});
+
+server.get("/me", [](http::request& req, http::response& res) {
+    const principal* who = req.context().get(principal_key);   // null if none was stored
+    if (!who) {
+        res.error(http::http_response::status::unauthorized);
+        return;
+    }
+    res.json({{"user", who->user}, {"scopes", who->scopes}});
+});
+```
+
+- `set(key, value)` stores a value (copied or moved in; move-only types such as `std::unique_ptr` are fine), `emplace(key, args...)` constructs it in place, and both replace (and destroy) the value the key had. `get(key)` returns a pointer to the value, or `nullptr` if the key has none. `contains(key)`, `erase(key)` (destroys it), `take(key)` (moves it out, as a `std::optional`) and `clear()` complete it.
+- Keys are told apart by their address, not by their type or name: two `context_key<std::string>` (a trace id and a tenant) are two values, and the keys of two libraries never collide. Define each key once, with static storage duration, and keep it private to the code that stores and reads its value (as Go recommends for context keys), or expose a typed accessor. A value is only read with the type of its key: there are no casts to get wrong.
+- Every kind of middleware (coroutine returning `bool`, or with `next()`) and every route callback taking the `request` sees the same context, also for requests matching no route (`get_matched_route()` is null) and in [in-memory dispatch](#in-memory-dispatch), where `dispatch_options::context` seeds it.
+- Lifetime: the values belong to the request and are destroyed with it, also when a middleware stops the chain, something throws, or an in-memory dispatch times out. Like the `request`, they are only valid until the middleware or handler returns: a handler answering later from a copy of the response must copy what it needs from them first.
+- The context is not synchronized: a request is processed by one coroutine at a time, so only that coroutine (the middlewares, then the handler) uses it.
+- A request that stores nothing pays nothing: the context allocates on its first value.
+
+It is the equivalent of Express `res.locals` (or `req.user`, set by Passport), Go `context.WithValue(ctx, key, value)` with a key of an unexported type, and Rust `http::Extensions` (axum, hyper), here with a value per key instead of per type. `set_auth_user()` and `set_auth_groups()` remain for a user name and groups as strings.
+
 ### Route Metadata and Documentation
 
 Routes can carry documentation fields (for API documentation tools) and free metadata for your application. The library does not interpret the metadata: middlewares read it from the matched route, e.g. to check the permission a route requires.
@@ -756,9 +798,14 @@ auto response = co_await server.dispatch(request, {.remote_ip = "10.0.0.7", .tim
 
 // Outside a coroutine
 server.dispatch(executor, request, [](std::shared_ptr<http::http_response> response) { /* ... */ });
+
+// With initial values of the request context, read by the middlewares and the handler
+http::dispatch_options options{.timeout = 5s};
+options.context.set(trace_key, trace_id);
+response = co_await server.dispatch(request, options);
 ```
 
-The server does not need to be listening. Chunked responses are collected whole. A `HEAD` request gets the response it gets on a connection: no content, with the `Content-Length` of the body of `GET`. Handlers can keep a copy of the response and answer later. The timeout covers the whole request, handler included: if it expires the result is `504` and the handler is cancelled (its pending awaits are aborted). WebSockets, SSE and `take_over()` answer `501`, as there is no connection. The request is served by the [virtual host](#virtual-hosts) of its URL (or `Host` header). `remote_ip` is the peer address: `get_request_ip()` returns it (or the forwarded client address, if it is a [trusted proxy](#client-ip-behind-proxies)), and it is empty unless set: internal calls never pass as a trusted local address by default.
+The server does not need to be listening. Chunked responses are collected whole. A `HEAD` request gets the response it gets on a connection: no content, with the `Content-Length` of the body of `GET`. Handlers can keep a copy of the response and answer later. The timeout covers the whole request, handler included: if it expires the result is `504` and the handler is cancelled (its pending awaits are aborted). WebSockets, SSE and `take_over()` answer `501`, as there is no connection. The request is served by the [virtual host](#virtual-hosts) of its URL (or `Host` header). `remote_ip` is the peer address: `get_request_ip()` returns it (or the forwarded client address, if it is a [trusted proxy](#client-ip-behind-proxies)), and it is empty unless set: internal calls never pass as a trusted local address by default. `context` holds the initial values of the [request context](#request-context) (empty by default): middlewares may replace them, and nothing is carried over from a request the caller is serving, so a gateway decides what to pass (or authenticates the call again). Copying `dispatch_options` copies its values; a value of a type that cannot be copied (e.g. `std::unique_ptr`) makes that copy throw `std::logic_error`, so move such options into `dispatch()`.
 
 Everything about routes, hosts, middlewares and request settings (error format, trusted proxies, body limit and decoders, CORS), `dispatch()` included, comes from `http::http_application`, which the server extends with its listeners, TLS and connection settings. An `http::http_application` can also be used on its own, without a server, only to dispatch requests in memory.
 
@@ -1706,6 +1753,7 @@ See the [examples](examples/) directory for complete working examples:
 ## Thread Safety
 
 - `http::server` - Thread-safe, can handle concurrent requests
+- `http::request_context` - Not synchronized: used by the coroutine processing its request (middlewares, then handler)
 - `http::response` - Copies share the response and can answer from any thread, even at the same time: only the first answer is sent. Chunks (`write_chunk()`, `end_chunked()`) are written in call order once `start_chunked()` returned `true`. Set the status and headers (`status()`, `header()`) from the thread running the handler, before answering, also on routes with a timeout: a timeout answer (504) copies the headers set so far
 - `http::client` - Single-threaded, create one per thread or use `async_client`
 - `http::async_client` - Thread-safe, uses internal worker threads

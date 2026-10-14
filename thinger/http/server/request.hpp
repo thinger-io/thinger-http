@@ -14,6 +14,7 @@
 #include "body_reader.hpp"
 #include "body_decoders.hpp"
 #include "multipart.hpp"
+#include "request_context.hpp"
 #include "../common/http_response.hpp"
 #include "../../util/types.hpp"
 
@@ -121,7 +122,13 @@ namespace thinger::http{
         void set_auth_user(const std::string& auth_user);
 
         const std::string& get_auth_user() const;
-        
+
+        /// Typed values of this request (see request_context), e.g. the principal an
+        /// authentication middleware stores for the route handler. Empty at first (or with the
+        /// values of dispatch_options::context), they are destroyed with the request.
+        request_context& context() noexcept { return context_; }
+        const request_context& context() const noexcept { return context_; }
+
         void set_matched_route(const route* route);
         
         const route* get_matched_route() const;
@@ -233,7 +240,10 @@ namespace thinger::http{
         std::vector<std::string> host_matches_;
 
         std::set<std::string> groups_;
-        
+
+        /// Values stored by the middlewares (or the in-memory dispatch) for the handler
+        request_context context_;
+
         const route* matched_route_ = nullptr;
 
         /// Body framing and reading: read-ahead bytes, then the connection
