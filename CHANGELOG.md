@@ -7,6 +7,8 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-14
+
 ### Added
 
 - Request context: typed values a middleware stores in the request for the route handler, such as the authenticated principal (`req.context().set(key, value)`, `req.context().get(key)`), as Express `res.locals`, Go `context.WithValue` or Rust `http::Extensions`. Values live under `http::context_key<T>` keys, told apart by their address, so two values of the same type do not collide; move-only values are supported, and they are destroyed with the request. Every kind of middleware and route callback sees them, and in-memory dispatch too, which seeds them with `dispatch_options::context`. A request storing nothing allocates nothing for it. See [Request Context](README.md#request-context).
@@ -111,6 +113,7 @@ These changes of the last weeks can be noticed by code written against an earlie
 - Client: connections are kept alive between requests (see the README to tune or disable the pool).
 - The unused `request_handler` interface was removed.
 
-[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/thinger-io/thinger-http/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/thinger-io/thinger-http/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/thinger-io/thinger-http/releases/tag/v0.1.0
