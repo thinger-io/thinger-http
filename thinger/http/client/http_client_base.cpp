@@ -12,6 +12,118 @@
 
 namespace thinger::http {
 
+namespace {
+
+    // The CAs a TLS context trusts besides the system ones: those of the client, then those
+    // of the request
+    struct trusted_cas {
+        std::vector<const std::string*> files;
+        std::vector<const std::string*> pems;
+
+        trusted_cas() = default;
+        trusted_cas(const std::vector<std::string>& client_files, const std::vector<std::string>& client_pems,
+                    const http_request& request) {
+            for (const auto& file : client_files) files.push_back(&file);
+            for (const auto& file : request.get_ca_files()) files.push_back(&file);
+            for (const auto& pem : client_pems) pems.push_back(&pem);
+            for (const auto& pem : request.get_ca_pems()) pems.push_back(&pem);
+        }
+    };
+
+    // What a context trusts identifies it: files by path, modification time and size, so a
+    // file changed in place is loaded again
+    std::string tls_context_key(bool system_ca, const trusted_cas& cas) {
+        std::string key = system_ca ? "system" : "custom";
+        for (const auto* file : cas.files) {
+            std::error_code time_ec, size_ec;
+            auto time = std::filesystem::last_write_time(*file, time_ec);
+            auto size = std::filesystem::file_size(*file, size_ec);
+            key += "\nfile:" + *file + ":" + (time_ec ? "-" : std::to_string(time.time_since_epoch().count())) +
+                   ":" + (size_ec ? "-" : std::to_string(size));
+        }
+        for (const auto* pem : cas.pems) key += "\npem:" + *pem;
+        return key;
+    }
+
+    // False if a CA file or PEM cannot be loaded; the system CAs are optional
+    bool load_cas(boost::asio::ssl::context& context, bool system_ca, const trusted_cas& cas) {
+        boost::system::error_code ec;
+        if (system_ca) {
+            context.set_default_verify_paths(ec);
+            if (ec) LOG_WARNING("cannot load the system CAs: {}", ec.message());
+        }
+        for (const auto* file : cas.files) {
+            context.load_verify_file(*file, ec);
+            if (ec) {
+                LOG_ERROR("cannot load the CA file {}: {}", *file, ec.message());
+                return false;
+            }
+        }
+        for (const auto* pem : cas.pems) {
+            context.add_certificate_authority(boost::asio::buffer(*pem), ec);
+            if (ec) {
+                LOG_ERROR("cannot load a CA certificate (PEM): {}", ec.message());
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // 303 always changes the method to GET, and 301 and 302 change POST, PUT and DELETE to GET,
+    // as browsers do; 307 and 308 keep it
+    method redirect_method(int status, method original) {
+        if (status == 303) return method::GET;
+        if ((status == 301 || status == 302) &&
+            (original == method::POST || original == method::PUT || original == method::DELETE)) {
+            return method::GET;
+        }
+        return original;
+    }
+
+    // ws:// and wss:// URLs, or http:// and https:// ones
+    std::optional<websocket_util::url_components> parse_websocket_url(const std::string& url) {
+        if (auto components = websocket_util::parse_websocket_url(url)) return components;
+        if (url.starts_with("http://")) return websocket_util::parse_websocket_url("ws://" + url.substr(7));
+        if (url.starts_with("https://")) return websocket_util::parse_websocket_url("wss://" + url.substr(8));
+        return std::nullopt;
+    }
+
+    // Turn a request into the opening handshake (RFC 6455 section 4.1); returns its key
+    std::string set_upgrade_headers(http_request& request, const websocket_util::url_components& url,
+                                    const std::string& subprotocol) {
+        request.set_url((url.secure ? "https://" : "http://") + url.host + ":" + url.port + url.path);
+        request.set_method(method::GET);
+        // set_header: the request may already have them
+        request.set_header("Upgrade", "websocket");
+        request.set_header("Connection", "Upgrade");
+        std::string key = websocket_util::generate_websocket_key();
+        request.add_header("Sec-WebSocket-Key", key);
+        request.add_header("Sec-WebSocket-Version", "13");
+        if (!subprotocol.empty()) request.add_header("Sec-WebSocket-Protocol", subprotocol);
+        return key;
+    }
+
+    // The accept key must match ours, and the subprotocol accepted be one offered (RFC 6455
+    // section 4.1)
+    bool valid_upgrade(const http_response& response, const std::string& key, const std::string& subprotocol) {
+        if (!websocket_util::validate_accept_key(response.get_header("Sec-WebSocket-Accept"), key)) {
+            LOG_ERROR("Invalid Sec-WebSocket-Accept key");
+            return false;
+        }
+        const auto& accepted = response.get_header("Sec-WebSocket-Protocol");
+        if (accepted.empty()) return true;
+        std::vector<std::string> offered;
+        boost::split(offered, subprotocol, boost::is_any_of(","));
+        for (auto& protocol : offered) boost::trim(protocol);
+        if (std::find(offered.begin(), offered.end(), accepted) == offered.end()) {
+            LOG_ERROR("WebSocket server accepted a subprotocol not offered: {}", accepted);
+            return false;
+        }
+        return true;
+    }
+
+}
+
 http_client_base::http_client_base()
     : env_proxy_(std::make_shared<const proxy_resolver>(proxy_config::from_environment())) {
 }
@@ -89,26 +201,11 @@ std::string http_client_base::proxy_for(const std::string& url) const {
 
 std::shared_ptr<boost::asio::ssl::context> http_client_base::tls_context(
     const http_request& request, uint64_t& id, boost::system::error_code& ec) {
-
-    // What the context trusts identifies it: files by path, modification time and size, so a
-    // file changed in place is loaded again
-    std::vector<const std::string*> files;
-    std::vector<const std::string*> pems;
+    trusted_cas cas;
     std::string key = "none";
     if (verify_ssl_) {
-        for (const auto& file : ca_files_) files.push_back(&file);
-        for (const auto& file : request.get_ca_files()) files.push_back(&file);
-        for (const auto& pem : ca_pems_) pems.push_back(&pem);
-        for (const auto& pem : request.get_ca_pems()) pems.push_back(&pem);
-        key = system_ca_ ? "system" : "custom";
-        for (const auto* file : files) {
-            std::error_code time_ec, size_ec;
-            auto time = std::filesystem::last_write_time(*file, time_ec);
-            auto size = std::filesystem::file_size(*file, size_ec);
-            key += "\nfile:" + *file + ":" + (time_ec ? "-" : std::to_string(time.time_since_epoch().count())) +
-                   ":" + (size_ec ? "-" : std::to_string(size));
-        }
-        for (const auto* pem : pems) key += "\npem:" + *pem;
+        cas = trusted_cas(ca_files_, ca_pems_, request);
+        key = tls_context_key(system_ca_, cas);
     }
 
     std::lock_guard lock(tls_mutex_);
@@ -122,30 +219,13 @@ std::shared_ptr<boost::asio::ssl::context> http_client_base::tls_context(
         context->set_verify_mode(boost::asio::ssl::verify_none);
     } else {
         context->set_verify_mode(boost::asio::ssl::verify_peer);
-        boost::system::error_code load_ec;
-        if (system_ca_) {
-            context->set_default_verify_paths(load_ec);
-            if (load_ec) LOG_WARNING("cannot load the system CAs: {}", load_ec.message());
-        }
-        for (const auto* file : files) {
-            context->load_verify_file(*file, load_ec);
-            if (load_ec) {
-                LOG_ERROR("cannot load the CA file {}: {}", *file, load_ec.message());
-                ec = client_error::invalid_ca_certificate;
-                return nullptr;
-            }
-        }
-        for (const auto* pem : pems) {
-            context->add_certificate_authority(boost::asio::buffer(*pem), load_ec);
-            if (load_ec) {
-                LOG_ERROR("cannot load a CA certificate (PEM): {}", load_ec.message());
-                ec = client_error::invalid_ca_certificate;
-                return nullptr;
-            }
+        if (!load_cas(*context, system_ca_, cas)) {
+            ec = client_error::invalid_ca_certificate;
+            return nullptr;
         }
     }
 
-    // Bounded: CAs that change (or many per-request sets) would grow it forever. The
+    // Bounded: CAs that change, or many per-request sets, would grow it forever. The
     // connections keep the contexts they use
     if (tls_contexts_.size() >= MAX_TLS_CONTEXTS) tls_contexts_.clear();
     id = ++next_tls_id_;
@@ -175,8 +255,8 @@ http_client_base::connection_plan http_client_base::plan_connection(const http_r
     if (choice.proxy) {
         plan.route.proxy = choice.proxy;
         // Plain requests are forwarded by the proxy. TLS goes end to end through a tunnel, as
-        // do protocol upgrades (WebSocket), which a forwarding proxy may not pass on (as
-        // browsers do)
+        // do protocol upgrades (WebSocket), which a forwarding proxy may not pass on, as
+        // browsers do
         plan.route.tunnel = request.is_ssl() || request.has_header(header::upgrade);
         plan.route.tls = plan.tls;
         plan.key += (plan.route.tunnel ? "|connect:" : "|forward:") + choice.proxy->key();
@@ -209,7 +289,7 @@ connection_pool::lease http_client_base::get_connection(const std::shared_ptr<ht
     const std::string& socket_path = request->get_unix_socket();
 
     // Connections are interchangeable if they reach the same origin the same way. Through a
-    // forwarding proxy, they reach the proxy: any origin is requested on them (as curl does)
+    // forwarding proxy, they reach the proxy: any origin is requested on them, as curl does
     std::string key;
     std::string origin;
     connection_plan plan;
@@ -278,7 +358,7 @@ bool http_client_base::can_retry(const client_connection& connection, const http
     // failing on a reused one before any byte of its response arrived most likely met that.
     // It is sent again on a new connection if that is safe, as Go does: nothing of it was
     // written, or it is idempotent (RFC 9110 section 9.2.2) or has an idempotency key.
-    // Otherwise (e.g. a POST) the server may have processed it, and the error is returned.
+    // Otherwise, e.g. for a POST, the server may have processed it, and the error is returned.
     // Never after a timeout: the server may be just slow
     const auto& ec = connection.last_error();
     if (!ec || !connection.reused() || connection.response_started()) return false;
@@ -312,7 +392,6 @@ awaitable<std::shared_ptr<http_response>> http_client_base::send_request(const s
     co_return response;
 }
 
-// HTTP methods implementation
 awaitable<client_response> http_client_base::get(const std::string& url, headers_map headers) {
     auto request = create_request(method::GET, url);
     for (const auto& [key, value] : headers) {
@@ -391,8 +470,8 @@ awaitable<client_response> http_client_base::send(std::shared_ptr<http_request> 
 
 awaitable<stream_result> http_client_base::send_streaming(std::shared_ptr<http_request> request,
                                                           stream_callback callback) {
-    // Force no compression for streaming - we can't decompress chunks on the fly
-    // Set this BEFORE apply_default_headers so it won't add gzip/deflate
+    // Streamed bodies are handed as received, so they are not asked compressed. Before
+    // apply_default_headers, which would ask for gzip and deflate
     if (!request->has_header("Accept-Encoding")) {
         request->add_header("Accept-Encoding", "identity");
     }
@@ -404,8 +483,8 @@ awaitable<stream_result> http_client_base::send_streaming(std::shared_ptr<http_r
         result.error = ec.message();
         co_return result;
     }
-    // (the callback is not called before the response starts: it is not called twice for a
-    // request sent again)
+    // The callback is not called before the response starts: never twice for a request
+    // sent again
     auto forward = [&callback](const stream_info& info) { return callback(info); };
     auto result = co_await lease->send_request_streaming(request, forward);
     if (lease->last_error() && can_retry(*lease, *request)) {
@@ -416,7 +495,7 @@ awaitable<stream_result> http_client_base::send_streaming(std::shared_ptr<http_r
             result = co_await lease->send_request_streaming(request, forward);
         }
     }
-    // Back to the pool only if the body was read whole (not aborted by the callback)
+    // Back to the pool only if the body was read whole, not aborted by the callback
     co_return result;
 }
 
@@ -439,77 +518,61 @@ awaitable<client_response> http_client_base::send_with_redirects(std::shared_ptr
 
         if (!response) {
             ec = lease->last_error();
-            // (with the answer of a proxy refusing the tunnel, if that was the error)
+            // With the answer of a proxy refusing the tunnel, if that was the error
             co_return client_response(ec ? ec : boost::asio::error::invalid_argument, lease->proxy_response());
         }
 
-        // Back to the pool (if it can carry another request): the redirect may reuse it
+        // Back to the pool, if it can carry another request: the redirect may reuse it
         lease.release();
 
-        if (!follow_redirects_ || !response->is_redirect_response() ||
-            redirect_count >= max_redirects_ || !response->has_header("Location")) {
+        if (!should_follow(*response, redirect_count)) {
             co_return client_response(boost::system::error_code{}, response);
         }
-
         std::string location = response->get_header("Location");
         LOG_DEBUG("Following redirect #{} to: {}", redirect_count + 1, location);
-
-        // Determine redirect method based on status code
-        method redirect_method = request->get_method();
-        int status = response->get_status_code();
-
-        // 303 See Other always changes to GET
-        if (status == 303) {
-            redirect_method = method::GET;
-        }
-        // 301/302 traditionally change POST/PUT/DELETE to GET (browser behavior)
-        else if ((status == 301 || status == 302) &&
-                 (request->get_method() == method::POST ||
-                  request->get_method() == method::PUT ||
-                  request->get_method() == method::DELETE)) {
-            redirect_method = method::GET;
-        }
-        // 307 and 308 preserve the original method
-
-        // Create redirect request
-        auto redirect_request = create_request(redirect_method, location);
-
-        // Preserve body for 307/308
-        if ((status == 307 || status == 308) && !request->get_body().empty()) {
-            redirect_request->set_content(request->get_body());
-            if (request->has_header("Content-Type")) {
-                redirect_request->add_header("Content-Type", request->get_header("Content-Type"));
-            }
-            if (request->has_header("Content-Length")) {
-                redirect_request->add_header("Content-Length", request->get_header("Content-Length"));
-            }
-        }
-
-        // Copy Authorization only for same origin
-        std::string original_url = request->get_url();
-        if (request->has_header("Authorization") && is_same_origin(original_url, location)) {
-            redirect_request->add_header("Authorization", request->get_header("Authorization"));
-            LOG_DEBUG("Preserving Authorization header for same-origin redirect");
-        }
-
-        // Handle cookies
-        if (request->get_cookie_store().update_from_headers(*response)) {
-            redirect_request->set_header(header::cookie, request->get_cookie_store().get_cookie_string());
-        }
-
-        // The proxy and CAs of the request apply to every hop; whether the proxy is used is
-        // decided again for the host of each one (NO_PROXY)
-        if (const auto& config = request->get_proxy_config()) {
-            redirect_request->set_proxy_config(*config);
-        }
-        for (const auto& file : request->get_ca_files()) redirect_request->add_ca_file(file);
-        for (const auto& pem : request->get_ca_pems()) redirect_request->add_ca_pem(pem);
-
-        request = std::move(redirect_request);
+        request = redirect_request(*request, *response, location);
     }
 }
 
-// Simple URL version delegates to the request version
+bool http_client_base::should_follow(const http_response& response, unsigned int redirect_count) const {
+    return follow_redirects_ && response.is_redirect_response() && redirect_count < max_redirects_ &&
+           response.has_header("Location");
+}
+
+std::shared_ptr<http_request> http_client_base::redirect_request(http_request& request, const http_response& response,
+                                                                 const std::string& location) {
+    int status = response.get_status_code();
+    auto next = create_request(redirect_method(status, request.get_method()), location);
+
+    // 307 and 308 send the body again
+    if ((status == 307 || status == 308) && !request.get_body().empty()) {
+        next->set_content(request.get_body());
+        if (request.has_header("Content-Type")) {
+            next->add_header("Content-Type", request.get_header("Content-Type"));
+        }
+        if (request.has_header("Content-Length")) {
+            next->add_header("Content-Length", request.get_header("Content-Length"));
+        }
+    }
+
+    // Credentials only to the same origin
+    if (request.has_header("Authorization") && is_same_origin(request.get_url(), location)) {
+        next->add_header("Authorization", request.get_header("Authorization"));
+        LOG_DEBUG("Preserving Authorization header for same-origin redirect");
+    }
+
+    if (request.get_cookie_store().update_from_headers(response)) {
+        next->set_header(header::cookie, request.get_cookie_store().get_cookie_string());
+    }
+
+    // The proxy and CAs of the request apply to every hop; whether the proxy is used is
+    // decided again for the host of each one (NO_PROXY)
+    if (const auto& config = request.get_proxy_config()) next->set_proxy_config(*config);
+    for (const auto& file : request.get_ca_files()) next->add_ca_file(file);
+    for (const auto& pem : request.get_ca_pems()) next->add_ca_pem(pem);
+    return next;
+}
+
 awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
     const std::string& url, const std::string& subprotocol) {
     auto request = std::make_shared<http_request>();
@@ -517,48 +580,14 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
     co_return co_await upgrade_websocket(std::move(request), subprotocol);
 }
 
-// Main implementation with request (supports custom headers)
 awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
     std::shared_ptr<http_request> request, const std::string& subprotocol) {
-
-    // Get URL from request
-    const std::string& url = request->get_url();
-
-    // Parse WebSocket URL (handle ws://, wss://, http://, https:// schemes)
-    auto components = websocket_util::parse_websocket_url(url);
-    if (!components) {
-        // Try parsing as http/https URL
-        auto ws_url = url;
-        if (ws_url.starts_with("http://")) {
-            ws_url = "ws://" + ws_url.substr(7);
-        } else if (ws_url.starts_with("https://")) {
-            ws_url = "wss://" + ws_url.substr(8);
-        }
-        components = websocket_util::parse_websocket_url(ws_url);
-        if (!components) {
-            LOG_ERROR("Invalid WebSocket URL: {}", url);
-            co_return std::nullopt;
-        }
+    auto url = parse_websocket_url(request->get_url());
+    if (!url) {
+        LOG_ERROR("Invalid WebSocket URL: {}", request->get_url());
+        co_return std::nullopt;
     }
-
-    // Set correct URL in request
-    std::string http_url = (components->secure ? "https://" : "http://")
-                          + components->host + ":" + components->port + components->path;
-    request->set_url(http_url);
-    request->set_method(method::GET);
-
-    // Add WebSocket-specific headers (use set_header to avoid duplicates if request already has these)
-    request->set_header("Upgrade", "websocket");
-    request->set_header("Connection", "Upgrade");
-
-    std::string ws_key = websocket_util::generate_websocket_key();
-    request->add_header("Sec-WebSocket-Key", ws_key);
-    request->add_header("Sec-WebSocket-Version", "13");
-
-    if (!subprotocol.empty()) {
-        request->add_header("Sec-WebSocket-Protocol", subprotocol);
-    }
-
+    auto key = set_upgrade_headers(*request, *url, subprotocol);
     apply_default_headers(request);
 
     // A connection of its own, never pooled: it becomes the WebSocket. Through a proxy, it
@@ -571,9 +600,7 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
     }
     auto connection = make_connection(plan);
 
-    // Send upgrade request
     auto response = co_await connection->send_request(request);
-
     if (!response || response->get_status_code() != 101) {
         if (!response) {
             LOG_ERROR("WebSocket connect error: {}", connection->last_error().message());
@@ -582,35 +609,14 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
                  response ? std::to_string(response->get_status_code()) : "no response");
         co_return std::nullopt;
     }
+    if (!valid_upgrade(*response, key, subprotocol)) co_return std::nullopt;
 
-    // Validate accept key
-    auto accept_key = response->get_header("Sec-WebSocket-Accept");
-    if (!websocket_util::validate_accept_key(accept_key, ws_key)) {
-        LOG_ERROR("Invalid Sec-WebSocket-Accept key");
-        co_return std::nullopt;
-    }
-
-    // The subprotocol accepted must be one offered (RFC 6455, 4.1)
-    auto accepted_protocol = response->get_header("Sec-WebSocket-Protocol");
-    if (!accepted_protocol.empty()) {
-        std::vector<std::string> offered;
-        boost::split(offered, subprotocol, boost::is_any_of(","));
-        for (auto& protocol : offered) boost::trim(protocol);
-        if (std::find(offered.begin(), offered.end(), accepted_protocol) == offered.end()) {
-            LOG_ERROR("WebSocket server accepted a subprotocol not offered: {}", accepted_protocol);
-            co_return std::nullopt;
-        }
-    }
-
-    // Upgrade to WebSocket
-    auto raw_socket = connection->release_socket();
-    auto ws = std::make_shared<asio::websocket>(raw_socket, false, false);
-    ws->set_protocol(accepted_protocol);
+    auto ws = std::make_shared<asio::websocket>(connection->release_socket(), false, false);
+    ws->set_protocol(response->get_header("Sec-WebSocket-Protocol"));
     // Frames the server sent right after its response, read along with it
     ws->set_read_ahead(connection->take_buffered());
 
-    LOG_INFO("WebSocket connected to {}", url);
-
+    LOG_INFO("WebSocket connected to {}", request->get_url());
     co_return websocket_client(std::move(ws));
 }
 

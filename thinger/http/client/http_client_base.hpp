@@ -191,6 +191,10 @@ private:
     // Send following redirects; the connection of the last response in `used`, if given
     awaitable<client_response> send_with_redirects(std::shared_ptr<http_request> request,
                                                    std::shared_ptr<client_connection>* used = nullptr);
+    bool should_follow(const http_response& response, unsigned int redirect_count) const;
+    // The request following a redirect to `location`, taking the cookies `response` sets
+    std::shared_ptr<http_request> redirect_request(http_request& request, const http_response& response,
+                                                   const std::string& location);
 
     // Send on the connection of `lease`, and again on a new one (then in `lease`) if a reused
     // one failed and the request can be sent twice (see can_retry)
