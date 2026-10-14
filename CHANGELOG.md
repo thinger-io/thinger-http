@@ -9,8 +9,10 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ### Added
 
+- Precompressed static files: `serve_static()` sends a file as its `<file>.br` or `<file>.gz` sibling to the clients accepting `br` or `gzip` (by `q` value, `br` first at equal quality), if the sibling is a regular file not older than the file, with `Content-Encoding`, the `Content-Type` of the file, `Vary: Accept-Encoding` and an `ETag` of its own (`W/"...-br"`); conditional requests, `HEAD` and byte ranges apply to it. On by default (`static_options::precompressed`).
 - Lists of content codings (`Content-Encoding: deflate, gzip`) are decoded in reverse order, by the client and by the server, up to five of them; a list with a coding that is not supported is kept as it is (`util::decode_content`).
 - `deflate` bodies without the zlib header (raw deflate) are decoded, as curl and browsers do.
+- `parse_accept_encoding()`: the quality `Accept-Encoding` gives gzip, deflate, br and identity.
 
 ### Changed
 

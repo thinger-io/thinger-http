@@ -32,9 +32,9 @@ namespace {
 
 }
 
-std::optional<file_info> file_info::of(const std::filesystem::path& path) {
+std::optional<file_info> file_info::of(const std::filesystem::path& path, bool follow_symlinks) {
     struct stat st{};
-    if (::stat(path.c_str(), &st) != 0) return std::nullopt;
+    if ((follow_symlinks ? ::stat(path.c_str(), &st) : ::lstat(path.c_str(), &st)) != 0) return std::nullopt;
 #ifdef __APPLE__
     const auto& modified = st.st_mtimespec;
 #else
@@ -42,11 +42,12 @@ std::optional<file_info> file_info::of(const std::filesystem::path& path) {
 #endif
     file_info info;
     info.regular = S_ISREG(st.st_mode);
+    info.symlink = S_ISLNK(st.st_mode);
     info.size = static_cast<uint64_t>(st.st_size);
     info.mtime = modified.tv_sec;
+    info.mtime_ns = static_cast<uint64_t>(modified.tv_sec) * 1'000'000'000 + static_cast<uint64_t>(modified.tv_nsec);
     // nanoseconds: a file rewritten within the same second, with the same size, gets another tag
-    auto nanoseconds = static_cast<uint64_t>(modified.tv_sec) * 1'000'000'000 + static_cast<uint64_t>(modified.tv_nsec);
-    info.etag = std::format("W/\"{:x}-{:x}\"", info.size, nanoseconds);
+    info.etag = std::format("W/\"{:x}-{:x}\"", info.size, info.mtime_ns);
     info.last_modified = util::format_http_date(info.mtime);
     return info;
 }

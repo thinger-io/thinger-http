@@ -1,6 +1,9 @@
 #include "virtual_host.hpp"
 #include "request.hpp"
 #include "response.hpp"
+#include "body_decoders.hpp"
+#include "mime_types.hpp"
+#include "file_server/file_info.hpp"
 #include "../../util/ascii.hpp"
 #include <boost/algorithm/string.hpp>
 #include <filesystem>
@@ -111,6 +114,75 @@ namespace {
         return !relative.empty() && *relative.begin() != "..";
     }
 
+    // A precompressed sibling of a static file: its suffix, and its content coding
+    struct precompressed_coding {
+        const char* suffix;
+        const char* coding;
+    };
+    constexpr precompressed_coding brotli_sibling{".br", "br"};
+    constexpr precompressed_coding gzip_sibling{".gz", "gzip"};
+
+    // Precompressed siblings a request accepts, in the order to look for them (how many):
+    // br and gzip by the quality its Accept-Encoding gives them, br first at equal quality
+    // (it is smaller); none without Accept-Encoding, nor one with a lower quality than
+    // identity (as response compression)
+    size_t accepted_siblings(const http_request& request, precompressed_coding (&siblings)[2]) {
+        auto values = request.get_headers_with_key("Accept-Encoding");
+        if (values.empty()) return 0;
+        std::string accept_encoding;
+        for (const auto& value : values) {
+            if (!accept_encoding.empty()) accept_encoding += ", ";
+            accept_encoding += value;
+        }
+        auto accepted = parse_accept_encoding(accept_encoding);
+        bool br = accepted.br > 0 && accepted.br >= accepted.identity;
+        bool gzip = accepted.gzip > 0 && accepted.gzip >= accepted.identity;
+        bool brotli_first = accepted.br >= accepted.gzip;
+        size_t count = 0;
+        if (br && brotli_first) siblings[count++] = brotli_sibling;
+        if (gzip) siblings[count++] = gzip_sibling;
+        if (br && !brotli_first) siblings[count++] = brotli_sibling;
+        return count;
+    }
+
+}
+
+void virtual_host::send_static_file(request& req, response& res, const std::filesystem::path& file,
+                                    const std::filesystem::path& root, bool precompressed) {
+    namespace fs = std::filesystem;
+    precompressed_coding siblings[2];
+    size_t count = precompressed ? accepted_siblings(*req.get_http_request(), siblings) : 0;
+    if (count == 0) {
+        res.send_file(file);
+        return;
+    }
+    if (!res.ensure_not_responded()) return;
+
+    // One stat for the file (send_file does not repeat it), and one per sibling looked for
+    auto original = file_info::of(file);
+    if (!original || !original->regular) {
+        res.send_file(file);
+        return;
+    }
+    const auto& content_type = mime_types::extension_to_type(file.extension().string());
+    for (size_t i = 0; i < count; ++i) {
+        auto sibling = file;
+        sibling += siblings[i].suffix;
+        // (a symlink only while it resolves inside the directory, as the files)
+        auto info = file_info::of(sibling, false);
+        if (info && info->symlink) {
+            std::error_code error;
+            auto target = fs::canonical(sibling, error);
+            info = !error && is_within(target, root) ? file_info::of(target) : std::nullopt;
+        }
+        // A sibling older than the file is stale: compressed from a previous version
+        if (!info || !info->regular || info->mtime_ns < original->mtime_ns) continue;
+        // Its own entity tag, telling the coding (as Apache does): another representation
+        info->etag.insert(info->etag.size() - 1, std::string("-") + siblings[i].coding);
+        res.send_file(sibling, *info, content_type, siblings[i].coding, false);
+        return;
+    }
+    res.send_file(file, *original, content_type, {}, false);
 }
 
 // Static file serving
@@ -139,7 +211,7 @@ void virtual_host::serve_static(const std::string& url_prefix,
 
         auto send = [&](const fs::path& file) {
             if (!options.cache_control.empty()) res.header(header::cache_control, options.cache_control);
-            res.send_file(file);
+            send_static_file(req, res, file, canonical_dir, options.precompressed);
         };
 
         // Empty path means root request — try fallback file directly

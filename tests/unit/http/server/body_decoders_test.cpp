@@ -448,3 +448,26 @@ TEST_CASE("Response compression follows the Accept-Encoding header", "[body][com
         REQUIRE(negotiate_content_coding(accept_encoding) == coding);
     }
 }
+
+TEST_CASE("Accept-Encoding gives each coding a quality", "[body][compression][unit]") {
+    struct expectation {
+        std::string_view accept_encoding;
+        int gzip, deflate, br, identity;
+    };
+    for (auto [accept_encoding, gzip, deflate, br, identity] : std::initializer_list<expectation>{
+             {"", -1, -1, -1, -1},
+             {"br", -1, -1, 1000, -1},
+             {"BR;q=0.5, x-gzip", 1000, -1, 500, -1},
+             {"gzip, deflate, br, zstd", 1000, 1000, 1000, -1},
+             {"*;q=0.2, br;q=0", 200, 200, 0, 200},
+             {"identity;q=0, gzip", 1000, -1, -1, 0},
+             {"br;q=abc, br;q=0.7", -1, -1, 700, -1},    // an invalid weight drops the element
+         }) {
+        INFO(accept_encoding);
+        auto accepted = parse_accept_encoding(accept_encoding);
+        REQUIRE(accepted.gzip == gzip);
+        REQUIRE(accepted.deflate == deflate);
+        REQUIRE(accepted.br == br);
+        REQUIRE(accepted.identity == identity);
+    }
+}

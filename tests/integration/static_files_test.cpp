@@ -4,6 +4,7 @@
 #include <thinger/http/server/file_server/file_info.hpp>
 #include <thinger/http/util/http_date.hpp>
 #include <thinger/util/ascii.hpp>
+#include <thinger/util/compression.hpp>
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -344,6 +345,206 @@ TEST_CASE("Static files with a Cache-Control of their own", "[server][static][in
         REQUIRE(response.status == 404);
         REQUIRE_FALSE(response.has_header("ETag"));
         REQUIRE(get(site.port, "/assets/").status == 404);
+    }
+}
+
+namespace {
+
+    // A precompressed sibling of a file of the site (its content is not checked: any bytes
+    // do), modified `offset` after the file
+    void write_sibling(const static_site& site, const std::string& name, const std::string& content,
+                       fs::file_time_type::duration offset = 1s) {
+        write_file(site.root / name, content);
+        auto original = site.root / name.substr(0, name.rfind('.'));
+        fs::last_write_time(site.root / name, fs::last_write_time(original) + offset);
+    }
+
+    // The entity tag of a precompressed sibling: its own, telling the coding
+    std::string sibling_etag(const http::file_info& sibling, const std::string& coding) {
+        auto etag = sibling.etag;
+        etag.insert(etag.size() - 1, "-" + coding);
+        return etag;
+    }
+
+}
+
+TEST_CASE("Static files are sent as their precompressed siblings", "[server][static][compression][integration]") {
+    static_site site;
+    site.server.serve_static("/static", site.root.string());
+    site.server.serve_static("/plain", site.root.string(), {.precompressed = false});
+    site.start();
+    write_sibling(site, "app.js.br", "BROTLI app.js");
+    write_sibling(site, "app.js.gz", "GZIP app.js");
+    auto br = site.info("app.js.br");
+    auto gz = site.info("app.js.gz");
+    auto file = site.info("app.js");
+
+    auto require_sibling = [](const raw_response& response, const http::file_info& sibling,
+                              const std::string& coding, const std::string& body) {
+        REQUIRE(response.status == 200);
+        REQUIRE(response.body == body);
+        REQUIRE(response.header("Content-Encoding") == coding);
+        REQUIRE(response.header("Content-Type").starts_with("application/javascript"));
+        REQUIRE(response.header("Content-Length") == std::to_string(body.size()));
+        REQUIRE(response.header("Vary") == "Accept-Encoding");
+        REQUIRE(response.header("ETag") == sibling_etag(sibling, coding));
+        REQUIRE(response.header("Last-Modified") == sibling.last_modified);
+        REQUIRE(response.header("Cache-Control") == "no-cache");
+    };
+    auto require_original = [&](const raw_response& response) {
+        REQUIRE(response.status == 200);
+        REQUIRE(response.body == "console.log('app');");
+        REQUIRE_FALSE(response.has_header("Content-Encoding"));
+        REQUIRE(response.header("ETag") == file.etag);
+    };
+
+    SECTION("br first at equal quality, else the coding of higher quality") {
+        require_sibling(get(site.port, "/static/app.js", "Accept-Encoding: gzip, deflate, br\r\n"), br, "br", "BROTLI app.js");
+        require_sibling(get(site.port, "/static/app.js", "Accept-Encoding: GZIP\r\n"), gz, "gzip", "GZIP app.js");
+        require_sibling(get(site.port, "/static/app.js", "Accept-Encoding: x-gzip\r\n"), gz, "gzip", "GZIP app.js");
+        require_sibling(get(site.port, "/static/app.js", "Accept-Encoding: br;q=0.5, gzip\r\n"), gz, "gzip", "GZIP app.js");
+        require_sibling(get(site.port, "/static/app.js", "Accept-Encoding: gzip;q=0.5, br;q=0.8\r\n"), br, "br", "BROTLI app.js");
+        require_sibling(get(site.port, "/static/app.js", "Accept-Encoding: *\r\n"), br, "br", "BROTLI app.js");
+        require_sibling(get(site.port, "/static/app.js", "Accept-Encoding: br;q=0, *\r\n"), gz, "gzip", "GZIP app.js");
+        // (Accept-Encoding headers make one list)
+        require_sibling(get(site.port, "/static/app.js", "Accept-Encoding: deflate\r\nAccept-Encoding: br\r\n"),
+                        br, "br", "BROTLI app.js");
+    }
+
+    SECTION("Without Accept-Encoding, or accepting neither br nor gzip, the file") {
+        require_original(get(site.port, "/static/app.js"));
+        require_original(get(site.port, "/static/app.js", "Accept-Encoding: deflate\r\n"));
+        require_original(get(site.port, "/static/app.js", "Accept-Encoding: identity\r\n"));
+        require_original(get(site.port, "/static/app.js", "Accept-Encoding: br;q=0, gzip;q=0\r\n"));
+    }
+
+    SECTION("Identity preferred over the codings, or not acceptable") {
+        require_original(get(site.port, "/static/app.js", "Accept-Encoding: gzip;q=0.5, br;q=0.5, identity\r\n"));
+        require_sibling(get(site.port, "/static/app.js", "Accept-Encoding: identity;q=0, gzip\r\n"), gz, "gzip", "GZIP app.js");
+        require_sibling(get(site.port, "/static/app.js", "Accept-Encoding: gzip;q=0.5, identity;q=0.5\r\n"), gz, "gzip", "GZIP app.js");
+    }
+
+    SECTION("A missing sibling: the next accepted one") {
+        fs::remove(site.root / "app.js.br");
+        require_sibling(get(site.port, "/static/app.js", "Accept-Encoding: br, gzip\r\n"), gz, "gzip", "GZIP app.js");
+        fs::remove(site.root / "app.js.gz");
+        require_original(get(site.port, "/static/app.js", "Accept-Encoding: br, gzip\r\n"));
+    }
+
+    SECTION("A sibling older than the file is not sent") {
+        write_sibling(site, "app.js.br", "STALE", -2s);
+        require_sibling(get(site.port, "/static/app.js", "Accept-Encoding: br, gzip\r\n"), gz, "gzip", "GZIP app.js");
+        write_sibling(site, "app.js.gz", "STALE", -1ns);
+        require_original(get(site.port, "/static/app.js", "Accept-Encoding: br, gzip\r\n"));
+        // (the same time is not older)
+        write_sibling(site, "app.js.gz", "SAME", 0s);
+        auto same = get(site.port, "/static/app.js", "Accept-Encoding: br, gzip\r\n");
+        REQUIRE(same.header("Content-Encoding") == "gzip");
+        REQUIRE(same.body == "SAME");
+    }
+
+    SECTION("A sibling that is not a regular file is not sent") {
+        fs::remove(site.root / "app.js.br");
+        fs::create_directory(site.root / "app.js.br");
+        require_sibling(get(site.port, "/static/app.js", "Accept-Encoding: br, gzip\r\n"), gz, "gzip", "GZIP app.js");
+    }
+
+    SECTION("HEAD: the headers of GET, with the length of the sibling") {
+        auto response = send_request(site.port, "HEAD", "/static/app.js", "Accept-Encoding: br\r\n");
+        REQUIRE(response.status == 200);
+        REQUIRE(response.body.empty());
+        REQUIRE(response.header("Content-Encoding") == "br");
+        REQUIRE(response.header("Content-Length") == std::to_string(br.size));
+        REQUIRE(response.header("ETag") == sibling_etag(br, "br"));
+        REQUIRE(response.header("Vary") == "Accept-Encoding");
+    }
+
+    SECTION("Conditional requests: 304 with the entity tag of each representation") {
+        auto revalidated = get(site.port, "/static/app.js", "Accept-Encoding: br\r\nIf-None-Match: " + sibling_etag(br, "br") + "\r\n");
+        REQUIRE(revalidated.status == 304);
+        REQUIRE(revalidated.body.empty());
+        REQUIRE(revalidated.header("ETag") == sibling_etag(br, "br"));
+        REQUIRE(revalidated.header("Vary") == "Accept-Encoding");
+        REQUIRE_FALSE(revalidated.has_header("Content-Length"));
+
+        // The tag of another representation does not match
+        auto other = get(site.port, "/static/app.js", "Accept-Encoding: br\r\nIf-None-Match: " + file.etag + "\r\n");
+        require_sibling(other, br, "br", "BROTLI app.js");
+        auto identity = get(site.port, "/static/app.js", "If-None-Match: " + sibling_etag(br, "br") + "\r\n");
+        require_original(identity);
+        REQUIRE(get(site.port, "/static/app.js", "If-None-Match: " + file.etag + "\r\n").status == 304);
+
+        auto since = get(site.port, "/static/app.js", "Accept-Encoding: gzip\r\nIf-Modified-Since: " + gz.last_modified + "\r\n");
+        REQUIRE(since.status == 304);
+        REQUIRE(since.header("ETag") == sibling_etag(gz, "gzip"));
+    }
+
+    SECTION("A range is one of the bytes of the sibling, as sent") {
+        auto response = get(site.port, "/static/app.js", "Accept-Encoding: br\r\nRange: bytes=0-5\r\n");
+        REQUIRE(response.status == 206);
+        REQUIRE(response.body == "BROTLI");
+        REQUIRE(response.header("Content-Encoding") == "br");
+        REQUIRE(response.header("Content-Range") == "bytes 0-5/" + std::to_string(br.size));
+        REQUIRE(response.header("Vary") == "Accept-Encoding");
+
+        auto past = get(site.port, "/static/app.js", "Accept-Encoding: br\r\nRange: bytes=1000-\r\n");
+        REQUIRE(past.status == 416);
+        REQUIRE(past.header("Content-Range") == "bytes */" + std::to_string(br.size));
+
+        auto if_range = get(site.port, "/static/app.js", "Accept-Encoding: br\r\nRange: bytes=0-5\r\nIf-Range: " +
+                                                         br.last_modified + "\r\n");
+        REQUIRE(if_range.status == 206);
+    }
+
+    SECTION("The siblings themselves are files as any other") {
+        auto response = get(site.port, "/static/app.js.br", "Accept-Encoding: br, gzip\r\n");
+        REQUIRE(response.status == 200);
+        REQUIRE(response.body == "BROTLI app.js");
+        REQUIRE_FALSE(response.has_header("Content-Encoding"));
+        REQUIRE(response.header("ETag") == br.etag);
+    }
+
+    SECTION("The fallback file too") {
+        write_sibling(site, "index.html.br", "BROTLI index");
+        auto response = get(site.port, "/static/app/dashboard", "Accept-Encoding: br\r\n");
+        REQUIRE(response.status == 200);
+        REQUIRE(response.body == "BROTLI index");
+        REQUIRE(response.header("Content-Encoding") == "br");
+        REQUIRE(response.header("Content-Type").starts_with("text/html"));
+        REQUIRE(get(site.port, "/static/", "Accept-Encoding: br\r\n").body == "BROTLI index");
+    }
+
+    SECTION("A symlinked sibling only while it resolves inside the directory") {
+        fs::remove(site.root / "app.js.br");
+        fs::remove(site.root / "app.js.gz");
+        write_file(site.base / "www-secret" / "app.js.br", "SECRET");
+        fs::last_write_time(site.base / "www-secret" / "app.js.br", fs::last_write_time(site.root / "app.js") + 1s);
+        fs::create_symlink(site.base / "www-secret" / "app.js.br", site.root / "app.js.br");
+        auto outside = get(site.port, "/static/app.js", "Accept-Encoding: br\r\n");
+        require_original(outside);
+        REQUIRE(outside.body.find("SECRET") == std::string::npos);
+
+        write_file(site.root / "compressed" / "app.js.gz", "LINKED GZIP");
+        fs::last_write_time(site.root / "compressed" / "app.js.gz", fs::last_write_time(site.root / "app.js") + 1s);
+        fs::create_symlink(site.root / "compressed" / "app.js.gz", site.root / "app.js.gz");
+        auto inside = get(site.port, "/static/app.js", "Accept-Encoding: gzip\r\n");
+        REQUIRE(inside.body == "LINKED GZIP");
+        REQUIRE(inside.header("Content-Encoding") == "gzip");
+    }
+
+    SECTION("Disabled: the file, compressed on the fly as usual") {
+        require_original(get(site.port, "/plain/app.js", "Accept-Encoding: br, gzip\r\n"));
+        write_sibling(site, "big.js.gz", "GZIP big.js");
+        auto big = get(site.port, "/plain/big.js", "Accept-Encoding: gzip\r\n");
+        REQUIRE(big.header("Content-Encoding") == "gzip");
+        REQUIRE(util::gzip::decompress(big.body) == std::string(4096, 'a'));
+    }
+
+    SECTION("A text file without sibling is still compressed on the fly") {
+        auto big = get(site.port, "/static/big.js", "Accept-Encoding: br, gzip\r\n");
+        REQUIRE(big.header("Content-Encoding") == "gzip");
+        REQUIRE(util::gzip::decompress(big.body) == std::string(4096, 'a'));
+        REQUIRE(big.header("ETag") == site.info("big.js").etag);
     }
 }
 

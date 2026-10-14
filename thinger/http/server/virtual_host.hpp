@@ -6,6 +6,7 @@
 #include "routing/route_registrar.hpp"
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <optional>
 #include <regex>
 #include <string>
@@ -25,6 +26,11 @@ struct static_options {
     // use: answered with 304 Not Modified (no body) while they do not change. Assets with a
     // hash in their names can be reused without asking: "public, max-age=31536000, immutable".
     std::string cache_control = "no-cache";
+    // Precompressed files (as nginx gzip_static and brotli_static): a file is sent as its
+    // "<file>.br" or "<file>.gz" sibling, if there is one not older than it and the client
+    // accepts br or gzip (br first at equal quality), with that Content-Encoding and the
+    // media type of the file. A build can then serve Brotli without compressing at runtime.
+    bool precompressed = true;
 };
 
 // Set of routes served for a host name (see http_application::host). The application
@@ -59,8 +65,9 @@ public:
 
     // Static files of `directory` served under `url_prefix` (GET, and HEAD through it), as
     // response::send_file does: with ETag and Last-Modified, answering conditional requests
-    // with 304 and single byte ranges with 206. Paths resolving outside the directory
-    // (through symlinks) are answered with 403.
+    // with 304 and single byte ranges with 206, or their precompressed siblings (see
+    // static_options). Paths resolving outside the directory (through symlinks) are
+    // answered with 403.
     void serve_static(const std::string& url_prefix,
                       const std::string& directory,
                       const std::string& fallback = "index.html");
@@ -138,6 +145,11 @@ private:
     route& make_route(method http_method, const std::string& path) {
         return router_[http_method][path];
     }
+
+    // Send a static `file` (canonical, inside the canonical directory `root`), or its
+    // precompressed sibling if `precompressed` and the request accepts it
+    static void send_static_file(request& req, response& res, const std::filesystem::path& file,
+                                 const std::filesystem::path& root, bool precompressed);
 
     std::string name_;
     std::optional<std::regex> pattern_;

@@ -17,15 +17,18 @@ class http_request;
 // modification time (the content is not hashed)
 struct file_info {
     bool regular = false;           // a regular file (not a directory, a device...)
+    bool symlink = false;           // a symbolic link (only if read without following them)
     uint64_t size = 0;
     std::time_t mtime = 0;          // modification time, in seconds since the epoch
+    uint64_t mtime_ns = 0;          // modification time, in nanoseconds since the epoch
     // Weak (the same file may be sent compressed or not): W/"<size>-<mtime in ns>", in hex
     std::string etag;
     // Modification time as an HTTP-date (IMF-fixdate)
     std::string last_modified;
 
-    // Metadata of `path`, following symlinks; nullopt if it cannot be read (e.g. it does not exist)
-    static std::optional<file_info> of(const std::filesystem::path& path);
+    // Metadata of `path`, following symlinks (or else of a symlink itself); nullopt if it
+    // cannot be read (e.g. it does not exist)
+    static std::optional<file_info> of(const std::filesystem::path& path, bool follow_symlinks = true);
 
     // Whether a GET or HEAD request is answered with 304 Not Modified (RFC 9110, 13.2.2):
     // If-None-Match is "*" or lists the entity tag (weak comparison); without If-None-Match,

@@ -26,6 +26,8 @@ namespace thinger::http {
 class websocket_connection;
 class sse_connection;
 class http_application;
+class virtual_host;
+struct file_info;
 
 // WebSocket upgrade that hands out the WebSocket as a byte stream socket
 // (see response::upgrade_websocket_stream)
@@ -208,10 +210,18 @@ public:
     std::shared_ptr<server_connection> get_connection() const;
 
 private:
+    // File response (see send_file) of `path`, whose metadata is `file`, as `content_type`.
+    // With `encoding`, the file is a precompressed representation (e.g. "gzip" for the .gz
+    // sibling of a file): sent with that Content-Encoding, never compressed again.
+    void send_file(const std::filesystem::path& path, const file_info& file, const std::string& content_type,
+                   std::string_view encoding, bool force_download);
+
     struct state;
 
     // The request timeout of the route (see route::timeout) is run by the application
     friend class http_application;
+    // Static files are sent with send_file() of a file already read, maybe precompressed
+    friend class virtual_host;
 
     // Call `hook` once the response starts (the first answer), from the thread answering.
     // Set before the response is handed to the handler.

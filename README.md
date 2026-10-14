@@ -381,6 +381,22 @@ Files are served with validators, so that browsers download them once and only c
 - `Accept-Ranges: bytes`: a `GET` with a single byte range (`Range: bytes=0-99`, `bytes=100-`, `bytes=-100`) gets `206 Partial Content`, or `416` if it starts past the end. Several ranges, or an invalid one, get the whole file; so does a range with an `If-Range` other than the `Last-Modified` date (the weak `ETag` never matches it).
 - Text files of 200 bytes or more are compressed for clients accepting gzip or deflate (see [Response Types](#response-types), with `Vary: Accept-Encoding`); ranges are sent as they are. A `HEAD` gets the headers of the `GET` with the length of the file, without reading it.
 
+#### Precompressed Files
+
+A file with a `<file>.br` or `<file>.gz` next to it (as builds emit them: Angular, Vite and webpack plugins, or `brotli`/`gzip -k` after the build) is sent as that sibling to the clients accepting `br` or `gzip`, as nginx `gzip_static`/`brotli_static` and `express-static-gzip` do. This gives Brotli without a Brotli library, and no compression work per request:
+
+- The coding is chosen by the `q` values of `Accept-Encoding` (as for compression), `br` first at equal quality; none if the client gives `identity` a higher quality. The next accepted sibling is tried when one is missing, and the file itself when none is there.
+- A sibling is only sent if it is a regular file not older than the file (an older one was compressed from a previous version), and, if it is a symlink, while it resolves inside the served directory.
+- It is sent with `Content-Encoding: br` (or `gzip`), the `Content-Type` of the file, `Vary: Accept-Encoding`, and validators of its own: its `Last-Modified`, and its `ETag` with the coding in it (`W/"<size>-<mtime>-br"`, as Apache does), so conditional requests get a `304` per representation, and the tag of one never matches another.
+- Byte ranges are ranges of the sibling as sent (as nginx does), with `If-Range` on its date; a `HEAD` gets its length. A request for `app.js.br` itself gets that file as is, without `Content-Encoding`.
+- Looking for siblings costs one `stat()` per accepted coding (none if the client accepts neither `br` nor `gzip`); the file itself is still checked with a single one.
+
+It is on by default: unlike nginx (where `gzip_static` is off), a sibling only exists if the deployment put it there, stale ones are skipped, and serving the files compressed at build time is what having them is for. Turn it off with `.precompressed = false`:
+
+```cpp
+server.serve_static("/", "/var/www/app", {.precompressed = false});
+```
+
 `res.send_file()` does the same in a handler. Its `Cache-Control` is `no-cache` unless the handler set one before (`res.header("Cache-Control", ...)`):
 
 ```cpp
