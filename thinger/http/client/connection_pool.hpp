@@ -98,8 +98,9 @@ public:
     config get_config() const;
 
     // Close each idle connection with a timer on its io_context (the default). Without them,
-    // expired connections are closed when the pool is next used: for an io_context that only
-    // runs while requests do, as a pending timer would keep it running
+    // expired connections are closed whenever the pool is used (a connection taken or given
+    // back): for an io_context that only runs while requests do, as a pending timer would
+    // keep it running
     void use_idle_timers(bool enabled);
 
     // An idle connection for `key`, claimed for a request; empty if there is none usable

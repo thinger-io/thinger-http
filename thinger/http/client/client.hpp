@@ -52,7 +52,8 @@ protected:
 
 public:
     // The io_context runs only during a call (and the WebSocket calls run it until it has no
-    // work): idle connections are closed when found expired, not by timers
+    // work): idle connections are not closed by timers, but when found expired as a request
+    // starts or ends. Between calls nothing runs: clear_connections() closes them
     client() { pool_.use_idle_timers(false); }
     // The idle connections are closed while their io_context exists
     ~client() override { clear_connections(); }

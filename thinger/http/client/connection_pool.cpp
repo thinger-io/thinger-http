@@ -75,6 +75,9 @@ struct connection_pool::state : std::enable_shared_from_this<state> {
         std::vector<std::shared_ptr<client_connection>> closing;
         {
             std::lock_guard lock(mutex);
+            // Without timers, the expired ones are closed as a request ends too (before they
+            // take the room of this one). (This key is not pruned: the lease counts as active)
+            if (!timers) sweep(std::chrono::steady_clock::now(), closing);
             auto it = hosts.find(key);
             if (it == hosts.end()) {
                 keep = false;

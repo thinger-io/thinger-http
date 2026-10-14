@@ -583,6 +583,40 @@ TEST_CASE("HTTP client closes connections idle for too long", "[http][client][po
         REQUIRE(server.accepts == 2);
         REQUIRE(keepalive_server::eventually([&] { return server.closed_by_client == 1; }));
     }
+
+    SECTION("Synchronous client: closed as a later request ends, once expired") {
+        // Expired while a request to another server is answered: closed as it ends, without
+        // waiting for a next call
+        keepalive_server slow;
+        slow.respond([](const keepalive_server::received&) {
+            return keepalive_server::reply{keepalive_server::ok("slow").response, keepalive_server::then::keep, 400ms};
+        });
+        http::client client;
+        client.timeout(5s).idle_timeout(200ms);
+        REQUIRE(client.get(server.url()).ok());
+        REQUIRE(client.get(slow.url()).ok());
+        REQUIRE(keepalive_server::eventually([&] { return server.closed_by_client == 1; }, 1s));
+        auto stats = client.pool_stats();
+        REQUIRE(stats.idle == 1);
+        REQUIRE(stats.hosts.size() == 1);
+        REQUIRE(slow.closed_by_client == 0);
+    }
+}
+
+TEST_CASE("HTTP client closes its idle connections on demand", "[http][client][pool][integration]") {
+    // Between the calls of a synchronous client nothing runs: a long-lived one that makes
+    // sporadic calls closes the connections it keeps
+    keepalive_server server;
+    http::client client;
+    client.timeout(5s);
+    REQUIRE(client.get(server.url()).ok());
+    REQUIRE(client.pool_size() == 1);
+    client.clear_connections();
+    REQUIRE(client.pool_size() == 0);
+    REQUIRE(keepalive_server::eventually([&] { return server.closed_by_client == 1; }, 1s));
+    // Later calls connect again
+    REQUIRE(client.get(server.url()).ok());
+    REQUIRE(server.accepts == 2);
 }
 
 TEST_CASE("HTTP client never shares a busy connection, and bounds the idle ones", "[http][client][pool][integration]") {
