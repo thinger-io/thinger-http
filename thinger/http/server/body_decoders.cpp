@@ -137,6 +137,47 @@ namespace {
         return utf8::is_valid(reinterpret_cast<const uint8_t*>(value.data()), value.size());
     }
 
+    // Add a value of a form: a member of the object, or for a repeated name, an array of its
+    // values in order
+    void add_form_value(json& form, const std::string& name, json value) {
+        auto member = form.find(name);
+        if (member == form.end()) {
+            form.emplace(name, std::move(value));
+        } else if (member->is_array()) {
+            member->push_back(std::move(value));
+        } else {
+            *member = json::array({std::move(*member), std::move(value)});
+        }
+    }
+
+    // The boundary of a multipart body: a single one (repeated ones are ambiguous), valid
+    std::string multipart_boundary(const media_type& type) {
+        std::string boundary;
+        size_t boundaries = 0;
+        for (const auto& [name, value] : type.parameters) {
+            if (name != "boundary") continue;
+            boundary = value;
+            ++boundaries;
+        }
+        if (boundaries != 1 || !multipart_parser::valid_boundary(boundary)) {
+            throw body_decode_error("Invalid multipart body: missing or invalid boundary");
+        }
+        return boundary;
+    }
+
+    // Value of a multipart form part of `content` (taken): a string, or an object for a file
+    json part_value(const multipart_part& part, std::string& content) {
+        if (!part.is_file()) {
+            if (!valid_utf8(content)) throw body_decode_error("Invalid multipart body: not valid UTF-8");
+            return std::move(content);
+        }
+        if (!valid_utf8(part.filename) || !valid_utf8(part.content_type)) {
+            throw body_decode_error("Invalid multipart body: not valid UTF-8");
+        }
+        return {{"filename", part.safe_filename()}, {"content_type", part.content_type},
+                {"content", json::binary(std::vector<uint8_t>(content.begin(), content.end()))}};
+    }
+
     // Charsets other than UTF-8 are not converted: rejected as an unsupported media type
     void require_utf8(const media_type& type, const std::string& what, bool allow_ascii = false) {
         auto charset = type.parameter("charset");
@@ -434,58 +475,17 @@ json body_decoder_registry::decode_form(std::string_view body, const media_type&
             throw body_decode_error("Invalid form data: not valid UTF-8");
         }
 
-        auto member = result.find(name);
-        if (member == result.end()) {
-            result.emplace(name, value);
-        } else if (member->is_array()) {
-            member->push_back(value);
-        } else {
-            *member = json::array({std::move(*member), value});
-        }
+        add_form_value(result, name, value);
     }
     return result;
 }
 
 json body_decoder_registry::decode_multipart(std::string_view body, const media_type& type, const body_limits&) {
-    // Repeated boundaries are ambiguous
-    std::string boundary;
-    size_t boundaries = 0;
-    for (const auto& [name, value] : type.parameters) {
-        if (name != "boundary") continue;
-        boundary = value;
-        ++boundaries;
-    }
-    if (boundaries != 1 || !multipart_parser::valid_boundary(boundary)) {
-        throw body_decode_error("Invalid multipart body: missing or invalid boundary");
-    }
-
     // As decode_form(): each form-data part with a name is a member, its value a string, or
     // an object for a file; a repeated name, an array of its values. Other parts are skipped.
     json result = json::object();
-    multipart_parser parser(boundary);
+    multipart_parser parser(multipart_boundary(type));
     std::string content;
-    auto add = [&](const multipart_part& part) {
-        json value;
-        if (part.is_file()) {
-            if (!valid_utf8(part.filename) || !valid_utf8(part.content_type)) {
-                throw body_decode_error("Invalid multipart body: not valid UTF-8");
-            }
-            value = {{"filename", part.safe_filename()}, {"content_type", part.content_type},
-                     {"content", json::binary(std::vector<uint8_t>(content.begin(), content.end()))}};
-        } else {
-            if (!valid_utf8(content)) throw body_decode_error("Invalid multipart body: not valid UTF-8");
-            value = std::move(content);
-        }
-        auto member = result.find(part.name);
-        if (member == result.end()) {
-            result.emplace(part.name, std::move(value));
-        } else if (member->is_array()) {
-            member->push_back(std::move(value));
-        } else {
-            *member = json::array({std::move(*member), std::move(value)});
-        }
-    };
-
     bool skip = true;
     for (;;) {
         auto event = parser.parse(body);
@@ -502,7 +502,7 @@ json body_decoder_registry::decode_multipart(std::string_view body, const media_
                 if (!skip) content.append(parser.data());
                 break;
             case multipart_parser::event::part_end:
-                if (!skip) add(parser.part());
+                if (!skip) add_form_value(result, parser.part().name, part_value(parser.part(), content));
                 break;
             case multipart_parser::event::end:
                 return result;
