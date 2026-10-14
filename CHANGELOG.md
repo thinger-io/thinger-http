@@ -14,6 +14,7 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ### Fixed
 
+- TLS: replacing the default certificate (`certificate_manager::set_default_certificate()`) while a server listens applies to the next handshakes without SNI or with a host name without a certificate, as Node's `setSecureContext()` and Go's `GetCertificate` do. They got the default certificate of when the server started listening until a restart (e.g. after an ACME renewal). Connections keep the certificate they took.
 - `certificate_manager`: certificates created while the cipher list or the legacy protocols were being changed read those settings without the lock.
 
 ## [0.2.0] - 2026-10-14

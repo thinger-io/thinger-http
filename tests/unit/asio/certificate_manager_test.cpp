@@ -316,6 +316,32 @@ TEST_CASE("Certificate Manager Tests", "[certificate_manager]") {
         REQUIRE_NOTHROW(certificate_manager::sni_callback(nullptr, nullptr, nullptr));
     }
     
+    SECTION("SNI Callback switches to the default certificate replaced") {
+        auto& mgr = certificate_manager::instance();
+        auto [cert1, key1] = generate_test_certificate("listener");
+        auto [cert2, key2] = generate_test_certificate("replaced");
+        REQUIRE(mgr.set_default_certificate(cert1, key1));
+        auto listener = mgr.get_default_certificate();
+
+        // without SNI, and while the default is the one of the listener, it is kept
+        SSL* ssl = SSL_new(listener->native_handle());
+        int alert = 0;
+        REQUIRE(certificate_manager::sni_callback(ssl, &alert, nullptr) == SSL_TLSEXT_ERR_OK);
+        REQUIRE(SSL_get_SSL_CTX(ssl) == listener->native_handle());
+
+        REQUIRE(mgr.set_default_certificate(cert2, key2));
+        REQUIRE(certificate_manager::sni_callback(ssl, &alert, nullptr) == SSL_TLSEXT_ERR_OK);
+        REQUIRE(SSL_get_SSL_CTX(ssl) == mgr.get_default_certificate()->native_handle());
+
+        // the connection keeps its context alive once replaced again
+        SSL_CTX* taken = SSL_get_SSL_CTX(ssl);
+        REQUIRE(mgr.set_default_certificate(cert1, key1));
+        char cn[256] = {};
+        X509_NAME_get_text_by_NID(X509_get_subject_name(SSL_CTX_get0_certificate(taken)), NID_commonName, cn, sizeof(cn));
+        REQUIRE(std::string(cn) == "replaced");
+        SSL_free(ssl);
+    }
+
     SECTION("Invalid Default Certificate keeps the current one") {
         auto& mgr = certificate_manager::instance();
         auto [cert, key] = generate_test_certificate("current");

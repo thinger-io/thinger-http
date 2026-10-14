@@ -234,31 +234,38 @@ void certificate_manager::generate_self_signed_certificate() {
     EVP_PKEY_free(pkey);
 }
 
+std::shared_ptr<boost::asio::ssl::context> certificate_manager::select_context(const char* hostname) const {
+    if (hostname != nullptr) {
+        LOG_DEBUG("SNI connection for: {}", hostname);
+        if (auto certificate = get_certificate(hostname)) return certificate;
+        LOG_WARNING("Using default server certificate for hostname: {}", hostname);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    return default_context_;
+}
+
 // SNI callback implementation
 int certificate_manager::sni_callback(SSL* ssl, int* al, void* arg) {
     if (!ssl) return SSL_TLSEXT_ERR_OK;
 
-    // Get SNI server name
+    // Get SNI server name (none if the client sent none)
     const char* hostname = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-    
-    if (hostname != nullptr) {
-        LOG_DEBUG("SNI connection for: {}", hostname);
 
-        // Called from OpenSSL: nothing may be thrown through it
-        try {
-            auto& mgr = certificate_manager::instance();
-            auto certificate = mgr.get_certificate(hostname);
-
-            if (certificate) {
-                auto ssl_ctx = certificate->native_handle();
-                SSL_set_SSL_CTX(ssl, ssl_ctx);
-            } else {
-                LOG_WARNING("Using default server certificate for hostname: {}", hostname);
-            }
-        } catch (const std::exception& e) {
-            LOG_ERROR("cannot select the certificate for hostname {}: {}", hostname, e.what());
+    // Called from OpenSSL: nothing may be thrown through it
+    try {
+        // The default certificate may have been replaced since the listener took it. The
+        // connection holds a reference to the context it switches to, which outlives a later
+        // replacement
+        auto context = certificate_manager::instance().select_context(hostname);
+        if (context && context->native_handle() != SSL_get_SSL_CTX(ssl) &&
+            SSL_set_SSL_CTX(ssl, context->native_handle()) == nullptr) {
+            LOG_ERROR("cannot set the certificate for hostname {}", hostname ? hostname : "");
+            if (al) *al = SSL_AD_INTERNAL_ERROR;
             return SSL_TLSEXT_ERR_ALERT_FATAL;
         }
+    } catch (const std::exception& e) {
+        LOG_ERROR("cannot select the certificate for hostname {}: {}", hostname ? hostname : "", e.what());
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
     }
     
     return SSL_TLSEXT_ERR_OK;

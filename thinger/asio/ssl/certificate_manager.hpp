@@ -54,11 +54,15 @@ private:
     // SSL/TLS configuration
     tls_settings settings_;
     
-    // Thread safety
+    // Guards all the above: certificates are set and removed while handshakes look them up
     mutable std::mutex mutex_;
     
     // Generate self-signed certificate for development (with the lock held)
     void generate_self_signed_certificate();
+
+    // The context of a handshake: the certificate of the host name (SNI), or the default one
+    // (none if there is no default yet)
+    std::shared_ptr<boost::asio::ssl::context> select_context(const char* hostname) const;
     
 public:
     // Singleton instance
@@ -78,8 +82,10 @@ public:
     
     bool remove_certificate(const std::string& hostname);
     
-    // Default certificate management. The PEM version keeps the current one and returns false
-    // if they are not valid
+    // Default certificate management: the certificate of the handshakes without a host name
+    // (SNI) or with one without a certificate. Replacing it applies to the next handshakes of
+    // the servers already listening, as Node's setSecureContext() does; connections keep theirs.
+    // The PEM version keeps the current one and returns false if they are not valid
     void set_default_certificate(std::shared_ptr<boost::asio::ssl::context> ssl_context);
     bool set_default_certificate(const std::string& certificate, const std::string& private_key);
     std::shared_ptr<boost::asio::ssl::context> get_default_certificate() const;
@@ -93,7 +99,9 @@ public:
     void set_server_ciphers(const std::string& ciphers, bool prefer_server_ciphers);
     void enable_legacy_protocols(bool enable);
     
-    // SNI callback for SSL handshake
+    // Server name callback of the handshakes (installed on the context of the listener):
+    // switches to the certificate of the host name, or to the default certificate when it is
+    // not the one the listener was created with. OpenSSL calls it with or without SNI
     static int sni_callback(SSL* ssl, int* al, void* arg);
 };
 
