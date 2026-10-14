@@ -14,19 +14,19 @@ certificate_manager& certificate_manager::instance() {
     return instance;
 }
 
-std::shared_ptr<boost::asio::ssl::context> certificate_manager::create_base_ssl_context() {
+std::shared_ptr<boost::asio::ssl::context> certificate_manager::create_base_ssl_context(const tls_settings& settings) {
     auto context = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
     context->set_options(boost::asio::ssl::context::single_dh_use);
     
     // Enable older TLS versions if configured
-    if (enable_legacy_protocols_) {
+    if (settings.legacy_protocols) {
         SSL_CTX_set_security_level(context->native_handle(), 0);
     }
     
     // Set cipher list if configured
-    if (!server_ciphers_.empty()) {
-        SSL_CTX_set_cipher_list(context->native_handle(), server_ciphers_.c_str());
-        if (prefer_server_ciphers_) {
+    if (!settings.ciphers.empty()) {
+        SSL_CTX_set_cipher_list(context->native_handle(), settings.ciphers.c_str());
+        if (settings.prefer_server_ciphers) {
             SSL_CTX_set_options(context->native_handle(), SSL_OP_CIPHER_SERVER_PREFERENCE);
         }
     }
@@ -38,7 +38,12 @@ std::shared_ptr<boost::asio::ssl::context> certificate_manager::create_ssl_conte
     const std::string& cert_chain,
     const std::string& private_key) {
     
-    auto context = create_base_ssl_context();
+    tls_settings settings;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        settings = settings_;
+    }
+    auto context = create_base_ssl_context(settings);
 
     boost::system::error_code ec;
     context->use_certificate_chain(boost::asio::buffer(cert_chain.data(), cert_chain.size()), ec);
@@ -127,8 +132,11 @@ void certificate_manager::set_default_certificate(std::shared_ptr<boost::asio::s
     default_context_ = ssl_context;
 }
 
-void certificate_manager::set_default_certificate(const std::string& certificate, const std::string& private_key) {
-    set_default_certificate(create_ssl_context(certificate, private_key));
+bool certificate_manager::set_default_certificate(const std::string& certificate, const std::string& private_key) {
+    auto context = create_ssl_context(certificate, private_key);
+    if (!context) return false;
+    set_default_certificate(std::move(context));
+    return true;
 }
 
 std::shared_ptr<boost::asio::ssl::context> certificate_manager::get_default_certificate() const {
@@ -148,7 +156,7 @@ void certificate_manager::set_default_host(const std::string& host) {
     default_host_ = host;
 }
 
-const std::string& certificate_manager::get_default_host() const {
+std::string certificate_manager::get_default_host() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return default_host_;
 }
@@ -160,13 +168,13 @@ std::set<std::string> certificate_manager::get_registered_hosts() const {
 
 void certificate_manager::set_server_ciphers(const std::string& ciphers, bool prefer_server_ciphers) {
     std::lock_guard<std::mutex> lock(mutex_);
-    server_ciphers_ = ciphers;
-    prefer_server_ciphers_ = prefer_server_ciphers;
+    settings_.ciphers = ciphers;
+    settings_.prefer_server_ciphers = prefer_server_ciphers;
 }
 
 void certificate_manager::enable_legacy_protocols(bool enable) {
     std::lock_guard<std::mutex> lock(mutex_);
-    enable_legacy_protocols_ = enable;
+    settings_.legacy_protocols = enable;
 }
 
 void certificate_manager::generate_self_signed_certificate() {
@@ -209,7 +217,7 @@ void certificate_manager::generate_self_signed_certificate() {
     X509_sign(x509, pkey, EVP_sha256());
     
     // Create SSL context
-    auto context = create_base_ssl_context();
+    auto context = create_base_ssl_context(settings_);
     
     // Set certificate and key
     if (SSL_CTX_use_certificate(context->native_handle(), x509) != 1) {

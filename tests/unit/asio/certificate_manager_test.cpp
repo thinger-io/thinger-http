@@ -316,6 +316,15 @@ TEST_CASE("Certificate Manager Tests", "[certificate_manager]") {
         REQUIRE_NOTHROW(certificate_manager::sni_callback(nullptr, nullptr, nullptr));
     }
     
+    SECTION("Invalid Default Certificate keeps the current one") {
+        auto& mgr = certificate_manager::instance();
+        auto [cert, key] = generate_test_certificate("current");
+        REQUIRE(mgr.set_default_certificate(cert, key));
+
+        REQUIRE_FALSE(mgr.set_default_certificate("invalid cert", "invalid key"));
+        REQUIRE(get_certificate_cn(mgr.get_default_certificate()) == "current");
+    }
+
     SECTION("Thread Safety") {
         auto& mgr = certificate_manager::instance();
         constexpr int num_threads = 10;

@@ -7,6 +7,15 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Changed
+
+- `certificate_manager::set_default_certificate(certificate, key)` returns `bool`, and keeps the current default certificate when they are not valid, instead of removing it.
+- `certificate_manager::get_default_host()` returns a copy (`std::string`), as the reference returned could change while it was read.
+
+### Fixed
+
+- `certificate_manager`: certificates created while the cipher list or the legacy protocols were being changed read those settings without the lock.
+
 ## [0.2.0] - 2026-10-14
 
 ### Added

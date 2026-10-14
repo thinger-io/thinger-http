@@ -27,8 +27,15 @@ private:
     certificate_manager(certificate_manager&&) = delete;
     certificate_manager& operator=(certificate_manager&&) = delete;
     
+    // Settings of the contexts created
+    struct tls_settings {
+        std::string ciphers;
+        bool prefer_server_ciphers = false;
+        bool legacy_protocols = false;
+    };
+
     // Create base SSL context with common settings
-    std::shared_ptr<boost::asio::ssl::context> create_base_ssl_context();
+    static std::shared_ptr<boost::asio::ssl::context> create_base_ssl_context(const tls_settings& settings);
     
     // Create SSL context from certificate and key strings
     std::shared_ptr<boost::asio::ssl::context> create_ssl_context(
@@ -45,14 +52,12 @@ private:
     std::string default_host_;
     
     // SSL/TLS configuration
-    std::string server_ciphers_;
-    bool prefer_server_ciphers_ = false;
-    bool enable_legacy_protocols_ = false;
+    tls_settings settings_;
     
     // Thread safety
     mutable std::mutex mutex_;
     
-    // Generate self-signed certificate for development
+    // Generate self-signed certificate for development (with the lock held)
     void generate_self_signed_certificate();
     
 public:
@@ -73,12 +78,13 @@ public:
     
     bool remove_certificate(const std::string& hostname);
     
-    // Default certificate management
+    // Default certificate management. The PEM version keeps the current one and returns false
+    // if they are not valid
     void set_default_certificate(std::shared_ptr<boost::asio::ssl::context> ssl_context);
-    void set_default_certificate(const std::string& certificate, const std::string& private_key);
+    bool set_default_certificate(const std::string& certificate, const std::string& private_key);
     std::shared_ptr<boost::asio::ssl::context> get_default_certificate() const;
     void set_default_host(const std::string& host);
-    const std::string& get_default_host() const;
+    std::string get_default_host() const;
     
     // Get all registered hostnames
     std::set<std::string> get_registered_hosts() const;
