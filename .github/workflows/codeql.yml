@@ -44,7 +44,20 @@ jobs:
       - name: Build
         run: cmake --build build -j$(( $(nproc) / 4 ))
 
+      # Everything compiled is analyzed, the downloaded dependencies too: their results are
+      # filtered out before the upload (paths-ignore does not apply to compiled languages)
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
         with:
+          category: "/language:c-cpp"
+          upload: never
+          output: sarif-results
+
+      - name: Keep the results of the project code
+        run: python3 .github/scripts/filter_sarif.py sarif-results
+
+      - name: Upload results
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: sarif-results
           category: "/language:c-cpp"
