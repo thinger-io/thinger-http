@@ -4,14 +4,13 @@
 #include "body_decoders.hpp"
 #include "response_compression.hpp"
 #include "file_server/file_info.hpp"
+#include "file_server/file_response.hpp"
 #include "../../util/logger.hpp"
 #include "../../util/base64.hpp"
 #include "../../util/sha1.hpp"
 #include "../../asio/sockets/websocket.hpp"
 #include <boost/algorithm/string.hpp>
 #include <algorithm>
-#include <fstream>
-#include <sstream>
 #include <atomic>
 #include <mutex>
 #include <optional>
@@ -291,6 +290,14 @@ void response::send_response(const std::shared_ptr<http_response>& response) {
     send_message(response);
 }
 
+const http_request& response::request_message() const {
+    return *state_->request;
+}
+
+const error_formatter* response::formatter() const {
+    return state_->formatter.get();
+}
+
 bool response::has_responded() const {
     return state_->responded;
 }
@@ -324,90 +331,7 @@ void response::send_file(const std::filesystem::path& path, bool force_download)
         error(http_response::status::forbidden, "Not a regular file");
         return;
     }
-    send_file(path, *file, mime_types::extension_to_type(path.extension().string()), {}, force_download);
-}
-
-void response::send_file(const std::filesystem::path& path, const file_info& file, const std::string& content_type,
-                         std::string_view encoding, bool force_download) {
-    const auto& request = *state_->request;
-    bool head = request.get_method() == method::HEAD;
-    bool get = request.get_method() == method::GET;
-
-    // Headers of the 200 and 304 answers alike: the validators, and how to cache them.
-    // Without a Cache-Control of the handler, caches store the file but revalidate it on
-    // every use (else they could reuse it for a while, guessing from Last-Modified).
-    auto message = new_response();
-    if (!message->has_header(header::cache_control)) message->add_header(header::cache_control, "no-cache");
-    message->set_header("ETag", file.etag);
-    message->set_header("Last-Modified", file.last_modified);
-    // A precompressed file is sent depending on Accept-Encoding, and a text file may be sent
-    // compressed: another representation either way
-    if (!encoding.empty() || compression::compressible(*message, file.size, content_type)) {
-        compression::add_vary(*message, "Accept-Encoding");
-    }
-
-    // Conditional request for a file the client has: no body, nor the length of the file
-    if ((get || head) && file.not_modified(request)) {
-        message->set_status(http_response::status::not_modified);
-        send_message(std::move(message), false);
-        return;
-    }
-
-    message->set_status(http_response::status::ok);
-    message->set_content_type(content_type);
-    if (!encoding.empty()) message->add_header("Content-Encoding", std::string(encoding));
-    message->add_header("Accept-Ranges", "bytes");
-    if (force_download) {
-        message->add_header("Content-Disposition", "attachment; filename=\"" + path.filename().string() + "\"");
-    }
-
-    // HEAD: the headers of the GET answer (with the length of the file, as it is), no body
-    if (head) {
-        message->set_content_length(file.size);
-        send_message(std::move(message), false);
-        return;
-    }
-
-    // A single byte range of a GET request (RFC 9110, 14.2), unless If-Range asks for the
-    // whole file once it changed: only the date can match, as the entity tag is weak. The
-    // range of a precompressed file is one of its bytes, as sent (as nginx does).
-    std::optional<byte_range> range;
-    const auto& range_header = request.get_header("Range");
-    if (get && !range_header.empty()) {
-        const auto& if_range = request.get_header("If-Range");
-        if (if_range.empty() || if_range == file.last_modified) range = parse_byte_range(range_header, file.size);
-    }
-    if (range && range->length == 0) {
-        auto unsatisfiable = new_response();
-        unsatisfiable->set_status(http_response::status::range_not_satisfiable);
-        unsatisfiable->add_header("Content-Range", "bytes */" + std::to_string(file.size));
-        format_error(state_->formatter.get(), {http_response::status::range_not_satisfiable,
-                                               "Range not satisfiable", nullptr}, *unsatisfiable);
-        send_message(std::move(unsatisfiable));
-        return;
-    }
-
-    uint64_t first = range ? range->first : 0;
-    uint64_t length = range ? range->length : file.size;
-    std::ifstream stream(path, std::ios::binary);
-    std::string content(length, '\0');
-    if (!stream || !stream.seekg(static_cast<std::streamoff>(first)) ||
-        !stream.read(content.data(), static_cast<std::streamsize>(length))) {
-        error(http_response::status::internal_server_error, "Failed to read file");
-        return;
-    }
-    message->set_content(std::move(content));
-
-    // A range is sent as is: compressing it would change the bytes it refers to
-    if (range) {
-        message->set_status(http_response::status::partial_content);
-        message->add_header("Content-Range", "bytes " + std::to_string(first) + "-" +
-                                             std::to_string(first + length - 1) + "/" + std::to_string(file.size));
-        send_message(std::move(message), false);
-        return;
-    }
-    // (compressed here unless it is already)
-    send_message(std::move(message), encoding.empty());
+    file_server::send(*this, {path, *file, mime_types::extension_to_type(path.extension().string()), {}, force_download});
 }
 
 namespace {

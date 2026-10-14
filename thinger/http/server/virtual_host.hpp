@@ -146,11 +146,6 @@ private:
         return router_[http_method][path];
     }
 
-    // Send a static `file` (canonical, inside the canonical directory `root`), or its
-    // precompressed sibling if `precompressed` and the request accepts it
-    static void send_static_file(request& req, response& res, const std::filesystem::path& file,
-                                 const std::filesystem::path& root, bool precompressed);
-
     std::string name_;
     std::optional<std::regex> pattern_;
     std::vector<std::string> parameters_;
