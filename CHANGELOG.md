@@ -7,6 +7,8 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-14
+
 ### Added
 
 - Precompressed static files: `serve_static()` sends a file as its `<file>.br` or `<file>.gz` sibling to the clients accepting `br` or `gzip` (by `q` value, `br` first at equal quality), if the sibling is a regular file not older than the file, with `Content-Encoding`, the `Content-Type` of the file, `Vary: Accept-Encoding` and an `ETag` of its own (`W/"...-br"`); conditional requests, `HEAD` and byte ranges apply to it. On by default (`static_options::precompressed`).
@@ -92,5 +94,6 @@ These changes of the last weeks can be noticed by code written against an earlie
 - Client: connections are kept alive between requests (see the README to tune or disable the pool).
 - The unused `request_handler` interface was removed.
 
-[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/thinger-io/thinger-http/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/thinger-io/thinger-http/releases/tag/v0.1.0
