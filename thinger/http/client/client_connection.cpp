@@ -448,7 +448,7 @@ awaitable<stream_result> client_connection::send_request_streaming(
             const std::string_view& data, size_t downloaded, size_t total) -> bool {
             if (result.status_code == 0) {
                 result.status_code = response_parser_.get_status_code();
-                // (the head is parsed: the callback may stop the download before its end)
+                // The head is parsed: the callback may stop the download before its end
                 if (auto head = response_parser_.get_response()) set_headers(result, *head);
             }
             result.bytes_transferred = downloaded;
@@ -460,7 +460,7 @@ awaitable<stream_result> client_connection::send_request_streaming(
     auto response = co_await exchange(std::move(request));
     if (!response) {
         result.error = error_.message();
-        // (the status of a proxy refusing the tunnel, with its error)
+        // The status of a proxy refusing the tunnel, with its error
         if (proxy_response_) {
             result.status_code = proxy_response_->get_status_code();
             set_headers(result, *proxy_response_);

@@ -210,7 +210,7 @@ connection_pool::lease connection_pool::acquire(const std::string& key) {
     std::vector<std::shared_ptr<client_connection>> closing;
     {
         std::lock_guard lock(state_->mutex);
-        // (expired ones of any key, in case their timers did not run)
+        // Expired ones of any key too, in case their timers did not run
         state_->sweep(std::chrono::steady_clock::now(), closing);
         if (auto it = state_->hosts.find(key); it != state_->hosts.end()) {
             auto& entry = it->second;

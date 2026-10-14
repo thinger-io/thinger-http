@@ -69,7 +69,6 @@ public:
     // connection timeout (on the connection thread)
     void hold_until(std::chrono::steady_clock::time_point time);
 
-    // Set request handler (awaitable — dispatch coroutine)
     void set_handler(std::function<awaitable<void>(std::shared_ptr<request>)> handler) {
         handler_ = std::move(handler);
     }
@@ -172,7 +171,6 @@ private:
     // reads or writes the connection)
     std::queue<std::shared_ptr<http_stream>> request_queue_;
 
-    // Request handler callback (awaitable coroutine)
     std::function<awaitable<void>(std::shared_ptr<request>)> handler_;
 
     // Buffers of the frame being written (kept, so they are not allocated for every frame)

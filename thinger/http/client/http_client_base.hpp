@@ -26,7 +26,6 @@ using headers_map = std::map<std::string, std::string>;
 
 class http_client_base {
 protected:
-    // Configuration
     std::chrono::seconds timeout_{30};
     unsigned int max_redirects_{5};
     bool follow_redirects_{true};
@@ -49,10 +48,9 @@ protected:
     // Connections kept alive between requests
     connection_pool pool_;
 
-    // Abstract method - each derived class provides its own io_context
+    // Each derived class provides its own io_context
     virtual boost::asio::io_context& get_io_context() = 0;
 
-    // Apply default headers
     void apply_default_headers(const std::shared_ptr<http_request>& request);
 
     // A connection for a request: an idle one of the pool if `reuse` and there is one, or a
@@ -64,7 +62,6 @@ public:
     http_client_base();
     virtual ~http_client_base();
 
-    // Configuration setters (fluent API)
     http_client_base& timeout(std::chrono::seconds t) { timeout_ = t; return *this; }
     http_client_base& max_redirects(unsigned int max) { max_redirects_ = max; return *this; }
     http_client_base& follow_redirects(bool follow) { follow_redirects_ = follow; return *this; }
@@ -98,7 +95,6 @@ public:
     http_client_base& max_idle_connections(size_t max);
     http_client_base& idle_timeout(std::chrono::milliseconds timeout);
 
-    // Configuration getters
     std::chrono::seconds get_timeout() const { return timeout_; }
     unsigned int get_max_redirects() const { return max_redirects_; }
     bool get_follow_redirects() const { return follow_redirects_; }
@@ -115,10 +111,8 @@ public:
     std::string proxy_for(const std::string& url) const;
     std::string proxy_for(const http_request& request) const;
 
-    // Request creation
     std::shared_ptr<http_request> create_request(method m, const std::string& url);
 
-    // Main HTTP methods - all return awaitable
     awaitable<client_response> get(const std::string& url, headers_map headers = {});
     awaitable<client_response> post(const std::string& url, std::string body = {},
                                     std::string content_type = "application/json", headers_map headers = {});
@@ -131,10 +125,9 @@ public:
     awaitable<client_response> head(const std::string& url, headers_map headers = {});
     awaitable<client_response> options(const std::string& url, headers_map headers = {});
 
-    // Generic send with custom request
     awaitable<client_response> send(std::shared_ptr<http_request> request);
 
-    // Streaming send - streams response through callback without loading into memory
+    // Hand the response body to the callback as it arrives, without holding it in memory
     awaitable<stream_result> send_streaming(std::shared_ptr<http_request> request,
                                             stream_callback callback);
 
@@ -143,12 +136,11 @@ public:
     awaitable<std::pair<client_response, std::shared_ptr<client_connection>>>
         send_with_connection(std::shared_ptr<http_request> request);
 
-    // WebSocket upgrade (simple API)
     awaitable<std::optional<websocket_client>> upgrade_websocket(
         const std::string& url,
         const std::string& subprotocol = "");
 
-    // WebSocket upgrade with custom request/headers (for builder pattern)
+    // With a request of its own: custom headers, proxy, CAs
     awaitable<std::optional<websocket_client>> upgrade_websocket(
         std::shared_ptr<http_request> request,
         const std::string& subprotocol = "");
@@ -202,7 +194,7 @@ private:
                                                            connection_pool::lease& lease);
     static bool can_retry(const client_connection& connection, const http_request& request);
 
-    // Check if URLs have same origin (for security when forwarding headers)
+    // Credentials are forwarded on redirects only to the same origin
     static bool is_same_origin(const std::string& url1, const std::string& url2);
 };
 
