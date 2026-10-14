@@ -418,6 +418,8 @@ namespace {
         }
         if (!host.empty()) outgoing->add_header(header::host, host);
 
+        // (not Expect: a client waiting for 100 Continue gets it from the server once the
+        // body is streamed to the target, the first time it is read, as nginx does)
         for (const auto& [name, value] : incoming_->get_headers()) {
             if (!is_end_to_end(name, connection) || is_forwarding_header(name) ||
                 headers::is_header(name, header::host) || headers::is_header(name, header::content_length) ||

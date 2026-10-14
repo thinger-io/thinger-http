@@ -25,10 +25,16 @@ namespace thinger::http{
         }
         body_reader_.set_limit(default_max_body_size);
         if (http_connection) {
+            expect_continue_ = http_stream && http_stream->get_continue() == http_stream::continue_state::pending;
             // (capturing only `this` fits in the function, without allocating)
             body_reader_.set_source([this](uint8_t* buffer, size_t size) -> thinger::awaitable<size_t> {
                 auto conn = http_connection_.lock();
                 if (!conn) co_return 0;
+                // The body is needed now: ask the client for it (Expect: 100-continue)
+                if (expect_continue_) [[unlikely]] {
+                    expect_continue_ = false;
+                    if (auto stream = http_stream_.lock()) conn->send_continue(*stream);
+                }
                 auto [ec, bytes] = co_await conn->get_socket()->read_some(buffer, size);
                 // a body that keeps arriving keeps the connection alive (e.g. a long upload)
                 if (bytes > 0) conn->extend_timeout();

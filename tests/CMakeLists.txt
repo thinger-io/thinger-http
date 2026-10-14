@@ -285,6 +285,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/request_framing_test.cpp)
     add_thinger_test(test_integration_request_framing integration/request_framing_test.cpp)
 endif()
 
+# Integration tests - Expect: 100-continue
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/expect_continue_test.cpp)
+    add_thinger_test(test_integration_expect_continue integration/expect_continue_test.cpp)
+endif()
+
 # Integration tests - Request body limits
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/request_body_limits_test.cpp)
     add_thinger_test(test_integration_request_body_limits integration/request_body_limits_test.cpp)

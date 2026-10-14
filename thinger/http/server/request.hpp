@@ -235,6 +235,10 @@ namespace thinger::http{
         /// Body decoders, accepted types and limits of the application (null: defaults)
         const body_settings* body_settings_ = nullptr;
 
+        /// The client waits for 100 Continue before sending the body: sent by the first read
+        /// from the connection (see server_connection::send_continue)
+        bool expect_continue_ = false;
+
         friend class connection_sink;
 
         /// Body parsed as JSON by the matched route, for callbacks taking it

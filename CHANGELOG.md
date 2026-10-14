@@ -13,12 +13,15 @@ All notable changes to thinger-http are documented in this file. The format foll
 - Lists of content codings (`Content-Encoding: deflate, gzip`) are decoded in reverse order, by the client and by the server, up to five of them; a list with a coding that is not supported is kept as it is (`util::decode_content`).
 - `deflate` bodies without the zlib header (raw deflate) are decoded, as curl and browsers do.
 - `parse_accept_encoding()`: the quality `Accept-Encoding` gives gzip, deflate, br and identity.
+- `Expect: 100-continue` (RFC 9110 section 10.1.1): the server sends `100 Continue` when the body is first read, by the server or by the handler, in order with the pipelined responses, so curl uploads no longer wait a second for it. A request answered without reading its body gets no `100 Continue`, and its connection is closed after the response, as Go and Node do. The reverse proxy sends it once it starts streaming the body to the target.
+- `417 Expectation Failed` (`http_response::status::expectation_failed`) for any expectation other than `100-continue`, as Node and Go answer. `http_request::get_expectation()` tells the expectation of a received request.
 
 ### Changed
 
 - gzip bodies are decoded whole: every member of concatenated gzip data, instead of the first one only, with the size limit on all of them. Bytes after the last member (other than zero padding), and after the end of a deflate stream, now fail to decode (`client_error::bad_content_encoding`, or `400` for request bodies) instead of being ignored.
 - `util::gzip::decompress()` and `util::deflate::decompress()` take a `std::string_view`.
 - Client: the synchronous `client` also closes its expired idle connections as a request ends, not only as the next one starts, so they no longer wait for the next call after a long request, nor take the room of other connections in the pool. Between calls they still stay open until the next call (as in curl and urllib3): `clear_connections()` closes them.
+- A request with `Expect: 100-continue` answered without reading its body (e.g. `401` from a middleware) closes the connection after the response (`Connection: close`), instead of discarding the body, which the client may never send. A request with another expectation is answered `417` before the middlewares and the handler run. `Expect` in HTTP/1.0 requests is ignored, as before.
 
 ### Fixed
 

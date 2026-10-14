@@ -23,6 +23,10 @@ namespace thinger::http {
         responded_ = true;
     }
 
+    void http_stream::add_interim_frame(std::shared_ptr<http_frame> frame) {
+        queue_.push(std::move(frame));
+    }
+
     size_t http_stream::get_queued_frames() const {
         return queue_.size();
     }

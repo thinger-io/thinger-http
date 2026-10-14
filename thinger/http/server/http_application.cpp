@@ -513,17 +513,24 @@ awaitable<bool> http_application::run_middlewares(request& req, response& res) {
 }
 
 awaitable<void> http_application::discard_unread_body(request& req) {
+    auto stream = req.get_http_stream();
     // A connection taken over belongs to its new owner, unread body included
-    if (auto stream = req.get_http_stream(); stream && stream->takes_over()) {
+    if (stream && stream->takes_over()) {
+        co_return;
+    }
+
+    // Not asked for (no 100 Continue sent), the body may never come: the connection is closed
+    // after the response instead of waiting for it
+    if (stream && (stream->get_continue() == http_stream::continue_state::pending ||
+                   stream->get_continue() == http_stream::continue_state::skipped)) {
+        close_after_response(req);
         co_return;
     }
 
     // Consume a body nobody read so the connection can be reused for the next request,
     // or close it after the response if the body is too large or cannot be read.
     if (!co_await req.discard_body(max_body_size_)) {
-        if (auto stream = req.get_http_stream()) {
-            stream->set_keep_alive(false);
-        }
+        if (stream) stream->set_keep_alive(false);
     }
 }
 

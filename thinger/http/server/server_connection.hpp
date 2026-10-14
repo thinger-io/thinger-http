@@ -52,6 +52,11 @@ public:
     // Queue a response frame, in call order (can be called from any thread)
     void handle_stream(std::shared_ptr<http_stream> stream, std::shared_ptr<http_frame> frame);
 
+    // Send the 100 Continue the client of `stream` waits for before sending the body (Expect:
+    // 100-continue), as the body is about to be read: once, in order with the responses, and
+    // only while its response has not started (on the connection thread)
+    void send_continue(http_stream& stream);
+
     // Update connection timeout
     void update_connection_timeout(std::chrono::seconds timeout);
 
@@ -134,8 +139,9 @@ private:
     boost::asio::steady_timer response_started_;
 
     // Rare cases where a queued frame is looked at, all tested at once on the way of every
-    // frame: the read loop waits for a response to start, or the connection drains
-    enum : uint8_t { watch_response_start = 1, watch_draining = 2 };
+    // frame: the read loop waits for a response to start, the connection drains, or the
+    // request in progress waits for its 100 Continue
+    enum : uint8_t { watch_response_start = 1, watch_draining = 2, watch_continue = 4 };
     uint8_t frame_watch_{0};
 
     // Stream of the request the read loop is handling, none while it waits for a request

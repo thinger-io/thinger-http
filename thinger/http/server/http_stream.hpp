@@ -73,6 +73,17 @@ namespace thinger::http {
         bool keep_alive_;
 
     public:
+        /**
+         * 100 Continue of a request whose client waits for it before sending the body
+         * (Expect: 100-continue): none expected, pending until the body is first read, sent,
+         * or skipped because the response started first (the body may never come)
+         */
+        enum class continue_state : uint8_t { none, pending, sent, skipped };
+
+    private:
+        continue_state continue_ = continue_state::none;
+
+    public:
         http_stream(stream_id stream_id, bool keep_alive) : stream_id_(stream_id), keep_alive_(keep_alive) {}
 
         virtual ~http_stream() {}
@@ -88,6 +99,19 @@ namespace thinger::http {
         void pop_frame();
 
         void add_frame(std::shared_ptr<http_frame> frame);
+
+        /**
+         * Queue an interim response (100 Continue): the response has not started yet
+         */
+        void add_interim_frame(std::shared_ptr<http_frame> frame);
+
+        continue_state get_continue() const {
+            return continue_;
+        }
+
+        void set_continue(continue_state state) {
+            continue_ = state;
+        }
 
         size_t get_queued_frames() const;
 

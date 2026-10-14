@@ -4,6 +4,27 @@
 
 namespace thinger::http {
 
+namespace {
+
+    // Interim response asking the client to send the body (RFC 9110 section 15.2.1)
+    class continue_frame : public http_frame {
+    public:
+        continue_frame() { set_last_frame(false); }
+
+        size_t get_size() override { return 0; }
+
+        void to_buffer(std::vector<boost::asio::const_buffer>& buffer) const override {
+            static constexpr std::string_view head = "HTTP/1.1 100 Continue\r\n\r\n";
+            buffer.emplace_back(boost::asio::buffer(head.data(), head.size()));
+        }
+
+        void log(const char* scope, int) const override {
+            LOG_DEBUG("[{}] HTTP/1.1 100 Continue", scope);
+        }
+    };
+
+}
+
 server_connection::server_connection(std::shared_ptr<asio::socket> socket)
     : socket_(std::move(socket))
     , timeout_timer_(socket_->get_io_context())
@@ -122,6 +143,14 @@ awaitable<void> server_connection::read_loop() {
 
             auto stream = std::make_shared<http_stream>(++request_id_, http_req->keep_alive());
             in_progress_ = stream.get();
+
+            // The client may wait for 100 Continue before sending the body: sent once the
+            // body is read, unless the client already started sending it
+            if (http_req->get_expectation() == http_request::expectation::continue_100 &&
+                http_req->has_pending_body() && unconsumed == 0) [[unlikely]] {
+                stream->set_continue(http_stream::continue_state::pending);
+                frame_watch_ |= watch_continue;
+            }
 
             // Add to queue for pipelining
             request_queue_.push(stream);
@@ -354,6 +383,30 @@ void server_connection::watch_frame(const std::shared_ptr<http_stream>& stream,
     if ((frame_watch_ & watch_draining) && !stream->responded() && !stream->takes_over()) {
         stream->set_keep_alive(false);
         if (auto* head = dynamic_cast<headers*>(frame.get())) head->set_keep_alive(false);
+    }
+
+    // A response starting before the 100 Continue its client waits for: the client may send
+    // the body or not, so where the next request starts is unknown. Not sent anymore, and the
+    // connection is closed after the response, which tells the client (as Go and Node do)
+    if ((frame_watch_ & watch_continue) && stream->get_continue() == http_stream::continue_state::pending) {
+        frame_watch_ &= ~watch_continue;
+        stream->set_continue(http_stream::continue_state::skipped);
+        if (!stream->takes_over()) {
+            stream->set_keep_alive(false);
+            if (auto* head = dynamic_cast<headers*>(frame.get())) head->set_keep_alive(false);
+        }
+    }
+}
+
+void server_connection::send_continue(http_stream& stream) {
+    if (stream.get_continue() != http_stream::continue_state::pending || !running_) return;
+    stream.set_continue(http_stream::continue_state::sent);
+    frame_watch_ &= ~watch_continue;
+    // Queued as the first frame of the stream, before its response: written once the
+    // responses of the previous requests are
+    stream.add_interim_frame(std::make_shared<continue_frame>());
+    if (!request_queue_.empty() && request_queue_.front().get() == &stream) {
+        process_output_queue();
     }
 }
 
