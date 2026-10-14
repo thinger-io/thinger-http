@@ -26,6 +26,7 @@ All notable changes to thinger-http are documented in this file. The format foll
 - Client: the synchronous `client` also closes its expired idle connections as a request ends, not only as the next one starts, so they no longer wait for the next call after a long request, nor take the room of other connections in the pool. Between calls they still stay open until the next call (as in curl and urllib3): `clear_connections()` closes them.
 - A request with `Expect: 100-continue` answered without reading its body (e.g. `401` from a middleware) closes the connection after the response (`Connection: close`), instead of discarding the body, which the client may never send. A request with another expectation is answered `417` before the middlewares and the handler run. `Expect` in HTTP/1.0 requests is ignored, as before.
 - The built-in body decoders include `multipart`: a route taking the body decoded that accepts `multipart/form-data` (by that media type) decodes it now, where it answered `415` for lack of a decoder. Routes that do not list it are not affected; `body_decoders().remove("multipart")` restores the previous behavior.
+- Internal reorganization of the server responses, without behavior changes: the reverse proxy is split by concern (`reverse_proxy/`), file responses and static files move to `file_server/`, and response compression to `response_compression.hpp`, which now declares `parse_accept_encoding()` and `negotiate_content_coding()` (`body_decoders.hpp` still includes it).
 
 ### Fixed
 
