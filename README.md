@@ -38,6 +38,7 @@ To reproduce, see [`benchmark/compare`](benchmark/compare/): `benchmark/compare/
 - **SSL/TLS** - HTTPS and WSS support via OpenSSL, with per-domain certificates (SNI)
 - **Virtual Hosts** - Routes per host name, exact or by pattern, on the same listener
 - **Reverse Proxy** - Forward requests to HTTP, HTTPS or Unix socket targets, streaming bodies and tunneling WebSockets
+- **File Uploads** - Streaming multipart/form-data parser, with temporary files and limits
 - **C++20 Coroutines** - Async-first API with sync wrappers
 - **Graceful Shutdown** - Stop listening, finish the requests in flight and tell long-lived connections, within a grace period; connection statistics at no cost per request
 - **Lightweight** - Minimal dependencies, suitable for embedded systems
@@ -292,6 +293,64 @@ Reads never go past the end of the body, nor past the maximum body size of the r
 - `co_await req.read_body()` loads the remaining body into `req.body()`, up to the maximum body size (it fails without reading a larger `Content-Length` body). Do not mix it with `read()`/`read_some()` on the same request: the stored body would miss the part already read (and fail to decompress if the request is compressed).
 - `read()`/`read_some()` return 0 at the end of the body, and also if reading it fails: `req.get_body_error()` tells why (`too_large`, `malformed` framing, `incomplete` if the connection ended first, or `bad_encoding`). A request whose body fails is answered with `400` (`413` if too large) unless the handler responded, and its connection is closed.
 
+### File Uploads (multipart/form-data)
+
+Coroutine handlers read `multipart/form-data` bodies (HTML forms with files, `curl -F`, the client's [`http::form`](#request-builder-fluent-api)) as they arrive, never holding the whole body in memory. `req.read_multipart()` keeps the fields in memory and writes the files to temporary files, deleted when the form is destroyed (at the end of the handler) unless the handler moves or keeps them:
+
+```cpp
+server.post("/v1/storages/:storage/files", [](http::request& req, http::response& res) -> thinger::awaitable<void> {
+    http::multipart_options options;
+    options.limits.max_file_size = 100 * 1024 * 1024;   // per file
+    options.limits.max_files = 10;
+    auto form = co_await req.read_multipart(options);
+    if (!form) {
+        res.error(form.status(), form.message());       // 400 malformed, 413 over a limit, 415 not a form
+        co_return;
+    }
+
+    std::string description = form.field("description", "");   // a text field
+    for (auto& file : form.files()) {
+        // file.filename() is what the client sent ("../../etc/passwd" too): never a path
+        auto name = file.safe_filename();               // "passwd"
+        if (name.empty()) continue;
+        if (!file.move_to(storage_path(req["storage"]) / name)) {   // renamed (copied across file systems)
+            res.error(http::http_response::status::internal_server_error);
+            co_return;
+        }
+    }
+    res.json({{"uploaded", form.files().size()}, {"description", description}});
+}).max_body_size(1024 * 1024 * 1024);                   // the route limit bounds the whole upload
+```
+
+To stream the parts somewhere else (a database, another server, a hash), `http::multipart_reader` reads them one by one, like Go's `multipart.Reader` or busboy, with the content of each part in pieces of up to 64 KB:
+
+```cpp
+server.post("/ingest", [](http::request& req, http::response& res) -> thinger::awaitable<void> {
+    http::multipart_reader reader(req);              // limits as the second argument
+    while (const http::multipart_part* part = co_await reader.next()) {
+        // part->name, part->filename, part->safe_filename(), part->content_type, part->header("X-Any")
+        for (auto data = co_await reader.read(); !data.empty(); data = co_await reader.read()) {
+            co_await sink.write(part->name, data);   // valid until the next read
+        }
+    }
+    if (reader.failed()) {
+        res.error(reader.status(), reader.message());
+        co_return;
+    }
+    res.send("ok");
+}).max_body_size(1024 * 1024 * 1024);
+```
+
+`multipart_options::on_file` does the same within `read_multipart()`: called for each file with the part and the reader, instead of writing temporary files. The parser itself (`http::multipart_parser`, fed bytes and returning events) does not depend on sockets.
+
+- **Limits** (`http::multipart_limits`), checked as the body arrives: `max_parts` (1000), `max_files` (none), `max_header_size` of each part (16 KB), `max_filename_size` (255 bytes), `max_field_size` (1 MB, each part without filename), `max_fields_size` (8 MB, all of them, as they are kept in memory) and `max_file_size` (none). The whole body is bounded by the maximum body size of the route (`413` `Payload Too Large`), 8 MB by default: give upload routes the limit they need. Exceeding any limit fails with `413`. `max_parts` is Go's default, and the header and field sizes busboy's (Multer).
+- **Syntax** (RFC 7578, RFC 2046 5.1), as strict as Go's `mime/multipart`: the boundary from the `Content-Type` (quoted or not, 1 to 70 characters of the RFC 2046 set, exactly one), CRLF line endings, spaces and tabs after delimiters, preamble and epilogue ignored, a closing delimiter required (a truncated body is `400`, as one with no parts but its closing delimiter is an empty form). The boundary within the content is a delimiter only at the start of a line and followed by `--`, whitespace or CRLF. Part headers are case-insensitive, without folding, CR, LF or NUL in values; a repeated `Content-Disposition` or `Content-Type`, or a repeated parameter (`name`, `filename`) is ambiguous and malformed. `filename*` (RFC 5987, UTF-8, ISO-8859-1 or US-ASCII) wins over `filename`, as in busboy; quoted strings keep backslashes that escape nothing, so Windows paths sent by old browsers stay paths (as Go reads them). A part without filename is a field; with one, even empty (a file input without a file), a file. Parts without `Content-Disposition: form-data` or without a name are skipped by `read_multipart()` and the decoder, as Go and busboy do; the reader gives them too, and any `multipart/*` type.
+- **Filenames**: `filename()` is what the client sent, which can be a path or have control characters. `safe_filename()` is what follows its last `/` or `\`, without control characters, and empty for `.` and `..`: a name to store the file with, though it can still collide with an existing file or be a dotfile.
+- **Temporary files** are created with `mkstemp()` (mode 0600) in `multipart_options::temp_directory` (the system one by default), written as the parts arrive (blocking writes, as Go does), and deleted on any error, and with the form. A file that cannot be written fails with `500`.
+- **Bodies the server already read** (`.deferred_body(false)`, in-memory dispatch) are parsed from `req.body()`, decompressed by the server if they had `Content-Encoding`; a body still to be read with a `Content-Encoding` other than `identity` is `415`, as it is not decoded while streaming.
+
+Handlers taking the body decoded (`nlohmann::json&`) can also accept `multipart/form-data` with `.accepts({"form", "multipart"})`: the `multipart` [body decoder](#body-types) reads it whole (within the maximum body size and the default limits) into the same object a urlencoded form gives, files included as objects `{"filename": <safe filename>, "content_type": ..., "content": <binary>}`, so one handler and one schema serve both form encodings. It is not accepted unless listed, as Express's `body-parser` does not parse multipart either: routes receiving files should stream them instead.
+
 ### Taking Over the Connection
 
 `res.take_over()` hands the connection to your code, for custom protocol upgrades or tunnels (WebSockets and SSE are built on it). The response set so far is sent first (200 by default; unless it is a `101`, a `2xx` to `CONNECT`, or carries a `Content-Length` or `Transfer-Encoding` set with `header()`, it says `Connection: close`, as what the handler writes is its body until the connection closes); then the server stops reading from the connection and calls the handler with the socket and any bytes the client had already sent past the request. From then on the handler owns the socket. It can also be called later from a copy of the response: until the response starts, the server handles nothing else the client sends on that connection (it stays readable from the socket, for the handler), but it notices a client that closes or half-closes the connection meanwhile, over TLS too, and closes it. A `take_over()` arriving after that does not call its handler: it is released, and a warning logged.
@@ -496,6 +555,7 @@ server.set_body_limits({.max_depth = 32});
 | `cbor` | `application/cbor` and any `+cbor` | The value; byte strings as binary values. Tagged items are rejected |
 | `ubjson` | `application/ubjson` | The value |
 | `form` | `application/x-www-form-urlencoded` | An object of strings (see below) |
+| `multipart` | `multipart/form-data` | The same object, with files as objects (see [File Uploads](#file-uploads-multipartform-data)) |
 | `text` | `text/plain` | A string |
 | `binary` | `application/octet-stream` | A binary value (`json::binary`) |
 

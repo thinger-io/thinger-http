@@ -15,6 +15,9 @@ All notable changes to thinger-http are documented in this file. The format foll
 - `parse_accept_encoding()`: the quality `Accept-Encoding` gives gzip, deflate, br and identity.
 - `Expect: 100-continue` (RFC 9110 section 10.1.1): the server sends `100 Continue` when the body is first read, by the server or by the handler, in order with the pipelined responses, so curl uploads no longer wait a second for it. A request answered without reading its body gets no `100 Continue`, and its connection is closed after the response, as Go and Node do. The reverse proxy sends it once it starts streaming the body to the target.
 - `417 Expectation Failed` (`http_response::status::expectation_failed`) for any expectation other than `100-continue`, as Node and Go answer. `http_request::get_expectation()` tells the expectation of a received request.
+- multipart/form-data bodies (file uploads), parsed as they arrive without holding the body in memory: `req.read_multipart()` gives the fields and writes the files to temporary files, deleted with the form unless moved (`move_to()`) or kept (`release()`); `http::multipart_reader` streams the parts and their content, like Go's `multipart.Reader`; `http::multipart_parser` is the incremental parser under both. Limits on parts, files, header sections, filename, field and file sizes (`413`), strict RFC 7578 / RFC 2046 syntax (`400`), `filename*`, and safe filenames against path traversal. See [File Uploads](README.md#file-uploads-multipartform-data).
+- `multipart` body decoder, for routes that `accepts({"multipart"})`: the same object as a urlencoded form, files as objects with their content.
+- Fuzz target `fuzz_multipart`, with its seed corpus.
 
 ### Changed
 
@@ -22,10 +25,12 @@ All notable changes to thinger-http are documented in this file. The format foll
 - `util::gzip::decompress()` and `util::deflate::decompress()` take a `std::string_view`.
 - Client: the synchronous `client` also closes its expired idle connections as a request ends, not only as the next one starts, so they no longer wait for the next call after a long request, nor take the room of other connections in the pool. Between calls they still stay open until the next call (as in curl and urllib3): `clear_connections()` closes them.
 - A request with `Expect: 100-continue` answered without reading its body (e.g. `401` from a middleware) closes the connection after the response (`Connection: close`), instead of discarding the body, which the client may never send. A request with another expectation is answered `417` before the middlewares and the handler run. `Expect` in HTTP/1.0 requests is ignored, as before.
+- The built-in body decoders include `multipart`: a route taking the body decoded that accepts `multipart/form-data` (by that media type) decodes it now, where it answered `415` for lack of a decoder. Routes that do not list it are not affected; `body_decoders().remove("multipart")` restores the previous behavior.
 
 ### Fixed
 
 - `Content-Encoding` names are case-insensitive and `x-gzip` is gzip when decoding responses (client) and request bodies (server), as RFC 9110 says; only `gzip` and `deflate` in lowercase were decoded.
+- Client: multipart forms percent-encode `"`, CR and LF in field names and filenames, as browsers and curl do. Before, a filename with a quote or a line break could end the `Content-Disposition` parameter or header and inject others.
 
 ## [0.1.0] - 2026-10-14
 
