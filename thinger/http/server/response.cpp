@@ -5,11 +5,12 @@
 #include "response_compression.hpp"
 #include "file_server/file_info.hpp"
 #include "file_server/file_response.hpp"
+#include "../common/syntax.hpp"
+#include "../../util/ascii.hpp"
 #include "../../util/logger.hpp"
 #include "../../util/base64.hpp"
 #include "../../util/sha1.hpp"
 #include "../../asio/sockets/websocket.hpp"
-#include <boost/algorithm/string.hpp>
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -100,7 +101,7 @@ void response::on_start(std::function<void()> hook) {
 
 bool response::answer_timeout(http::http_response::status status) {
     if (state_->responded) return false;
-    // (set before answering: whoever sees the response sent sees why)
+    // Set before answering: whoever sees the response sent sees why
     state_->timed_out = true;
     auto message = new_response();
     message->set_status(status);
@@ -117,7 +118,7 @@ bool response::answer_timeout(http::http_response::status status) {
 }
 
 bool response::timed_out() const {
-    // (a handler may have moved the response away)
+    // A handler may have moved the response away
     return state_ && state_->timed_out;
 }
 
@@ -192,7 +193,7 @@ void response::frame_takeover(http_response& message) const {
 }
 
 void response::prepare_body(http_response& message, bool compress) const {
-    // (the usual answer is framed already: its Content-Length was set with its content)
+    // The usual answer is framed already: its Content-Length was set with its content
     if (!framed(message)) [[unlikely]] {
         frame_message(message);
     }
@@ -306,18 +307,16 @@ std::shared_ptr<server_connection> response::get_connection() const {
     return state_->sink->connection();
 }
 
-// Redirect implementation
 void response::redirect(const std::string& url, http::http_response::status redirect_type) {
     if (!ensure_not_responded()) return;
     auto response = new_response();
     response->set_status(redirect_type);
     response->add_header(header::location, url);
-    // (without it, a keep-alive client would read the body until the connection closes)
+    // Without it, a keep-alive client would read the body until the connection closes
     response->set_content_length(0);
     send_message(std::move(response));
 }
 
-// File sending: the whole file, a byte range of it, or 304 if the client has it already
 void response::send_file(const std::filesystem::path& path, bool force_download) {
     if (!ensure_not_responded()) return;
 
@@ -336,32 +335,52 @@ void response::send_file(const std::filesystem::path& path, bool force_download)
 
 namespace {
 
+    using ::thinger::util::ascii::iequals;
+
+    // Why a WebSocket handshake is rejected: the error answered, and whether the client is
+    // told the version supported
+    struct handshake_rejection {
+        http_response::status status;
+        const char* message;
+        bool unsupported_version = false;
+    };
+
+    // Checks of a WebSocket handshake request (RFC 6455, 4.2.1) before its subprotocol
+    std::optional<handshake_rejection> check_handshake(const http_request& request) {
+        using status = http_response::status;
+        if (!iequals(request.get_header(header::upgrade), "websocket")) {
+            return handshake_rejection{status::upgrade_required, "This service requires use of WebSockets"};
+        }
+        if (request.get_method() != method::GET) {
+            return handshake_rejection{status::bad_request, "A WebSocket handshake must be a GET request"};
+        }
+        bool upgrade = false;
+        for (const auto& value : request.get_headers_with_key(header::connection)) {
+            upgrade = upgrade || syntax::any_element(value, [](std::string_view option) { return iequals(option, "upgrade"); });
+        }
+        if (!upgrade) return handshake_rejection{status::bad_request, "A WebSocket handshake requires Connection: Upgrade"};
+        if (request.get_header("Sec-WebSocket-Version") != "13") {
+            return handshake_rejection{status::upgrade_required, "Unsupported WebSocket version", true};
+        }
+        return std::nullopt;
+    }
+
     // Subprotocols offered by the client, in its order of preference: the comma-separated
     // values of its Sec-WebSocket-Protocol headers
     std::vector<std::string> offered_protocols(const http_request& request) {
         std::vector<std::string> offered;
         for (const auto& value : request.get_headers_with_key("Sec-WebSocket-Protocol")) {
-            std::vector<std::string> tokens;
-            boost::split(tokens, value, boost::is_any_of(","));
-            for (auto& token : tokens) {
-                boost::trim(token);
-                if (!token.empty()) offered.push_back(std::move(token));
-            }
+            syntax::for_each_element(value, [&](std::string_view protocol) { offered.emplace_back(protocol); });
         }
         return offered;
     }
 
-    // Whether a comma-separated header (any of its values) holds `token` (case-insensitive)
-    bool has_token(const std::vector<std::string>& values, std::string_view token) {
-        for (const auto& value : values) {
-            std::vector<std::string> tokens;
-            boost::split(tokens, value, boost::is_any_of(","));
-            for (auto& candidate : tokens) {
-                boost::trim(candidate);
-                if (boost::iequals(candidate, token)) return true;
-            }
+    // The first subprotocol offered that is supported, empty if none
+    std::string select_protocol(const std::vector<std::string>& offered, const std::vector<std::string>& supported) {
+        for (const auto& candidate : offered) {
+            if (std::find(supported.begin(), supported.end(), candidate) != supported.end()) return candidate;
         }
-        return false;
+        return {};
     }
 
     // A Sec-WebSocket-Key: 16 bytes in base64 (RFC 6455, 4.1)
@@ -374,75 +393,47 @@ namespace {
         return ::thinger::util::base64::decode(key).size() == 16;
     }
 
+    std::string websocket_accept(const std::string& key) {
+        return ::thinger::util::base64::encode(::thinger::util::sha1::hash(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
+    }
+
 }
 
 std::shared_ptr<http_response> response::websocket_handshake(const std::vector<std::string>& protocols,
                                                              bool protocol_required, bool reject_unknown_protocol,
                                                              std::string& protocol) {
     const auto& request = *state_->request;
-
-    // Check if this is a WebSocket upgrade request (RFC 6455, 4.2.1)
-    if (!boost::iequals(request.get_header(http::header::upgrade), "websocket")) {
-        error(http_response::status::upgrade_required, "This service requires use of WebSockets");
-        return nullptr;
-    }
-    if (request.get_method() != method::GET) {
-        error(http_response::status::bad_request, "A WebSocket handshake must be a GET request");
-        return nullptr;
-    }
-    if (!has_token(request.get_headers_with_key(http::header::connection), "upgrade")) {
-        error(http_response::status::bad_request, "A WebSocket handshake requires Connection: Upgrade");
-        return nullptr;
-    }
-    if (request.get_header("Sec-WebSocket-Version") != "13") {
-        header("Sec-WebSocket-Version", "13");
-        error(http_response::status::upgrade_required, "Unsupported WebSocket version");
+    if (auto rejection = check_handshake(request)) {
+        if (rejection->unsupported_version) header("Sec-WebSocket-Version", "13");
+        error(rejection->status, rejection->message);
         return nullptr;
     }
 
-    // Subprotocol: the first one offered by the client that is supported
     auto offered = offered_protocols(request);
-    protocol.clear();
-    for (const auto& candidate : offered) {
-        if (std::find(protocols.begin(), protocols.end(), candidate) != protocols.end()) {
-            protocol = candidate;
-            break;
-        }
+    protocol = select_protocol(offered, protocols);
+    bool required = protocol_required && !protocols.empty();
+    if (protocol.empty() && !offered.empty() && (reject_unknown_protocol || required)) {
+        LOG_DEBUG("Unsupported WebSocket protocol: {}", request.get_header("Sec-WebSocket-Protocol"));
+        error(http_response::status::bad_request, "Unsupported WebSocket protocol");
+        return nullptr;
     }
-    if (protocol.empty()) {
-        if (!offered.empty() && (reject_unknown_protocol || (protocol_required && !protocols.empty()))) {
-            LOG_DEBUG("Unsupported WebSocket protocol: {}", request.get_header("Sec-WebSocket-Protocol"));
-            error(http_response::status::bad_request, "Unsupported WebSocket protocol");
-            return nullptr;
-        }
-        if (offered.empty() && protocol_required && !protocols.empty()) {
-            error(http_response::status::bad_request, "This method requires specifying a WebSocket protocol");
-            return nullptr;
-        }
+    if (offered.empty() && required) {
+        error(http_response::status::bad_request, "This method requires specifying a WebSocket protocol");
+        return nullptr;
     }
 
-    // Get WebSocket key
-    auto ws_key = request.get_header("Sec-WebSocket-Key");
-    if (!valid_websocket_key(ws_key)) {
+    const auto& key = request.get_header("Sec-WebSocket-Key");
+    if (!valid_websocket_key(key)) {
         error(http_response::status::bad_request, "Missing or invalid Sec-WebSocket-Key header");
         return nullptr;
     }
 
-    // Calculate WebSocket accept key
-    std::string accept_key = ws_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    std::string hash = ::thinger::util::sha1::hash(accept_key);
-    accept_key = ::thinger::util::base64::encode(hash);
-
-    // Create upgrade response
     auto response = new_response();
     response->set_status(http_response::status::switching_protocols);
     response->add_header(header::upgrade, "websocket");
     response->add_header(header::connection, "Upgrade");
-    response->add_header("Sec-WebSocket-Accept", accept_key);
-
-    if (!protocol.empty()) {
-        response->add_header("Sec-WebSocket-Protocol", protocol);
-    }
+    response->add_header("Sec-WebSocket-Accept", websocket_accept(key));
+    if (!protocol.empty()) response->add_header("Sec-WebSocket-Protocol", protocol);
     return response;
 }
 
@@ -465,7 +456,6 @@ namespace {
 
 }
 
-// WebSocket upgrade implementation
 void response::upgrade_websocket(websocket_handler handler, const std::set<std::string>& supported_protocols) {
     accept_websocket(supported_protocols, [handler = std::move(handler)](std::shared_ptr<websocket_connection> connection,
                                                                         asio::socket&) {
@@ -495,7 +485,6 @@ void response::accept_websocket(const std::set<std::string>& supported_protocols
                                         true, true, protocol);
     if (!response) return;
 
-    // Send the upgrade response and take over the connection
     take_over(std::move(response), [deliver = std::move(deliver), protocol](std::shared_ptr<asio::socket> socket, std::string buffered) {
         // A client must wait for the handshake response before sending frames (RFC 6455)
         if (!buffered.empty()) {
@@ -504,8 +493,7 @@ void response::accept_websocket(const std::set<std::string>& supported_protocols
             return;
         }
 
-        // Create WebSocket from the socket
-        auto websocket = std::make_shared<asio::websocket>(socket, true, true); // binary=true, server=true
+        auto websocket = std::make_shared<asio::websocket>(socket, true, true);   // binary, server
         websocket->set_protocol(protocol);
         wrap_connection(*socket, *websocket, connection_type::websocket);
         auto ws_connection = std::make_shared<websocket_connection>(websocket);
@@ -537,7 +525,7 @@ void response::upgrade_websocket_stream(const websocket_options& options, websoc
 
     take_over(std::move(response), [handler = std::move(handler), options, protocol](std::shared_ptr<asio::socket> socket, std::string buffered) {
         auto websocket = std::make_shared<asio::websocket>(socket, options.binary, true);
-        // (the handler may ask to be told of a shutdown on the websocket: see on_server_shutdown())
+        // The handler may ask to be told of a shutdown on the websocket (on_server_shutdown())
         wrap_connection(*socket, *websocket, connection_type::websocket);
         websocket->set_protocol(protocol);
         // Frames the client sent right after its request, without waiting for the response
@@ -570,7 +558,6 @@ void response::take_over(std::shared_ptr<http_response> message, takeover_handle
     state_->sink->take_over(std::move(message), std::move(handler));
 }
 
-// Server-Sent Events implementation
 void response::start_sse(sse_handler handler) {
     accept_sse([handler = std::move(handler)](std::shared_ptr<sse_connection> connection, asio::socket&) {
         handler(std::move(connection));
@@ -589,7 +576,6 @@ void response::accept_sse(std::function<void(std::shared_ptr<sse_connection>, as
     if (!ensure_not_responded()) return;
     if (reject_takeover("Server-Sent Events")) return;
 
-    // Create SSE response headers
     auto response = new_response();
     response->set_status(http_response::status::ok);
     response->set_content_type("text/event-stream");
@@ -606,13 +592,8 @@ void response::accept_sse(std::function<void(std::shared_ptr<sse_connection>, as
     // Send the SSE headers and take over the connection (anything the client sends
     // afterwards is not part of the event stream)
     take_over(std::move(response), [deliver = std::move(deliver)](std::shared_ptr<asio::socket> socket, std::string) {
-        // Create SSE connection
         auto sse_conn = std::make_shared<sse_connection>(socket);
-
-        // Start the SSE connection
         sse_conn->start();
-
-        // Call user handler
         deliver(std::move(sse_conn), *socket);
     });
 }
@@ -629,7 +610,7 @@ bool response::start_chunked(const std::string& content_type, http::http_respons
 
     std::lock_guard lock(state_->chunked_mutex);
     if (head_request()) {
-        // (without Transfer-Encoding, as start_stream() does)
+        // Without Transfer-Encoding, as start_stream() does
         state_->sink->send(std::move(response));
     } else if (!state_->sink->begin(std::move(response))) {
         return false;
@@ -660,49 +641,61 @@ bool response::end_chunked() {
 }
 
 
+namespace {
+
+    bool is_framing_header(std::string_view name) {
+        return headers::is_header(name, header::content_length) || headers::is_header(name, header::transfer_encoding) ||
+               headers::is_header(name, header::connection);
+    }
+
+    // Status and headers of the head of a streamed response: those of `head` replace the ones
+    // with the same name set before (e.g. CORS); the framing is the response's own
+    void apply_head(http_response& message, const http_response& head) {
+        message.set_status(head.get_status());
+        message.set_reason_phrase(head.get_reason());
+        for (const auto& [key, value] : head.get_headers()) {
+            if (!is_framing_header(key)) message.remove_headers(key);
+        }
+        for (const auto& [key, value] : head.get_headers()) {
+            if (!is_framing_header(key)) message.add_header(key, value);
+        }
+        // headers set before (header()) may carry framing too
+        message.remove_headers(header::content_length);
+        message.remove_headers(header::transfer_encoding);
+    }
+
+    bool is_http_1_1(const http_request& request) {
+        return request.get_http_version_major() > 1 ||
+               (request.get_http_version_major() == 1 && request.get_http_version_minor() >= 1);
+    }
+
+    // Framing of a streamed response, with its Content-Length if it has one
+    body_framing frame_stream(http_response& message, const http_request& request,
+                              std::optional<size_t> content_length) {
+        int code = message.get_status_code();
+        bool no_body = request.get_method() == method::HEAD || (code >= 100 && code < 200) || code == 204 || code == 304;
+        if (no_body) {
+            // the length of the resource (HEAD, 304), but never for 1xx and 204
+            if (content_length && code >= 200 && code != 204) message.set_content_length(*content_length);
+            return body_framing::none;
+        }
+        if (content_length) {
+            message.set_content_length(*content_length);
+            return body_framing::length;
+        }
+        return is_http_1_1(request) ? body_framing::chunked : body_framing::close;
+    }
+
+}
+
 // Streamed response: the sink writes the head, then each part of the body once the previous
 // one is written. The response checks the body against its framing, so a writer can never
 // put more on the connection than the head announced (it would be read as what follows)
 bool response::start_stream(const http_response& head, std::optional<size_t> content_length) {
     if (!ensure_not_responded()) return false;
     auto message = new_response();
-    message->set_status(head.get_status());
-    message->set_reason_phrase(head.get_reason());
-    // the headers of `head` replace those with the same name set before (e.g. CORS)
-    auto is_framing = [](const std::string& key) {
-        return headers::is_header(key, header::content_length) || headers::is_header(key, header::transfer_encoding) ||
-               headers::is_header(key, header::connection);
-    };
-    for (const auto& [key, value] : head.get_headers()) {
-        if (!is_framing(key)) message->remove_headers(key);
-    }
-    for (const auto& [key, value] : head.get_headers()) {
-        if (!is_framing(key)) message->add_header(key, value);
-    }
-    // headers set before (header()) may carry framing too
-    message->remove_headers(header::content_length);
-    message->remove_headers(header::transfer_encoding);
-
-    const auto& request = *state_->request;
-    int code = message->get_status_code();
-    bool no_body = request.get_method() == method::HEAD || (code >= 100 && code < 200) || code == 204 || code == 304;
-    bool http_1_1 = request.get_http_version_major() > 1 ||
-                    (request.get_http_version_major() == 1 && request.get_http_version_minor() >= 1);
-
-    body_framing framing;
-    if (no_body) {
-        framing = body_framing::none;
-        // the length of the resource (HEAD, 304), but never for 1xx and 204
-        if (content_length && code >= 200 && code != 204) message->set_content_length(*content_length);
-    } else if (content_length) {
-        framing = body_framing::length;
-        message->set_content_length(*content_length);
-    } else if (http_1_1) {
-        framing = body_framing::chunked;
-    } else {
-        framing = body_framing::close;
-    }
-
+    apply_head(*message, head);
+    auto framing = frame_stream(*message, *state_->request, content_length);
     if (!mark_responded()) return false;
 
     std::lock_guard lock(state_->chunked_mutex);
@@ -732,7 +725,7 @@ awaitable<bool> response::write_stream(std::string data) {
             state_->stream_remaining -= data.size();
         }
     }
-    // (an empty chunk would end a chunked body)
+    // An empty chunk would end a chunked body
     if (data.empty()) co_return true;
     co_return co_await state_->sink->write_stream(std::move(data));
 }
