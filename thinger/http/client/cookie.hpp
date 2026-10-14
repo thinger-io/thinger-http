@@ -4,6 +4,7 @@
 #include <string>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace thinger::http{
 
@@ -63,9 +64,14 @@ namespace thinger::http{
         bool http_only_ = false;
         same_site_policy same_site_ = same_site_policy::lax;
 
-        // helper for parsing
+        // helpers for parsing
         static std::string trim(const std::string& str);
         static bool iequals(const std::string& a, const std::string& b);
+        // The parts of a Set-Cookie header between semicolons, trimmed, without empty ones
+        static std::vector<std::string> split_parts(const std::string& cookie_string);
+        // An attribute after name=value: name=value, or a flag without value
+        void set_attribute(const std::string& part);
+        void set_max_age_attribute(const std::string& value);
     };
 
 }

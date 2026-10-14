@@ -9,7 +9,6 @@
 
 namespace thinger::http {
 
-    // Helper to trim whitespace
     std::string cookie::trim(const std::string& str) {
         const auto start = str.find_first_not_of(" \t");
         if (start == std::string::npos) return "";
@@ -17,7 +16,6 @@ namespace thinger::http {
         return str.substr(start, end - start + 1);
     }
 
-    // Case-insensitive string comparison
     bool cookie::iequals(const std::string& a, const std::string& b) {
         if (a.size() != b.size()) return false;
         return std::equal(a.begin(), a.end(), b.begin(), [](char c1, char c2) {
@@ -31,7 +29,6 @@ namespace thinger::http {
         std::tm tm = {};
         std::istringstream ss(date_str);
 
-        // Try different date formats
         // Format 1: "Wdy, DD Mon YYYY HH:MM:SS GMT" (RFC 1123)
         ss >> std::get_time(&tm, "%a, %d %b %Y %H:%M:%S");
         if (!ss.fail()) {
@@ -60,14 +57,7 @@ namespace thinger::http {
     cookie::cookie(std::string name, std::string value)
         : name_(std::move(name)), value_(std::move(value)) {}
 
-    cookie cookie::parse(const std::string& cookie_string) {
-        cookie result;
-
-        if (cookie_string.empty()) {
-            return result;
-        }
-
-        // Split by semicolons
+    std::vector<std::string> cookie::split_parts(const std::string& cookie_string) {
         std::vector<std::string> parts;
         std::string current;
         for (char c : cookie_string) {
@@ -83,69 +73,68 @@ namespace thinger::http {
         if (!current.empty()) {
             parts.push_back(trim(current));
         }
+        return parts;
+    }
 
-        if (parts.empty()) {
-            return result;
-        }
+    cookie cookie::parse(const std::string& cookie_string) {
+        cookie result;
+        auto parts = split_parts(cookie_string);
+        if (parts.empty()) return result;
 
-        // First part is name=value
+        // The first part is name=value: without '=', the cookie is invalid
         const auto& name_value = parts[0];
         auto eq_pos = name_value.find('=');
-        if (eq_pos != std::string::npos) {
-            result.name_ = trim(name_value.substr(0, eq_pos));
-            result.value_ = trim(name_value.substr(eq_pos + 1));
-        } else {
-            // Invalid cookie format - no = in first part
-            return result;
+        if (eq_pos == std::string::npos) return result;
+        result.name_ = trim(name_value.substr(0, eq_pos));
+        result.value_ = trim(name_value.substr(eq_pos + 1));
+
+        for (size_t i = 1; i < parts.size(); ++i) result.set_attribute(parts[i]);
+        return result;
+    }
+
+    void cookie::set_attribute(const std::string& part) {
+        auto eq_pos = part.find('=');
+        if (eq_pos == std::string::npos) {
+            std::string flag = trim(part);
+            if (iequals(flag, "Secure")) {
+                secure_ = true;
+            } else if (iequals(flag, "HttpOnly")) {
+                http_only_ = true;
+            }
+            return;
         }
 
-        // Parse remaining attributes
-        for (size_t i = 1; i < parts.size(); ++i) {
-            const auto& part = parts[i];
-            eq_pos = part.find('=');
-
-            if (eq_pos != std::string::npos) {
-                std::string attr_name = trim(part.substr(0, eq_pos));
-                std::string attr_value = trim(part.substr(eq_pos + 1));
-
-                if (iequals(attr_name, "Path")) {
-                    result.path_ = attr_value;
-                } else if (iequals(attr_name, "Domain")) {
-                    result.domain_ = attr_value;
-                } else if (iequals(attr_name, "Expires")) {
-                    result.expires_ = parse_http_date(attr_value);
-                } else if (iequals(attr_name, "Max-Age")) {
-                    try {
-                        int64_t max_age = std::stoll(attr_value);
-                        result.max_age_ = max_age;
-                        // Also compute expires from max-age
-                        auto now = std::chrono::system_clock::now();
-                        auto expires_time = now + std::chrono::seconds(max_age);
-                        result.expires_ = std::chrono::system_clock::to_time_t(expires_time);
-                    } catch (...) {
-                        // Invalid max-age, ignore
-                    }
-                } else if (iequals(attr_name, "SameSite")) {
-                    if (iequals(attr_value, "Strict")) {
-                        result.same_site_ = same_site_policy::strict;
-                    } else if (iequals(attr_value, "Lax")) {
-                        result.same_site_ = same_site_policy::lax;
-                    } else if (iequals(attr_value, "None")) {
-                        result.same_site_ = same_site_policy::none;
-                    }
-                }
-            } else {
-                // Flag attributes (no value)
-                std::string attr_name = trim(part);
-                if (iequals(attr_name, "Secure")) {
-                    result.secure_ = true;
-                } else if (iequals(attr_name, "HttpOnly")) {
-                    result.http_only_ = true;
-                }
+        std::string attr_name = trim(part.substr(0, eq_pos));
+        std::string attr_value = trim(part.substr(eq_pos + 1));
+        if (iequals(attr_name, "Path")) {
+            path_ = attr_value;
+        } else if (iequals(attr_name, "Domain")) {
+            domain_ = attr_value;
+        } else if (iequals(attr_name, "Expires")) {
+            expires_ = parse_http_date(attr_value);
+        } else if (iequals(attr_name, "Max-Age")) {
+            set_max_age_attribute(attr_value);
+        } else if (iequals(attr_name, "SameSite")) {
+            if (iequals(attr_value, "Strict")) {
+                same_site_ = same_site_policy::strict;
+            } else if (iequals(attr_value, "Lax")) {
+                same_site_ = same_site_policy::lax;
+            } else if (iequals(attr_value, "None")) {
+                same_site_ = same_site_policy::none;
             }
         }
+    }
 
-        return result;
+    void cookie::set_max_age_attribute(const std::string& value) {
+        try {
+            int64_t max_age = std::stoll(value);
+            max_age_ = max_age;
+            // Expires too, from Max-Age
+            auto expires_time = std::chrono::system_clock::now() + std::chrono::seconds(max_age);
+            expires_ = std::chrono::system_clock::to_time_t(expires_time);
+        } catch (...) {
+            // An invalid Max-Age is ignored
+        }
     }
 
     // Setters
