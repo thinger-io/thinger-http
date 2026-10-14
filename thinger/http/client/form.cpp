@@ -8,6 +8,25 @@
 
 namespace thinger::http {
 
+namespace {
+
+    // A field name or filename within the quotes of a Content-Disposition, as browsers (and
+    // curl) write it: '"', CR and LF percent-encoded, so neither can end the parameter or the
+    // header line (WHATWG HTML, multipart/form-data encoding)
+    std::string escape_quoted(const std::string& value) {
+        std::string result;
+        result.reserve(value.size());
+        for (char c : value) {
+            if (c == '"') result += "%22";
+            else if (c == '\r') result += "%0D";
+            else if (c == '\n') result += "%0A";
+            else result += c;
+        }
+        return result;
+    }
+
+}
+
 // ============================================
 // Field methods
 // ============================================
@@ -111,7 +130,7 @@ std::string form::build_multipart() const {
     // Add text fields
     for (const auto& [name, value] : fields_) {
         oss << "--" << boundary << "\r\n";
-        oss << "Content-Disposition: form-data; name=\"" << name << "\"\r\n";
+        oss << "Content-Disposition: form-data; name=\"" << escape_quoted(name) << "\"\r\n";
         oss << "\r\n";
         oss << value << "\r\n";
     }
@@ -119,8 +138,8 @@ std::string form::build_multipart() const {
     // Add files
     for (const auto& file : files_) {
         oss << "--" << boundary << "\r\n";
-        oss << "Content-Disposition: form-data; name=\"" << file.name << "\"; "
-            << "filename=\"" << file.filename << "\"\r\n";
+        oss << "Content-Disposition: form-data; name=\"" << escape_quoted(file.name) << "\"; "
+            << "filename=\"" << escape_quoted(file.filename) << "\"\r\n";
         oss << "Content-Type: " << file.content_type << "\r\n";
         oss << "\r\n";
         oss << file.content << "\r\n";

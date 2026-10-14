@@ -97,6 +97,16 @@ TEST_CASE("Form Files", "[form][unit]") {
         REQUIRE(body.find("--") != std::string::npos);
     }
 
+    SECTION("quotes and line breaks in names and filenames are percent-encoded") {
+        form f;
+        f.field("a\"b", "value")
+         .file("x\r\nContent-Type: text/html", "content", "evil\".txt\"; name=\"other", "text/plain");
+
+        std::string body = f.body();
+        REQUIRE(body.find("name=\"a%22b\"\r\n") != std::string::npos);
+        REQUIRE(body.find("name=\"x%0D%0AContent-Type: text/html\"; filename=\"evil%22.txt%22; name=%22other\"\r\n") != std::string::npos);
+    }
+
     SECTION("file from binary data") {
         std::vector<uint8_t> data = {0x89, 0x50, 0x4E, 0x47};  // PNG header
         form f;
