@@ -144,8 +144,9 @@ namespace thinger::http{
         thinger::awaitable<size_t> read_some(uint8_t* buffer, size_t max_size);
 
         /// Read full body into http_request content (for non-deferred dispatch), decoding
-        /// its Content-Encoding (gzip, deflate). Fails if the body exceeds the maximum body
-        /// size (see get_max_body_size()), a Content-Length one without reading it.
+        /// its Content-Encoding (gzip, deflate, or a list of them; see util::decode_content).
+        /// Fails if the body exceeds the maximum body size (see get_max_body_size()), a
+        /// Content-Length one without reading it.
         /// Only reads what is still pending: do not mix it with read()/read_some() on
         /// the same request, or the stored body will be incomplete (and fail to
         /// decompress if Content-Encoding is set).

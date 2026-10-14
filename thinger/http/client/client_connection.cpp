@@ -23,33 +23,33 @@ void set_headers(stream_result& result, const http_response& response) {
     }
 }
 
-// Decode a gzip or deflate Content-Encoding, up to `max_size` bytes once decoded: inflating
-// stops as soon as the body goes past them, so a small body expanding to gigabytes (a
-// decompression bomb) takes no more memory than the limit. Other codings, and empty bodies
-// (e.g. of responses to HEAD), are kept as they are
+// Decode the Content-Encoding (gzip, x-gzip, deflate, or several of them; see
+// util::decode_content), up to `max_size` bytes once decoded: inflating stops as soon as the
+// body goes past them, so a small body expanding to gigabytes (a decompression bomb) takes no
+// more memory than the limit. Bodies with other codings (as Node's fetch), and empty bodies
+// (e.g. of responses to HEAD), are kept as they are, with their Content-Encoding.
 client_error decompress(http_response& response, size_t max_size) {
-    if (response.get_content().empty()) return client_error::none;
-    std::string encoding = response.get_header("Content-Encoding");
-    std::optional<std::string> decoded;
-    bool too_large = false;
-    if (encoding == "gzip") {
-        decoded = ::thinger::util::gzip::decompress(response.get_content(), max_size, &too_large);
-    } else if (encoding == "deflate") {
-        decoded = ::thinger::util::deflate::decompress(response.get_content(), max_size, &too_large);
-    } else {
-        return client_error::none;
+    if (response.get_content().empty() || !response.has_header("Content-Encoding")) return client_error::none;
+    // (the values of every Content-Encoding header make one list)
+    std::string encoding;
+    for (const auto& value : response.get_headers_with_key("Content-Encoding")) {
+        if (!encoding.empty()) encoding += ", ";
+        encoding += value;
     }
-    if (!decoded) {
-        if (too_large) {
+    switch (::thinger::util::decode_content(encoding, response.get_content(), max_size)) {
+        case ::thinger::util::content_decoding::decoded:
+            response.remove_headers("Content-Encoding");
+            return client_error::none;
+        case ::thinger::util::content_decoding::unsupported:
+            return client_error::none;
+        case ::thinger::util::content_decoding::too_large:
             LOG_ERROR("the decompressed {} response exceeds the maximum allowed size: {} max", encoding, max_size);
             return client_error::body_too_large;
-        }
-        LOG_ERROR("Failed to decompress {} response", encoding);
-        return client_error::bad_content_encoding;
+        case ::thinger::util::content_decoding::invalid:
+            break;
     }
-    response.set_content(std::move(*decoded));
-    response.remove_header("Content-Encoding");
-    return client_error::none;
+    LOG_ERROR("Failed to decompress {} response", encoding);
+    return client_error::bad_content_encoding;
 }
 
 std::string_view trim(std::string_view value) {

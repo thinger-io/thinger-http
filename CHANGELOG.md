@@ -7,9 +7,20 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- Lists of content codings (`Content-Encoding: deflate, gzip`) are decoded in reverse order, by the client and by the server, up to five of them; a list with a coding that is not supported is kept as it is (`util::decode_content`).
+- `deflate` bodies without the zlib header (raw deflate) are decoded, as curl and browsers do.
+
 ### Changed
 
+- gzip bodies are decoded whole: every member of concatenated gzip data, instead of the first one only, with the size limit on all of them. Bytes after the last member (other than zero padding), and after the end of a deflate stream, now fail to decode (`client_error::bad_content_encoding`, or `400` for request bodies) instead of being ignored.
+- `util::gzip::decompress()` and `util::deflate::decompress()` take a `std::string_view`.
 - Client: the synchronous `client` also closes its expired idle connections as a request ends, not only as the next one starts, so they no longer wait for the next call after a long request, nor take the room of other connections in the pool. Between calls they still stay open until the next call (as in curl and urllib3): `clear_connections()` closes them.
+
+### Fixed
+
+- `Content-Encoding` names are case-insensitive and `x-gzip` is gzip when decoding responses (client) and request bodies (server), as RFC 9110 says; only `gzip` and `deflate` in lowercase were decoded.
 
 ## [0.1.0] - 2026-10-14
 

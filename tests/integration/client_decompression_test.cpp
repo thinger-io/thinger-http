@@ -157,6 +157,72 @@ TEST_CASE("Client decodes compressed responses within its maximum content size",
     }
 }
 
+TEST_CASE("Client decodes content codings as RFC 9110 names them, also several of them", "[http][client][compression][integration]") {
+    encoded_server server;
+    http::client client;
+    client.timeout(5s);
+    client.max_content_size(mib);
+    const std::string original = std::string(3000, 'c') + "end";
+    auto gzipped = compress(format::gzip, original);
+
+    SECTION("Coding names are case-insensitive, and x-gzip is gzip") {
+        for (auto coding : {"GZIP", "x-gzip", "X-Gzip"}) {
+            CAPTURE(coding);
+            server.set("coded", coding, gzipped);
+            auto res = client.get(server.url("coded"));
+            REQUIRE(res.ok());
+            REQUIRE(res.body() == original);
+            REQUIRE_FALSE(res.has_header("Content-Encoding"));
+        }
+        server.set("coded", "Deflate", compress(format::deflate, original));
+        REQUIRE(client.get(server.url("coded")).body() == original);
+    }
+
+    SECTION("Raw deflate, without the zlib header (as curl and browsers accept)") {
+        auto zlib = compress(format::deflate, original);
+        server.set("raw", "deflate", zlib.substr(2, zlib.size() - 6));
+        auto res = client.get(server.url("raw"));
+        REQUIRE(res.ok());
+        REQUIRE(res.body() == original);
+    }
+
+    SECTION("gzip members, concatenated") {
+        server.set("members", "gzip", gzipped + compress(format::gzip, "more"));
+        auto res = client.get(server.url("members"));
+        REQUIRE(res.ok());
+        REQUIRE(res.body() == original + "more");
+    }
+
+    SECTION("Bytes after the gzip data fail") {
+        server.set("trailing", "gzip", gzipped + "trailing garbage");
+        auto res = client.get(server.url("trailing"));
+        REQUIRE_FALSE(res);
+        REQUIRE(res.error_code() == http::client_error::bad_content_encoding);
+    }
+
+    SECTION("Several codings are undone in reverse order") {
+        server.set("stacked", "deflate, gzip", compress(format::gzip, compress(format::deflate, original)));
+        auto res = client.get(server.url("stacked"));
+        REQUIRE(res.ok());
+        REQUIRE(res.body() == original);
+        REQUIRE_FALSE(res.has_header("Content-Encoding"));
+    }
+
+    SECTION("Several codings with one not supported are kept as they are") {
+        server.set("stacked", "gzip, br", gzipped);
+        auto res = client.get(server.url("stacked"));
+        REQUIRE(res.ok());
+        REQUIRE(res.body() == gzipped);
+        REQUIRE(res.header("Content-Encoding") == "gzip, br");
+    }
+
+    SECTION("More than five codings fail") {
+        server.set("many", "gzip, gzip, gzip, gzip, gzip, gzip", gzipped);
+        auto res = client.get(server.url("many"));
+        REQUIRE(res.error_code() == http::client_error::bad_content_encoding);
+    }
+}
+
 TEST_CASE("Client stops inflating decompression bombs at its maximum content size", "[http][client][compression][integration]") {
     auto type = GENERATE(format::gzip, format::deflate);
     CAPTURE(name_of(type));

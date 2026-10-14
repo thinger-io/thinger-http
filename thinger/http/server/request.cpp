@@ -215,33 +215,32 @@ namespace thinger::http{
         co_return co_await body_reader_.read_some(buffer, max_size);
     }
 
-    // Decode the body in place according to its Content-Encoding (gzip or deflate; any
-    // other encoding is left to the handler), up to `max_size` bytes once decoded
+    // Decode the body in place according to its Content-Encoding (gzip, x-gzip, deflate, or
+    // several of them; a body with any other coding is left to the handler, with its
+    // Content-Encoding), up to `max_size` bytes once decoded
     static body_error decode_content_encoding(http_request& http_request, size_t max_size) {
         if (!http_request.has_header("Content-Encoding")) return body_error::none;
 
-        const std::string encoding = http_request.get_header("Content-Encoding");
-        std::optional<std::string> decoded;
-        bool too_large = false;
-        if (encoding == "gzip") {
-            decoded = ::thinger::util::gzip::decompress(http_request.get_body(), max_size, &too_large);
-        } else if (encoding == "deflate") {
-            decoded = ::thinger::util::deflate::decompress(http_request.get_body(), max_size, &too_large);
-        } else {
-            return body_error::none;
+        // (the values of every Content-Encoding header make one list)
+        std::string encoding;
+        for (const auto& value : http_request.get_headers_with_key("Content-Encoding")) {
+            if (!encoding.empty()) encoding += ", ";
+            encoding += value;
         }
-
-        if (!decoded) {
-            if (too_large) {
+        switch (::thinger::util::decode_content(encoding, http_request.get_body(), max_size)) {
+            case ::thinger::util::content_decoding::decoded:
+                http_request.remove_headers("Content-Encoding");
+                return body_error::none;
+            case ::thinger::util::content_decoding::unsupported:
+                return body_error::none;
+            case ::thinger::util::content_decoding::too_large:
                 LOG_ERROR("Decompressed {} request body exceeds the maximum body size", encoding);
                 return body_error::too_large;
-            }
-            LOG_ERROR("Failed to decompress {} request body", encoding);
-            return body_error::bad_encoding;
+            case ::thinger::util::content_decoding::invalid:
+                break;
         }
-        http_request.get_body() = std::move(*decoded);
-        http_request.remove_header("Content-Encoding");
-        return body_error::none;
+        LOG_ERROR("Failed to decompress {} request body", encoding);
+        return body_error::bad_encoding;
     }
 
     thinger::awaitable<bool> request::read_body() {

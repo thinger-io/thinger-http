@@ -91,6 +91,37 @@ TEST_CASE("Compressed request bodies are validated and bounded", "[server][body]
         REQUIRE(result->get_status() == http::http_response::status::bad_request);
     }
 
+    SECTION("Coding names are case-insensitive, and x-gzip is gzip") {
+        for (auto encoding : {"GZIP", "x-gzip", "X-Gzip"}) {
+            CAPTURE(encoding);
+            auto result = run_dispatch(server, compressed_request(encoding, *gzip), options);
+            REQUIRE(result->get_content() == "1000");
+        }
+        auto result = run_dispatch(server, compressed_request("Deflate", *deflate), options);
+        REQUIRE(result->get_content() == "1000");
+    }
+
+    SECTION("gzip members, concatenated, and several codings") {
+        auto result = run_dispatch(server, compressed_request("gzip", *gzip + *gzip), options);
+        REQUIRE(result->get_content() == "2000");
+        result = run_dispatch(server, compressed_request("deflate, gzip", *util::gzip::compress(*deflate)), options);
+        REQUIRE(result->get_content() == "1000");
+    }
+
+    SECTION("Bytes after the compressed data: 400") {
+        auto result = run_dispatch(server, compressed_request("gzip", *gzip + "garbage"), options);
+        REQUIRE(result->get_status() == http::http_response::status::bad_request);
+        result = run_dispatch(server, compressed_request("deflate", *deflate + "x"), options);
+        REQUIRE(result->get_status() == http::http_response::status::bad_request);
+    }
+
+    SECTION("Codings not supported are left to the handler") {
+        auto result = run_dispatch(server, compressed_request("br", "0123"), options);
+        REQUIRE(result->get_content() == "4");
+        result = run_dispatch(server, compressed_request("gzip, br", *gzip), options);
+        REQUIRE(result->get_content() == std::to_string(gzip->size()));
+    }
+
     SECTION("Not compressed at all") {
         auto result = run_dispatch(server, compressed_request("gzip", "plain text"), options);
         REQUIRE(result->get_status() == http::http_response::status::bad_request);
