@@ -1,5 +1,6 @@
 #include "body_decoders.hpp"
 #include "../common/multipart_parser.hpp"
+#include "../common/syntax.hpp"
 #include "../util/url.hpp"
 #include "../util/utf8.hpp"
 #include "../../util/ascii.hpp"
@@ -42,10 +43,6 @@ namespace {
         return slash > 0 && slash + 1 < value.size();
     }
 
-    bool is_ows(char c) {
-        return c == ' ' || c == '\t';
-    }
-
     // RFC 9110, 5.6.4: qdtext, and the characters of a quoted-pair after the backslash
     bool is_qdtext(char c) {
         auto u = static_cast<unsigned char>(c);
@@ -63,10 +60,77 @@ namespace {
         return result;
     }
 
-    std::string_view trim(std::string_view value) {
-        while (!value.empty() && is_ows(value.front())) value.remove_prefix(1);
-        while (!value.empty() && is_ows(value.back())) value.remove_suffix(1);
-        return value;
+    // Cursor over a media type, reading the rules it is made of
+    class media_type_reader {
+    public:
+        explicit media_type_reader(std::string_view value) : value_(value) {}
+
+        size_t position() const { return position_; }
+        bool at_end() const { return position_ >= value_.size(); }
+        bool next_is(char c) const { return !at_end() && value_[position_] == c; }
+
+        bool consume(char c) {
+            if (!next_is(c)) return false;
+            ++position_;
+            return true;
+        }
+
+        void skip_ows() {
+            while (!at_end() && syntax::is_whitespace(value_[position_])) ++position_;
+        }
+
+        std::string_view token() {
+            size_t start = position_;
+            while (!at_end() && is_tchar(value_[position_])) ++position_;
+            return value_.substr(start, position_ - start);
+        }
+
+        // A parameter value: a token, or a quoted string (unescaped); false if malformed
+        bool parameter_value(std::string& value) {
+            if (consume('"')) return quoted_string(value);
+            auto token_value = token();
+            value = token_value;
+            return !token_value.empty();
+        }
+
+    private:
+        // The rest of a quoted string, after its opening quote
+        bool quoted_string(std::string& value) {
+            while (!at_end()) {
+                char c = value_[position_++];
+                if (c == '"') return true;
+                if (c == '\\') {
+                    if (at_end() || !is_quoted_pair_char(value_[position_])) return false;
+                    c = value_[position_++];
+                } else if (!is_qdtext(c)) {
+                    return false;
+                }
+                value += c;
+            }
+            return false;
+        }
+
+        std::string_view value_;
+        size_t position_ = 0;
+    };
+
+    // Parameters of a media type (";name=value", RFC 9110, 5.6.6), up to the end; false if
+    // malformed
+    bool read_parameters(media_type_reader& reader, std::vector<std::pair<std::string, std::string>>& parameters) {
+        reader.skip_ows();
+        while (!reader.at_end()) {
+            if (!reader.consume(';')) return false;
+            reader.skip_ows();
+            if (reader.at_end()) break;
+            if (reader.next_is(';')) continue;   // empty parameter
+            auto name = reader.token();
+            if (name.empty() || !reader.consume('=')) return false;
+            std::string value;
+            if (!reader.parameter_value(value)) return false;
+            parameters.emplace_back(lowercase(name), std::move(value));
+            reader.skip_ows();
+        }
+        return true;
     }
 
     bool valid_utf8(std::string_view value) {
@@ -197,93 +261,29 @@ namespace {
         }
     }
 
-    // Quality of an Accept media range (RFC 9110, 12.4.2) in thousandths; -1 if invalid
-    int parse_quality(std::string_view value) {
-        if (value.empty() || value.size() > 5) return -1;
-        if (value[0] != '0' && value[0] != '1') return -1;
-        int quality = (value[0] - '0') * 1000;
-        if (value.size() == 1) return quality;
-        if (value[1] != '.') return -1;
-        int scale = 100;
-        for (size_t i = 2; i < value.size(); ++i, scale /= 10) {
-            if (value[i] < '0' || value[i] > '9') return -1;
-            quality += (value[i] - '0') * scale;
-        }
-        return quality <= 1000 ? quality : -1;
-    }
-
 }
 
 // --- media_type ---
 
 std::optional<media_type> media_type::parse(std::string_view value) {
-    // (parsed on every request with a body: the usual value, such as "application/json",
-    // needs neither a copy in lowercase nor a parameter list)
+    // Parsed on every request with a body: the usual value, such as "application/json",
+    // needs neither a copy in lowercase nor a parameter list
     if (is_plain_media_type(value)) return media_type{std::string(value), {}};
 
-    size_t i = 0;
-    const size_t n = value.size();
-    auto skip_ows = [&]() { while (i < n && is_ows(value[i])) ++i; };
-    auto token = [&]() {
-        size_t start = i;
-        while (i < n && is_tchar(value[i])) ++i;
-        return value.substr(start, i - start);
-    };
-
-    skip_ows();
-    size_t start = i;
-    auto type = token();
-    if (type.empty() || i >= n || value[i] != '/') return std::nullopt;
-    ++i;
-    auto subtype = token();
+    media_type_reader reader(value);
+    reader.skip_ows();
+    size_t start = reader.position();
+    auto type = reader.token();
+    if (type.empty() || !reader.consume('/')) return std::nullopt;
+    auto subtype = reader.token();
     if (subtype.empty()) return std::nullopt;
     // "*/subtype" is not a media range
     if (type == "*" && subtype != "*") return std::nullopt;
 
-    // "type/subtype" as sent, lowercase
     media_type result;
-    result.type.assign(value.substr(start, i - start));
+    result.type.assign(value.substr(start, reader.position() - start));
     ::thinger::util::ascii::to_lower(result.type);
-
-    skip_ows();
-    while (i < n) {
-        if (value[i] != ';') return std::nullopt;
-        ++i;
-        skip_ows();
-        if (i == n) break;
-        if (value[i] == ';') continue;   // empty parameter
-
-        auto name = token();
-        if (name.empty() || i >= n || value[i] != '=') return std::nullopt;
-        ++i;
-
-        std::string parameter_value;
-        if (i < n && value[i] == '"') {
-            ++i;
-            bool closed = false;
-            while (i < n) {
-                char c = value[i++];
-                if (c == '"') {
-                    closed = true;
-                    break;
-                }
-                if (c == '\\') {
-                    if (i >= n || !is_quoted_pair_char(value[i])) return std::nullopt;
-                    c = value[i++];
-                } else if (!is_qdtext(c)) {
-                    return std::nullopt;
-                }
-                parameter_value += c;
-            }
-            if (!closed) return std::nullopt;
-        } else {
-            auto token_value = token();
-            if (token_value.empty()) return std::nullopt;
-            parameter_value = token_value;
-        }
-        result.parameters.emplace_back(lowercase(name), std::move(parameter_value));
-        skip_ows();
-    }
+    if (!read_parameters(reader, result.parameters)) return std::nullopt;
     return result;
 }
 
@@ -536,7 +536,7 @@ body_type_match match_body_type(const body_decoder_registry& decoders,
                                 const std::vector<std::string>& accepted,
                                 std::string_view content_type) {
     body_type_match match;
-    content_type = trim(content_type);
+    content_type = syntax::trim(content_type);
     auto type = media_type::parse(content_type.empty() ? default_body_media_type : content_type);
     if (!type) {
         match.error = "Invalid Content-Type";
@@ -572,6 +572,58 @@ std::vector<std::string> accepted_media_types(const body_decoder_registry& decod
 
 // --- response encoding ---
 
+namespace {
+
+    // A media range of an Accept header, and its quality in thousandths
+    struct accepted_range {
+        media_type range;
+        int quality;
+    };
+
+    // Media ranges of an Accept header with their quality (1 unless given); invalid ones are
+    // skipped
+    std::vector<accepted_range> parse_accept(std::string_view accept) {
+        std::vector<accepted_range> ranges;
+        syntax::for_each_element(accept, [&](std::string_view element) {
+            auto range = media_type::parse(element);
+            if (!range) return;
+            int quality = 1000;
+            for (const auto& [name, value] : range->parameters) {
+                if (name == "q") {
+                    quality = syntax::parse_qvalue(value);
+                    break;
+                }
+            }
+            if (quality >= 0) ranges.push_back({std::move(*range), quality});
+        });
+        return ranges;
+    }
+
+    // How specifically a media range matches a media type: 2 by its type, 1 by "type/*",
+    // 0 by "*/*"; -1 if it does not
+    int specificity(std::string_view range, std::string_view type) {
+        if (range == type) return 2;
+        if (range == "*/*") return 0;
+        if (range.ends_with("/*") && type.starts_with(range.substr(0, range.size() - 1))) return 1;
+        return -1;
+    }
+
+    // Quality of a media type: that of the most specific range matching it, 0 if none does
+    int quality_of(std::string_view type, const std::vector<accepted_range>& ranges) {
+        int best_specificity = -1;
+        int quality = 0;
+        for (const auto& [range, range_quality] : ranges) {
+            int match = specificity(range.type, type);
+            if (match > best_specificity) {
+                best_specificity = match;
+                quality = range_quality;
+            }
+        }
+        return quality;
+    }
+
+}
+
 response_encoding negotiate_response_encoding(std::string_view accept) {
     // In order of preference when the client accepts several with the same quality
     static const std::array<std::pair<std::string_view, std::string_view>, 5> candidates{{
@@ -582,49 +634,10 @@ response_encoding negotiate_response_encoding(std::string_view accept) {
         {"application/ubjson", "ubjson"},
     }};
     response_encoding result{"application/json", "json"};
-
-    // Media ranges with their quality (1 unless given)
-    std::vector<std::pair<media_type, int>> ranges;
-    size_t position = 0;
-    while (position < accept.size()) {
-        size_t end = accept.find(',', position);
-        if (end == std::string_view::npos) end = accept.size();
-        auto element = trim(accept.substr(position, end - position));
-        position = end + 1;
-        if (element.empty()) continue;
-        auto range = media_type::parse(element);
-        if (!range) continue;
-        int quality = 1000;
-        for (const auto& [name, value] : range->parameters) {
-            if (name == "q") {
-                quality = parse_quality(value);
-                break;
-            }
-        }
-        if (quality >= 0) ranges.emplace_back(std::move(*range), quality);
-    }
-    if (ranges.empty()) return result;
-
+    auto ranges = parse_accept(accept);
     int best_quality = 0;
     for (const auto& [type, format] : candidates) {
-        // The quality of the most specific range matching the type
-        int specificity = -1;
-        int quality = 0;
-        for (const auto& [range, range_quality] : ranges) {
-            int match = -1;
-            if (range.type == type) {
-                match = 2;
-            } else if (range.type == "*/*") {
-                match = 0;
-            } else if (range.type.ends_with("/*") &&
-                       type.starts_with(std::string_view(range.type).substr(0, range.type.size() - 1))) {
-                match = 1;
-            }
-            if (match > specificity) {
-                specificity = match;
-                quality = range_quality;
-            }
-        }
+        int quality = quality_of(type, ranges);
         if (quality > best_quality) {
             best_quality = quality;
             result = {std::string(type), std::string(format)};
