@@ -8,6 +8,62 @@ namespace thinger::http {
 using detail::path_matcher;
 using detail::pattern_token;
 
+namespace {
+
+    using path_segment = std::vector<pattern_token>;
+
+    // Parameter names, in order of their captures: empty for a repeated one
+    std::vector<std::string> capture_names(const std::vector<pattern_token>& tokens) {
+        std::vector<std::string> names;
+        for (const auto& token : tokens) {
+            if (!token.parameter) continue;
+            bool repeated = std::find(names.begin(), names.end(), token.text) != names.end();
+            names.push_back(repeated ? std::string{} : token.text);
+        }
+        return names;
+    }
+
+    // The pattern as segments: the text between slashes
+    std::vector<path_segment> split_segments(const std::vector<pattern_token>& tokens) {
+        std::vector<path_segment> segments(1);
+        for (const auto& token : tokens) {
+            if (token.parameter) {
+                segments.back().push_back(token);
+                continue;
+            }
+            for (size_t start = 0;;) {
+                size_t slash = token.text.find('/', start);
+                auto text = token.text.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+                if (!text.empty()) segments.back().push_back({false, std::move(text), {}});
+                if (slash == std::string::npos) break;
+                segments.emplace_back();
+                start = slash + 1;
+            }
+        }
+        return segments;
+    }
+
+    // The segments from `first` on, joined by slashes
+    path_segment join_segments(const std::vector<path_segment>& segments, size_t first) {
+        path_segment joined;
+        for (size_t j = first; j < segments.size(); ++j) {
+            if (j > first) joined.push_back({false, "/", {}});
+            joined.insert(joined.end(), segments[j].begin(), segments[j].end());
+        }
+        return joined;
+    }
+
+    bool is_static(const path_segment& tokens) {
+        return std::none_of(tokens.begin(), tokens.end(), [](const auto& token) { return token.parameter; });
+    }
+
+    void warn_repeat(const route& added, const route& existing, std::string_view method_name) {
+        LOG_WARNING("Route {} {} repeats route {} {} and will never match", method_name,
+                    added.get_pattern(), method_name, existing.get_pattern());
+    }
+
+}
+
 struct route_tree::node {
     // A route matching the rest of the path from this node's segment on
     struct rest_route {
@@ -30,6 +86,63 @@ struct route_tree::node {
 
     // Route ending at this node
     std::unique_ptr<leaf> end;
+
+    node* static_child(const std::string& text) {
+        auto& child = statics[text];
+        if (!child) child = std::make_unique<node>();
+        return child.get();
+    }
+
+    node* parameter_child() {
+        if (!parameter) parameter = std::make_unique<node>();
+        return parameter.get();
+    }
+
+    // The same constraints (whatever the parameter names) share a node
+    node* constrained_child_for(std::unique_ptr<const path_matcher> matcher, const route& target,
+                                std::string_view method_name) {
+        auto it = std::find_if(constrained.begin(), constrained.end(),
+                               [&](const auto& entry) { return entry.matcher->key() == matcher->key(); });
+        if (it == constrained.end()) {
+            // Different constraints are tried in creation order
+            for (const auto& sibling : constrained) {
+                if (sibling.matcher->may_overlap(*matcher)) warn_overlap(target, *sibling.first, method_name);
+            }
+            constrained.push_back({std::move(matcher), std::make_unique<node>(), &target});
+            it = std::prev(constrained.end());
+        }
+        return it->child.get();
+    }
+
+    void add_rest(std::unique_ptr<const path_matcher> matcher, leaf added, std::string_view method_name) {
+        auto existing = std::find_if(rest.begin(), rest.end(),
+                                     [&](const auto& r) { return r.matcher->key() == matcher->key(); });
+        if (existing != rest.end()) {
+            warn_repeat(*added.target, *existing->target.target, method_name);
+            return;
+        }
+        // Wildcards of the same kind are tried in registration order
+        for (const auto& r : rest) {
+            if (r.matcher->is_catch_all() == matcher->is_catch_all() && r.matcher->may_overlap(*matcher)) {
+                warn_overlap(*added.target, *r.target.target, method_name);
+            }
+        }
+
+        // Catch-alls after the routes with more after their wildcard
+        auto position = rest.end();
+        if (!matcher->is_catch_all()) {
+            position = std::find_if(rest.begin(), rest.end(), [](const auto& r) { return r.matcher->is_catch_all(); });
+        }
+        rest.insert(position, {std::move(matcher), std::move(added)});
+    }
+
+    void set_end(leaf added, std::string_view method_name) {
+        if (end) {
+            warn_repeat(*added.target, *end->target, method_name);
+            return;
+        }
+        end = std::make_unique<leaf>(std::move(added));
+    }
 };
 
 route_tree::route_tree() : root_(std::make_unique<node>()) {}
@@ -39,112 +152,36 @@ route_tree& route_tree::operator=(route_tree&&) noexcept = default;
 
 void route_tree::insert(const route& target, std::string_view method_name) {
     auto tokens = detail::parse_route_pattern(target.get_pattern());
-
-    // Parameter names, in order of their captures
-    std::vector<std::string> names;
-    for (const auto& token : tokens) {
-        if (!token.parameter) continue;
-        bool repeated = std::find(names.begin(), names.end(), token.text) != names.end();
-        names.push_back(repeated ? std::string{} : token.text);
-    }
-
-    // Split the pattern into segments: the text between slashes
-    std::vector<std::vector<pattern_token>> segments(1);
-    for (const auto& token : tokens) {
-        if (token.parameter) {
-            segments.back().push_back(token);
-            continue;
-        }
-        for (size_t start = 0;;) {
-            size_t slash = token.text.find('/', start);
-            auto text = token.text.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
-            if (!text.empty()) segments.back().push_back({false, std::move(text), {}});
-            if (slash == std::string::npos) break;
-            segments.emplace_back();
-            start = slash + 1;
-        }
-    }
+    auto names = capture_names(tokens);
 
     // A regex depending on its context is matched with the whole route on the whole path
     bool whole = std::any_of(tokens.begin(), tokens.end(), [](const auto& token) {
         return token.parameter && detail::regex_depends_on_context(token.regex);
     });
-    if (whole) segments = {tokens};
+    auto segments = whole ? std::vector<path_segment>{tokens} : split_segments(tokens);
 
     node* current = root_.get();
     for (size_t i = 0; i < segments.size(); ++i) {
         const auto& segment = segments[i];
-
-        // Static segment
-        if (std::none_of(segment.begin(), segment.end(), [](const auto& token) { return token.parameter; })) {
-            std::string text = segment.empty() ? std::string{} : segment.front().text;
-            auto& child = current->statics[text];
-            if (!child) child = std::make_unique<node>();
-            current = child.get();
+        if (is_static(segment)) {
+            current = current->static_child(segment.empty() ? std::string{} : segment.front().text);
             continue;
         }
-
-        // Parameter
         if (segment.size() == 1 && segment.front().regex.empty()) {
-            if (!current->parameter) current->parameter = std::make_unique<node>();
-            current = current->parameter.get();
+            current = current->parameter_child();
             continue;
         }
-
-        // Constrained segment: the same constraints (whatever the parameter names) share a node
         auto matcher = std::make_unique<const path_matcher>(segment);
         if (!whole && !matcher->may_match_slash()) {
-            auto it = std::find_if(current->constrained.begin(), current->constrained.end(),
-                                   [&](const auto& entry) { return entry.matcher->key() == matcher->key(); });
-            if (it == current->constrained.end()) {
-                // Different constraints are tried in creation order
-                for (const auto& sibling : current->constrained) {
-                    if (sibling.matcher->may_overlap(*matcher)) warn_overlap(target, *sibling.first, method_name);
-                }
-                current->constrained.push_back({std::move(matcher), std::make_unique<node>(), &target});
-                it = std::prev(current->constrained.end());
-            }
-            current = it->child.get();
+            current = current->constrained_child_for(std::move(matcher), target, method_name);
             continue;
         }
-
         // A parameter that may match '/': the rest of the route matches the rest of the path
-        std::vector<pattern_token> rest;
-        for (size_t j = i; j < segments.size(); ++j) {
-            if (j > i) rest.push_back({false, "/", {}});
-            rest.insert(rest.end(), segments[j].begin(), segments[j].end());
-        }
-        auto rest_matcher = std::make_unique<const path_matcher>(rest);
-        auto existing = std::find_if(current->rest.begin(), current->rest.end(),
-                                     [&](const auto& r) { return r.matcher->key() == rest_matcher->key(); });
-        if (existing != current->rest.end()) {
-            LOG_WARNING("Route {} {} repeats route {} {} and will never match", method_name,
-                        target.get_pattern(), method_name, existing->target.target->get_pattern());
-            return;
-        }
-        // Wildcards of the same kind are tried in registration order
-        for (const auto& r : current->rest) {
-            if (r.matcher->is_catch_all() == rest_matcher->is_catch_all() && r.matcher->may_overlap(*rest_matcher)) {
-                warn_overlap(target, *r.target.target, method_name);
-            }
-        }
-
-        // Catch-alls after the routes with more after their wildcard
-        auto position = current->rest.end();
-        if (!rest_matcher->is_catch_all()) {
-            position = std::find_if(current->rest.begin(), current->rest.end(),
-                                    [](const auto& r) { return r.matcher->is_catch_all(); });
-        }
-        current->rest.insert(position, {std::move(rest_matcher), leaf{&target, std::move(names)}});
+        current->add_rest(std::make_unique<const path_matcher>(join_segments(segments, i)),
+                          leaf{&target, std::move(names)}, method_name);
         return;
     }
-
-    if (current->end) {
-        LOG_WARNING("Route {} {} repeats route {} {} and will never match", method_name,
-                    target.get_pattern(), method_name, current->end->target->get_pattern());
-        return;
-    }
-    current->end = std::make_unique<leaf>(leaf{&target, std::move(names)});
+    current->set_end(leaf{&target, std::move(names)}, method_name);
 }
 
 void route_tree::warn_overlap(const route& added, const route& existing, std::string_view method_name) {
