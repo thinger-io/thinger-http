@@ -1,0 +1,14 @@
+„--boundary
+Content-Disposition: form-data; name="a"
+
+0123456789
+--boundary
+Content-Disposition: form-data; name="b"
+
+0123456789abcdef
+--boundary
+Content-Disposition: form-data; name="f"; filename="long-filename.bin"
+Content-Type: text/plain
+
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+--boundary--
