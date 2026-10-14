@@ -67,52 +67,61 @@ struct connection_pool::state : std::enable_shared_from_this<state> {
         }
     }
 
+    // The server closes a connection once idle for the time it announced: it is not reused
+    // near that time, as undici does, nor at all if that is too short
+    std::chrono::milliseconds idle_time_for(std::optional<std::chrono::seconds> announced) const {
+        auto timeout = limits.idle_timeout;
+        if (announced) {
+            timeout = std::min(timeout, std::chrono::duration_cast<std::chrono::milliseconds>(*announced) -
+                                            keep_alive_margin);
+        }
+        return timeout;
+    }
+
+    // Room for one more idle connection of `key`, closing the oldest idle ones: the most
+    // likely to be closed by their servers soon (lock held)
+    void make_room(const std::string& key, host& entry, std::vector<std::shared_ptr<client_connection>>& closing) {
+        while (entry.idle.size() >= limits.max_idle_per_host) closing.push_back(remove(entry.idle.front()));
+        while (idle.size() >= limits.max_idle) {
+            auto oldest = idle.front().key;
+            closing.push_back(remove(idle.begin()));
+            if (oldest != key) prune(oldest);
+        }
+    }
+
+    // Keep a connection idle for `timeout` (lock held)
+    void park(const std::string& key, host& entry, const std::shared_ptr<client_connection>& connection,
+              std::chrono::milliseconds timeout) {
+        auto id = ++next_id;
+        connection->unclaim();
+        if (timers) {
+            connection->expire_after(timeout, [pool = weak_from_this(), key, id]() {
+                if (auto self = pool.lock()) self->expire(key, id);
+            });
+        }
+        idle.push_back(idle_entry{key, connection, std::chrono::steady_clock::now() + timeout, id});
+        entry.idle.push_back(std::prev(idle.end()));
+    }
+
     void release(const std::string& key, std::shared_ptr<client_connection> connection) {
-        // (the connection is not shared with another request now)
+        // The connection is not shared with another request now
         bool reusable = connection->reusable();
         auto announced = connection->keep_alive_timeout();
-        bool keep = reusable;
+        bool keep = false;
         std::vector<std::shared_ptr<client_connection>> closing;
         {
             std::lock_guard lock(mutex);
-            // Without timers, the expired ones are closed as a request ends too (before they
-            // take the room of this one). (This key is not pruned: the lease counts as active)
+            // Without timers, the expired ones are closed as a request ends too, before they
+            // take the room of this one. This key is not pruned: the lease counts as active
             if (!timers) sweep(std::chrono::steady_clock::now(), closing);
-            auto it = hosts.find(key);
-            if (it == hosts.end()) {
-                keep = false;
-            } else {
+            if (auto it = hosts.find(key); it != hosts.end()) {
                 if (it->second.active > 0) --it->second.active;
-
-                // The server closes the connection once idle for the time it announced: it is
-                // not reused near that time (as undici does), nor at all if it is too short
-                auto timeout = limits.idle_timeout;
-                if (announced) {
-                    timeout = std::min(timeout, std::chrono::duration_cast<std::chrono::milliseconds>(*announced) -
-                                                    keep_alive_margin);
-                }
-                keep = keep && !closed && timeout.count() > 0 && limits.max_idle_per_host > 0 && limits.max_idle > 0;
-
+                auto timeout = idle_time_for(announced);
+                keep = reusable && !closed && timeout.count() > 0 && limits.max_idle_per_host > 0 &&
+                       limits.max_idle > 0;
                 if (keep) {
-                    // Room for it, closing the oldest idle ones: the most likely to be closed
-                    // by their servers soon
-                    auto& entry = it->second;
-                    while (entry.idle.size() >= limits.max_idle_per_host) closing.push_back(remove(entry.idle.front()));
-                    while (idle.size() >= limits.max_idle) {
-                        auto oldest = idle.front().key;
-                        closing.push_back(remove(idle.begin()));
-                        if (oldest != key) prune(oldest);
-                    }
-
-                    auto id = ++next_id;
-                    connection->unclaim();
-                    if (timers) {
-                        connection->expire_after(timeout, [pool = weak_from_this(), key, id]() {
-                            if (auto self = pool.lock()) self->expire(key, id);
-                        });
-                    }
-                    idle.push_back(idle_entry{key, connection, std::chrono::steady_clock::now() + timeout, id});
-                    entry.idle.push_back(std::prev(idle.end()));
+                    make_room(key, it->second, closing);
+                    park(key, it->second, connection, timeout);
                 } else {
                     prune(key);
                 }
@@ -132,7 +141,7 @@ struct connection_pool::state : std::enable_shared_from_this<state> {
             if (it == hosts.end()) return;
             auto& entries = it->second.idle;
             auto entry = std::find_if(entries.begin(), entries.end(), [id](auto e) { return e->id == id; });
-            // (lent again, or closed, meanwhile)
+            // Lent again, or closed, meanwhile
             if (entry == entries.end()) return;
             connection = remove(*entry);
             prune(key);
