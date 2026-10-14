@@ -273,6 +273,10 @@ namespace thinger::http{
         return body_reader_.error();
     }
 
+    thinger::awaitable<multipart_form> request::read_multipart(multipart_options options) {
+        co_return co_await http::read_multipart(*this, std::move(options));
+    }
+
     thinger::awaitable<bool> request::discard_body(size_t max_size) {
         co_return co_await body_reader_.discard(max_size);
     }

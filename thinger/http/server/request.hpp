@@ -13,6 +13,7 @@
 #include "server_connection.hpp"
 #include "body_reader.hpp"
 #include "body_decoders.hpp"
+#include "multipart.hpp"
 #include "../common/http_response.hpp"
 #include "../../util/types.hpp"
 
@@ -151,6 +152,12 @@ namespace thinger::http{
         /// the same request, or the stored body will be incomplete (and fail to
         /// decompress if Content-Encoding is set).
         thinger::awaitable<bool> read_body();
+
+        /// Read a multipart/form-data body (see multipart_form): its fields in memory and its
+        /// files in temporary files, within the limits of the options and the maximum body
+        /// size. Check the form for errors (400 malformed, 413 over a limit, 415 not a form).
+        /// To stream the parts instead, read them with a multipart_reader.
+        thinger::awaitable<multipart_form> read_multipart(multipart_options options = {});
 
         /// Read and drop an unread body so the connection can be reused.
         /// Returns false if the body exceeds `max_size` or the read fails.

@@ -85,6 +85,8 @@ struct body_format {
 //   ubjson    application/ubjson                             the value
 //   form      application/x-www-form-urlencoded              an object of strings (repeated
 //                                                            names: an array of strings)
+//   multipart multipart/form-data                            the same, with files as objects
+//                                                            {filename, content_type, content}
 //   text      text/plain                                     a string (valid UTF-8)
 //   binary    application/octet-stream                       a binary value (json::binary)
 //
@@ -126,6 +128,7 @@ public:
     static nlohmann::json decode_cbor(std::string_view body, const media_type& type, const body_limits& limits);
     static nlohmann::json decode_ubjson(std::string_view body, const media_type& type, const body_limits& limits);
     static nlohmann::json decode_form(std::string_view body, const media_type& type, const body_limits& limits);
+    static nlohmann::json decode_multipart(std::string_view body, const media_type& type, const body_limits& limits);
     static nlohmann::json decode_text(std::string_view body, const media_type& type, const body_limits& limits);
     static nlohmann::json decode_binary(std::string_view body, const media_type& type, const body_limits& limits);
 
