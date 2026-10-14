@@ -246,7 +246,8 @@ std::shared_ptr<boost::asio::ssl::context> certificate_manager::select_context(c
     if (hostname != nullptr) {
         LOG_DEBUG("SNI connection for: {}", hostname);
         if (auto certificate = get_certificate(hostname)) return certificate;
-        LOG_WARNING("Using default server certificate for hostname: {}", hostname);
+        // At debug level: any client (or scanner) can send names without a certificate
+        LOG_DEBUG("Using default server certificate for hostname: {}", hostname);
     }
     std::lock_guard<std::mutex> lock(mutex_);
     return default_context_;

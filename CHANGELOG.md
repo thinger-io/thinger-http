@@ -12,6 +12,7 @@ All notable changes to thinger-http are documented in this file. The format foll
 - `certificate_manager::set_default_certificate(certificate, key)` returns `bool`, and keeps the current default certificate when they are not valid, instead of removing it.
 - `certificate_manager::get_default_host()` returns a copy (`std::string`), as the reference returned could change while it was read.
 - The manager installs its SNI callback on the contexts it creates, and on those given to `set_default_certificate()` and `set_certificate()`, when they are created or set. The servers no longer install it as they start listening (`tcp_socket_server::set_sni_callback()` is still there for other contexts).
+- A TLS handshake with a host name (SNI) without a certificate of its own logs at debug level, instead of a warning per handshake.
 
 ### Fixed
 
