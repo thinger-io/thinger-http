@@ -131,6 +131,10 @@ private:
     awaitable<io_result> write_to_proxy(const http_request& request);
     awaitable<std::shared_ptr<http_response>> exchange(std::shared_ptr<http_request> request);
     awaitable<std::shared_ptr<http_response>> read_response(const http_request& request);
+    // The response parsed whole, with the bytes read past it; null, and why in error_, if it
+    // cannot be used
+    std::shared_ptr<http_response> complete_response(const http_request& request, const uint8_t* begin,
+                                                     const uint8_t* end);
 
     std::shared_ptr<thinger::asio::socket> socket_;
     std::string socket_path_;

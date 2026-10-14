@@ -30,7 +30,7 @@ void set_headers(stream_result& result, const http_response& response) {
 // (e.g. of responses to HEAD), are kept as they are, with their Content-Encoding.
 client_error decompress(http_response& response, size_t max_size) {
     if (response.get_content().empty() || !response.has_header("Content-Encoding")) return client_error::none;
-    // (the values of every Content-Encoding header make one list)
+    // The values of every Content-Encoding header make one list
     std::string encoding;
     for (const auto& value : response.get_headers_with_key("Content-Encoding")) {
         if (!encoding.empty()) encoding += ", ";
@@ -57,6 +57,21 @@ std::string_view trim(std::string_view value) {
     auto first = value.find_first_not_of(whitespace);
     if (first == std::string_view::npos) return {};
     return value.substr(first, value.find_last_not_of(whitespace) - first + 1);
+}
+
+// CONNECT host:port, in authority-form (RFC 9110 section 9.3.6, RFC 9112 section 3.2.3),
+// with the credentials of the proxy: only it sees them
+void set_connect_request(http_request& connect, const http_request& request, const std::string& authority,
+                         const std::string& proxy_authorization) {
+    connect.set_method(method::CONNECT);
+    connect.set_uri(authority);
+    connect.add_header(header::host, authority);
+    if (request.has_header(header::user_agent)) {
+        connect.add_header(header::user_agent, request.get_header(header::user_agent));
+    }
+    if (!proxy_authorization.empty()) {
+        connect.add_header("Proxy-Authorization", proxy_authorization);
+    }
 }
 
 // Whether a Connection header lists `option` (e.g. "close")
@@ -216,20 +231,10 @@ awaitable<boost::system::error_code> client_connection::connect_through_proxy(co
 }
 
 awaitable<boost::system::error_code> client_connection::open_tunnel(const http_request& request) {
-    // CONNECT host:port, in authority-form (RFC 9110 section 9.3.6, RFC 9112 section 3.2.3),
-    // with the credentials of the proxy: only it sees them
     const auto& host = request.get_host();
     std::string authority = (host.find(':') != std::string::npos ? "[" + host + "]" : host) + ":" + request.get_port();
     http_request connect;
-    connect.set_method(method::CONNECT);
-    connect.set_uri(authority);
-    connect.add_header(header::host, authority);
-    if (request.has_header(header::user_agent)) {
-        connect.add_header(header::user_agent, request.get_header(header::user_agent));
-    }
-    if (!route_.proxy->authorization.empty()) {
-        connect.add_header("Proxy-Authorization", route_.proxy->authorization);
-    }
+    set_connect_request(connect, request, authority, route_.proxy->authorization);
     LOG_DEBUG("opening a tunnel to {} through the proxy {}", authority, route_.proxy->url());
 
     std::vector<boost::asio::const_buffer> buffers;
@@ -316,42 +321,45 @@ awaitable<std::shared_ptr<http_response>> client_connection::read_response(const
             co_return nullptr;
         }
         if (boost::indeterminate(result)) continue;
-
-        // Data past the response, other than that of a switched protocol (another response
-        // than the one requested, or garbage), leaves the connection out of sync. A client
-        // asking to close it sends nothing more on it (RFC 9112 section 9.6)
-        bool reusable = response_parser_.keep_alive() && begin == end &&
-                        !has_connection_option(request.get_header(header::connection), "close");
-        auto response = response_parser_.consume_response();
-        if (reusable) {
-            reusable_ = true;
-            if (response->has_header("Keep-Alive")) {
-                keep_alive_timeout_ = keep_alive_timeout_of(response->get_header("Keep-Alive"));
-            }
-        }
-        if (response->get_status_code() == 101) {
-            if (!request.has_header(header::upgrade)) {
-                error_ = client_error::unexpected_upgrade;
-                co_return nullptr;
-            }
-            // What followed the response belongs to the new protocol (e.g. WebSocket frames)
-            buffered_.assign(reinterpret_cast<const char*>(begin), static_cast<size_t>(end - begin));
-        } else if (!reusable) {
-            socket_->close();
-        }
-
-        // A streamed body is handed as received. A body that cannot be decoded fails the
-        // request, as one too large once decoded (and the connection is closed, as after any
-        // error)
-        if (decompress_ && !response_parser_.is_streaming()) {
-            if (auto error = decompress(*response, response_parser_.get_max_content_size()); error != client_error::none) {
-                error_ = error;
-                co_return nullptr;
-            }
-        }
-
-        co_return response;
+        co_return complete_response(request, begin, end);
     }
+}
+
+std::shared_ptr<http_response> client_connection::complete_response(const http_request& request,
+                                                                   const uint8_t* begin, const uint8_t* end) {
+    // Data past the response, other than that of a switched protocol (another response
+    // than the one requested, or garbage), leaves the connection out of sync. A client
+    // asking to close it sends nothing more on it (RFC 9112 section 9.6)
+    bool reusable = response_parser_.keep_alive() && begin == end &&
+                    !has_connection_option(request.get_header(header::connection), "close");
+    auto response = response_parser_.consume_response();
+    if (reusable) {
+        reusable_ = true;
+        if (response->has_header("Keep-Alive")) {
+            keep_alive_timeout_ = keep_alive_timeout_of(response->get_header("Keep-Alive"));
+        }
+    }
+    if (response->get_status_code() == 101) {
+        if (!request.has_header(header::upgrade)) {
+            error_ = client_error::unexpected_upgrade;
+            return nullptr;
+        }
+        // What followed the response belongs to the new protocol, e.g. WebSocket frames
+        buffered_.assign(reinterpret_cast<const char*>(begin), static_cast<size_t>(end - begin));
+    } else if (!reusable) {
+        socket_->close();
+    }
+
+    // A streamed body is handed as received. A body that cannot be decoded fails the
+    // request, as one too large once decoded, and the connection is closed as after any
+    // error
+    if (decompress_ && !response_parser_.is_streaming()) {
+        if (auto error = decompress(*response, response_parser_.get_max_content_size()); error != client_error::none) {
+            error_ = error;
+            return nullptr;
+        }
+    }
+    return response;
 }
 
 awaitable<std::shared_ptr<http_response>> client_connection::exchange(std::shared_ptr<http_request> request) {
