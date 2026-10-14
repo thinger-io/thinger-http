@@ -88,6 +88,8 @@ private:
         bool range = false;
         std::string port;                               // empty for any port
     };
+    // An entry of the list (lowercase); nothing if it cannot be parsed
+    static std::optional<entry> parse_entry(std::string_view token);
 
     bool all_ = false;
     std::vector<entry> entries_;
