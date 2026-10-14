@@ -1,7 +1,8 @@
 name: Quality
 
 # Complexity (lizard), duplication (jscpd) and static analysis (clang-tidy, see .clang-tidy).
-# Reported in the job summary and as an artifact: findings never fail the build.
+# Reported in the job summary and as an artifact. Findings never fail the build, except
+# functions a pull request adds or changes above the complexity limits (the ratchet).
 
 on:
   push:
@@ -26,6 +27,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The complexity ratchet compares with the base of the pull request, or the commit
+          # before the push
+          fetch-depth: 0
 
       - name: Install tools
         run: |
@@ -49,6 +54,16 @@ jobs:
         run: |
           run-clang-tidy-18 -p build -j $(( $(nproc) / 4 )) -quiet "$PWD/thinger/.*\.cpp$" \
             > reports/clang-tidy.txt 2> reports/clang-tidy.log || true
+
+      # New or changed functions above CCN 15 or 100 lines fail pull requests, and are
+      # warnings on pushes; untouched ones are only reported in the summary
+      - name: Complexity ratchet
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          FAIL: ${{ github.event_name == 'pull_request' && '--fail' || '' }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          python3 .github/scripts/complexity_ratchet.py --base "$BASE" $FAIL thinger
 
       - name: Summary
         if: always()
