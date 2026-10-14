@@ -33,6 +33,10 @@ All notable changes to thinger-http are documented in this file. The format foll
 - `Content-Encoding` names are case-insensitive and `x-gzip` is gzip when decoding responses (client) and request bodies (server), as RFC 9110 says; only `gzip` and `deflate` in lowercase were decoded.
 - Client: multipart forms percent-encode `"`, CR and LF in field names and filenames, as browsers and curl do. Before, a filename with a quote or a line break could end the `Content-Disposition` parameter or header and inject others.
 
+### Removed
+
+- `thinger/util/gzip.hpp`, a legacy header (the global `Gzip` class, on CryptoPP and Boost.Iostreams) that nothing used and did not compile on its own. Compression is in `thinger/util/compression.hpp` (`util::gzip`, `util::deflate`).
+
 ## [0.1.0] - 2026-10-14
 
 First tagged release. Until now the library was used from `main`.
