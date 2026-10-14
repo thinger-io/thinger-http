@@ -114,7 +114,7 @@ void virtual_host::serve_static(const std::string& url_prefix,
                                 static_options options) {
     namespace fs = std::filesystem;
 
-    // (no double slash for the prefix "/")
+    // No double slash for the prefix "/"
     std::string route = url_prefix;
     if (!route.empty() && route.back() == '/') route.pop_back();
     route += "/:path(.*)";
@@ -122,7 +122,7 @@ void virtual_host::serve_static(const std::string& url_prefix,
     auto handler = [directory = fs::path(directory), options = std::move(options)](request& req, response& res) {
         file_server::serve(req, res, directory, options);
     };
-    // (HEAD requests reach it too, unless a HEAD route matches them)
+    // HEAD requests reach it too, unless a HEAD route matches them
     get(route, std::move(handler)).hidden();
 }
 

@@ -68,7 +68,7 @@ namespace {
                           bool precompressed) {
         precompressed_coding siblings[2];
         size_t count = precompressed ? accepted_siblings(*req.get_http_request(), siblings) : 0;
-        // (once answered, send_file() reports it without looking for the file)
+        // Once answered, send_file() reports it without looking for the file
         if (count == 0 || res.has_responded()) {
             res.send_file(file);
             return;
