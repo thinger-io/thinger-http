@@ -1364,6 +1364,39 @@ res.upgrade_websocket([](auto ws) {
 
 A client offering several subprotocols (`Sec-WebSocket-Protocol: a, b`) gets the first one it offers that is in the set; one offering none of them, or none at all when the set is not empty, is answered with `400`.
 
+### WebSocket Flow Control
+
+`send_text()` and `send_binary()` queue the message and return. The queue holds up to 100 messages; one sent to a full queue is dropped (the newest), which suits sampled telemetry but not a stream that must arrive whole. For those, the server can follow the pace of the client, and stop reading a client whose data it cannot forward yet:
+
+```cpp
+res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) -> thinger::awaitable<void> {
+    // Wait for each message to be written to the socket: one message queued at a time
+    for (auto& chunk : chunks) {
+        if (!co_await ws->send_binary_async(chunk)) co_return;   // closed
+    }
+});
+
+// Or queue without waiting, and wait while the queue is above its high watermark
+ws->set_write_limits({.max_messages = 0, .high_watermark = 1 << 20, .low_watermark = 256 << 10});
+ws->send_binary(chunk);
+co_await ws->wait_writable();
+
+// Stop reading while the destination of the messages is congested
+ws->on_message([ws, sink](std::string message, bool binary) {
+    sink->write(std::move(message));
+    if (sink->congested()) {
+        ws->pause_reading();
+        sink->on_drain([ws] { ws->resume_reading(); });
+    }
+});
+```
+
+- **Awaited sends** (`send_text_async()`, `send_binary_async()`) complete once the message is written to the socket, as Go's `WriteMessage`: `true`, or `false` if the connection closed first. They are never dropped.
+- **Limits** (`set_write_limits()`, a `http::write_limits`): `max_messages` (100 by default) and `max_bytes` (no limit by default) of the queue, the message being written included; an empty queue always takes a message. `queued_bytes()` and `queued_messages()` tell what is not written yet.
+- **Watermarks**, as `highWaterMark` and `'drain'` in Node streams: once the bytes queued reach `high_watermark`, `on_high_watermark()` is called and `wait_writable()` waits, until they drain to `low_watermark` (`on_low_watermark()`).
+- **Overflow policy** of a full queue, for the messages sent without waiting: `drop_newest` (the default), `drop_oldest` (the oldest messages queued, never the one being written nor an awaited one), or `close`, which closes the connection with `1013 Try Again Later` (the code the IANA registry has for a server shedding a client, which may reconnect later; `1008 Policy Violation` is about the messages a peer sends).
+- **Pausing reads**: after `pause_reading()` nothing more is read from the socket (the message being delivered is the last one), so the TCP window of the client fills and its writes block, as `socket.pause()` in Node; `resume_reading()` goes on where it stopped. While paused, the pings and the close frame of the client are not seen (as in any WebSocket not being read: the client may time out), and the keepalive is suspended, as its pongs could not be read. `stop()` still closes it: the closing handshake reads up to the close frame of the client, discarding the messages before it.
+
 ### WebSocket as a Socket
 
 `res.upgrade_websocket_stream()` hands the accepted WebSocket out as a socket (`thinger::asio::websocket`, a `thinger::asio::socket`), with the same interface as TCP, TLS and Unix sockets: a protocol written for a socket (MQTT, a custom binary protocol...) runs over WebSocket unchanged, without telling the difference, and a tunnel connects it to any other socket.
@@ -1673,6 +1706,18 @@ server.get("/events", [](auto& req, auto& res) {
         // Set retry interval (milliseconds)
         sse->send_retry(5000);
     });
+});
+```
+
+The queue of an SSE connection has the same flow control as a WebSocket, counting fields (`send_event()`, `send_data()`, `send_retry()`): `set_write_limits()` (up to 101 fields by default, dropping the newest), `queued_bytes()`, the watermarks and `wait_writable()`. `drop_oldest` drops whole events, never the rest of an event being written; `close` closes the connection, and `EventSource` reconnects.
+
+```cpp
+res.start_sse([](std::shared_ptr<http::sse_connection> sse) -> thinger::awaitable<void> {
+    sse->set_write_limits({.max_messages = 0, .high_watermark = 1 << 20, .low_watermark = 256 << 10});
+    for (auto& update : updates) {
+        sse->send_data(update);
+        if (!co_await sse->wait_writable()) co_return;   // closed
+    }
 });
 ```
 
