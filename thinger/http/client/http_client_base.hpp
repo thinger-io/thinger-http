@@ -76,7 +76,7 @@ public:
 
     // Log the header values and the start of the bodies (up to `max_length` bytes) of the
     // requests and responses: an opt-in for debugging, off by default (see body_logging)
-    http_client_base& log_bodies(bool enabled, size_t max_length = body_logging::default_max_length) {
+    http_client_base& log_bodies(bool enabled = true, size_t max_length = body_logging::default_max_length) {
         body_logging_ = {enabled, max_length};
         return *this;
     }

@@ -53,7 +53,7 @@ public:
 
     // Log the header values and the start of the bodies (up to `max_length` bytes) of the
     // requests and responses: an opt-in for debugging, off by default (see body_logging).
-    // Applies to the connections accepted after the call
+    // Set it before the server starts, as the other settings
     void log_bodies(bool enabled = true, size_t max_length = body_logging::default_max_length);
     const body_logging& get_body_logging() const { return body_logging_; }
     

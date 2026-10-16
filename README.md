@@ -1782,7 +1782,7 @@ For debugging, `log_bodies()` also logs the header values (`debug`) and the star
 
 ```cpp
 http::server server;
-server.log_bodies(true, 512);      // for the connections accepted from now on
+server.log_bodies(true, 512);      // before the server starts
 
 http::client client;
 client.log_bodies(true, 512);      // fluent, as the other client settings
