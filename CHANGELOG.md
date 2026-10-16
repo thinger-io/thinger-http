@@ -7,6 +7,8 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-16
+
 ### Added
 
 - Flow control for the server WebSocket (`websocket_connection`) and SSE (`sse_connection`) connections, for streams between a fast and a slow end. See [WebSocket Flow Control](README.md#websocket-flow-control).
@@ -141,7 +143,8 @@ These changes of the last weeks can be noticed by code written against an earlie
 - Client: connections are kept alive between requests (see the README to tune or disable the pool).
 - The unused `request_handler` interface was removed.
 
-[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/thinger-io/thinger-http/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/thinger-io/thinger-http/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/thinger-io/thinger-http/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/thinger-io/thinger-http/releases/tag/v0.1.0
