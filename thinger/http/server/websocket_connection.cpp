@@ -224,7 +224,7 @@ namespace thinger::http{
             out_queue_.pop_front();
             ws_->set_binary(message.binary);
 
-            watch_write();
+            flow_.write_started(*this, [](websocket_connection& self){ self.close_congested("its write timed out"); });
             auto [write_ec, write_bytes] = co_await ws_->write(std::string_view(message.data));
             flow_.write_finished();
 
@@ -258,14 +258,6 @@ namespace thinger::http{
         for(auto& message : discarded){
             if(message.waiter) message.waiter->finish(false);
         }
-    }
-
-    void websocket_connection::watch_write()
-    {
-        if(flow_.limits().write_timeout.count() <= 0) return;
-        flow_.write_started([weak = weak_from_this()]{
-            if(auto self = weak.lock()) self->close_congested("its write timed out");
-        });
     }
 
     void websocket_connection::close_congested(const char* reason)

@@ -90,8 +90,7 @@ namespace thinger::http {
         co_return !closed_;
     }
 
-    void write_flow::write_started(sync_callback<void()> on_timeout){
-        if(closed_ || limits_.write_timeout.count() <= 0) return;
+    void write_flow::watch_write(sync_callback<void()> on_timeout){
         write_watched_ = true;
         auto generation = ++state_->write_generation;
         write_timer_.expires_after(limits_.write_timeout);

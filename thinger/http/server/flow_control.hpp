@@ -111,9 +111,15 @@ namespace thinger::http {
         /// wait was cancelled)
         awaitable<bool> wait_writable();
 
-        /// The write of a message starts: with a write timeout, `on_timeout` is called if it
-        /// does not finish in time. And it finishes
-        void write_started(sync_callback<void()> on_timeout);
+        /// The write of a message starts, and finishes: with a write timeout, a write that does
+        /// not finish in time calls `on_timeout(connection)`, if the connection still lives
+        template<typename Connection, typename OnTimeout>
+        void write_started(Connection& connection, OnTimeout on_timeout) {
+            if(closed_ || limits_.write_timeout.count() <= 0) return;
+            watch_write([weak = connection.weak_from_this(), on_timeout = std::move(on_timeout)]{
+                if(auto self = weak.lock()) on_timeout(*self);
+            });
+        }
         void write_finished();
 
         /// The connection closed: waits end, notifications pending are dropped, and the
@@ -130,6 +136,7 @@ namespace thinger::http {
             sync_callback<void()> on_low;
         };
 
+        void watch_write(sync_callback<void()> on_timeout);
         void update_watermarks();
         void notify(bool high);
 

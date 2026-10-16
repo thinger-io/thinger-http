@@ -251,11 +251,6 @@ private:
     bool drop_oldest(size_t size);
 
     /**
-     * Watch the write starting, with a write timeout
-     */
-    void watch_write();
-
-    /**
      * Close a websocket that does not keep up: 1013 (Try Again Later)
      */
     void close_congested(const char* reason);

@@ -96,7 +96,10 @@ namespace thinger::http {
             out_queue_.pop_front();
             event_open_ = !field.ends_event;
 
-            watch_write();
+            flow_.write_started(*this, [](sse_connection& self){
+                LOG_WARNING("closing sse connection: its write timed out");
+                self.close();
+            });
             auto [write_ec, write_bytes] = co_await socket_->write(std::string_view(field.data));
             flow_.write_finished();
 
@@ -109,16 +112,6 @@ namespace thinger::http {
             idle_ = false;
         }
         writing_ = false;
-    }
-
-    void sse_connection::watch_write(){
-        if(flow_.limits().write_timeout.count() <= 0) return;
-        flow_.write_started([weak = weak_from_this()]{
-            auto self = weak.lock();
-            if(!self) return;
-            LOG_WARNING("closing sse connection: its write timed out");
-            self->close();
-        });
     }
 
     awaitable<bool> sse_connection::wait_writable(){
