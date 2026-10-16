@@ -73,8 +73,8 @@ private:
 
     void process_out_queue();
 
-    // Write the fields queued, one at a time
-    awaitable<void> write_loop();
+    // Write the fields queued, one at a time (`self` keeps the connection alive)
+    awaitable<void> write_loop(std::shared_ptr<sse_connection> self);
 
     // Queue a field, applying the overflow policy if the queue is full
     void push_field(out_field field);

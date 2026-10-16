@@ -88,16 +88,10 @@ namespace thinger::http {
     void sse_connection::process_out_queue(){
         if(writing_ || out_queue_.empty()) return;
         writing_ = true;
-
-        co_spawn(socket_->get_io_context(),
-            [this, self = shared_from_this()]() -> awaitable<void> {
-                co_await write_loop();
-                writing_ = false;
-            },
-            detached);
+        co_spawn(socket_->get_io_context(), write_loop(shared_from_this()), detached);
     }
 
-    awaitable<void> sse_connection::write_loop(){
+    awaitable<void> sse_connection::write_loop([[maybe_unused]] std::shared_ptr<sse_connection> self){
         while(!out_queue_.empty()){
             auto field = std::move(out_queue_.front());
             out_queue_.pop_front();
@@ -115,6 +109,7 @@ namespace thinger::http {
             }
             idle_ = false;
         }
+        writing_ = false;
     }
 
     awaitable<bool> sse_connection::wait_writable(){

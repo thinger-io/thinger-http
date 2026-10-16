@@ -209,16 +209,10 @@ namespace thinger::http{
     {
         if(out_queue_.empty() || writing_) return;
         writing_ = true;
-
-        co_spawn(ws_->get_io_context(),
-            [this, self = shared_from_this()]() -> awaitable<void> {
-                co_await write_loop();
-                writing_ = false;
-            },
-            detached);
+        co_spawn(ws_->get_io_context(), write_loop(shared_from_this()), detached);
     }
 
-    awaitable<void> websocket_connection::write_loop()
+    awaitable<void> websocket_connection::write_loop([[maybe_unused]] std::shared_ptr<websocket_connection> self)
     {
         while(!out_queue_.empty() && ws_->is_open()) {
             LOG_LEVEL(2, "handling websocket write, remaining in queue: {}", out_queue_.size());
@@ -247,6 +241,7 @@ namespace thinger::http{
             discard_queue();
             wake_reader();
         }
+        writing_ = false;
     }
 
     void websocket_connection::discard_queue()

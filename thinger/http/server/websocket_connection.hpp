@@ -257,9 +257,9 @@ private:
     void process_out_queue();
 
     /**
-     * Write the messages queued, one at a time
+     * Write the messages queued, one at a time (`self` keeps the connection alive)
      */
-    awaitable<void> write_loop();
+    awaitable<void> write_loop(std::shared_ptr<websocket_connection> self);
 
     /**
      * Writing ended for good: the messages queued are discarded (their senders told)
