@@ -110,7 +110,8 @@ namespace {
         std::atomic<size_t> max_queued{0};
         std::atomic<bool> failed{false};
         std::atomic<bool> done{false};
-        std::promise<sse_ptr> created;
+        // weak: the state may outlive the server, the connection may not
+        std::promise<std::weak_ptr<http::sse_connection>> created;
     };
 
     // The producer is stalled: what it sent and the server queue (read from this thread:
@@ -283,7 +284,7 @@ TEST_CASE("SSE producer waiting for the queue to drain", "[sse][flow][integratio
     sse_client client(running.port);
     // The client does not read: the producer waits once the socket buffers and the queue fill,
     // with the field that reached the high watermark ("data: " + payload + "\n\n" each)
-    auto sse = state->created.get_future().get();
+    auto sse = state->created.get_future().get().lock();
     REQUIRE(stalled(*state, sse, 16 * (size + 8)));
     REQUIRE(state->sent.load() < count);
 

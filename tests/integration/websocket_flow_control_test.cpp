@@ -79,7 +79,8 @@ namespace {
         std::atomic<size_t> max_queued{0};
         std::atomic<bool> failed{false};
         std::atomic<bool> done{false};
-        std::promise<ws_ptr> created;
+        // weak: the state may outlive the server, the connection may not
+        std::promise<std::weak_ptr<http::websocket_connection>> created;
 
         void sample(size_t queued) {
             if (queued > max_queued) max_queued = queued;
@@ -215,7 +216,7 @@ TEST_CASE("WebSocket awaitable send with a slow reader", "[websocket][flow][inte
 
     // The client does not read: the producer is suspended once the socket buffers fill, with
     // one message queued (the one being written)
-    auto ws = state->created.get_future().get();
+    auto ws = state->created.get_future().get().lock();
     REQUIRE(stalled(*state, ws, size));
     REQUIRE(state->sent.load() < count);
     REQUIRE(state->max_queued.load() == size);
@@ -314,7 +315,7 @@ TEST_CASE("WebSocket producer waiting for the queue to drain", "[websocket][flow
     raw_ws_client client(running.port);
     REQUIRE(client.handshake("/push").starts_with("HTTP/1.1 101"));
     // stalled at the high watermark
-    auto ws = state->created.get_future().get();
+    auto ws = state->created.get_future().get().lock();
     REQUIRE(stalled(*state, ws, high));
     REQUIRE(state->sent.load() < count);
     REQUIRE(state->max_queued.load() == high);
