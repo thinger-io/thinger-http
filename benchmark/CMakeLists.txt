@@ -36,3 +36,11 @@ target_link_libraries(benchmark_routes_server PRIVATE thinger::http)
 # Server with a few routes, for end-to-end load tests of the per-request cost
 add_executable(benchmark_few_routes_server routing/few_routes_server.cpp)
 target_link_libraries(benchmark_few_routes_server PRIVATE thinger::http)
+
+# WebSocket echo throughput of the server websocket_connection
+add_executable(benchmark_ws_echo websocket/ws_echo_benchmark.cpp)
+target_link_libraries(benchmark_ws_echo PRIVATE thinger::http)
+
+# A server pushing to a slow WebSocket reader: bytes queued and memory by producer mode
+add_executable(benchmark_ws_slow_reader websocket/ws_slow_reader_benchmark.cpp)
+target_link_libraries(benchmark_ws_slow_reader PRIVATE thinger::http)
