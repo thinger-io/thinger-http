@@ -84,9 +84,6 @@ private:
     // Queue a field, applying the overflow policy if the queue is full
     void push_field(out_field field);
 
-    // Make room for a field of `size` bytes in a full queue: false if it is discarded
-    bool make_room(size_t size);
-
     // Drop the oldest whole events queued until a field of `size` bytes fits: false if it does
     // not fit even so
     bool drop_oldest(size_t size);

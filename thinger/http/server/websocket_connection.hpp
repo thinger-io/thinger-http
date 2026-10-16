@@ -245,11 +245,6 @@ private:
     void push_message(std::string data, bool binary);
 
     /**
-     * Make room for a message of `size` bytes in a full queue: false if it is discarded
-     */
-    bool make_room(size_t size);
-
-    /**
      * Drop the oldest messages that may be dropped until one of `size` bytes fits: false if
      * it does not fit even so
      */

@@ -43,28 +43,20 @@ namespace thinger::http {
 
     void sse_connection::push_field(out_field field){
         if(flow_.closed()) return;
-        // a full queue: the overflow policy decides
-        if(flow_.overflows(field.data.size()) && !make_room(field.data.size())) return;
-        flow_.add(field.data.size());
-        out_queue_.push_back(std::move(field));
-        process_out_queue();
-    }
-
-    bool sse_connection::make_room(size_t size){
-        switch(flow_.limits().policy){
-            case overflow_policy::drop_oldest:
-                // not enough to drop: the newest field goes instead
-                if(drop_oldest(size)) return true;
+        switch(flow_.admit(field.data.size(), [this](size_t size){ return drop_oldest(size); })){
+            case write_flow::admission::queue:
+                flow_.add(field.data.size());
+                out_queue_.push_back(std::move(field));
+                process_out_queue();
                 break;
-            case overflow_policy::close:
+            case write_flow::admission::drop:
+                LOG_DEBUG("sse connection is congested. discarding field");
+                break;
+            case write_flow::admission::close:
                 LOG_WARNING("sse connection is congested. closing it");
                 close();
-                return false;
-            case overflow_policy::drop_newest:
                 break;
         }
-        LOG_DEBUG("sse connection is congested. discarding field");
-        return false;
     }
 
     bool sse_connection::drop_oldest(size_t size){

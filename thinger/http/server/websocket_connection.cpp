@@ -341,27 +341,18 @@ namespace thinger::http{
     }
 
     void websocket_connection::push_message(std::string data, bool binary){
-        // a full queue: the overflow policy decides
-        if(flow_.overflows(data.size()) && !make_room(data.size())) return;
-
-        LOG_LEVEL(2, "adding frame to websocket queue");
-        enqueue(out_message{std::move(data), binary, nullptr});
-    }
-
-    bool websocket_connection::make_room(size_t size){
-        switch(flow_.limits().policy){
-            case overflow_policy::drop_oldest:
-                // not enough to drop: the newest message goes instead
-                if(drop_oldest(size)) return true;
+        switch(flow_.admit(data.size(), [this](size_t size){ return drop_oldest(size); })){
+            case write_flow::admission::queue:
+                LOG_LEVEL(2, "adding frame to websocket queue");
+                enqueue(out_message{std::move(data), binary, nullptr});
                 break;
-            case overflow_policy::close:
+            case write_flow::admission::drop:
+                LOG_WARNING("websocket is congested. discarding packets!");
+                break;
+            case write_flow::admission::close:
                 close_congested("it is congested");
-                return false;
-            case overflow_policy::drop_newest:
                 break;
         }
-        LOG_WARNING("websocket is congested. discarding packets!");
-        return false;
     }
 
     bool websocket_connection::drop_oldest(size_t size){

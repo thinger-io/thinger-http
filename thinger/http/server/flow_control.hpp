@@ -72,6 +72,23 @@ namespace thinger::http {
         /// `dropped_messages` are out of the queue
         bool overflows(size_t size, size_t dropped_bytes = 0, size_t dropped_messages = 0) const;
 
+        /// What to do with a message sent without waiting
+        enum class admission { queue, drop, close };
+
+        /// The overflow policy, for a message of `size` bytes sent without waiting: queued if it
+        /// fits. drop_oldest calls `drop_oldest(size)`, which drops what the connection may and
+        /// tells whether the message fits then; if not, it is dropped instead
+        template<typename DropOldest>
+        admission admit(size_t size, DropOldest&& drop_oldest) {
+            if(!overflows(size)) return admission::queue;
+            switch(limits_.policy){
+                case overflow_policy::drop_newest: return admission::drop;
+                case overflow_policy::close: return admission::close;
+                case overflow_policy::drop_oldest: break;
+            }
+            return drop_oldest(size) ? admission::queue : admission::drop;
+        }
+
         /// A message of `size` bytes is queued (may reach the high watermark)
         void add(size_t size);
 
