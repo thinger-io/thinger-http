@@ -50,6 +50,13 @@
             inline void disable() {
                 set_logger(nullptr);
             }
+
+            // Whether a message at `level` would be logged: check it before building
+            // anything costly to log
+            inline bool should_log(spdlog::level::level_enum level) {
+                auto& logger = get_logger();
+                return logger && logger->should_log(level);
+            }
         }
     }
 
@@ -69,6 +76,11 @@
     #define LOG_TRACE(...)    THINGER_LOG_IMPL(spdlog::level::trace, __VA_ARGS__)
     #define LOG_LEVEL(LEVEL, ...) THINGER_LOG_IMPL(static_cast<spdlog::level::level_enum>(LEVEL), __VA_ARGS__)
 
+    // Whether a message at that level would be logged
+    #define LOG_INFO_ENABLED()  thinger::logging::should_log(spdlog::level::info)
+    #define LOG_DEBUG_ENABLED() thinger::logging::should_log(spdlog::level::debug)
+    #define LOG_TRACE_ENABLED() thinger::logging::should_log(spdlog::level::trace)
+
     // Thinger specific macros
     #define THINGER_LOG(...)                LOG_INFO(__VA_ARGS__)
     #define THINGER_LOG_TAG(TAG, ...)       LOG_INFO("[{}] " __VA_ARGS__, TAG)
@@ -87,6 +99,10 @@
     #define LOG_DEBUG(...) void()
     #define LOG_TRACE(...) void()
     #define LOG_LEVEL(...) void()
+
+    #define LOG_INFO_ENABLED() false
+    #define LOG_DEBUG_ENABLED() false
+    #define LOG_TRACE_ENABLED() false
 
     #define THINGER_LOG(...) void()
     #define THINGER_LOG_ERROR(...) void()
