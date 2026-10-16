@@ -134,11 +134,16 @@ namespace {
 TEST_CASE("SSE overflow policies", "[sse][flow][integration]") {
     http::server server;
     std::function<void(const sse_ptr&)> setup;
+    std::promise<void> handled;
     server.get("/events", [&](http::request&, http::response& res) {
-        res.start_sse([&](sse_ptr sse) { setup(sse); });
+        res.start_sse([&](sse_ptr sse) {
+            setup(sse);
+            handled.set_value();
+        });
     });
     running_server running(server);
-    sse_client client(running.port);
+    // connected once `setup` is set: the request is sent right away
+    auto connect = [&] { return std::make_unique<sse_client>(running.port); };
 
     SECTION("drop_newest by default: 101 fields") {
         http::write_limits limits;
@@ -147,7 +152,8 @@ TEST_CASE("SSE overflow policies", "[sse][flow][integration]") {
             // queued at once: the first one is being written, still counted
             for (size_t i = 0; i < 150; ++i) sse->send_data(std::to_string(i));
         };
-        REQUIRE(client.read_events(150) == data_events(0, 101));
+        REQUIRE(connect()->read_events(150) == data_events(0, 101));
+        handled.get_future().get();
         REQUIRE(limits.max_messages == 101);
         REQUIRE(limits.policy == http::overflow_policy::drop_newest);
     }
@@ -166,7 +172,8 @@ TEST_CASE("SSE overflow policies", "[sse][flow][integration]") {
         // the oldest whole events after it are dropped
         std::string expected = "event: e0\ndata: 0\n\n";
         for (size_t i = 26; i < 30; ++i) expected += "event: e" + std::to_string(i) + "\ndata: " + std::to_string(i) + "\n\n";
-        REQUIRE(client.read_events(30) == expected);
+        REQUIRE(connect()->read_events(30) == expected);
+        handled.get_future().get();
         REQUIRE(queued == 10);
     }
 
@@ -176,7 +183,7 @@ TEST_CASE("SSE overflow policies", "[sse][flow][integration]") {
             sse->set_write_limits({.max_messages = 0, .max_bytes = 30});
             for (size_t i = 0; i < 5; ++i) sse->send_data(std::to_string(i));
         };
-        REQUIRE(client.read_events(5) == data_events(0, 3));
+        REQUIRE(connect()->read_events(5) == data_events(0, 3));
     }
 
     SECTION("close") {
@@ -185,9 +192,10 @@ TEST_CASE("SSE overflow policies", "[sse][flow][integration]") {
             for (size_t i = 0; i < 5; ++i) sse->send_data(std::to_string(i));
         };
         // at most the field being written as the others were queued
-        auto stream = client.read_events(5, 3s);
+        auto client = connect();
+        auto stream = client->read_events(5, 3s);
         REQUIRE((stream.empty() || stream == "data: 0\n\n"));
-        REQUIRE(client.closed());
+        REQUIRE(client->closed());
     }
 }
 
