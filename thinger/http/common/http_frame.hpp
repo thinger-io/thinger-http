@@ -3,6 +3,7 @@
 
 #include <functional>
 #include "../data/out_data.hpp"
+#include "body_logging.hpp"
 
 namespace thinger::http {
 
@@ -34,8 +35,8 @@ namespace thinger::http {
         // Report the frame written (or failed) to the callback set with on_written(), once
         void notify_written(bool written);
 
-        // debug
-        virtual void log(const char* scope, int level) const;
+        // Log the frame (see body_logging): nothing by default, as for body data
+        virtual void log(const char* scope, const body_logging& options = {}) const;
 
     private:
         bool last_frame_ = true;

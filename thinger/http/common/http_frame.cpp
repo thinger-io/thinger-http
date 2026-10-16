@@ -31,8 +31,6 @@ namespace thinger::http {
         }
     }
 
-    void http_frame::log(const char* scope, int level) const{
-        LOG_WARNING("[%s] unimplemented log method", scope);
-    }
+    void http_frame::log(const char*, const body_logging&) const {}
 
 }

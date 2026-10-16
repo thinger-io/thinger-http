@@ -3,6 +3,7 @@
 
 #include "http_application.hpp"
 #include "connection_tracker.hpp"
+#include "../common/body_logging.hpp"
 #include "../../asio/socket_server.hpp"
 #include "../../asio/socket_server_base.hpp"
 #include "../../asio/unix_socket_server.hpp"
@@ -36,6 +37,7 @@ protected:
 
     // Listening attempts (-1 = infinite)
     int max_listening_attempts_ = -1;
+    body_logging body_logging_;
 
     // The connections served, for the statistics and the shutdown
     std::shared_ptr<connection_tracker> connections_ = std::make_shared<connection_tracker>();
@@ -48,6 +50,12 @@ public:
     void enable_ssl(bool enabled = true);
     void set_connection_timeout(std::chrono::seconds timeout);
     void set_max_listening_attempts(int attempts);
+
+    // Log the header values and the start of the bodies (up to `max_length` bytes) of the
+    // requests and responses: an opt-in for debugging, off by default (see body_logging).
+    // Applies to the connections accepted after the call
+    void log_bodies(bool enabled = true, size_t max_length = body_logging::default_max_length);
+    const body_logging& get_body_logging() const { return body_logging_; }
     
     // Server control
     virtual bool listen(const std::string& host, uint16_t port);

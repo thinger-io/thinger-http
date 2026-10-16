@@ -76,32 +76,15 @@ namespace thinger::http {
     }
      */
 
-    void http_request::log(const char* scope, int level) const{
-        // Log the request with context
+    void http_request::log(const char* scope, const body_logging& options) const{
+        if(!LOG_INFO_ENABLED()) return;
         LOG_INFO("[{}] {} {}", scope, http::get_method(method_), get_uri());
-        
-        // Log headers at debug level
-        LOG_DEBUG("Headers:");
-        for(const auto& t: headers_){
-            LOG_DEBUG("  {}: {}", t.first, t.second);
+        if(LOG_DEBUG_ENABLED()){
+            LOG_DEBUG("Headers:");
+            log_headers(options);
         }
-        for(const auto& t: proxy_headers_){
-            LOG_DEBUG("  (PROXY) {}: {}", t.first, t.second);
-        }
-        
-        // Log body if present (at trace level)
-        if(!content_.empty()){
-            LOG_TRACE("Body: {} bytes", content_.size());
-            if(content_.size() <= 500) {
-                std::istringstream f(content_);
-                std::string line;
-                while (std::getline(f, line)) {
-                    LOG_TRACE("  {}", line);
-                }
-            } else {
-                LOG_TRACE("  {} (truncated)", content_.substr(0, 500));
-            }
-        }
+        // The body, unless it is not read yet: the size it announces
+        log_body(content_, content_.empty() ? get_content_length() : content_.size(), options);
     }
 
     void http_request::set_chunked_callback(std::function<void(int, const std::string&)> callback){

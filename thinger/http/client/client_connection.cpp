@@ -388,7 +388,7 @@ awaitable<std::shared_ptr<http_response>> client_connection::exchange(std::share
             co_return;
         }
 
-        request->log("CLIENT->", 0);
+        request->log("CLIENT->", body_logging_);
         io_result written;
         if (route_.proxy && !route_.tunnel) {
             written = co_await write_to_proxy(*request);

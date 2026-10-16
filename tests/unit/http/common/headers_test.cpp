@@ -344,7 +344,7 @@ TEST_CASE("Headers log does not crash", "[http][headers]") {
     thinger::http::http_request h;
     h.add_header("Host", "example.com");
     h.add_proxy("X-Forwarded-For", "10.0.0.1");
-    REQUIRE_NOTHROW(h.log("test", 0));
+    REQUIRE_NOTHROW(h.log("test"));
 }
 // ============================================================================
 // Body framing headers (Content-Length / Transfer-Encoding)

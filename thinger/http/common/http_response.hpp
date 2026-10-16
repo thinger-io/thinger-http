@@ -83,7 +83,7 @@ public:
     bool is_redirect_response() const;
 
     // log
-    void log(const char* scope, int level) const override;
+    void log(const char* scope, const body_logging& options = {}) const override;
 
     // factory methods
     static std::shared_ptr<http_response> stock_http_reply(http_response::status status);

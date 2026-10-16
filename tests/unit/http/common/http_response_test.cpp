@@ -391,23 +391,23 @@ TEST_CASE("HTTP Response log", "[http][response][unit]") {
         http_response res;
         res.set_status(http_response::status::ok);
         res.set_content("test body", "text/plain");
-        REQUIRE_NOTHROW(res.log("test", 0));
+        REQUIRE_NOTHROW(res.log("test"));
     }
 
     SECTION("log with large body does not crash") {
         http_response res;
         res.set_content(std::string(1000, 'x'), "text/plain");
-        REQUIRE_NOTHROW(res.log("test", 0));
+        REQUIRE_NOTHROW(res.log("test"));
     }
 
     SECTION("log with empty body does not crash") {
         http_response res;
-        REQUIRE_NOTHROW(res.log("test", 0));
+        REQUIRE_NOTHROW(res.log("test"));
     }
 
     SECTION("log with proxy headers does not crash") {
         http_response res;
         res.add_proxy("X-Forwarded-For", "10.0.0.1");
-        REQUIRE_NOTHROW(res.log("test", 0));
+        REQUIRE_NOTHROW(res.log("test"));
     }
 }

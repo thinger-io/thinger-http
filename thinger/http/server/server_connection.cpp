@@ -18,7 +18,7 @@ namespace {
             buffer.emplace_back(boost::asio::buffer(head.data(), head.size()));
         }
 
-        void log(const char* scope, int) const override {
+        void log(const char* scope, const body_logging&) const override {
             LOG_DEBUG("[{}] HTTP/1.1 100 Continue", scope);
         }
     };
@@ -198,7 +198,7 @@ std::pair<std::shared_ptr<http_stream>, std::shared_ptr<request>> server_connect
     // Queued in order, for pipelining
     request_queue_.push(stream);
 
-    http_req->log("SERVER REQUEST", 0);
+    http_req->log("SERVER REQUEST", body_logging_);
 
     auto req = std::make_shared<request>(self, stream, std::move(http_req));
     if (read_ahead_size > 0) {
@@ -320,7 +320,7 @@ void server_connection::process_output_queue() {
         auto frame = stream->current_frame();
         stream->pop_frame();
 
-        frame->log("SERVER RESPONSE", 0);
+        frame->log("SERVER RESPONSE", body_logging_);
 
         auto& buffers = write_buffers_;
         buffers.clear();

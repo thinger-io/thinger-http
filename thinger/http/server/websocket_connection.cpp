@@ -1,5 +1,4 @@
 #include "../../util/logger.hpp"
-#include "../../util/hex.hpp"
 #include "../../util/types.hpp"
 #include "websocket_connection.hpp"
 #include <utility>
@@ -156,7 +155,8 @@ namespace thinger::http{
 
         if (on_frame_callback_) {
             std::string data(reinterpret_cast<const char*>(data_ptr), data_size);
-            LOG_DEBUG("decoded payload: '{}'", util::lowercase_hex_encode(data));
+            // Only the size: messages may hold credentials (see body_logging)
+            LOG_TRACE("websocket {} message received: {} bytes", ws_->is_binary() ? "binary" : "text", data_size);
             on_frame_callback_(std::move(data), ws_->is_binary());
         }
 

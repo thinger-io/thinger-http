@@ -122,12 +122,23 @@ public:
 
     // debug
     void debug_headers(std::ostream& os) const;
-    void log(const char* scope, int level) const override;
+    void log(const char* scope, const body_logging& options = {}) const override;
+
+    // Whether the value of the header `name` is a credential, never logged (Authorization,
+    // Proxy-Authorization, Cookie, Set-Cookie)
+    static bool is_sensitive_header(std::string_view name);
 
     // process header intended to be override to process headers
     virtual void process_header(std::string key, std::string value);
 
 protected:
+    // Log each header (debug): its name, and its value if `options` is enabled, but those of
+    // the sensitive headers
+    void log_headers(const body_logging& options) const;
+
+    // Log the size of a body (trace), and its start if `options` is enabled
+    static void log_body(std::string_view body, size_t size, const body_logging& options);
+
     // Keep track of the body framing (Content-Length, Transfer-Encoding) of a received header
     void process_framing_header(std::string_view key, std::string_view value);
 

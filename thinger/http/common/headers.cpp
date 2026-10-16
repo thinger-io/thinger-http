@@ -220,14 +220,81 @@ namespace thinger::http{
         }
     }
 
-    void headers::log(const char* scope, int level) const{
+    namespace {
+
+        [[maybe_unused]] constexpr std::string_view redacted = "[redacted]";
+
+        // The first `max_length` bytes of `data` for a log line: control characters escaped,
+        // so a value cannot forge log lines, and how much is left out
+        [[maybe_unused]] std::string printable(std::string_view data, size_t max_length) {
+            static constexpr char hex[] = "0123456789abcdef";
+            auto shown = data.substr(0, max_length);
+            std::string out;
+            out.reserve(shown.size() + 32);
+            for (unsigned char c : shown) {
+                switch (c) {
+                    case '\n': out += "\\n"; break;
+                    case '\r': out += "\\r"; break;
+                    case '\t': out += "\\t"; break;
+                    case '\\': out += "\\\\"; break;
+                    default:
+                        if (c < 0x20 || c == 0x7f) {
+                            out += "\\x";
+                            out += hex[c >> 4];
+                            out += hex[c & 0xf];
+                        } else {
+                            out += static_cast<char>(c);
+                        }
+                }
+            }
+            if (shown.size() < data.size()) {
+                out += "... (";
+                out += std::to_string(data.size() - shown.size());
+                out += " more bytes)";
+            }
+            return out;
+        }
+
+        [[maybe_unused]] void log_header(std::string_view label, const std::string& name, const std::string& value,
+                        const body_logging& options) {
+            if (!options.enabled) {
+                LOG_DEBUG("  {}{}", label, printable(name, name.size()));
+            } else if (headers::is_sensitive_header(name)) {
+                LOG_DEBUG("  {}{}: {}", label, printable(name, name.size()), redacted);
+            } else {
+                LOG_DEBUG("  {}{}: {}", label, printable(name, name.size()), printable(value, options.max_length));
+            }
+        }
+
+    }
+
+    bool headers::is_sensitive_header(std::string_view name) {
+        return is_header(name, "Authorization") || is_header(name, "Proxy-Authorization") ||
+               is_header(name, "Cookie") || is_header(name, "Set-Cookie");
+    }
+
+    void headers::log_headers(const body_logging& options) const {
+        if (!LOG_DEBUG_ENABLED()) return;
+        for (const auto& [name, value] : headers_) {
+            log_header("", name, value, options);
+        }
+        for (const auto& [name, value] : proxy_headers_) {
+            log_header("(PROXY) ", name, value, options);
+        }
+    }
+
+    void headers::log_body(std::string_view body, size_t size, const body_logging& options) {
+        if (size == 0 || !LOG_TRACE_ENABLED()) return;
+        LOG_TRACE("Body: {} bytes", size);
+        if (options.enabled && !body.empty()) {
+            LOG_TRACE("  {}", printable(body, options.max_length));
+        }
+    }
+
+    void headers::log(const char* scope, const body_logging& options) const {
+        if (!LOG_DEBUG_ENABLED()) return;
         LOG_DEBUG("[{}] Headers:", scope);
-        for(const auto& t: headers_){
-            LOG_DEBUG("  {}: {}", t.first, t.second);
-        }
-        for(const auto& t: proxy_headers_){
-            LOG_DEBUG("  (PROXY REPLACE) {}: {}", t.first, t.second);
-        }
+        log_headers(options);
     }
 
     size_t headers::get_content_length() const{

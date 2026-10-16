@@ -123,6 +123,9 @@ namespace thinger::http {
         void set_max_content_size(size_t size) { max_content_size_ = size; }
         size_t get_max_content_size() const { return max_content_size_; }
 
+        // How the responses are logged as they are consumed (see body_logging)
+        void set_body_logging(const body_logging& options) { body_logging_ = options; }
+
     private:
         enum class state {
             status_line,
@@ -173,6 +176,7 @@ namespace thinger::http {
         std::function<bool(const std::string_view&, size_t, size_t)> on_streaming_;
         size_t streaming_downloaded_ = 0;
         size_t max_content_size_ = DEFAULT_MAX_CONTENT_SIZE;
+        body_logging body_logging_;
     };
 
 }

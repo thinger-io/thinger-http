@@ -18,6 +18,10 @@ void http_server_base::set_max_listening_attempts(int attempts) {
     max_listening_attempts_ = attempts;
 }
 
+void http_server_base::log_bodies(bool enabled, size_t max_length) {
+    body_logging_ = {enabled, max_length};
+}
+
 // Server control
 bool http_server_base::listen(const std::string& host, uint16_t port) {
     reset_shutdown();
@@ -130,6 +134,7 @@ void http_server_base::setup_connection_handler() {
     socket_server_->set_handler([this](std::shared_ptr<asio::socket> socket) {
         auto connection = std::make_shared<server_connection>(socket);
         connection->track(connections_);
+        connection->set_body_logging(body_logging_);
 
         connection->set_handler([this](std::shared_ptr<request> req) {
             auto sink = std::make_shared<connection_sink>(*req);

@@ -314,7 +314,7 @@ namespace thinger::http {
 
     std::shared_ptr<http_response> response_factory::consume_response() {
         auto response = std::exchange(resp_, nullptr);
-        if (response) response->log("HTTP CLIENT RESPONSE", 0);
+        if (response) response->log("HTTP CLIENT RESPONSE", body_logging_);
         return response;
     }
 

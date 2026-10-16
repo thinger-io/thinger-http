@@ -73,6 +73,9 @@ public:
         handler_ = std::move(handler);
     }
 
+    // How the requests and responses are logged (see body_logging)
+    void set_body_logging(const body_logging& options) { body_logging_ = options; }
+
 private:
     // Read requests, one after another, and hand each to the handler
     awaitable<void> read_loop();
@@ -172,6 +175,8 @@ private:
     std::queue<std::shared_ptr<http_stream>> request_queue_;
 
     std::function<awaitable<void>(std::shared_ptr<request>)> handler_;
+
+    body_logging body_logging_;
 
     // Buffers of the frame being written (kept, so they are not allocated for every frame)
     std::vector<boost::asio::const_buffer> write_buffers_;

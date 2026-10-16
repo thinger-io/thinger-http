@@ -130,7 +130,7 @@ public:
     void process_header(std::string key, std::string value) override;
 
     // logs
-    void log(const char* scope, int level) const override;
+    void log(const char* scope, const body_logging& options = {}) const override;
 
     // factory methods
     static std::shared_ptr<http_request> create_http_request(const std::string& method, const std::string& url);

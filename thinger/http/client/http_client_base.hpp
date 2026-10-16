@@ -3,6 +3,7 @@
 
 #include "../common/http_request.hpp"
 #include "../common/http_response.hpp"
+#include "../common/body_logging.hpp"
 #include "client_connection.hpp"
 #include "client_response.hpp"
 #include "connection_pool.hpp"
@@ -33,6 +34,7 @@ protected:
     bool auto_decompress_{true};
     bool verify_ssl_{true};
     std::string unix_socket_;
+    body_logging body_logging_;
     size_t max_content_size_{8 * 1048576};  // 8 MB default; buffered-mode responses above this are rejected
 
     // Proxy set with proxy() (null if none), and the one of the environment (null if not
@@ -71,6 +73,13 @@ public:
     // Content-Encoding
     http_client_base& auto_decompress(bool decompress) { auto_decompress_ = decompress; return *this; }
     http_client_base& verify_ssl(bool verify) { verify_ssl_ = verify; return *this; }
+
+    // Log the header values and the start of the bodies (up to `max_length` bytes) of the
+    // requests and responses: an opt-in for debugging, off by default (see body_logging)
+    http_client_base& log_bodies(bool enabled, size_t max_length = body_logging::default_max_length) {
+        body_logging_ = {enabled, max_length};
+        return *this;
+    }
     http_client_base& unix_socket(const std::string& path) { unix_socket_ = path; return *this; }
     http_client_base& max_content_size(size_t size) { max_content_size_ = size; return *this; }
 
@@ -101,6 +110,7 @@ public:
     const std::string& get_user_agent() const { return user_agent_; }
     bool get_auto_decompress() const { return auto_decompress_; }
     bool get_verify_ssl() const { return verify_ssl_; }
+    const body_logging& get_body_logging() const { return body_logging_; }
     size_t get_max_content_size() const { return max_content_size_; }
     size_t get_max_idle_connections_per_host() const { return pool_.get_config().max_idle_per_host; }
     size_t get_max_idle_connections() const { return pool_.get_config().max_idle; }

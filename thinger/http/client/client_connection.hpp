@@ -121,6 +121,11 @@ public:
     void set_timeout(std::chrono::seconds timeout) { timeout_ = timeout; }
     // Decode gzip and deflate bodies (the default); otherwise they are kept as received
     void set_decompress(bool decompress) { decompress_ = decompress; }
+    // How the requests and responses are logged (see body_logging)
+    void set_body_logging(const body_logging& options) {
+        body_logging_ = options;
+        response_parser_.set_body_logging(options);
+    }
 
 private:
     // Internal helpers
@@ -151,6 +156,7 @@ private:
     bool response_started_ = false;
     bool reusable_ = false;
     bool decompress_ = true;
+    body_logging body_logging_;
     std::optional<std::chrono::seconds> keep_alive_timeout_;
     boost::asio::steady_timer idle_timer_;
 };
