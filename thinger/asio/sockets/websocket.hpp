@@ -63,6 +63,8 @@ public:
     static constexpr uint16_t CLOSE_NORMAL = 1000;
     static constexpr uint16_t CLOSE_GOING_AWAY = 1001;
     static constexpr uint16_t CLOSE_PROTOCOL_ERROR = 1002;
+    static constexpr uint16_t CLOSE_INVALID_PAYLOAD = 1007;
+    static constexpr uint16_t CLOSE_MESSAGE_TOO_BIG = 1009;
     // IANA registry: the server sheds a client (e.g. one that does not keep up); it may retry
     static constexpr uint16_t CLOSE_TRY_AGAIN_LATER = 1013;
 
@@ -78,10 +80,12 @@ public:
         std::chrono::seconds timeout) override;
     void close() override;
     // Close the connection with `code`: the closing handshake on its own when called on the
-    // io_context, waiting for the close frame of the peer if `expect_reply`
+    // io_context, waiting for the close frame of the peer if `expect_reply`. On the thread of
+    // the io_context, as any operation. A code that may not be sent (RFC 6455, 7.4: e.g. 1005,
+    // 1006 or 1015) is sent as 1000
     void close(uint16_t code, bool expect_reply = true);
     // Send a close frame (waiting for a pending write), wait for the close frame of the peer
-    // (up to CLOSE_TIMEOUT), and close
+    // (up to CLOSE_TIMEOUT), and close. A code that may not be sent is sent as 1000
     awaitable<void> close_graceful(uint16_t code = CLOSE_NORMAL);
     void cancel() override;
     bool requires_handshake() const override;

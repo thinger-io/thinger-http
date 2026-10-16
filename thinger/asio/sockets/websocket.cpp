@@ -43,6 +43,13 @@ void random_mask(uint8_t mask[websocket::MASK_SIZE_BYTES]) {
     std::memcpy(mask, &value, websocket::MASK_SIZE_BYTES);
 }
 
+// The code to send in a close frame: 1000 for one that may not be sent
+uint16_t sendable_close_code(uint16_t code) {
+    if (valid_close_code(code)) return code;
+    LOG_WARNING("websocket close code {} may not be sent, closing with 1000", code);
+    return websocket::CLOSE_NORMAL;
+}
+
 boost::system::error_code protocol_error() {
     return boost::system::errc::make_error_code(boost::system::errc::protocol_error);
 }
@@ -539,6 +546,7 @@ void websocket::close() {
 
 void websocket::close(uint16_t code, bool expect_reply) {
     if (closed_) return;
+    code = sendable_close_code(code);
     closed_ = true;
     ++keepalive_generation_;
     keepalive_timer_->cancel();
@@ -622,6 +630,7 @@ awaitable<void> websocket::linger(std::shared_ptr<socket> socket, std::vector<ui
 
 awaitable<void> websocket::close_graceful(uint16_t code) {
     if (closed_) co_return;
+    code = sendable_close_code(code);
     if (!close_sent_ && !close_received_) {
         if (co_await send_close(code)) {
             close(code);
