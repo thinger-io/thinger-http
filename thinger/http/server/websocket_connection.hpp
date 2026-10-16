@@ -1,17 +1,38 @@
 #ifndef THINGER_WEBSOCKET_CONNECTION_HPP
 #define THINGER_WEBSOCKET_CONNECTION_HPP
 
+#include <chrono>
+#include <deque>
 #include <memory>
-#include <queue>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/streambuf.hpp>
 #include "../../asio/sockets/websocket.hpp"
 #include "../../asio/sockets/socket.hpp"
 #include "../data/out_data.hpp"
 #include "../../util/types.hpp"
 #include "connection_tracker.hpp"
+#include "flow_control.hpp"
 
 namespace thinger::http{
 
+/**
+ * A server WebSocket exchanging whole messages: received with on_message(), sent with
+ * send_text()/send_binary() (queued, without waiting) or send_text_async()/send_binary_async()
+ * (waiting until written).
+ *
+ * Flow control, for streams between a fast and a slow end (see flow_control.hpp):
+ * - Sending: the queue holds up to 100 messages by default, and drops the newest message sent
+ *   to a full queue (set_write_limits() changes the limits and the overflow policy).
+ *   queued_bytes() tells what is not written yet; the watermarks call on_high_watermark() and
+ *   on_low_watermark(), and wait_writable() waits for the queue to drain. A producer awaiting
+ *   send_*_async() has one message queued at a time, and goes at the pace of the peer.
+ * - Receiving: pause_reading() stops reading the socket, so the TCP window of the peer fills
+ *   and its writes block, until resume_reading().
+ *
+ * Callbacks run on the thread of the websocket; the other calls may come from any thread,
+ * except the getters (queued_bytes()...), and set_write_limits() and the callback setters,
+ * which are meant for the handler that accepts the websocket, or execute().
+ */
 class websocket_connection : public std::enable_shared_from_this<websocket_connection>{
 
 public:
@@ -25,7 +46,7 @@ public:
 
     /**
     * Parameter for controlling the maximum number of pending messages stored
-    * in the output queue.
+    * in the output queue, by default (see set_write_limits()).
     */
     static constexpr int MAX_OUTPUT_MESSAGES = 100;
 
@@ -84,21 +105,76 @@ public:
 
     /**
      *
-     * @return true if the endpoint connection is congested
+     * @return true if the queue is full: the overflow policy applies to the next message sent
      */
     bool congested_connection();
 
     /**
-     * Send a text frame over connection
+     * Send a text frame over connection, without waiting: queued, or handled by the overflow
+     * policy if the queue is full
      * @param text
      */
     void send_text(std::string text);
 
     /**
-       * Send a binary frame over connection
+       * Send a binary frame over connection, without waiting (see send_text())
        * @param text
        */
     void send_binary(std::string data);
+
+    /**
+     * Send a text frame and wait until it is written to the socket (taken by the kernel): true,
+     * or false if the connection closed or failed first. Never dropped by the overflow
+     * policy; a cancelled wait leaves the message queued
+     */
+    awaitable<bool> send_text_async(std::string text);
+
+    /**
+     * Send a binary frame and wait until it is written (see send_text_async())
+     */
+    awaitable<bool> send_binary_async(std::string data);
+
+    /**
+     * Limits of the queue, watermarks and overflow policy (see write_limits)
+     */
+    void set_write_limits(const write_limits& limits);
+    const write_limits& get_write_limits() const;
+
+    /**
+     * Payload bytes, and messages, queued and not written yet (the one being written included)
+     */
+    size_t queued_bytes() const;
+    size_t queued_messages() const;
+
+    /**
+     * Called when the bytes queued reach the high watermark, and when they drain to the low
+     * watermark after that
+     */
+    void on_high_watermark(sync_callback<void()> callback);
+    void on_low_watermark(sync_callback<void()> callback);
+
+    /**
+     * Wait while the queue is above its high watermark, until it drains to the low one: true,
+     * or false if the connection closed. Right away if it is not congested
+     */
+    awaitable<bool> wait_writable();
+
+    /**
+     * Stop reading from the socket, from the next read on: messages already received are
+     * delivered, nothing else is read, and the peer's writes block once the TCP buffers fill.
+     * Writes go on. While paused, pings and the close frame of the peer are not seen (as in
+     * any WebSocket not read: the peer may time out), and the keepalive is suspended, as its
+     * pongs could not be read. stop() still closes it: the closing handshake reads up to the
+     * close frame of the peer, discarding the messages before it
+     */
+    void pause_reading();
+
+    /**
+     * Read again, in order and from where reading stopped; the keepalive is restarted
+     */
+    void resume_reading();
+
+    bool is_reading_paused() const;
 
     /**
     * Return the base socket used in this client connection and release it for being used by another connection handler.
@@ -119,9 +195,76 @@ private:
     awaitable<void> read_loop();
 
     /**
+     * Deliver the message read whole: false if it is not valid
+     */
+    bool deliver_message();
+
+    /**
+     * Wait while reading is paused: false if the websocket closed, or was released
+     */
+    awaitable<bool> wait_resumed();
+
+    /**
+     * Wake the read loop paused
+     */
+    void wake_reader();
+
+    /**
+     * Keepalive suspended while paused, and restarted on resume
+     */
+    void suspend_keepalive();
+    void restore_keepalive();
+
+    /**
+     * Close the connection (waiting for the handshake), and end the read loop if paused
+     */
+    awaitable<void> close_connection(uint16_t code);
+
+    struct send_waiter;
+
+    struct out_message {
+        std::string data;
+        bool binary = false;
+        /// The sender waiting for it to be written (send_*_async()), if any
+        std::shared_ptr<send_waiter> waiter;
+    };
+
+    /**
+     * Queue a message sent without waiting, applying the overflow policy if the queue is full
+     */
+    void push_message(std::string data, bool binary);
+
+    /**
+     * Make room for a message of `size` bytes in a full queue: false if it is discarded
+     */
+    bool make_room(size_t size);
+
+    /**
+     * Drop the oldest messages that may be dropped until one of `size` bytes fits
+     */
+    void drop_oldest(size_t size);
+
+    /**
+     * Queue a message, and start writing if needed
+     */
+    void enqueue(out_message message);
+
+    awaitable<bool> send_async(std::string data, bool binary);
+
+    /**
      * Process the output queue
      */
     void process_out_queue();
+
+    /**
+     * Write the messages queued, one at a time
+     */
+    awaitable<void> write_loop();
+
+    /**
+     * Writing ended for good: the messages queued are discarded (their senders told)
+     */
+    void discard_queue();
 
     /**
      * The server shuts down (on the websocket thread)
@@ -136,8 +279,14 @@ private:
     /// Shared keeper to keep the connection alive
     //std::shared_ptr<base::shared_keeper<websocket_connection>> shared_keeper_;
 
-    /// Out queue
-    std::queue<std::pair<std::string, bool>> out_queue_;
+    /// Out queue: messages not written yet (the one being written is out of it)
+    std::deque<out_message> out_queue_;
+
+    /// A message is being written
+    bool message_in_flight_ = false;
+
+    /// Bytes queued against the write limits
+    write_flow flow_;
 
     /// Buffer for incoming data.
     boost::asio::streambuf buffer_{MAX_BUFFER_SIZE};
@@ -155,6 +304,18 @@ private:
     std::shared_ptr<taken_over_connection> tracking_;
 
     bool writing_ = false;
+
+    /// Reading paused (see pause_reading()), and the timer the read loop waits on meanwhile
+    bool paused_ = false;
+    boost::asio::steady_timer resume_timer_;
+
+    /// Started (start()), and released (release_socket())
+    bool started_ = false;
+    bool released_ = false;
+
+    /// Keepalive settings while suspended
+    std::chrono::milliseconds keepalive_ping_{0};
+    std::chrono::milliseconds keepalive_idle_{0};
 };
 
 }
