@@ -36,8 +36,9 @@ namespace thinger::asio {
 //   socket for its user right away; the closing handshake goes on by itself: the rest of a
 //   frame being written, a close frame (code 1000), and the connection closed once the peer
 //   answers or after CLOSE_TIMEOUT. Called while nothing runs the io_context (e.g. by a
-//   synchronous client), it closes the connection at once instead. close_graceful() does
-//   the handshake, waiting. A websocket destroyed open on its io_context closes with 1001.
+//   synchronous client), it closes the connection at once instead. close(code) does the same
+//   with another status code. close_graceful() does the handshake, waiting. A websocket
+//   destroyed open on its io_context closes with 1001.
 // - An optional keepalive pings the peer (one ping at a time) and closes the connection
 //   when it is idle (see set_keepalive()).
 // - Text is not validated as UTF-8 here, neither in text messages nor in close reasons:
@@ -62,6 +63,8 @@ public:
     static constexpr uint16_t CLOSE_NORMAL = 1000;
     static constexpr uint16_t CLOSE_GOING_AWAY = 1001;
     static constexpr uint16_t CLOSE_PROTOCOL_ERROR = 1002;
+    // IANA registry: the server sheds a client (e.g. one that does not keep up); it may retry
+    static constexpr uint16_t CLOSE_TRY_AGAIN_LATER = 1013;
 
     // `binary`: frames written are binary (otherwise text); `server`: the server role (frames
     // received must be masked, frames sent are not)
@@ -74,6 +77,9 @@ public:
         const std::string &port,
         std::chrono::seconds timeout) override;
     void close() override;
+    // Close the connection with `code`: the closing handshake on its own when called on the
+    // io_context, waiting for the close frame of the peer if `expect_reply`
+    void close(uint16_t code, bool expect_reply = true);
     // Send a close frame (waiting for a pending write), wait for the close frame of the peer
     // (up to CLOSE_TIMEOUT), and close
     awaitable<void> close_graceful(uint16_t code = CLOSE_NORMAL);
@@ -126,9 +132,11 @@ public:
 
     // Keepalive: ping the peer once nothing was received from it for `ping_interval`, and
     // close the connection once nothing was received for `idle_timeout` (pongs included).
-    // 0 disables each one; calling it again replaces the previous settings. Requires the
-    // websocket to be owned by a std::shared_ptr.
+    // 0 disables each one; calling it again replaces the previous settings, and counts the
+    // idle time from then. Requires the websocket to be owned by a std::shared_ptr.
     void set_keepalive(std::chrono::milliseconds ping_interval, std::chrono::milliseconds idle_timeout);
+    std::chrono::milliseconds get_ping_interval() const { return ping_interval_; }
+    std::chrono::milliseconds get_idle_timeout() const { return idle_timeout_; }
 
     // Keepalive of the message interface: ping after CONNECTION_TIMEOUT_SECONDS without
     // receiving anything, close after twice that
@@ -187,9 +195,6 @@ private:
     // Send the control frames queued, holding the turn
     awaitable<void> flush_control();
 
-    // Close the connection: the closing handshake on its own when called on the io_context,
-    // waiting for the close frame of the peer if `expect_reply`
-    void close(uint16_t code, bool expect_reply = true);
     void start_linger();
     // The rest of a frame and a close frame, the bytes still buffered and the payload
     // remaining of the frame being received: what the closing handshake needs once this

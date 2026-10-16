@@ -25,10 +25,11 @@ constexpr uint8_t OPCODE_PONG = 0xA;
 
 constexpr size_t MAX_CONTROL_PAYLOAD = 125;
 
-// Close codes that may be sent back (RFC 6455, 7.4)
+// Close codes that may be sent back (RFC 6455, 7.4, and the IANA registry up to 1014, as Node
+// ws and Go accept)
 bool valid_close_code(uint16_t code) {
     if (code >= 3000 && code <= 4999) return true;
-    return code >= 1000 && code <= 1011 && code != 1004 && code != 1005 && code != 1006;
+    return code >= 1000 && code <= 1014 && code != 1004 && code != 1005 && code != 1006;
 }
 
 // Mask keys must be unpredictable (RFC 6455, 5.3): taken from the CSPRNG of OpenSSL (a few
@@ -671,6 +672,7 @@ void websocket::set_keepalive(std::chrono::milliseconds ping_interval, std::chro
     }
     keepalive_timer_ = std::make_shared<boost::asio::steady_timer>(io_context_);
     last_ping_ = {};
+    last_received_ = std::chrono::steady_clock::now();
 
     co_spawn(io_context_, [weak, timer = keepalive_timer_, generation]() -> awaitable<void> {
         using clock = std::chrono::steady_clock;
