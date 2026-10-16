@@ -35,7 +35,7 @@ namespace thinger::http{
  * on_low_watermark(), pause_reading(), resume_reading(), stop(), execute(), and the
  * queued_bytes() and queued_messages() getters (relaxed atomics, as Node's bufferedAmount).
  * On the thread of the websocket only (e.g. from its callbacks, or execute()):
- * get_write_limits(), queue_full(), congested_connection(), is_reading_paused() and
+ * get_write_limits(), queue_full(), is_reading_paused() and
  * release_socket(); on_message() and on_shutdown() are set before it starts (in the handler
  * that accepts it).
  */
@@ -114,11 +114,6 @@ public:
      * waiting. Not the watermark state (see wait_writable())
      */
     bool queue_full() const;
-
-    /**
-     * Deprecated: queue_full()
-     */
-    bool congested_connection();
 
     /**
      * Send a text frame over connection, without waiting: queued, or handled by the overflow

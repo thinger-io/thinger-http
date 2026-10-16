@@ -439,7 +439,7 @@ TEST_CASE("WebSocket overflow policies", "[websocket][flow][integration]") {
             limits = ws->get_write_limits();
             // queued at once (the first one may be being written, still counted)
             for (uint32_t i = 0; i < 150; ++i) ws->send_text(indexed(i, 10));
-            congested = ws->queue_full() && ws->congested_connection();
+            congested = ws->queue_full();
         };
         REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
         created.get_future().get();

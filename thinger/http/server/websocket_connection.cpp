@@ -328,10 +328,6 @@ namespace thinger::http{
         return flow_.overflows(1);
     }
 
-    bool websocket_connection::congested_connection(){
-        return queue_full();
-    }
-
     void websocket_connection::send_binary(std::string data){
         execute([this, data = std::move(data)]() mutable {
             push_message(std::move(data), true);

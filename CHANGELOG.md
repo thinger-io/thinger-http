@@ -11,7 +11,7 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 - Flow control for the server WebSocket (`websocket_connection`) and SSE (`sse_connection`) connections, for streams between a fast and a slow end. See [WebSocket Flow Control](README.md#websocket-flow-control).
   - `send_text_async()` and `send_binary_async()`: awaitable sends that complete once the message is written to the socket (never dropped).
-  - `set_write_limits()` with a `http::write_limits`: limits of the queue in messages and in bytes, high and low watermarks (`on_high_watermark()`, `on_low_watermark()`, told asynchronously, and `wait_writable()`), the overflow policy of the messages sent without waiting: `drop_newest` (the default, as before), `drop_oldest`, or `close` (WebSocket `1013 Try Again Later`), and an optional `write_timeout` closing a client that stops reading. `queued_bytes()` and `queued_messages()` (atomic, readable from any thread) tell what is not written yet; `queue_full()` replaces `congested_connection()`, which stays. SSE drops whole events.
+  - `set_write_limits()` with a `http::write_limits`: limits of the queue in messages and in bytes, high and low watermarks (`on_high_watermark()`, `on_low_watermark()`, told asynchronously, and `wait_writable()`), the overflow policy of the messages sent without waiting: `drop_newest` (the default, as before), `drop_oldest`, or `close` (WebSocket `1013 Try Again Later`), and an optional `write_timeout` closing a client that stops reading. `queued_bytes()` and `queued_messages()` (atomic, readable from any thread) tell what is not written yet; `queue_full()` tells whether the next message overflows. SSE drops whole events.
   - `pause_reading()` and `resume_reading()`: a WebSocket stops reading its socket, so TCP backpressure reaches the client, and goes on in order. The keepalive is suspended while paused.
 - `asio::websocket::close(code)` is public, with `CLOSE_TRY_AGAIN_LATER` (1013), `CLOSE_INVALID_PAYLOAD` (1007) and `CLOSE_MESSAGE_TOO_BIG` (1009); codes that may not be sent (1005, 1006, 1015...) are sent as 1000. `get_ping_interval()`/`get_idle_timeout()` tell the keepalive settings.
 - Benchmarks `benchmark_ws_echo` (echo throughput) and `benchmark_ws_slow_reader` (memory with a slow reader, by producer mode).
@@ -22,6 +22,10 @@ All notable changes to thinger-http are documented in this file. The format foll
 - Received close codes 1012 to 1014 (IANA registry) are valid, as in Node ws and Go: they were answered as a protocol error (1002).
 - A server WebSocket whose write fails is closed, and the messages queued are discarded, instead of being kept until the connection was released.
 - A server WebSocket receiving invalid UTF-8 text closes with `1007`, and one receiving a message larger than its buffer with `1009`, instead of only stopping to read.
+
+### Removed
+
+- `websocket_connection::congested_connection()`: use `queue_full()`.
 
 ## [0.3.0] - 2026-10-14
 
