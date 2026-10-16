@@ -16,24 +16,19 @@ namespace thinger::http{
 
 /**
  * A Server-Sent Events stream. Each field sent (send_event(), send_data(), send_retry()) is
- * queued without waiting, and the queue has the flow control of websocket_connection (see
- * flow_control.hpp): limits counted in fields, an overflow policy (drop_newest by default;
- * drop_oldest drops whole events, never one partly written; close closes the connection, and
- * EventSource reconnects), a write timeout, queued_bytes(), watermarks and wait_writable().
+ * queued without waiting, with the flow control of websocket_connection (see write_limits),
+ * counted in fields. drop_oldest drops whole events; close closes, and EventSource reconnects.
  *
- * Threads. From any thread: the send_*() calls, stop(), wait_writable(), set_write_limits(),
- * on_high_watermark(), on_low_watermark(), and the queued_bytes() and queued_messages()
- * getters (relaxed atomics). On the thread of the connection only: get_write_limits();
- * on_shutdown() is set in the handler that accepts it.
+ * Threads. From any thread: send_*(), stop(), wait_writable(), set_write_limits(),
+ * on_high_watermark(), on_low_watermark(), queued_bytes() and queued_messages(). On the
+ * connection thread only: get_write_limits(). on_shutdown() is set in the handler that
+ * accepts it.
  */
 class sse_connection : public std::enable_shared_from_this<sse_connection>, public boost::noncopyable{
 
 public:
 
-    /**
-     * Parameter for controlling the maximum number of pending messages stored
-     * in the output queue: by default, up to one more field is queued (see set_write_limits())
-     */
+    /// Default limit of the queue, in fields (max_messages is one more)
     static const int MAX_OUTPUT_MESSAGES = 100;
 
     sse_connection(std::shared_ptr<asio::socket> socket) :
@@ -78,23 +73,23 @@ private:
 
     void process_out_queue();
 
-    // Write the fields queued, one at a time (`self` keeps the connection alive)
+    /// Write the fields queued, one at a time (`self` keeps the connection alive)
     awaitable<void> write_loop(std::shared_ptr<sse_connection> self);
 
-    // Queue a field, applying the overflow policy if the queue is full
+    /// Queue a field, or apply the overflow policy
     void push_field(out_field field);
 
-    // Drop the oldest whole events queued until a field of `size` bytes fits: false if it does
-    // not fit even so
+    /// Drop the oldest whole events, not the one being written, until a field of `size` bytes
+    /// fits: false if it does not fit even so
     bool drop_oldest(size_t size);
 
-    // Past the end of the event `it` is in: its data field (or the end of the queue)
+    /// Past the end of the event `it` is in: its data field (or the end of the queue)
     std::deque<out_field>::iterator next_event(std::deque<out_field>::iterator it);
 
-    // Close the connection (on its thread)
+    /// Close the connection (on its thread)
     void close();
 
-    // Taken over from a server: told when it shuts down
+    /// Taken over from a server: told when it shuts down
     void track_shutdown();
 
 public:
@@ -110,12 +105,9 @@ public:
         });
     }
 
-    /**
-     * Set what to do when the server shuts down gracefully (see http_server_base::shutdown()),
-     * on the connection thread: e.g. send a last event and stop(). By default the connection
-     * is closed (clients reconnect). Whatever is open at the end of the grace period is closed
-     * anyway
-     */
+    /// What to do when the server shuts down gracefully (see http_server_base::shutdown()),
+    /// e.g. send a last event and stop(). By default it closes (clients reconnect); whatever
+    /// is open at the end of the grace period is closed anyway
     void on_shutdown(sync_callback<void()> callback){
         on_shutdown_callback_ = std::move(callback);
     }
@@ -134,37 +126,25 @@ public:
 
     void handle_write(const std::string& type, const std::string& value);
 
-    /**
-     * Limits of the queue (in fields), watermarks and overflow policy (see write_limits)
-     */
     void set_write_limits(const write_limits& limits);
     write_limits get_write_limits() const { return flow_.limits(); }
 
-    /**
-     * Bytes, and fields, queued and not written yet (the one being written included)
-     */
+    /// Bytes, and fields, not written yet (the one being written included)
     size_t queued_bytes() const { return flow_.queued_bytes(); }
     size_t queued_messages() const { return flow_.queued_messages(); }
 
-    /**
-     * Told when the bytes queued reach the high watermark, and when they drain to the low
-     * watermark after that: posted to the thread of the connection (never from within a
-     * send), and not once it is closed
-     */
+    /// The watermarks crossed (see write_limits); not told once the connection is closed
     void on_high_watermark(sync_callback<void()> callback);
     void on_low_watermark(sync_callback<void()> callback);
 
-    /**
-     * Wait while the queue is above its high watermark, until it drains to the low one: true,
-     * or false if the connection closed. Right away if it is not congested
-     */
+    /// Wait while above the high watermark, until drained to the low one: true, or false if
+    /// the connection closed
     awaitable<bool> wait_writable();
 
 private:
-    /// Socket being used HTTP connection
     std::shared_ptr<asio::socket> socket_;
 
-    /// Out queue: fields not written yet (the one being written is out of it)
+    /// Fields not written yet (the one being written is out of it)
     std::deque<out_field> out_queue_;
 
     bool writing_ = false;
@@ -173,7 +153,7 @@ private:
     /// belong to it
     bool event_open_ = false;
 
-    /// Timer used for controlling HTTP timeout
+    /// Closes the connection when nothing is written for 60 seconds
     boost::asio::steady_timer timer_;
 
     bool idle_;
@@ -181,7 +161,6 @@ private:
     /// Bytes queued against the write limits
     write_flow flow_;
 
-    /// Server shutdown callback
     sync_callback<void()> on_shutdown_callback_;
 
     /// The server tracking this connection, if any (see connection_tracker.hpp)
