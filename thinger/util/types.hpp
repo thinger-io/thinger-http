@@ -3,6 +3,7 @@
 
 #include <concepts>
 #include <functional>
+#include <memory>
 #include <type_traits>
 #include <boost/asio.hpp>
 #include <boost/asio/awaitable.hpp>
@@ -58,6 +59,21 @@ namespace thinger {
         } else {
             std::invoke(callback, std::forward<Args>(args)...);
         }
+    }
+
+    // `operation`, keeping `keeper` alive until it ends
+    template<typename T>
+    awaitable<T> kept_alive(std::shared_ptr<void> keeper, awaitable<T> operation) {
+        co_return co_await std::move(operation);
+    }
+
+    // Run `operation` on the thread of `io_context`, resuming the caller where it was. The
+    // operation keeps `keeper` (the object it uses) alive, also if the caller goes away
+    template<typename T>
+    awaitable<T> on_io_context(boost::asio::io_context& io_context, std::shared_ptr<void> keeper,
+                               awaitable<T> operation) {
+        if (io_context.get_executor().running_in_this_thread()) co_return co_await std::move(operation);
+        co_return co_await co_spawn(io_context, kept_alive(std::move(keeper), std::move(operation)), use_awaitable);
     }
 
     // A std::function for callbacks that are called, never awaited: it does not take a
