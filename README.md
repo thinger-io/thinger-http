@@ -1774,6 +1774,29 @@ thinger::logging::set_logger(logger);
 | `critical` | Critical errors |
 | `off` | Disable logging |
 
+### What the Message Logs Show
+
+The client and the server log each request and response: the request line or the status (`info`), the header names (`debug`) and the body size (`trace`). Header values, bodies and WebSocket messages are never logged by default, as they may hold credentials: tokens, cookies, passwords, private keys.
+
+For debugging, `log_bodies()` also logs the header values (`debug`) and the start of the bodies (`trace`), up to a maximum length, with control characters escaped. The values of `Authorization`, `Proxy-Authorization`, `Cookie` and `Set-Cookie` are redacted even then, and WebSocket messages are still logged by their size alone.
+
+```cpp
+http::server server;
+server.log_bodies(true, 512);      // for the connections accepted from now on
+
+http::client client;
+client.log_bodies(true, 512);      // fluent, as the other client settings
+```
+
+```text
+[CLIENT->] POST /login
+Headers:
+  Authorization: [redacted]
+  Content-Type: application/json
+Body: 1834 bytes
+  {"user":"alice","note":"..."}... (1322 more bytes)
+```
+
 ## Build Options
 
 | CMake Option | Default | Description |
