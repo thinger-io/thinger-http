@@ -22,16 +22,22 @@ namespace thinger::http{
  *
  * Flow control, for streams between a fast and a slow end (see flow_control.hpp):
  * - Sending: the queue holds up to 100 messages by default, and drops the newest message sent
- *   to a full queue (set_write_limits() changes the limits and the overflow policy).
- *   queued_bytes() tells what is not written yet; the watermarks call on_high_watermark() and
- *   on_low_watermark(), and wait_writable() waits for the queue to drain. A producer awaiting
- *   send_*_async() has one message queued at a time, and goes at the pace of the peer.
+ *   to a full queue (set_write_limits() changes the limits, the overflow policy and the write
+ *   timeout). queued_bytes() tells what is not written yet; the watermarks notify
+ *   on_high_watermark() and on_low_watermark(), and wait_writable() waits for the queue to
+ *   drain. A producer awaiting send_*_async() has one message queued at a time, and goes at
+ *   the pace of the peer.
  * - Receiving: pause_reading() stops reading the socket, so the TCP window of the peer fills
  *   and its writes block, until resume_reading().
  *
- * Callbacks run on the thread of the websocket; the other calls may come from any thread,
- * except the getters (queued_bytes()...), and set_write_limits() and the callback setters,
- * which are meant for the handler that accepts the websocket, or execute().
+ * Threads. Callbacks run on the thread of the websocket. From any thread: send_text(),
+ * send_binary(), send_*_async(), wait_writable(), set_write_limits(), on_high_watermark(),
+ * on_low_watermark(), pause_reading(), resume_reading(), stop(), execute(), and the
+ * queued_bytes() and queued_messages() getters (relaxed atomics, as Node's bufferedAmount).
+ * On the thread of the websocket only (e.g. from its callbacks, or execute()):
+ * get_write_limits(), queue_full(), congested_connection(), is_reading_paused() and
+ * release_socket(); on_message() and on_shutdown() are set before it starts (in the handler
+ * that accepts it).
  */
 class websocket_connection : public std::enable_shared_from_this<websocket_connection>{
 
@@ -104,8 +110,13 @@ public:
     void stop();
 
     /**
-     *
-     * @return true if the queue is full: the overflow policy applies to the next message sent
+     * Whether the queue is full: the overflow policy applies to the next message sent without
+     * waiting. Not the watermark state (see wait_writable())
+     */
+    bool queue_full() const;
+
+    /**
+     * Deprecated: queue_full()
      */
     bool congested_connection();
 
@@ -138,7 +149,7 @@ public:
      * Limits of the queue, watermarks and overflow policy (see write_limits)
      */
     void set_write_limits(const write_limits& limits);
-    const write_limits& get_write_limits() const;
+    write_limits get_write_limits() const;
 
     /**
      * Payload bytes, and messages, queued and not written yet (the one being written included)
@@ -147,8 +158,9 @@ public:
     size_t queued_messages() const;
 
     /**
-     * Called when the bytes queued reach the high watermark, and when they drain to the low
-     * watermark after that
+     * Told when the bytes queued reach the high watermark, and when they drain to the low
+     * watermark after that: posted to the thread of the websocket (never from within a send),
+     * and not once it is closing
      */
     void on_high_watermark(sync_callback<void()> callback);
     void on_low_watermark(sync_callback<void()> callback);
@@ -162,10 +174,13 @@ public:
     /**
      * Stop reading from the socket, from the next read on: messages already received are
      * delivered, nothing else is read, and the peer's writes block once the TCP buffers fill.
-     * Writes go on. While paused, pings and the close frame of the peer are not seen (as in
-     * any WebSocket not read: the peer may time out), and the keepalive is suspended, as its
-     * pongs could not be read. stop() still closes it: the closing handshake reads up to the
-     * close frame of the peer, discarding the messages before it
+     * Called on the thread of the websocket (e.g. from on_message()) no other message is
+     * delivered; from another thread, one more may be. Writes go on. While paused, pings and
+     * the close frame of the peer are not seen (as in any WebSocket not read: the peer may
+     * time out), and the keepalive is suspended, as its pongs could not be read: a dead peer
+     * is not noticed until reading resumes, so bound the pause, or set a write_timeout (see
+     * write_limits) for a peer that stops reading too. stop() still closes it: the closing
+     * handshake reads up to the close frame of the peer, discarding the messages before it
      */
     void pause_reading();
 
@@ -240,9 +255,20 @@ private:
     bool make_room(size_t size);
 
     /**
-     * Drop the oldest messages that may be dropped until one of `size` bytes fits
+     * Drop the oldest messages that may be dropped until one of `size` bytes fits: false if
+     * it does not fit even so
      */
-    void drop_oldest(size_t size);
+    bool drop_oldest(size_t size);
+
+    /**
+     * Watch the write starting, with a write timeout
+     */
+    void watch_write();
+
+    /**
+     * Close a websocket that does not keep up: 1013 (Try Again Later)
+     */
+    void close_congested(const char* reason);
 
     /**
      * Queue a message, and start writing if needed
@@ -281,9 +307,6 @@ private:
 
     /// Out queue: messages not written yet (the one being written is out of it)
     std::deque<out_message> out_queue_;
-
-    /// A message is being written
-    bool message_in_flight_ = false;
 
     /// Bytes queued against the write limits
     write_flow flow_;

@@ -1,7 +1,10 @@
 #ifndef THINGER_HTTP_SERVER_FLOW_CONTROL_HPP
 #define THINGER_HTTP_SERVER_FLOW_CONTROL_HPP
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <memory>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include "../../util/types.hpp"
@@ -22,15 +25,21 @@ namespace thinger::http {
      * The queue holds what is not written yet, the message being written included. It is full
      * when another message would go over `max_messages`, or over `max_bytes` of payload (an
      * empty queue takes a message of any size); 0 disables each limit. Messages sent without
-     * waiting to a full queue are handled by `policy`: drop_oldest never drops the message
+     * waiting to a full queue are handled by `policy`. drop_oldest never drops the message
      * being written, nor those a sender is waiting for (send_text_async()), nor the fields of
-     * an SSE event already being written.
+     * an SSE event already being written; when that is not enough, the new message is dropped
+     * instead, so the limits hold.
      *
-     * The watermarks tell a producer when to stop and when to go on, as the highWaterMark and
-     * the 'drain' event of Node streams: once the bytes queued reach `high_watermark`, the
-     * connection is congested until they drain to `low_watermark` (on_high_watermark() and
-     * on_low_watermark() are called once per cycle, and wait_writable() waits meanwhile). A
+     * The watermarks tell a producer when to stop and when to go on, as Netty's
+     * WriteBufferWaterMark and isWritable(): once the bytes queued reach `high_watermark`, the
+     * connection is not writable until they drain to `low_watermark`. on_high_watermark() and
+     * on_low_watermark() are told once per cycle, asynchronously (posted to the connection's
+     * thread, never from within a send), and wait_writable() waits meanwhile. A
      * `high_watermark` of 0 disables them.
+     *
+     * `write_timeout` (0, off, by default): a message whose write to the socket does not
+     * complete within it closes the connection (a WebSocket with 1013), as a client that
+     * stopped reading; awaited sends and wait_writable() then complete with false.
      */
     struct write_limits {
         size_t max_messages = 100;
@@ -38,62 +47,101 @@ namespace thinger::http {
         size_t high_watermark = 0;
         size_t low_watermark = 0;
         overflow_policy policy = overflow_policy::drop_newest;
+        std::chrono::milliseconds write_timeout{0};
     };
 
     /**
-     * Accounting of the bytes queued by a connection against its write_limits: watermark
-     * callbacks, and producers waiting for the queue to drain. On the thread of the connection.
+     * Accounting of the messages queued by a connection against its write_limits: watermark
+     * notifications, producers waiting for the queue to drain, and the write timeout. On the
+     * thread of the connection, except queued_bytes() and queued_messages(), which may be read
+     * from any thread.
      */
     class write_flow {
     public:
         explicit write_flow(boost::asio::io_context& io_context, write_limits limits = {});
+        ~write_flow();
 
+        write_flow(const write_flow&) = delete;
+        write_flow& operator=(const write_flow&) = delete;
+
+        /// New limits, the watermark state re-evaluated with them
         void set_limits(const write_limits& limits);
         const write_limits& limits() const { return limits_; }
 
-        /// Whether a message of `size` bytes goes over the limits of a queue holding `messages`
-        bool overflows(size_t messages, size_t size) const;
+        /// Whether a message of `size` bytes goes over the limits, once `dropped_bytes` and
+        /// `dropped_messages` are out of the queue
+        bool overflows(size_t size, size_t dropped_bytes = 0, size_t dropped_messages = 0) const;
 
         /// A message of `size` bytes is queued (may reach the high watermark)
         void add(size_t size);
 
-        /// A message of `size` bytes is written or dropped (may drain to the low watermark)
-        void remove(size_t size);
+        /// `messages` of `bytes` in all are written or dropped (may drain to the low watermark)
+        void remove(size_t bytes, size_t messages = 1);
 
-        size_t queued_bytes() const { return queued_bytes_; }
+        /// Nothing is queued anymore (no notification): once closed
+        void clear();
+
+        size_t queued_bytes() const { return queued_bytes_.load(std::memory_order_relaxed); }
+        size_t queued_messages() const { return queued_messages_.load(std::memory_order_relaxed); }
 
         /// Above the high watermark, not drained to the low one yet
         bool congested() const { return congested_; }
 
-        void on_high_watermark(sync_callback<void()> callback) { on_high_ = std::move(callback); }
-        void on_low_watermark(sync_callback<void()> callback) { on_low_ = std::move(callback); }
+        void on_high_watermark(sync_callback<void()> callback);
+        void on_low_watermark(sync_callback<void()> callback);
 
         /// Wait while congested: true once drained, false if the connection closed (or the
         /// wait was cancelled)
         awaitable<bool> wait_writable();
 
-        /// The connection closed: waits end, and the callbacks are released
+        /// The write of a message starts: with a write timeout, `on_timeout` is called if it
+        /// does not finish in time. And it finishes
+        void write_started(sync_callback<void()> on_timeout);
+        void write_finished();
+
+        /// The connection closed: waits end, notifications pending are dropped, and the
+        /// callbacks are released
         void close();
         bool closed() const { return closed_; }
 
     private:
-        static void notify(const sync_callback<void()>& callback);
+        /// Shared with the notifications posted and the write timer, which may outlive this
+        struct shared_state {
+            bool closed = false;
+            uint64_t write_generation = 0;
+            sync_callback<void()> on_high;
+            sync_callback<void()> on_low;
+        };
 
+        void update_watermarks();
+        void notify(bool high);
+
+        boost::asio::io_context& io_context_;
+        std::shared_ptr<shared_state> state_;
         write_limits limits_;
-        size_t queued_bytes_ = 0;
+        std::atomic<size_t> queued_bytes_{0};
+        std::atomic<size_t> queued_messages_{0};
         bool congested_ = false;
         bool closed_ = false;
+        bool write_watched_ = false;
         /// Never expires: cancelled to wake the producers waiting
         boost::asio::steady_timer drained_;
-        sync_callback<void()> on_high_;
-        sync_callback<void()> on_low_;
+        boost::asio::steady_timer write_timer_;
     };
 
-    /// Run `operation` on the thread of `io_context`, resuming the caller where it was
+    /// `operation`, keeping `keeper` alive until it ends
     template<typename T>
-    awaitable<T> on_io_context(boost::asio::io_context& io_context, awaitable<T> operation) {
+    awaitable<T> kept_alive(std::shared_ptr<void> keeper, awaitable<T> operation) {
+        co_return co_await std::move(operation);
+    }
+
+    /// Run `operation` on the thread of `io_context`, resuming the caller where it was. The
+    /// operation keeps `keeper` (the connection it uses) alive, also if the caller goes away
+    template<typename T>
+    awaitable<T> on_io_context(boost::asio::io_context& io_context, std::shared_ptr<void> keeper,
+                               awaitable<T> operation) {
         if (io_context.get_executor().running_in_this_thread()) co_return co_await std::move(operation);
-        co_return co_await co_spawn(io_context, std::move(operation), use_awaitable);
+        co_return co_await co_spawn(io_context, kept_alive(std::move(keeper), std::move(operation)), use_awaitable);
     }
 
 }

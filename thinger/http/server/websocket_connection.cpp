@@ -121,7 +121,10 @@ namespace thinger::http{
             if(remaining == 0){
 
                 // is the message complete ? FIN flag is set
-                if(ws_->is_message_complete() && !deliver_message()) co_return;
+                if(ws_->is_message_complete() && !deliver_message()){
+                    ws_->close(asio::websocket::CLOSE_INVALID_PAYLOAD);
+                    co_return;
+                }
 
                 next_read_size = DEFAULT_BUFFER_SIZE;
 
@@ -129,6 +132,7 @@ namespace thinger::http{
                 // check if the buffer is not going to overflow
                 if(buffer_.size() + remaining > buffer_.max_size()){
                     LOG_ERROR("websocket buffer overflow. closing connection");
+                    ws_->close(asio::websocket::CLOSE_MESSAGE_TOO_BIG);
                     co_return;
                 }
 
@@ -218,12 +222,12 @@ namespace thinger::http{
             LOG_LEVEL(2, "handling websocket write, remaining in queue: {}", out_queue_.size());
             auto message = std::move(out_queue_.front());
             out_queue_.pop_front();
-            message_in_flight_ = true;
             ws_->set_binary(message.binary);
 
+            watch_write();
             auto [write_ec, write_bytes] = co_await ws_->write(std::string_view(message.data));
+            flow_.write_finished();
 
-            message_in_flight_ = false;
             flow_.remove(message.data.size());
             if(message.waiter) message.waiter->finish(!write_ec);
 
@@ -246,13 +250,30 @@ namespace thinger::http{
 
     void websocket_connection::discard_queue()
     {
+        // closed first: nobody is told the queue drained
+        flow_.close();
         auto discarded = std::move(out_queue_);
         out_queue_.clear();
+        flow_.clear();
         for(auto& message : discarded){
-            flow_.remove(message.data.size());
             if(message.waiter) message.waiter->finish(false);
         }
-        flow_.close();
+    }
+
+    void websocket_connection::watch_write()
+    {
+        if(flow_.limits().write_timeout.count() <= 0) return;
+        flow_.write_started([weak = weak_from_this()]{
+            if(auto self = weak.lock()) self->close_congested("its write timed out");
+        });
+    }
+
+    void websocket_connection::close_congested(const char* reason)
+    {
+        if(!ws_->is_open()) return;
+        LOG_WARNING("closing websocket: {}", reason);
+        ws_->close(asio::websocket::CLOSE_TRY_AGAIN_LATER);
+        wake_reader();
     }
 
     std::shared_ptr<asio::socket> websocket_connection::release_socket(){
@@ -303,8 +324,12 @@ namespace thinger::http{
         });
     }
 
+    bool websocket_connection::queue_full() const{
+        return flow_.overflows(1);
+    }
+
     bool websocket_connection::congested_connection(){
-        return flow_.overflows(queued_messages(), 1);
+        return queue_full();
     }
 
     void websocket_connection::send_binary(std::string data){
@@ -321,7 +346,7 @@ namespace thinger::http{
 
     void websocket_connection::push_message(std::string data, bool binary){
         // a full queue: the overflow policy decides
-        if(flow_.overflows(queued_messages(), data.size()) && !make_room(data.size())) return;
+        if(flow_.overflows(data.size()) && !make_room(data.size())) return;
 
         LOG_LEVEL(2, "adding frame to websocket queue");
         enqueue(out_message{std::move(data), binary, nullptr});
@@ -330,13 +355,11 @@ namespace thinger::http{
     bool websocket_connection::make_room(size_t size){
         switch(flow_.limits().policy){
             case overflow_policy::drop_oldest:
-                drop_oldest(size);
-                return true;
+                // not enough to drop: the newest message goes instead
+                if(drop_oldest(size)) return true;
+                break;
             case overflow_policy::close:
-                if(!ws_->is_open()) return false;
-                LOG_WARNING("websocket is congested. closing it");
-                ws_->close(asio::websocket::CLOSE_TRY_AGAIN_LATER);
-                wake_reader();
+                close_congested("it is congested");
                 return false;
             case overflow_policy::drop_newest:
                 break;
@@ -345,18 +368,24 @@ namespace thinger::http{
         return false;
     }
 
-    void websocket_connection::drop_oldest(size_t size){
+    bool websocket_connection::drop_oldest(size_t size){
+        size_t bytes = 0;
+        size_t messages = 0;
         auto it = out_queue_.begin();
-        while(it != out_queue_.end() && flow_.overflows(queued_messages(), size)){
+        while(it != out_queue_.end() && flow_.overflows(size, bytes, messages)){
             // a sender waits for it: never dropped
             if(it->waiter){
                 ++it;
                 continue;
             }
             LOG_LEVEL(2, "websocket is congested. discarding the oldest message");
-            flow_.remove(it->data.size());
+            bytes += it->data.size();
+            ++messages;
             it = out_queue_.erase(it);
         }
+        // accounted for once the queue is consistent
+        flow_.remove(bytes, messages);
+        return !flow_.overflows(size);
     }
 
     void websocket_connection::enqueue(out_message message){
@@ -372,25 +401,22 @@ namespace thinger::http{
     }
 
     awaitable<bool> websocket_connection::send_text_async(std::string text){
-        auto self = shared_from_this();
-        co_return co_await on_io_context(ws_->get_io_context(), send_async(std::move(text), false));
+        return on_io_context(ws_->get_io_context(), shared_from_this(), send_async(std::move(text), false));
     }
 
     awaitable<bool> websocket_connection::send_binary_async(std::string data){
-        auto self = shared_from_this();
-        co_return co_await on_io_context(ws_->get_io_context(), send_async(std::move(data), true));
+        return on_io_context(ws_->get_io_context(), shared_from_this(), send_async(std::move(data), true));
     }
 
     awaitable<bool> websocket_connection::wait_writable(){
-        auto self = shared_from_this();
-        co_return co_await on_io_context(ws_->get_io_context(), flow_.wait_writable());
+        return on_io_context(ws_->get_io_context(), shared_from_this(), flow_.wait_writable());
     }
 
     void websocket_connection::set_write_limits(const write_limits& limits){
-        flow_.set_limits(limits);
+        execute([this, limits]{ flow_.set_limits(limits); });
     }
 
-    const write_limits& websocket_connection::get_write_limits() const{
+    write_limits websocket_connection::get_write_limits() const{
         return flow_.limits();
     }
 
@@ -399,15 +425,15 @@ namespace thinger::http{
     }
 
     size_t websocket_connection::queued_messages() const{
-        return out_queue_.size() + (message_in_flight_ ? 1 : 0);
+        return flow_.queued_messages();
     }
 
     void websocket_connection::on_high_watermark(sync_callback<void()> callback){
-        flow_.on_high_watermark(std::move(callback));
+        execute([this, callback = std::move(callback)]() mutable { flow_.on_high_watermark(std::move(callback)); });
     }
 
     void websocket_connection::on_low_watermark(sync_callback<void()> callback){
-        flow_.on_low_watermark(std::move(callback));
+        execute([this, callback = std::move(callback)]() mutable { flow_.on_low_watermark(std::move(callback)); });
     }
 
 }

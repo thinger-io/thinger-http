@@ -19,7 +19,12 @@ namespace thinger::http{
  * queued without waiting, and the queue has the flow control of websocket_connection (see
  * flow_control.hpp): limits counted in fields, an overflow policy (drop_newest by default;
  * drop_oldest drops whole events, never one partly written; close closes the connection, and
- * EventSource reconnects), queued_bytes(), watermarks and wait_writable().
+ * EventSource reconnects), a write timeout, queued_bytes(), watermarks and wait_writable().
+ *
+ * Threads. From any thread: the send_*() calls, stop(), wait_writable(), set_write_limits(),
+ * on_high_watermark(), on_low_watermark(), and the queued_bytes() and queued_messages()
+ * getters (relaxed atomics). On the thread of the connection only: get_write_limits();
+ * on_shutdown() is set in the handler that accepts it.
  */
 class sse_connection : public std::enable_shared_from_this<sse_connection>, public boost::noncopyable{
 
@@ -82,8 +87,18 @@ private:
     // Make room for a field of `size` bytes in a full queue: false if it is discarded
     bool make_room(size_t size);
 
-    // Drop the oldest whole events queued until a field of `size` bytes fits
-    void drop_oldest(size_t size);
+    // Drop the oldest whole events queued until a field of `size` bytes fits: false if it does
+    // not fit even so
+    bool drop_oldest(size_t size);
+
+    // Past the end of the event `it` is in: its data field (or the end of the queue)
+    std::deque<out_field>::iterator next_event(std::deque<out_field>::iterator it);
+
+    // Watch the write starting, with a write timeout
+    void watch_write();
+
+    // Run `callback` on the thread of the connection
+    void execute(sync_callback<void()> callback);
 
     // Close the connection (on its thread)
     void close();
@@ -131,21 +146,22 @@ public:
     /**
      * Limits of the queue (in fields), watermarks and overflow policy (see write_limits)
      */
-    void set_write_limits(const write_limits& limits){ flow_.set_limits(limits); }
-    const write_limits& get_write_limits() const { return flow_.limits(); }
+    void set_write_limits(const write_limits& limits);
+    write_limits get_write_limits() const { return flow_.limits(); }
 
     /**
      * Bytes, and fields, queued and not written yet (the one being written included)
      */
     size_t queued_bytes() const { return flow_.queued_bytes(); }
-    size_t queued_messages() const { return out_queue_.size() + (field_in_flight_ ? 1 : 0); }
+    size_t queued_messages() const { return flow_.queued_messages(); }
 
     /**
-     * Called when the bytes queued reach the high watermark, and when they drain to the low
-     * watermark after that
+     * Told when the bytes queued reach the high watermark, and when they drain to the low
+     * watermark after that: posted to the thread of the connection (never from within a
+     * send), and not once it is closed
      */
-    void on_high_watermark(sync_callback<void()> callback){ flow_.on_high_watermark(std::move(callback)); }
-    void on_low_watermark(sync_callback<void()> callback){ flow_.on_low_watermark(std::move(callback)); }
+    void on_high_watermark(sync_callback<void()> callback);
+    void on_low_watermark(sync_callback<void()> callback);
 
     /**
      * Wait while the queue is above its high watermark, until it drains to the low one: true,
@@ -161,9 +177,6 @@ private:
     std::deque<out_field> out_queue_;
 
     bool writing_ = false;
-
-    /// A field is being written
-    bool field_in_flight_ = false;
 
     /// The last field taken for writing left its event open: the fields up to its data
     /// belong to it
