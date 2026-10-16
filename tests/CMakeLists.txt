@@ -290,6 +290,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/body_decoders_test.cpp)
     add_thinger_test(test_integration_body_decoders integration/body_decoders_test.cpp)
 endif()
 
+# Integration tests - Logging of the messages
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/body_logging_test.cpp)
+    add_thinger_test(test_integration_body_logging integration/body_logging_test.cpp)
+endif()
+
 # Integration tests - Virtual hosts
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/virtual_host_test.cpp)
     add_thinger_test(test_integration_virtual_host integration/virtual_host_test.cpp)
