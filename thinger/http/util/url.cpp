@@ -1,4 +1,5 @@
 #include "url.hpp"
+#include <array>
 
 namespace thinger::http::util::url{
 
@@ -127,6 +128,68 @@ namespace thinger::http::util::url{
             first = false;
         }
         return result;
+    }
+
+    namespace {
+
+        constexpr std::string_view redacted = "[redacted]";
+
+        bool is_credential_parameter(std::string_view name) {
+            static constexpr std::array<std::string_view, 8> names{
+                "access_token", "authorization", "token", "api_key", "apikey", "key", "password", "client_secret"};
+            return std::any_of(names.begin(), names.end(), [&](std::string_view candidate) {
+                return candidate.size() == name.size() &&
+                       std::equal(candidate.begin(), candidate.end(), name.begin(), [](char a, char b) {
+                           return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+                       });
+            });
+        }
+
+        // "scheme://user:password@host...": the password redacted
+        std::string redact_user_info(std::string_view uri) {
+            auto scheme_end = uri.find("://");
+            if (scheme_end == std::string_view::npos) return std::string(uri);
+            auto authority_start = scheme_end + 3;
+            auto authority_end = uri.find_first_of("/?#", authority_start);
+            auto authority = uri.substr(authority_start, authority_end == std::string_view::npos ? std::string_view::npos
+                                                                                                   : authority_end - authority_start);
+            auto at = authority.rfind('@');
+            if (at == std::string_view::npos) return std::string(uri);
+            auto colon = authority.substr(0, at).find(':');
+            if (colon == std::string_view::npos) return std::string(uri);
+            std::string out(uri.substr(0, authority_start + colon + 1));
+            out += redacted;
+            out += uri.substr(authority_start + at);
+            return out;
+        }
+
+    }
+
+    std::string loggable_uri(std::string_view uri) {
+        auto query = uri.find('?');
+        if (query == std::string_view::npos) return redact_user_info(uri);
+        auto fragment = uri.find('#', query);
+        auto query_end = fragment == std::string_view::npos ? uri.size() : fragment;
+
+        std::string out = redact_user_info(uri.substr(0, query + 1));
+        auto pos = query + 1;
+        while (pos <= query_end) {
+            auto amp = uri.find('&', pos);
+            auto end = (amp == std::string_view::npos || amp > query_end) ? query_end : amp;
+            auto pair = uri.substr(pos, end - pos);
+            auto eq = pair.find('=');
+            if (eq != std::string_view::npos && is_credential_parameter(url_decode(std::string(pair.substr(0, eq))))) {
+                out += pair.substr(0, eq + 1);
+                out += redacted;
+            } else {
+                out += pair;
+            }
+            if (end == query_end) break;
+            out += '&';
+            pos = end + 1;
+        }
+        out += uri.substr(query_end);
+        return out;
     }
 
 }

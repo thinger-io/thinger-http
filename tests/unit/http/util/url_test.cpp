@@ -287,3 +287,44 @@ TEST_CASE("parse and get_url_encoded_data roundtrip", "[url][unit]") {
         REQUIRE(params == params2);
     }
 }
+
+// ============================================================================
+// loggable_uri
+// ============================================================================
+
+TEST_CASE("loggable_uri redacts credentials in query parameters and user info", "[url][unit][logging]") {
+
+    SECTION("A target without query or user info is unchanged") {
+        REQUIRE(loggable_uri("/v1/users/alice/devices") == "/v1/users/alice/devices");
+        REQUIRE(loggable_uri("https://example.com/a/b") == "https://example.com/a/b");
+        REQUIRE(loggable_uri("") == "");
+    }
+
+    SECTION("Credential parameters are redacted, the others kept, in order") {
+        REQUIRE(loggable_uri("/v1/data?authorization=eyJhbGciOi.x.y&count=10") ==
+                "/v1/data?authorization=[redacted]&count=10");
+        REQUIRE(loggable_uri("/cb?code=abc&access_token=t0k3n&state=s") == "/cb?code=abc&access_token=[redacted]&state=s");
+        REQUIRE(loggable_uri("/x?a=1&TOKEN=secret") == "/x?a=1&TOKEN=[redacted]");
+        REQUIRE(loggable_uri("/x?api%5Fkey=secret") == "/x?api%5Fkey=[redacted]");
+        REQUIRE(loggable_uri("/x?password=p&client_secret=c&apikey=k&key=k2") ==
+                "/x?password=[redacted]&client_secret=[redacted]&apikey=[redacted]&key=[redacted]");
+    }
+
+    SECTION("Names that only contain a credential name are kept") {
+        REQUIRE(loggable_uri("/x?tokens=3&keyboard=1&mytoken=2") == "/x?tokens=3&keyboard=1&mytoken=2");
+    }
+
+    SECTION("Parameters without a value, empty pairs and the fragment are kept") {
+        REQUIRE(loggable_uri("/x?token&a=1") == "/x?token&a=1");
+        REQUIRE(loggable_uri("/x?a=1&&token=s#frag") == "/x?a=1&&token=[redacted]#frag");
+        REQUIRE(loggable_uri("/x?") == "/x?");
+        REQUIRE(loggable_uri("/x#token=s") == "/x#token=s");
+    }
+
+    SECTION("The password of the user info is redacted, the user kept") {
+        REQUIRE(loggable_uri("http://user:pa55@proxy:3128/path?token=t") ==
+                "http://user:[redacted]@proxy:3128/path?token=[redacted]");
+        REQUIRE(loggable_uri("wss://user@host/ws") == "wss://user@host/ws");
+        REQUIRE(loggable_uri("http://host/p?q=a@b:c") == "http://host/p?q=a@b:c");
+    }
+}

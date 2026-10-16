@@ -33,6 +33,7 @@ All notable changes to thinger-http are documented in this file. The format foll
 ### Security
 
 - The HTTP logs no longer show bodies, header values or WebSocket messages, which may hold credentials. The client and the server logged the bodies at `trace` level, and the header values at `debug` level, Authorization and Cookie included; the server WebSocket logged every message received (hex encoded) at `debug` level. They now log the request line or the status, the header names and the body size; bodies and header values only with `log_bodies()`, and the values of `Authorization`, `Proxy-Authorization`, `Cookie` and `Set-Cookie` never. Nothing is formatted unless its level is logged.
+- The logged request lines and URLs redact the values of query parameters that carry credentials (`access_token`, `authorization`, `token`, `api_key`, `apikey`, `key`, `password`, `client_secret`) and the password of the user info: `GET /data?authorization=[redacted]&count=10`. `http::util::url::loggable_uri()` does it.
 
 ## [0.3.0] - 2026-10-14
 

@@ -63,6 +63,7 @@ namespace {
             res.header("X-Visible", "visible-value");
             res.send(req.body() == request_body ? response_body : std::string("unexpected body"));
         });
+        server.get("/data", [](http::request&, http::response& res) { res.send("ok"); });
         server.get("/echo", [](http::request&, http::response& res) {
             res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) {
                 ws->on_message([ws](std::string message, bool binary) {
@@ -200,4 +201,19 @@ TEST_CASE("Logged bodies cannot forge log lines", "[logging][unit]") {
     INFO("captured logs:\n" << quiet.dump());
     REQUIRE(quiet.contains("Body: 18 bytes"));
     REQUIRE_FALSE(quiet.contains("forged"));
+}
+
+TEST_CASE("Credentials in the query string are redacted from the request lines", "[logging][integration]") {
+    http::server server;
+    routes(server);
+    running_server running(server);
+    log_capture logs;
+
+    http::client client;
+    auto res = client.get("http://127.0.0.1:" + std::to_string(running.port) + "/data?authorization=" + token + "&count=10");
+    REQUIRE(res.status() == 200);
+
+    require_no_secret(logs);
+    REQUIRE(logs.contains("[CLIENT->] GET /data?authorization=[redacted]&count=10"));
+    REQUIRE(logs.contains("[SERVER REQUEST] GET /data?authorization=[redacted]&count=10"));
 }

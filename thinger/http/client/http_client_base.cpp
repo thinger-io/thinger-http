@@ -244,7 +244,7 @@ http_client_base::connection_plan http_client_base::plan_connection(const http_r
 
     auto choice = select_proxy(request);
     if (!choice.error.empty()) {
-        LOG_ERROR("cannot use the proxy for {}: {}", request.get_url(), choice.error);
+        LOG_ERROR("cannot use the proxy for {}: {}", util::url::loggable_uri(request.get_url()), choice.error);
         ec = client_error::invalid_proxy;
         return plan;
     }
@@ -587,7 +587,7 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
     std::shared_ptr<http_request> request, const std::string& subprotocol) {
     auto url = parse_websocket_url(request->get_url());
     if (!url) {
-        LOG_ERROR("Invalid WebSocket URL: {}", request->get_url());
+        LOG_ERROR("Invalid WebSocket URL: {}", util::url::loggable_uri(request->get_url()));
         co_return std::nullopt;
     }
     auto key = set_upgrade_headers(*request, *url, subprotocol);

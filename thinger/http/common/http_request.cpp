@@ -78,7 +78,7 @@ namespace thinger::http {
 
     void http_request::log(const char* scope, const body_logging& options) const{
         if(!LOG_INFO_ENABLED()) return;
-        LOG_INFO("[{}] {} {}", scope, http::get_method(method_), get_uri());
+        LOG_INFO("[{}] {} {}", scope, http::get_method(method_), loggable_uri(get_uri()));
         if(LOG_DEBUG_ENABLED()){
             LOG_DEBUG("Headers:");
             log_headers(options);

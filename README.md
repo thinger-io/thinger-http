@@ -1776,7 +1776,7 @@ thinger::logging::set_logger(logger);
 
 ### What the Message Logs Show
 
-The client and the server log each request and response: the request line or the status (`info`), the header names (`debug`) and the body size (`trace`). Header values, bodies and WebSocket messages are never logged by default, as they may hold credentials: tokens, cookies, passwords, private keys.
+The client and the server log each request and response: the request line or the status (`info`), the header names (`debug`) and the body size (`trace`). In the request line, the values of query parameters that carry credentials (`access_token`, `authorization`, `token`, `api_key`, `password`...) are shown as `[redacted]`. Header values, bodies and WebSocket messages are never logged by default, as they may hold credentials: tokens, cookies, passwords, private keys.
 
 For debugging, `log_bodies()` also logs the header values (`debug`) and the start of the bodies (`trace`), up to a maximum length, with control characters escaped. The values of `Authorization`, `Proxy-Authorization`, `Cookie` and `Set-Cookie` are redacted even then, and WebSocket messages are still logged by their size alone.
 

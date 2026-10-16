@@ -5,6 +5,7 @@
 #include <cctype>
 #include <string>
 #include <map>
+#include <string_view>
 
 namespace thinger::http::util::url{
 
@@ -21,6 +22,12 @@ namespace thinger::http::util::url{
     void parse_url_encoded_data(std::string::const_iterator& start, std::string::const_iterator& end, std::multimap<std::string, std::string>& store);
 
     std::string get_url_encoded_data(const std::multimap<std::string, std::string>& store);
+
+    // `uri` (a request target or a URL) for a log line: the values of the query parameters that
+    // carry credentials (access_token, authorization, token, api_key, apikey, key, password,
+    // client_secret, compared without case) and the password of the user info are replaced by
+    // "[redacted]"; the rest is kept as is
+    std::string loggable_uri(std::string_view uri);
 
 }
 
