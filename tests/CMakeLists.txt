@@ -225,6 +225,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_message_test.cpp)
     add_thinger_test(test_integration_websocket_message integration/websocket_message_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_flow_control_test.cpp)
+    add_thinger_test(test_integration_websocket_flow_control integration/websocket_flow_control_test.cpp)
+endif()
+
 # Integration tests - Sockets defined by the application
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/custom_socket_test.cpp)
     add_thinger_test(test_integration_custom_socket integration/custom_socket_test.cpp)
@@ -271,6 +275,10 @@ endif()
 # Integration tests - SSE
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/sse_test.cpp)
     add_thinger_test(test_integration_sse integration/sse_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/sse_flow_control_test.cpp)
+    add_thinger_test(test_integration_sse_flow_control integration/sse_flow_control_test.cpp)
 endif()
 
 # Integration tests - Schema validation
