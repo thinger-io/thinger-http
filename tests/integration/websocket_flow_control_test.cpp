@@ -79,11 +79,30 @@ namespace {
         std::atomic<size_t> max_queued{0};
         std::atomic<bool> failed{false};
         std::atomic<bool> done{false};
+        std::promise<ws_ptr> created;
 
         void sample(size_t queued) {
             if (queued > max_queued) max_queued = queued;
         }
     };
+
+    // The producer is stalled: what it sent and the server queue (read from this thread:
+    // queued_bytes() is atomic) unchanged over `samples` polls in a row, with something queued
+    // up to `bound`
+    bool stalled(const producer_state& state, const ws_ptr& ws, size_t bound, int samples = 20) {
+        uint32_t last_sent = UINT32_MAX;
+        size_t last_queued = SIZE_MAX;
+        int same = 0;
+        return eventually([&] {
+            auto sent = state.sent.load();
+            auto queued = ws->queued_bytes();
+            bool stuck = sent == last_sent && queued == last_queued && queued > 0 && queued <= bound;
+            same = stuck ? same + 1 : 0;
+            last_sent = sent;
+            last_queued = queued;
+            return same >= samples;
+        });
+    }
 
     awaitable<void> awaited_producer(ws_ptr ws, std::shared_ptr<producer_state> state, uint32_t count, size_t size) {
         for (uint32_t i = 0; i < count; ++i) {
@@ -115,6 +134,7 @@ namespace {
 
     // Start `producer` and a sampler of the queue on the thread of the websocket
     awaitable<void> start_producer(awaitable<void> producer, ws_ptr ws, std::shared_ptr<producer_state> state) {
+        state->created.set_value(ws);
         auto executor = co_await boost::asio::this_coro::executor;
         co_spawn(executor, queue_sampler(ws, state), detached);
         co_spawn(executor, std::move(producer), detached);
@@ -193,13 +213,11 @@ TEST_CASE("WebSocket awaitable send with a slow reader", "[websocket][flow][inte
     raw_ws_client client(running.port);
     REQUIRE(client.handshake("/push").starts_with("HTTP/1.1 101"));
 
-    // The client does not read: the producer is suspended once the socket buffers fill
-    std::this_thread::sleep_for(500ms);
-    auto stalled = state->sent.load();
-    std::this_thread::sleep_for(300ms);
-    REQUIRE(state->sent.load() == stalled);
-    REQUIRE(stalled < count);
-    // one message queued at most: the one being written
+    // The client does not read: the producer is suspended once the socket buffers fill, with
+    // one message queued (the one being written)
+    auto ws = state->created.get_future().get();
+    REQUIRE(stalled(*state, ws, size));
+    REQUIRE(state->sent.load() < count);
     REQUIRE(state->max_queued.load() == size);
 
     // It resumes as the client reads: everything arrives, in order
@@ -253,25 +271,27 @@ TEST_CASE("WebSocket watermarks and queued bytes", "[websocket][flow][integratio
     auto ws = created.get_future().get();
     {
         std::lock_guard lock(mutex);
-        // the high watermark is reached by the 16th message (1 MB), once
-        REQUIRE(events == std::vector<std::string>{"high " + std::to_string(16 * size),
-                                                   "queued " + std::to_string(count * size) + " " + std::to_string(count)});
+        // everything queued at once; the high watermark is told afterwards, not from a send
+        REQUIRE(events.front() == "queued " + std::to_string(count * size) + " " + std::to_string(count));
     }
 
     // The client does not read: what is not written yet is accounted for exactly
-    std::this_thread::sleep_for(300ms);
     auto [bytes, messages] = on_ws_thread(ws, [&] { return std::pair{ws->queued_bytes(), ws->queued_messages()}; });
     REQUIRE(messages > 0);
     REQUIRE(bytes == messages * size);
-    REQUIRE(on_ws_thread(ws, [&] { return ws->congested_connection(); }) == false);   // no message limit
+    REQUIRE(on_ws_thread(ws, [&] { return ws->queue_full(); }) == false);   // no message limit
 
     auto received = read_indexes(client, 5s, count);
     REQUIRE(received == range(0, count));
     REQUIRE(eventually([&] { return on_ws_thread(ws, [&] { return ws->queued_bytes(); }) == 0; }));
     REQUIRE(on_ws_thread(ws, [&] { return ws->queued_messages(); }) == 0);
+    REQUIRE(eventually([&] {
+        std::lock_guard lock(mutex);
+        return events.size() == 3;
+    }));
     std::lock_guard lock(mutex);
-    REQUIRE(events.size() == 3);
-    // drained to the low watermark, once: at a message boundary at or below it
+    // high once, then low once: drained at or below the low watermark
+    REQUIRE(events[1].starts_with("high "));
     REQUIRE(events[2].starts_with("low "));
     REQUIRE(std::stoul(events[2].substr(4)) <= 256 * 1024);
 }
@@ -293,11 +313,10 @@ TEST_CASE("WebSocket producer waiting for the queue to drain", "[websocket][flow
 
     raw_ws_client client(running.port);
     REQUIRE(client.handshake("/push").starts_with("HTTP/1.1 101"));
-    std::this_thread::sleep_for(500ms);
-    auto stalled = state->sent.load();
-    std::this_thread::sleep_for(300ms);
-    REQUIRE(state->sent.load() == stalled);
-    REQUIRE(stalled < count);
+    // stalled at the high watermark
+    auto ws = state->created.get_future().get();
+    REQUIRE(stalled(*state, ws, high));
+    REQUIRE(state->sent.load() < count);
     REQUIRE(state->max_queued.load() == high);
 
     REQUIRE(read_indexes(client, 5s, count) == range(0, count));
@@ -417,9 +436,9 @@ TEST_CASE("WebSocket overflow policies", "[websocket][flow][integration]") {
         http::write_limits limits;
         setup = [&](const ws_ptr& ws) {
             limits = ws->get_write_limits();
-            // queued at once: the first one is being written, still counted
+            // queued at once (the first one may be being written, still counted)
             for (uint32_t i = 0; i < 150; ++i) ws->send_text(indexed(i, 10));
-            congested = ws->congested_connection();
+            congested = ws->queue_full() && ws->congested_connection();
         };
         REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
         created.get_future().get();
@@ -467,10 +486,12 @@ TEST_CASE("WebSocket overflow policies", "[websocket][flow][integration]") {
         REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
         created.get_future().get();
         REQUIRE(queued == 1000);
-        // the first message is being written as the others are queued: it is not dropped
-        auto expected = range(21, 30);
-        expected.insert(expected.begin(), 0);
-        REQUIRE(read_indexes(client) == expected);
+        // the first message may be being written as the others are queued (co_spawn starts
+        // the writer inline since Boost 1.80): then it is not dropped
+        auto in_flight = range(21, 30);
+        in_flight.insert(in_flight.begin(), 0);
+        auto received = read_indexes(client);
+        REQUIRE((received == range(20, 30) || received == in_flight));
     }
 
     SECTION("close: 1013 Try Again Later") {
@@ -493,5 +514,185 @@ TEST_CASE("WebSocket overflow policies", "[websocket][flow][integration]") {
         client.send_frame(OP_CLOSE, close_payload(1013));
         REQUIRE(client.closed_within(3s));
         REQUIRE(eventually([&] { return weak.expired(); }, 5s));
+    }
+}
+
+TEST_CASE("WebSocket drop_oldest falls back to drop_newest", "[websocket][flow][integration]") {
+    // awaited messages are never dropped: with nothing else to drop, the new message goes
+    static constexpr size_t big = 16 * 1024 * 1024;
+    http::server server;
+    std::promise<size_t> queued;
+    server.get("/ws", [&](http::request&, http::response& res) {
+        res.upgrade_websocket([&](ws_ptr ws) -> awaitable<void> {
+            ws->set_write_limits({.max_messages = 3, .policy = http::overflow_policy::drop_oldest});
+            auto executor = co_await boost::asio::this_coro::executor;
+            // larger than the socket buffers: the first one is still being written below
+            for (uint32_t i = 0; i < 3; ++i) {
+                co_spawn(executor, [ws, i]() -> awaitable<void> { co_await ws->send_binary_async(indexed(i, big)); },
+                         detached);
+            }
+            // the three are queued (started now, or before this resumes)
+            co_await boost::asio::post(executor, use_awaitable);
+            ws->send_binary(indexed(3, 10));
+            queued.set_value(ws->queued_messages());
+        });
+    });
+    running_server running(server);
+    raw_ws_client client(running.port);
+    REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
+    REQUIRE(queued.get_future().get() == 3);
+    REQUIRE(read_indexes(client, 5s) == range(0, 3));
+}
+
+TEST_CASE("WebSocket watermark callbacks that send", "[websocket][flow][integration]") {
+    http::server server;
+    std::promise<int> lows_in_handler;
+    auto lows = std::make_shared<std::atomic<int>>(0);
+    std::promise<std::weak_ptr<http::websocket_connection>> created;
+    std::function<void(const ws_ptr&)> setup;
+    server.get("/ws", [&](http::request&, http::response& res) {
+        res.upgrade_websocket([&](ws_ptr ws) {
+            ws->on_low_watermark([lows, weak = std::weak_ptr(ws)] {
+                ++*lows;
+                // re-enters the queue: never while it is being changed
+                if (auto ws = weak.lock()) {
+                    for (int i = 0; i < 4000; ++i) ws->send_binary("x");
+                }
+            });
+            setup(ws);
+            lows_in_handler.set_value(lows->load());
+            created.set_value(ws);
+        });
+    });
+    running_server running(server);
+    raw_ws_client client(running.port);
+
+    SECTION("during drop_oldest") {
+        setup = [](const ws_ptr& ws) {
+            ws->set_write_limits({.max_messages = 0, .max_bytes = 640 << 10, .high_watermark = 500 << 10,
+                                  .low_watermark = 450 << 10, .policy = http::overflow_policy::drop_oldest});
+            for (int i = 0; i < 10; ++i) ws->send_binary(std::string(64 * 1024, 'y'));
+            // drops five messages: below the low watermark
+            ws->send_binary(std::string(300 * 1024, 'z'));
+        };
+        REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
+        REQUIRE(lows_in_handler.get_future().get() == 0);
+        // told afterwards; what it sends arrives
+        REQUIRE(eventually([&] { return lows->load() >= 1; }));
+        size_t ones = 0;
+        while (auto frame = client.read_frame(2s)) {
+            if (frame->payload == "x" && ++ones == 4000) break;
+        }
+        REQUIRE(ones == 4000);
+    }
+
+    SECTION("never once it is closing") {
+        setup = [](const ws_ptr& ws) {
+            ws->set_write_limits({.max_messages = 0, .high_watermark = 1 << 20, .low_watermark = 512 << 10});
+            for (int i = 0; i < 200; ++i) ws->send_binary(std::string(64 * 1024, 'y'));
+            ws->stop();
+        };
+        REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
+        REQUIRE(lows_in_handler.get_future().get() == 0);
+        auto weak = created.get_future().get();
+        // the client reads up to the close frame, and answers it
+        std::optional<ws_frame> frame;
+        while ((frame = client.read_frame(5s)) && frame->opcode != OP_CLOSE) {}
+        REQUIRE(frame);
+        client.send_frame(OP_CLOSE, close_payload(1000));
+        REQUIRE(client.closed_within(5s));
+        REQUIRE(eventually([&] { return weak.expired(); }));
+        REQUIRE(lows->load() == 0);
+    }
+}
+
+TEST_CASE("WebSocket limits changed while congested", "[websocket][flow][integration]") {
+    http::server server;
+    std::promise<ws_ptr> created;
+    auto lows = std::make_shared<std::atomic<int>>(0);
+    server.get("/ws", [&](http::request&, http::response& res) {
+        res.upgrade_websocket([&](ws_ptr ws) {
+            ws->set_write_limits({.max_messages = 0, .high_watermark = 1 << 20, .low_watermark = 256 << 10});
+            ws->on_low_watermark([lows] { ++*lows; });
+            for (int i = 0; i < 400; ++i) ws->send_binary(std::string(64 * 1024, 'y'));
+            created.set_value(ws);
+        });
+    });
+    running_server running(server);
+    raw_ws_client client(running.port);
+    REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
+    auto ws = created.get_future().get();
+
+    // congested: a producer on another thread waits, until the watermarks are disabled
+    boost::asio::io_context other;
+    auto writable = co_spawn(other, ws->wait_writable(), boost::asio::use_future);
+    std::thread producer([&] { other.run(); });
+    REQUIRE(writable.wait_for(200ms) == std::future_status::timeout);
+    ws->set_write_limits({.max_messages = 0});
+    REQUIRE(writable.wait_for(5s) == std::future_status::ready);
+    REQUIRE(writable.get());
+    producer.join();
+    REQUIRE(eventually([&] { return lows->load() == 1; }));
+}
+
+TEST_CASE("WebSocket write timeout", "[websocket][flow][integration]") {
+    constexpr size_t size = 64 * 1024;
+    http::server server;
+    auto state = std::make_shared<producer_state>();
+    auto writable = std::make_shared<std::promise<bool>>();
+    server.get("/push", [state, writable](http::request&, http::response& res) {
+        res.upgrade_websocket([state, writable](ws_ptr ws) -> awaitable<void> {
+            ws->set_write_limits({.max_messages = 0, .high_watermark = 1 << 20, .write_timeout = 300ms});
+            auto executor = co_await boost::asio::this_coro::executor;
+            // a producer waiting for the queue to drain, and another one awaiting its sends
+            co_spawn(executor, [ws, writable]() -> awaitable<void> {
+                for (uint32_t i = 0; i < 400; ++i) ws->send_binary(indexed(i, size));
+                writable->set_value(co_await ws->wait_writable());
+            }, detached);
+            co_await start_producer(awaited_producer(ws, state, 400, size), ws, state);
+        });
+    });
+    running_server running(server);
+    raw_ws_client client(running.port);
+    REQUIRE(client.handshake("/push").starts_with("HTTP/1.1 101"));
+
+    // The client does not read: the write in progress times out, and both producers are told
+    REQUIRE(eventually([&] { return state->done.load(); }));
+    REQUIRE(state->failed.load());
+    auto result = writable->get_future();
+    REQUIRE(result.wait_for(5s) == std::future_status::ready);
+    REQUIRE_FALSE(result.get());
+    // closed with 1013, after the rest of the frame being written
+    std::optional<ws_frame> frame;
+    while ((frame = client.read_frame(5s)) && frame->opcode != OP_CLOSE) {}
+    REQUIRE(frame);
+    REQUIRE(frame->close_code() == 1013);
+}
+
+TEST_CASE("WebSocket close codes of messages not delivered", "[websocket][flow][integration]") {
+    http::server server;
+    server.get("/ws", [](http::request&, http::response& res) {
+        res.upgrade_websocket([](ws_ptr ws) { ws->on_message([](std::string, bool) {}); });
+    });
+    running_server running(server);
+    raw_ws_client client(running.port);
+    REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
+
+    SECTION("Invalid UTF-8: 1007") {
+        client.send_frame(OP_TEXT, "\xC0\xAF");
+        auto frame = client.read_frame(3s);
+        REQUIRE(frame);
+        REQUIRE(frame->opcode == OP_CLOSE);
+        REQUIRE(frame->close_code() == 1007);
+    }
+
+    SECTION("Larger than the buffer: 1009") {
+        // the header of a 32 MB frame, and the start of its payload
+        auto frame = make_frame(OP_BINARY, std::string(32 * 1024 * 1024, 'x'));
+        client.send_raw(frame.substr(0, 64 * 1024));
+        auto close = client.read_frame(3s);
+        REQUIRE(close);
+        REQUIRE(close->opcode == OP_CLOSE);
+        REQUIRE(close->close_code() == 1009);
     }
 }
