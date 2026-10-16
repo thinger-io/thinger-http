@@ -11,8 +11,7 @@
 
 namespace thinger::http {
 
-    // What a connection does with a message sent without waiting (WebSocket send_text() and
-    // send_binary(), SSE events) when its queue is full
+    // What a connection does with a message sent without waiting to a full queue
     enum class overflow_policy {
         drop_newest,    // discard the message sent (the default)
         drop_oldest,    // discard the oldest messages queued to make room for it
@@ -20,41 +19,31 @@ namespace thinger::http {
     };
 
     /**
-     * Limits of the queue of a server connection that pushes messages (WebSocket, SSE).
-     *
-     * The queue holds what is not written yet, the message being written included. It is full
-     * when another message would go over `max_messages`, or over `max_bytes` of payload (an
-     * empty queue takes a message of any size); 0 disables each limit. Messages sent without
-     * waiting to a full queue are handled by `policy`. drop_oldest never drops the message
-     * being written, nor those a sender is waiting for (send_text_async()), nor the fields of
-     * an SSE event already being written; when that is not enough, the new message is dropped
-     * instead, so the limits hold.
-     *
-     * The watermarks tell a producer when to stop and when to go on, as Netty's
-     * WriteBufferWaterMark and isWritable(): once the bytes queued reach `high_watermark`, the
-     * connection is not writable until they drain to `low_watermark`. on_high_watermark() and
-     * on_low_watermark() are told once per cycle, asynchronously (posted to the connection's
-     * thread, never from within a send), and wait_writable() waits meanwhile. A
-     * `high_watermark` of 0 disables them.
-     *
-     * `write_timeout` (0, off, by default): a message whose write to the socket does not
-     * complete within it closes the connection (a WebSocket with 1013), as a client that
-     * stopped reading; awaited sends and wait_writable() then complete with false.
+     * Limits of the queue of a server connection (WebSocket, SSE): what is not written yet, the
+     * message being written included. 0 disables a limit.
      */
     struct write_limits {
+        /// Full when another message would go over either (an empty queue takes any size)
         size_t max_messages = 100;
         size_t max_bytes = 0;
+        /// Once the bytes queued reach the high watermark, the connection is not writable until
+        /// they drain to the low one (as Netty's WriteBufferWaterMark): on_high_watermark() and
+        /// on_low_watermark() are told once per cycle, posted to the connection's thread (never
+        /// from within a send), and wait_writable() waits meanwhile
         size_t high_watermark = 0;
         size_t low_watermark = 0;
+        /// For messages sent without waiting. drop_oldest never drops the message being
+        /// written, one a sender waits for, nor the rest of an SSE event being written; when
+        /// that is not enough, the new message is dropped, so the limits hold
         overflow_policy policy = overflow_policy::drop_newest;
+        /// A write to the socket not done in time closes the connection (a WebSocket with 1013),
+        /// as a client that stopped reading; awaited sends and wait_writable() then return false
         std::chrono::milliseconds write_timeout{0};
     };
 
     /**
-     * Accounting of the messages queued by a connection against its write_limits: watermark
-     * notifications, producers waiting for the queue to drain, and the write timeout. On the
-     * thread of the connection, except queued_bytes() and queued_messages(), which may be read
-     * from any thread.
+     * Accounting of the queue of a connection against its write_limits. On the thread of the
+     * connection, except queued_bytes(), queued_messages() and the calls taking an `owner`.
      */
     class write_flow {
     public:
@@ -64,7 +53,7 @@ namespace thinger::http {
         write_flow(const write_flow&) = delete;
         write_flow& operator=(const write_flow&) = delete;
 
-        /// New limits, the watermark state re-evaluated with them
+        /// The watermark state is re-evaluated with the new limits
         void set_limits(const write_limits& limits);
         const write_limits& limits() const { return limits_; }
 
@@ -75,9 +64,8 @@ namespace thinger::http {
         /// What to do with a message sent without waiting
         enum class admission { queue, drop, close };
 
-        /// The overflow policy, for a message of `size` bytes sent without waiting: queued if it
-        /// fits. drop_oldest calls `drop_oldest(size)`, which drops what the connection may and
-        /// tells whether the message fits then; if not, it is dropped instead
+        /// The overflow policy for a message of `size` bytes sent without waiting.
+        /// `drop_oldest(size)` drops what the connection may and tells whether it fits then
         template<typename DropOldest>
         admission admit(size_t size, DropOldest&& drop_oldest) {
             if(!overflows(size)) return admission::queue;
@@ -95,7 +83,7 @@ namespace thinger::http {
         /// `messages` of `bytes` in all are written or dropped (may drain to the low watermark)
         void remove(size_t bytes, size_t messages = 1);
 
-        /// Nothing is queued anymore (no notification): once closed
+        /// Nothing is queued anymore, without notifications: once closed
         void clear();
 
         size_t queued_bytes() const { return queued_bytes_.load(std::memory_order_relaxed); }
@@ -104,19 +92,17 @@ namespace thinger::http {
         /// Above the high watermark, not drained to the low one yet
         bool congested() const { return congested_; }
 
-        /// Wait while congested: true once drained, false if the connection closed (or the
-        /// wait was cancelled)
+        /// Wait while congested: true once drained, false if closed (or cancelled)
         awaitable<bool> wait_writable();
 
-        /// From any thread: run on the thread of the connection, keeping `owner` (the
-        /// connection holding this flow) alive until then
+        /// From any thread: run on the connection thread, `owner` (the connection) kept alive
         void set_limits(std::shared_ptr<void> owner, const write_limits& limits);
         void on_high_watermark(std::shared_ptr<void> owner, sync_callback<void()> callback);
         void on_low_watermark(std::shared_ptr<void> owner, sync_callback<void()> callback);
         awaitable<bool> wait_writable(std::shared_ptr<void> owner);
 
-        /// The write of a message starts, and finishes: with a write timeout, a write that does
-        /// not finish in time calls `on_timeout(connection)`, if the connection still lives
+        /// A write starts, and finishes: one not done within the write timeout calls
+        /// `on_timeout(connection)`, if the connection still lives
         template<typename Connection, typename OnTimeout>
         void write_started(Connection& connection, OnTimeout on_timeout) {
             if(closed_ || limits_.write_timeout.count() <= 0) return;
@@ -126,8 +112,7 @@ namespace thinger::http {
         }
         void write_finished();
 
-        /// The connection closed: waits end, notifications pending are dropped, and the
-        /// callbacks are released
+        /// Waits end, pending notifications are dropped and the callbacks released
         void close();
         bool closed() const { return closed_; }
 
