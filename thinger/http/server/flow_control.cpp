@@ -73,14 +73,6 @@ namespace thinger::http {
         });
     }
 
-    void write_flow::on_high_watermark(sync_callback<void()> callback){
-        if(!closed_) state_->on_high = std::move(callback);
-    }
-
-    void write_flow::on_low_watermark(sync_callback<void()> callback){
-        if(!closed_) state_->on_low = std::move(callback);
-    }
-
     awaitable<bool> write_flow::wait_writable(){
         while(congested_ && !closed_){
             co_await drained_.async_wait(use_nothrow_awaitable);
@@ -88,6 +80,32 @@ namespace thinger::http {
             if(state.cancelled() != boost::asio::cancellation_type::none) co_return false;
         }
         co_return !closed_;
+    }
+
+    void write_flow::dispatch(std::shared_ptr<void> owner, sync_callback<void()> operation){
+        boost::asio::dispatch(io_context_, [owner = std::move(owner), operation = std::move(operation)]{
+            operation();
+        });
+    }
+
+    void write_flow::set_limits(std::shared_ptr<void> owner, const write_limits& limits){
+        dispatch(std::move(owner), [this, limits]{ set_limits(limits); });
+    }
+
+    void write_flow::on_high_watermark(std::shared_ptr<void> owner, sync_callback<void()> callback){
+        dispatch(std::move(owner), [this, callback = std::move(callback)]() mutable {
+            if(!closed_) state_->on_high = std::move(callback);
+        });
+    }
+
+    void write_flow::on_low_watermark(std::shared_ptr<void> owner, sync_callback<void()> callback){
+        dispatch(std::move(owner), [this, callback = std::move(callback)]() mutable {
+            if(!closed_) state_->on_low = std::move(callback);
+        });
+    }
+
+    awaitable<bool> write_flow::wait_writable(std::shared_ptr<void> owner){
+        return on_io_context(io_context_, std::move(owner), wait_writable());
     }
 
     void write_flow::watch_write(sync_callback<void()> on_timeout){

@@ -91,9 +91,6 @@ private:
     // Past the end of the event `it` is in: its data field (or the end of the queue)
     std::deque<out_field>::iterator next_event(std::deque<out_field>::iterator it);
 
-    // Run `callback` on the thread of the connection
-    void execute(sync_callback<void()> callback);
-
     // Close the connection (on its thread)
     void close();
 

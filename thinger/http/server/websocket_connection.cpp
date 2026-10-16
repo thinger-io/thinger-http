@@ -388,11 +388,11 @@ namespace thinger::http{
     }
 
     awaitable<bool> websocket_connection::wait_writable(){
-        return on_io_context(ws_->get_io_context(), shared_from_this(), flow_.wait_writable());
+        return flow_.wait_writable(shared_from_this());
     }
 
     void websocket_connection::set_write_limits(const write_limits& limits){
-        execute([this, limits]{ flow_.set_limits(limits); });
+        flow_.set_limits(shared_from_this(), limits);
     }
 
     write_limits websocket_connection::get_write_limits() const{
@@ -408,11 +408,11 @@ namespace thinger::http{
     }
 
     void websocket_connection::on_high_watermark(sync_callback<void()> callback){
-        execute([this, callback = std::move(callback)]() mutable { flow_.on_high_watermark(std::move(callback)); });
+        flow_.on_high_watermark(shared_from_this(), std::move(callback));
     }
 
     void websocket_connection::on_low_watermark(sync_callback<void()> callback){
-        execute([this, callback = std::move(callback)]() mutable { flow_.on_low_watermark(std::move(callback)); });
+        flow_.on_low_watermark(shared_from_this(), std::move(callback));
     }
 
 }

@@ -104,12 +104,16 @@ namespace thinger::http {
         /// Above the high watermark, not drained to the low one yet
         bool congested() const { return congested_; }
 
-        void on_high_watermark(sync_callback<void()> callback);
-        void on_low_watermark(sync_callback<void()> callback);
-
         /// Wait while congested: true once drained, false if the connection closed (or the
         /// wait was cancelled)
         awaitable<bool> wait_writable();
+
+        /// From any thread: run on the thread of the connection, keeping `owner` (the
+        /// connection holding this flow) alive until then
+        void set_limits(std::shared_ptr<void> owner, const write_limits& limits);
+        void on_high_watermark(std::shared_ptr<void> owner, sync_callback<void()> callback);
+        void on_low_watermark(std::shared_ptr<void> owner, sync_callback<void()> callback);
+        awaitable<bool> wait_writable(std::shared_ptr<void> owner);
 
         /// The write of a message starts, and finishes: with a write timeout, a write that does
         /// not finish in time calls `on_timeout(connection)`, if the connection still lives
@@ -136,6 +140,7 @@ namespace thinger::http {
             sync_callback<void()> on_low;
         };
 
+        void dispatch(std::shared_ptr<void> owner, sync_callback<void()> operation);
         void watch_write(sync_callback<void()> on_timeout);
         void update_watermarks();
         void notify(bool high);

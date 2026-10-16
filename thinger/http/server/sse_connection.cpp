@@ -115,25 +115,19 @@ namespace thinger::http {
     }
 
     awaitable<bool> sse_connection::wait_writable(){
-        return on_io_context(socket_->get_io_context(), shared_from_this(), flow_.wait_writable());
-    }
-
-    void sse_connection::execute(sync_callback<void()> callback){
-        boost::asio::dispatch(socket_->get_io_context(), [self = shared_from_this(), callback = std::move(callback)]{
-            callback();
-        });
+        return flow_.wait_writable(shared_from_this());
     }
 
     void sse_connection::set_write_limits(const write_limits& limits){
-        execute([this, limits]{ flow_.set_limits(limits); });
+        flow_.set_limits(shared_from_this(), limits);
     }
 
     void sse_connection::on_high_watermark(sync_callback<void()> callback){
-        execute([this, callback = std::move(callback)]() mutable { flow_.on_high_watermark(std::move(callback)); });
+        flow_.on_high_watermark(shared_from_this(), std::move(callback));
     }
 
     void sse_connection::on_low_watermark(sync_callback<void()> callback){
-        execute([this, callback = std::move(callback)]() mutable { flow_.on_low_watermark(std::move(callback)); });
+        flow_.on_low_watermark(shared_from_this(), std::move(callback));
     }
 
 }
