@@ -233,6 +233,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_flow_control_test.cp
     add_thinger_test(test_integration_websocket_flow_control integration/websocket_flow_control_test.cpp)
 endif()
 
+# Integration tests - WebSockets on the executor of their creator (strands of a multi-threaded io_context)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_executor_test.cpp)
+    add_thinger_test(test_integration_websocket_executor integration/websocket_executor_test.cpp)
+endif()
+
 # Integration tests - Sockets defined by the application
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/custom_socket_test.cpp)
     add_thinger_test(test_integration_custom_socket integration/custom_socket_test.cpp)
