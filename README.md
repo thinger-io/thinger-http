@@ -115,7 +115,7 @@ include(FetchContent)
 FetchContent_Declare(
     thinger-http
     GIT_REPOSITORY https://github.com/thinger-io/thinger-http.git
-    GIT_TAG v0.5.0
+    GIT_TAG v0.6.0
 )
 FetchContent_MakeAvailable(thinger-http)
 

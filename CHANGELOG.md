@@ -7,6 +7,8 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-17
+
 ### Added
 
 - `asio::websocket` takes the executor it is used on (e.g. a strand), the io_context of its socket by default, and `get_executor()` returns it. `asio::running_in_this_thread(executor)` (`<thinger/asio/io_context_of.hpp>`) tells whether the caller runs on an io_context executor or a strand held as an `any_io_executor`.
@@ -173,7 +175,8 @@ These changes of the last weeks can be noticed by code written against an earlie
 - Client: connections are kept alive between requests (see the README to tune or disable the pool).
 - The unused `request_handler` interface was removed.
 
-[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/thinger-io/thinger-http/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/thinger-io/thinger-http/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/thinger-io/thinger-http/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/thinger-io/thinger-http/compare/v0.2.0...v0.3.0
