@@ -172,6 +172,49 @@ TEST_CASE("io_context_of finds the io_context behind an executor", "[client][exe
     pool.join();
 }
 
+TEST_CASE("running_in_this_thread tells whether the caller runs on an executor", "[client][executor_client]") {
+    boost::asio::io_context context;
+    boost::asio::any_io_executor io = context.get_executor();
+    boost::asio::any_io_executor tracked = boost::asio::require(context.get_executor(),
+                                                                boost::asio::execution::outstanding_work.tracked);
+    boost::asio::any_io_executor strand = boost::asio::make_strand(context);
+    boost::asio::any_io_executor strand_of_any = boost::asio::make_strand(io);
+
+    CHECK_FALSE(asio::running_in_this_thread(io));
+    CHECK_FALSE(asio::running_in_this_thread(tracked));
+    CHECK_FALSE(asio::running_in_this_thread(strand));
+    CHECK_FALSE(asio::running_in_this_thread(boost::asio::any_io_executor()));
+
+    // On the io_context, outside the strands
+    std::vector<bool> on_io;
+    boost::asio::post(context, [&] {
+        on_io = {asio::running_in_this_thread(io), asio::running_in_this_thread(tracked),
+                 asio::running_in_this_thread(strand), asio::running_in_this_thread(strand_of_any)};
+        tracked = {};   // its work would keep the io_context running
+    });
+    // Within each strand
+    bool in_strand = false;
+    bool in_strand_of_any = false;
+    bool other_strand = true;
+    boost::asio::post(strand, [&] {
+        in_strand = asio::running_in_this_thread(strand) && asio::running_in_this_thread(io);
+        other_strand = asio::running_in_this_thread(strand_of_any);
+    });
+    boost::asio::post(strand_of_any, [&] { in_strand_of_any = asio::running_in_this_thread(strand_of_any); });
+    context.run();
+
+    CHECK(on_io == std::vector<bool>{true, true, false, false});
+    CHECK(in_strand);
+    CHECK(in_strand_of_any);
+    CHECK_FALSE(other_strand);
+
+    boost::asio::thread_pool pool(1);
+    bool on_pool = true;
+    boost::asio::post(pool, [&] { on_pool = asio::running_in_this_thread(pool.get_executor()); });
+    pool.join();
+    CHECK_FALSE(on_pool);
+}
+
 TEST_CASE("The executor client runs its requests on the caller's thread", "[client][executor_client]") {
     servers origins;
     boost::asio::io_context context;
