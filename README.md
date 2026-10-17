@@ -1328,6 +1328,27 @@ client.request("https://api.example.com/users")
 client.wait();
 ```
 
+### Executor Client (executor_client)
+
+`executor_client` runs on an io_context the caller already runs, usually the one of the coroutine making the call: its requests run on that thread, with no hop to another one, and it has no threads of its own and no idle timers. Its requests are awaited, as with `async_client`, and take the same settings (timeouts, redirects, TLS, CAs, proxies, the request builder). It keeps no idle connection by default, so each request opens its own, and it closes its connections when it is destroyed.
+
+Use it for occasional calls from server coroutines (a token refresh, a webhook, an order to another service), created where it is needed:
+
+```cpp
+server.get("/weather", [](thinger::http::response& res) -> thinger::awaitable<void> {
+    auto client = co_await thinger::http::executor_client::for_current_coroutine();
+    auto forecast = co_await client->get("https://api.example.com/forecast");
+    res.json(forecast.json());
+});
+
+// Or on a given io_context
+thinger::http::executor_client client(io_context);
+```
+
+`for_current_coroutine()` takes the io_context of the calling coroutine, an io_context executor or a strand of one (as server handlers have), and throws `std::logic_error` on any other executor (e.g. a `thread_pool`); `io_context_of(executor)` tells which io_context an executor runs on, or null. Use the client on the threads running its io_context (with several threads, from a strand of it), and destroy it there, before the io_context. Cancelling the coroutine awaiting a request (a cancellation slot, or `||` with a timer) cancels the request and closes its connection.
+
+For many calls to the same host, as a gateway sending most requests to one backend, use a pooled client instead (`async_client`), whose connections are kept alive and shared by every request. `max_idle_connections_per_host()` enables keep-alive here too, but a client created per call does not keep its connections for the next one.
+
 ## WebSocket
 
 ### WebSocket Server

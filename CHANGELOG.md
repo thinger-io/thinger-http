@@ -7,9 +7,18 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- `executor_client`: an HTTP client running on an io_context the caller already runs, usually the one of the calling coroutine (`executor_client::for_current_coroutine()`), with no threads of its own and no idle timers. Its requests run on the caller's thread and are cancelled with the coroutine awaiting them; it keeps no idle connection by default and closes its connections when destroyed. For occasional calls from server coroutines; a pooled client (`async_client`) suits many calls to the same host. See [Executor Client](README.md#executor-client-executor_client).
+- `http::io_context_of(executor)`: the io_context of an io_context executor or of a strand of one, null for other executors.
+
 ### Changed
 
 - Quieter startup and shutdown logs. At `info`, a server logs where it listens (`listening on http://0.0.0.0:8080`, `https://...` or `unix:/path`, with the port bound), when a graceful shutdown starts (`shutting down the server on http://0.0.0.0:8080: 2 connections open, grace period of 30000 ms`) and when it stopped (`server on http://0.0.0.0:8080 stopped`, also after `stop()` without a shutdown), one line each, as Node and Go servers do; the workers log the signal received and what it does in one line (`received signal 15: stopping gracefully, within 30000 ms (a second signal stops at once)`). The rest moved to `debug`: a line per worker thread stopped, worker clients registered and unregistered, the steps of the workers starting and stopping, acceptors starting and stopping, and the socket servers' own `TCP server is now listening` (`Unix socket server ...`, `Standalone server ...`), which said `TCP` for TLS too. Warnings and errors did not change. See [What a Server Logs When It Starts and Stops](README.md#what-a-server-logs-when-it-starts-and-stops).
+
+### Fixed
+
+- The connect timeout of the TCP and Unix sockets runs on the executor of the coroutine connecting, as the connect does. It ran on the io_context of the socket: from a strand of an io_context run by several threads, it could cancel the socket on one thread while the connect used it on another.
 
 ## [0.4.0] - 2026-10-16
 
