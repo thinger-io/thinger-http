@@ -7,6 +7,8 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-17
+
 ### Added
 
 - `executor_client`: an HTTP client running on an io_context the caller already runs, usually the one of the calling coroutine (`executor_client::for_current_coroutine()`), with no threads of its own and no idle timers. Its requests run on the caller's thread and are cancelled with the coroutine awaiting them; it keeps no idle connection by default and closes its connections when destroyed. For occasional calls from server coroutines; a pooled client (`async_client`) suits many calls to the same host. See [Executor Client](README.md#executor-client-executor_client).
@@ -157,7 +159,8 @@ These changes of the last weeks can be noticed by code written against an earlie
 - Client: connections are kept alive between requests (see the README to tune or disable the pool).
 - The unused `request_handler` interface was removed.
 
-[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/thinger-io/thinger-http/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/thinger-io/thinger-http/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/thinger-io/thinger-http/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/thinger-io/thinger-http/compare/v0.1.0...v0.2.0
