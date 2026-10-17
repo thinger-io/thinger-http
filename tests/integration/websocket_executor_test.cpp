@@ -3,7 +3,6 @@
 #include <thinger/asio/sockets/websocket.hpp>
 #include <thinger/http/client/client.hpp>
 #include <thinger/http/client/executor_client.hpp>
-#include <thinger/http/client/websocket_util.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
@@ -124,11 +123,6 @@ TEST_CASE("Client WebSockets on strands of an io_context run by several threads"
     });
     running_server running(server);
     auto url = "ws://127.0.0.1:" + std::to_string(running.port) + "/echo";
-
-    // The first std::regex compiled fills a cache of the locale (std::ctype<char>::narrow),
-    // which libstdc++ fills without synchronization: compiled here once, the URL parsing of the
-    // clients, on several threads at a time, only reads it
-    REQUIRE(http::websocket_util::parse_websocket_url(url));
 
     boost::asio::io_context context;
     constexpr int sockets = 4;

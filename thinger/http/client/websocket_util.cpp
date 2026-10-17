@@ -9,7 +9,8 @@
 namespace thinger::http::websocket_util {
 
 std::optional<url_components> parse_websocket_url(const std::string& url) {
-    std::regex url_regex(R"(^(wss?)://([^/:]+)(?::(\d+))?(/.*)?$)", std::regex::icase);
+    // Compiled once (thread-safe), not on every call
+    static const std::regex url_regex(R"(^(wss?)://([^/:]+)(?::(\d+))?(/.*)?$)", std::regex::icase);
     std::smatch match;
 
     if (!std::regex_match(url, match, url_regex)) {
