@@ -177,7 +177,7 @@ void basic_socket_server<Protocol>::accept_next() {
             LOG_ERROR("cannot accept more connections: {}", e.message());
             retry_accept();
         } else {
-            LOG_INFO("stop accepting connections");
+            LOG_DEBUG("stop accepting connections");
         }
     });
 }
@@ -191,7 +191,7 @@ void basic_socket_server<Protocol>::wait_connections() {
             LOG_ERROR("cannot accept more connections: {}", e.message());
             retry_accept();
         } else {
-            LOG_INFO("stop accepting connections");
+            LOG_DEBUG("stop accepting connections");
         }
     });
 }

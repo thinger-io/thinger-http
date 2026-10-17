@@ -34,7 +34,7 @@ namespace thinger::asio{
     bool worker_thread::stop() {
         if(!thread_.joinable()) return false;
         
-        LOG_INFO("stopping worker thread: {}", worker_name_);
+        LOG_DEBUG("stopping worker thread: {}", worker_name_);
         worker_.stop();
         thread_.join();
         return true;

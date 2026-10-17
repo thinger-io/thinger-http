@@ -57,11 +57,13 @@ namespace thinger::asio{
         // wait for any signal to be received
         signals_.async_wait([this, grace](const boost::system::error_code& ec, int signal_number){
             if(ec) return;
-            LOG_INFO("received signal: {}", signal_number);
             if(!grace){
+                LOG_INFO("received signal {}: stopping", signal_number);
                 stop();
                 return;
             }
+            LOG_INFO("received signal {}: stopping gracefully, within {} ms (a second signal stops at once)",
+                     signal_number, grace->count());
             // A second signal does not wait for the graceful stop
             signals_.async_wait([this](const boost::system::error_code& ec, int signal_number){
                 if(ec) return;
@@ -80,7 +82,6 @@ namespace thinger::asio{
     }
 
     void workers::begin_graceful_stop(std::chrono::milliseconds grace) {
-        LOG_INFO("stopping gracefully, within {} ms (a second signal stops at once)", grace.count());
         auto state = std::make_shared<graceful_stop_state>();
         graceful_stop_ = state;
 
@@ -90,7 +91,7 @@ namespace thinger::asio{
             boost::asio::post(wait_context_, [this, weak]() {
                 auto state = weak.lock();
                 if (!state || state != graceful_stop_ || --state->pending > 0) return;
-                LOG_INFO("every worker client stopped gracefully");
+                LOG_DEBUG("every worker client stopped gracefully");
                 stop();
             });
         };
@@ -129,7 +130,7 @@ namespace thinger::asio{
         if(running_) return false;
         running_ = true;
 
-        LOG_INFO("starting {} working threads in the shared pool", worker_threads);
+        LOG_DEBUG("starting {} working threads in the shared pool", worker_threads);
         worker_threads_.reserve(worker_threads);
         for(auto thread_number=1; thread_number<=worker_threads; ++thread_number){
             auto worker = std::make_unique<worker_thread>("worker thread " + std::to_string(thread_number));
@@ -143,7 +144,7 @@ namespace thinger::asio{
 
     boost::asio::io_context& workers::get_isolated_io_context(std::string thread_name)
     {
-        LOG_INFO("starting '{}' worker thread", thread_name);
+        LOG_DEBUG("starting '{}' worker thread", thread_name);
         auto worker = std::make_unique<worker_thread>(std::move(thread_name));
         auto& io_context = worker->get_io_context();
         auto thread_id = worker->start();
@@ -155,13 +156,13 @@ namespace thinger::asio{
 
     void workers::do_stop()
     {
-        LOG_INFO("executing full stop");
+        LOG_DEBUG("executing full stop");
         
         // First, notify all clients to stop
         {
             std::lock_guard<std::mutex> lock(clients_mutex_);
             if (!clients_.empty()) {
-                LOG_INFO("Stopping {} worker clients", clients_.size());
+                LOG_DEBUG("Stopping {} worker clients", clients_.size());
                 for (auto* client : clients_) {
                     if (client && client->is_running()) {
                         try {
@@ -176,33 +177,33 @@ namespace thinger::asio{
         }
         
         // Stop all job threads
-        LOG_INFO("stopping job threads");
+        LOG_DEBUG("stopping job threads");
         for(auto const& worker_thread : job_threads_){
             worker_thread->stop();
         }
 
         // Stop all worker threads
-        LOG_INFO("stopping worker threads");
+        LOG_DEBUG("stopping worker threads");
         for(auto const& worker_thread : worker_threads_){
             worker_thread->stop();
         }
 
         // Clear auxiliary references
-        LOG_INFO("clearing structures");
+        LOG_DEBUG("clearing structures");
         worker_threads_.clear();
         job_threads_.clear();
         workers_threads_map_.clear();
         next_io_context_.store(0, std::memory_order_relaxed);
 
         // Cancel signals (and leave them to their default action) and stop wait_context
-        LOG_INFO("stopping wait context");
+        LOG_DEBUG("stopping wait context");
         graceful_stop_.reset();
         signals_.cancel();
         signals_.clear();
         wait_work_.reset();
         wait_context_.stop();
         
-        LOG_INFO("all done!");
+        LOG_DEBUG("all done!");
     }
 
     bool workers::stop()
@@ -281,11 +282,11 @@ namespace thinger::asio{
             auto result = clients_.insert(client);
             
             if (result.second) { // Successfully inserted
-                LOG_INFO("Worker client registered: {}", client->get_service_name());
+                LOG_DEBUG("Worker client registered: {}", client->get_service_name());
                 
                 // Auto-start if this is the first client and auto-manage is enabled
                 if (auto_manage_ && clients_.size() == 1 && !running_) {
-                    LOG_INFO("First worker client registered, starting workers automatically");
+                    LOG_DEBUG("First worker client registered, starting workers automatically");
                     should_start = true;
                 }
             }
@@ -307,11 +308,11 @@ namespace thinger::asio{
             size_t removed = clients_.erase(client);
             
             if (removed > 0) {
-                LOG_INFO("Worker client unregistered: {}", client->get_service_name());
+                LOG_DEBUG("Worker client unregistered: {}", client->get_service_name());
                 
                 // Auto-stop if no clients remain and auto-manage is enabled
                 if (auto_manage_ && clients_.empty() && running_) {
-                    LOG_INFO("Last worker client unregistered, stopping workers automatically");
+                    LOG_DEBUG("Last worker client unregistered, stopping workers automatically");
                     should_stop = true;
                 }
             }
