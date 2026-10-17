@@ -11,6 +11,12 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 - `asio::websocket` takes the executor it is used on (e.g. a strand), the io_context of its socket by default, and `get_executor()` returns it. `asio::running_in_this_thread(executor)` (`<thinger/asio/io_context_of.hpp>`) tells whether the caller runs on an io_context executor or a strand held as an `any_io_executor`.
 
+### Changed
+
+- `websocket_client`'s synchronous calls (`send_text()`, `send_binary()`, `receive()`, `close()`) throw `std::logic_error` when called on the strand the WebSocket was opened from, where they waited forever; the coroutine API works there.
+- `parse_websocket_url()` compiles its regex once instead of on every call.
+- Renames and signatures of internal helpers, following the executor of the WebSocket: `on_io_context(io_context, keeper, operation)` (`<thinger/util/types.hpp>`) is `on_executor(executor, keeper, operation)`, which runs the operation at once when the calling coroutine is on that executor; `http::write_flow` takes an `any_io_executor` instead of an `io_context&`; and the `deliver` of `response::accept_websocket()` receives the `asio::websocket&` of the connection instead of its raw `asio::socket&`.
+
 ### Fixed
 
 - A WebSocket runs its keepalive, the control frames it sends (pings and pongs) and its closing handshake on the executor it was created with, and the clients create it with the executor of the coroutine opening it (`client`, `async_client` and `executor_client` `websocket()`). They ran on the io_context of the socket: opened from a strand of an io_context run by several threads, they could use the WebSocket on one thread while the caller used it on another. `websocket_connection` runs on the executor of its WebSocket too. Nothing changes on an io_context run by one thread, nor for the server.

@@ -39,7 +39,9 @@ namespace thinger::asio {
 //   answers or after CLOSE_TIMEOUT. Called anywhere else (e.g. by a synchronous client, while
 //   nothing runs its io_context), it closes the connection at once instead. close(code) does
 //   the same with another status code. close_graceful() does the handshake, waiting. A
-//   websocket destroyed open on its executor closes with 1001.
+//   websocket destroyed open on its executor closes with 1001. An executor that is neither an
+//   io_context executor nor a strand cannot be told to be running (see
+//   asio::running_in_this_thread()): close() then closes at once, without the handshake.
 // - An optional keepalive pings the peer (one ping at a time) and closes the connection
 //   when it is idle (see set_keepalive()).
 // - Text is not validated as UTF-8 here, neither in text messages nor in close reasons:
