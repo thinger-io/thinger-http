@@ -19,6 +19,7 @@ All notable changes to thinger-http are documented in this file. The format foll
 ### Fixed
 
 - The connect timeout of the TCP and Unix sockets runs on the executor of the coroutine connecting, as the connect does. It ran on the io_context of the socket: from a strand of an io_context run by several threads, it could cancel the socket on one thread while the connect used it on another.
+- The library builds on macOS with Apple clang (libc++) and OpenSSL 3.6: the self-signed certificate wrote into the subject name OpenSSL now returns as const, and the key of the client's TLS contexts printed a file time count that is a 128-bit integer with libc++.
 
 ## [0.4.0] - 2026-10-16
 
