@@ -35,7 +35,7 @@ public:
             socket_(socket),
             timer_(socket->get_io_context()),
             idle_(false),
-            flow_(socket->get_io_context(), write_limits{.max_messages = MAX_OUTPUT_MESSAGES + 1})
+            flow_(socket->get_io_context().get_executor(), write_limits{.max_messages = MAX_OUTPUT_MESSAGES + 1})
     {
         LOG_DEBUG("created sse connection");
     }

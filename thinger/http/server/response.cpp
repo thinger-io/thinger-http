@@ -439,10 +439,10 @@ std::shared_ptr<http_response> response::websocket_handshake(const std::vector<s
 
 namespace {
 
-    // Run a coroutine handler on `io_context`, detached: what it throws is logged
-    template<typename F>
-    void spawn_handler(boost::asio::io_context& io_context, const char* what, F&& run) {
-        co_spawn(io_context, std::forward<F>(run), [what](const std::exception_ptr& error) {
+    // Run a coroutine handler on `executor` (or an io_context), detached: what it throws is logged
+    template<typename Executor, typename F>
+    void spawn_handler(Executor&& executor, const char* what, F&& run) {
+        co_spawn(std::forward<Executor>(executor), std::forward<F>(run), [what](const std::exception_ptr& error) {
             if (!error) return;
             try {
                 std::rethrow_exception(error);
@@ -458,7 +458,7 @@ namespace {
 
 void response::upgrade_websocket(websocket_handler handler, const std::set<std::string>& supported_protocols) {
     accept_websocket(supported_protocols, [handler = std::move(handler)](std::shared_ptr<websocket_connection> connection,
-                                                                        asio::socket&) {
+                                                                        asio::websocket&) {
         handler(connection);
         connection->start();
     });
@@ -466,8 +466,8 @@ void response::upgrade_websocket(websocket_handler handler, const std::set<std::
 
 void response::upgrade_websocket(websocket_coroutine handler, const std::set<std::string>& supported_protocols) {
     accept_websocket(supported_protocols, [handler = std::move(handler)](std::shared_ptr<websocket_connection> connection,
-                                                                        asio::socket& socket) mutable {
-        spawn_handler(socket.get_io_context(), "WebSocket",
+                                                                        asio::websocket& websocket) mutable {
+        spawn_handler(websocket.get_executor(), "WebSocket",
                       [handler = std::move(handler), connection]() mutable -> awaitable<void> {
             co_await handler(connection);
             connection->start();
@@ -476,7 +476,7 @@ void response::upgrade_websocket(websocket_coroutine handler, const std::set<std
 }
 
 void response::accept_websocket(const std::set<std::string>& supported_protocols,
-                                std::function<void(std::shared_ptr<websocket_connection>, asio::socket&)> deliver) {
+                                std::function<void(std::shared_ptr<websocket_connection>, asio::websocket&)> deliver) {
     if (!ensure_not_responded()) return;
     if (reject_takeover("WebSocket upgrade")) return;
 
@@ -493,21 +493,23 @@ void response::accept_websocket(const std::set<std::string>& supported_protocols
             return;
         }
 
-        auto websocket = std::make_shared<asio::websocket>(socket, true, true);   // binary, server
+        // binary, server; on the io_context of the connection, where it is taken over (the
+        // default executor)
+        auto websocket = std::make_shared<asio::websocket>(socket, true, true);
         websocket->set_protocol(protocol);
         wrap_connection(*socket, *websocket, connection_type::websocket);
         auto ws_connection = std::make_shared<websocket_connection>(websocket);
 
         // The handler sets its callbacks, then the WebSocket starts
-        deliver(ws_connection, *socket);
+        deliver(ws_connection, *websocket);
     });
 }
 
 void response::upgrade_websocket_stream(const websocket_options& options, websocket_stream_coroutine handler) {
     upgrade_websocket_stream(options, websocket_stream_handler(
         [handler = std::move(handler)](std::shared_ptr<asio::websocket> websocket, std::string protocol) mutable {
-            auto& io_context = websocket->get_io_context();
-            spawn_handler(io_context, "WebSocket",
+            auto executor = websocket->get_executor();
+            spawn_handler(std::move(executor), "WebSocket",
                           [handler = std::move(handler), websocket = std::move(websocket),
                            protocol = std::move(protocol)]() mutable {
                 return handler(std::move(websocket), std::move(protocol));
@@ -524,6 +526,7 @@ void response::upgrade_websocket_stream(const websocket_options& options, websoc
     if (!response) return;
 
     take_over(std::move(response), [handler = std::move(handler), options, protocol](std::shared_ptr<asio::socket> socket, std::string buffered) {
+        // On the io_context of the connection, where it is taken over (the default executor)
         auto websocket = std::make_shared<asio::websocket>(socket, options.binary, true);
         // The handler may ask to be told of a shutdown on the websocket (on_server_shutdown())
         wrap_connection(*socket, *websocket, connection_type::websocket);

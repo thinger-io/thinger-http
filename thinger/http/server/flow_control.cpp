@@ -3,11 +3,11 @@
 
 namespace thinger::http {
 
-    write_flow::write_flow(boost::asio::io_context& io_context, write_limits limits) :
-        io_context_(io_context),
+    write_flow::write_flow(boost::asio::any_io_executor executor, write_limits limits) :
+        executor_(std::move(executor)),
         state_(std::make_shared<shared_state>()),
-        drained_(io_context, boost::asio::steady_timer::time_point::max()),
-        write_timer_(io_context)
+        drained_(executor_, boost::asio::steady_timer::time_point::max()),
+        write_timer_(executor_)
     {
         set_limits(limits);
     }
@@ -66,7 +66,7 @@ namespace thinger::http {
         if(!(high ? state_->on_high : state_->on_low)) return;
         // never from within a send or a drop: whatever the callback does (sending, closing...)
         // finds the queue consistent. Dropped if the connection closes meanwhile
-        boost::asio::post(io_context_, [state = state_, high]{
+        boost::asio::post(executor_, [state = state_, high]{
             if(state->closed) return;
             auto callback = high ? state->on_high : state->on_low;
             if(callback) callback();
@@ -83,7 +83,7 @@ namespace thinger::http {
     }
 
     void write_flow::dispatch(std::shared_ptr<void> owner, sync_callback<void()> operation){
-        boost::asio::dispatch(io_context_, [owner = std::move(owner), operation = std::move(operation)]{
+        boost::asio::dispatch(executor_, [owner = std::move(owner), operation = std::move(operation)]{
             operation();
         });
     }
@@ -105,7 +105,7 @@ namespace thinger::http {
     }
 
     awaitable<bool> write_flow::wait_writable(std::shared_ptr<void> owner){
-        return on_io_context(io_context_, std::move(owner), wait_writable());
+        return on_executor(executor_, std::move(owner), wait_writable());
     }
 
     void write_flow::watch_write(sync_callback<void()> on_timeout){

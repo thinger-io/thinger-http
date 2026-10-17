@@ -266,9 +266,9 @@ private:
     // Answers 501 if the connection cannot be taken over (in-memory requests)
     bool reject_takeover(const char* feature);
     // Upgrade to a WebSocket with a message interface, and to an event stream: `deliver`
-    // receives the connection, and the socket it runs on (its io_context runs `deliver`)
+    // receives the connection, and the socket it runs on (whose executor runs `deliver`)
     void accept_websocket(const std::set<std::string>& supported_protocols,
-                          std::function<void(std::shared_ptr<websocket_connection>, asio::socket&)> deliver);
+                          std::function<void(std::shared_ptr<websocket_connection>, asio::websocket&)> deliver);
     void accept_sse(std::function<void(std::shared_ptr<sse_connection>, asio::socket&)> deliver);
     // Checks of a WebSocket upgrade request and the subprotocol negotiated: the 101 response
     // to send, or null if the request was answered with an error

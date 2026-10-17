@@ -8,8 +8,8 @@ namespace thinger::http{
 
     // A sender waiting for its message to be written (send_*_async())
     struct websocket_connection::send_waiter {
-        explicit send_waiter(boost::asio::io_context& io_context) :
-            timer(io_context, boost::asio::steady_timer::time_point::max()) {}
+        explicit send_waiter(const boost::asio::any_io_executor& executor) :
+            timer(executor, boost::asio::steady_timer::time_point::max()) {}
 
         void finish(bool success){
             done = true;
@@ -29,8 +29,8 @@ namespace thinger::http{
 
     websocket_connection::websocket_connection(std::shared_ptr<asio::websocket> socket) :
         ws_(std::move(socket)),
-        flow_(ws_->get_io_context(), write_limits{.max_messages = MAX_OUTPUT_MESSAGES}),
-        resume_timer_(ws_->get_io_context(), boost::asio::steady_timer::time_point::max())
+        flow_(ws_->get_executor(), write_limits{.max_messages = MAX_OUTPUT_MESSAGES}),
+        resume_timer_(ws_->get_executor(), boost::asio::steady_timer::time_point::max())
     {
         LOG_LEVEL(2, "websocket connection created");
     }
@@ -50,7 +50,7 @@ namespace thinger::http{
             return;
         }
         LOG_LEVEL(1, "closing websocket: the server shuts down");
-        co_spawn(ws_->get_io_context(),
+        co_spawn(ws_->get_executor(),
             [this, self = shared_from_this()]() -> awaitable<void> {
                 co_await close_connection(asio::websocket::CLOSE_GOING_AWAY);
             },
@@ -68,7 +68,7 @@ namespace thinger::http{
 
     void websocket_connection::start_read_loop()
     {
-        co_spawn(ws_->get_io_context(),
+        co_spawn(ws_->get_executor(),
             [this, self = shared_from_this()]() -> awaitable<void> {
                 // RAII guard: clears the on_message callback when the coroutine
                 // frame is destroyed (normal exit, exception, or io_context
@@ -213,7 +213,7 @@ namespace thinger::http{
     {
         if(out_queue_.empty() || writing_) return;
         writing_ = true;
-        co_spawn(ws_->get_io_context(), write_loop(shared_from_this()), detached);
+        co_spawn(ws_->get_executor(), write_loop(shared_from_this()), detached);
     }
 
     awaitable<void> websocket_connection::write_loop([[maybe_unused]] std::shared_ptr<websocket_connection> self)
@@ -307,7 +307,7 @@ namespace thinger::http{
     void websocket_connection::stop(){
         execute([this, self = shared_from_this()]{
             LOG_LEVEL(1, "closing websocket");
-            co_spawn(ws_->get_io_context(),
+            co_spawn(ws_->get_executor(),
                 [this, self]() -> awaitable<void> {
                     co_await close_connection(asio::websocket::CLOSE_NORMAL);
                     LOG_LEVEL(1, "websocket closed");
@@ -374,17 +374,17 @@ namespace thinger::http{
     }
 
     awaitable<bool> websocket_connection::send_async(std::string data, bool binary){
-        auto waiter = std::make_shared<send_waiter>(ws_->get_io_context());
+        auto waiter = std::make_shared<send_waiter>(ws_->get_executor());
         enqueue(out_message{std::move(data), binary, waiter});
         co_return co_await waiter->wait();
     }
 
     awaitable<bool> websocket_connection::send_text_async(std::string text){
-        return on_io_context(ws_->get_io_context(), shared_from_this(), send_async(std::move(text), false));
+        return on_executor(ws_->get_executor(), shared_from_this(), send_async(std::move(text), false));
     }
 
     awaitable<bool> websocket_connection::send_binary_async(std::string data){
-        return on_io_context(ws_->get_io_context(), shared_from_this(), send_async(std::move(data), true));
+        return on_executor(ws_->get_executor(), shared_from_this(), send_async(std::move(data), true));
     }
 
     awaitable<bool> websocket_connection::wait_writable(){

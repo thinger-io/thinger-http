@@ -67,13 +67,14 @@ namespace thinger {
         co_return co_await std::move(operation);
     }
 
-    // Run `operation` on the thread of `io_context`, resuming the caller where it was. The
-    // operation keeps `keeper` (the object it uses) alive, also if the caller goes away
+    // Run `operation` on `executor` (e.g. the strand of the object it uses), resuming the
+    // caller where it was: at once if the caller already runs there. The operation keeps
+    // `keeper` (the object it uses) alive, also if the caller goes away
     template<typename T>
-    awaitable<T> on_io_context(boost::asio::io_context& io_context, std::shared_ptr<void> keeper,
-                               awaitable<T> operation) {
-        if (io_context.get_executor().running_in_this_thread()) co_return co_await std::move(operation);
-        co_return co_await co_spawn(io_context, kept_alive(std::move(keeper), std::move(operation)), use_awaitable);
+    awaitable<T> on_executor(boost::asio::any_io_executor executor, std::shared_ptr<void> keeper,
+                             awaitable<T> operation) {
+        if (executor == co_await boost::asio::this_coro::executor) co_return co_await std::move(operation);
+        co_return co_await co_spawn(executor, kept_alive(std::move(keeper), std::move(operation)), use_awaitable);
     }
 
     // A std::function for callbacks that are called, never awaited: it does not take a

@@ -5,7 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <memory>
-#include <boost/asio/io_context.hpp>
+#include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include "../../util/types.hpp"
 
@@ -42,12 +42,12 @@ namespace thinger::http {
     };
 
     /**
-     * Accounting of the queue of a connection against its write_limits. On the thread of the
+     * Accounting of the queue of a connection against its write_limits. On the executor of the
      * connection, except queued_bytes(), queued_messages() and the calls taking an `owner`.
      */
     class write_flow {
     public:
-        explicit write_flow(boost::asio::io_context& io_context, write_limits limits = {});
+        explicit write_flow(boost::asio::any_io_executor executor, write_limits limits = {});
         ~write_flow();
 
         write_flow(const write_flow&) = delete;
@@ -130,7 +130,7 @@ namespace thinger::http {
         void update_watermarks();
         void notify(bool high);
 
-        boost::asio::io_context& io_context_;
+        boost::asio::any_io_executor executor_;
         std::shared_ptr<shared_state> state_;
         write_limits limits_;
         std::atomic<size_t> queued_bytes_{0};

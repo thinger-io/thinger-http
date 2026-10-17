@@ -6,6 +6,7 @@
 #include <memory>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/streambuf.hpp>
+#include "../../asio/io_context_of.hpp"
 #include "../../asio/sockets/websocket.hpp"
 #include "../../asio/sockets/socket.hpp"
 #include "../data/out_data.hpp"
@@ -56,7 +57,13 @@ public:
 
     /// Run `callback` on the websocket thread
     inline void execute(sync_callback<void()> callback){
-        boost::asio::dispatch(ws_->get_io_context(), [self = shared_from_this(), callback = std::move(callback)](){
+        // Already there (e.g. from on_message()): at once, as dispatch() does, without its cost
+        // through a type-erased executor on every message
+        if(asio::running_in_this_thread(ws_->get_executor())){
+            callback();
+            return;
+        }
+        boost::asio::dispatch(ws_->get_executor(), [self = shared_from_this(), callback = std::move(callback)](){
             callback();
         });
     }
