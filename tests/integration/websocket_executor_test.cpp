@@ -15,6 +15,7 @@
 #include "server_test_helpers.hpp"
 
 #include <atomic>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -262,4 +263,40 @@ TEST_CASE("A WebSocket runs on the executor of its creator", "[websocket][execut
         CHECK(socket->get_executor() == boost::asio::any_io_executor(socket->get_io_context().get_executor()));
         socket->close();
     }
+}
+
+TEST_CASE("The synchronous calls of a client WebSocket fail on its strand", "[websocket][executor][integration]") {
+    http::server server;
+    server.get("/echo", [](http::request&, http::response& res) {
+        res.upgrade_websocket_stream({}, [](std::shared_ptr<asio::websocket> ws, std::string) -> awaitable<void> {
+            co_await echo(std::move(ws));
+        });
+    });
+    running_server running(server);
+    auto url = "ws://127.0.0.1:" + std::to_string(running.port) + "/echo";
+
+    // They would wait running the io_context, which cannot run the strand from within it
+    boost::asio::io_context context;
+    bool opened = false;
+    int thrown = 0;
+    std::string echoed;
+    co_spawn(boost::asio::make_strand(context), [&]() -> awaitable<void> {
+        auto client = co_await http::executor_client::for_current_coroutine();
+        auto ws = co_await client->websocket(url);
+        if (!ws) co_return;
+        opened = true;
+        try { ws->send_text("lost"); } catch (const std::logic_error&) { ++thrown; }
+        try { ws->send_binary(std::string_view("lost")); } catch (const std::logic_error&) { ++thrown; }
+        try { ws->receive(); } catch (const std::logic_error&) { ++thrown; }
+        try { ws->close(); } catch (const std::logic_error&) { ++thrown; }
+
+        // The coroutine API works there, on the connection still open
+        if (co_await ws->send_text_async("hello")) echoed = (co_await ws->receive_async()).first;
+        co_await ws->close_async();
+    }, detached);
+    context.run_for(10s);
+
+    REQUIRE(opened);
+    CHECK(thrown == 4);
+    CHECK(echoed == "hello");
 }

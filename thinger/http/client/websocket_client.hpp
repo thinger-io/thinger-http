@@ -54,6 +54,10 @@ public:
 
     // ============================================
     // Synchronous API
+    //
+    // Each call waits running the io_context of the socket. Called on the strand the WebSocket
+    // was opened from (e.g. from a coroutine of executor_client on a strand), where it would
+    // wait forever, it throws std::logic_error: use the coroutine API there
     // ============================================
 
     /**

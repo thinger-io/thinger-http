@@ -1,9 +1,26 @@
 #include "websocket_client.hpp"
+#include "../../asio/io_context_of.hpp"
 #include "../../util/logger.hpp"
 
 #include <future>
+#include <stdexcept>
 
 namespace thinger::http {
+
+namespace {
+
+    // A synchronous call waits running the io_context of the socket, which cannot run the
+    // strand of the WebSocket from within it: it would wait forever
+    void ensure_not_on_strand(const asio::websocket& websocket, const char* call) {
+        const auto& executor = websocket.get_executor();
+        if (!asio::running_in_this_thread(executor)) return;
+        if (executor == boost::asio::any_io_executor(websocket.get_io_context().get_executor())) return;
+        throw std::logic_error(std::string("websocket_client::") + call +
+                               "() called on the strand of its WebSocket, where it would wait forever: "
+                               "use the coroutine API (send_text_async(), receive_async()...)");
+    }
+
+}
 
 websocket_client::websocket_client(std::shared_ptr<asio::websocket> ws)
     : websocket_(std::move(ws)) {}
@@ -49,6 +66,7 @@ std::shared_ptr<asio::websocket> websocket_client::release_socket() {
 
 bool websocket_client::send_text(std::string_view message) {
     if (!is_open()) return false;
+    ensure_not_on_strand(*websocket_, "send_text");
 
     std::promise<bool> promise;
     auto future = promise.get_future();
@@ -82,6 +100,7 @@ bool websocket_client::send_binary(const void* data, size_t size) {
 
 bool websocket_client::send_binary(std::string_view data) {
     if (!is_open()) return false;
+    ensure_not_on_strand(*websocket_, "send_binary");
 
     std::promise<bool> promise;
     auto future = promise.get_future();
@@ -112,6 +131,7 @@ bool websocket_client::send_binary(std::string_view data) {
 
 std::pair<std::string, bool> websocket_client::receive() {
     if (!is_open()) return {"", false};
+    ensure_not_on_strand(*websocket_, "receive");
 
     std::promise<std::pair<std::string, bool>> promise;
     auto future = promise.get_future();
@@ -141,6 +161,7 @@ std::pair<std::string, bool> websocket_client::receive() {
 
 void websocket_client::close() {
     if (!websocket_) return;
+    ensure_not_on_strand(*websocket_, "close");
 
     std::promise<void> promise;
     auto future = promise.get_future();
