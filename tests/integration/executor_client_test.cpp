@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <thinger/http/client/client.hpp>
 #include <thinger/http/client/executor_client.hpp>
+#include <thinger/asio/io_context_of.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
@@ -157,17 +158,17 @@ TEST_CASE("io_context_of finds the io_context behind an executor", "[client][exe
     boost::asio::io_context context;
     boost::asio::any_io_executor io = context.get_executor();
 
-    CHECK(http::io_context_of(context.get_executor()) == &context);
-    CHECK(http::io_context_of(io) == &context);
-    CHECK(http::io_context_of(boost::asio::make_strand(context)) == &context);
-    CHECK(http::io_context_of(boost::asio::make_strand(io)) == &context);
-    CHECK(http::io_context_of(boost::asio::make_strand(boost::asio::any_io_executor(boost::asio::make_strand(io)))) ==
+    CHECK(asio::io_context_of(context.get_executor()) == &context);
+    CHECK(asio::io_context_of(io) == &context);
+    CHECK(asio::io_context_of(boost::asio::make_strand(context)) == &context);
+    CHECK(asio::io_context_of(boost::asio::make_strand(io)) == &context);
+    CHECK(asio::io_context_of(boost::asio::make_strand(boost::asio::any_io_executor(boost::asio::make_strand(io)))) ==
           &context);
 
     boost::asio::thread_pool pool(1);
-    CHECK(http::io_context_of(pool.get_executor()) == nullptr);
-    CHECK(http::io_context_of(boost::asio::make_strand(boost::asio::any_io_executor(pool.get_executor()))) == nullptr);
-    CHECK(http::io_context_of(boost::asio::any_io_executor()) == nullptr);
+    CHECK(asio::io_context_of(pool.get_executor()) == nullptr);
+    CHECK(asio::io_context_of(boost::asio::make_strand(boost::asio::any_io_executor(pool.get_executor()))) == nullptr);
+    CHECK(asio::io_context_of(boost::asio::any_io_executor()) == nullptr);
     pool.join();
 }
 

@@ -1,5 +1,4 @@
 #include "executor_client.hpp"
-#include <boost/asio/strand.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <stdexcept>
 
@@ -17,24 +16,12 @@ executor_client::~executor_client() {
 }
 
 awaitable<std::unique_ptr<executor_client>> executor_client::for_current_coroutine() {
-    auto* io_context = io_context_of(co_await boost::asio::this_coro::executor);
+    auto* io_context = asio::io_context_of(co_await boost::asio::this_coro::executor);
     if (!io_context) {
         throw std::logic_error("executor_client: the coroutine does not run on an io_context, "
                                "nor on a strand of one");
     }
     co_return std::make_unique<executor_client>(*io_context);
-}
-
-boost::asio::io_context* io_context_of(const boost::asio::any_io_executor& executor) {
-    using io_executor = boost::asio::io_context::executor_type;
-    if (auto* io = executor.target<io_executor>()) return &io->context();
-    if (auto* strand = executor.target<boost::asio::strand<io_executor>>()) {
-        return &strand->get_inner_executor().context();
-    }
-    if (auto* strand = executor.target<boost::asio::strand<boost::asio::any_io_executor>>()) {
-        return io_context_of(strand->get_inner_executor());
-    }
-    return nullptr;
 }
 
 } // namespace thinger::http

@@ -3,7 +3,7 @@
 
 #include "http_client_base.hpp"
 #include "request_builder.hpp"
-#include <boost/asio/any_io_executor.hpp>
+#include "../../asio/io_context_of.hpp"
 #include <boost/asio/io_context.hpp>
 #include <memory>
 #include <optional>
@@ -46,7 +46,7 @@ public:
     executor_client(const executor_client&) = delete;
     executor_client& operator=(const executor_client&) = delete;
 
-    // A client on the io_context of the calling coroutine (see io_context_of()). Throws
+    // A client on the io_context of the calling coroutine (see asio::io_context_of()). Throws
     // std::logic_error if the coroutine runs on another kind of executor (e.g. a thread_pool)
     static awaitable<std::unique_ptr<executor_client>> for_current_coroutine();
 
@@ -80,10 +80,6 @@ protected:
 private:
     boost::asio::io_context& io_context_;
 };
-
-// The io_context of an executor: an io_context executor, or a strand of one (of any depth);
-// null for any other executor (e.g. of a thread_pool)
-boost::asio::io_context* io_context_of(const boost::asio::any_io_executor& executor);
 
 } // namespace thinger::http
 

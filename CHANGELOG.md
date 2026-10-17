@@ -10,7 +10,7 @@ All notable changes to thinger-http are documented in this file. The format foll
 ### Added
 
 - `executor_client`: an HTTP client running on an io_context the caller already runs, usually the one of the calling coroutine (`executor_client::for_current_coroutine()`), with no threads of its own and no idle timers. Its requests run on the caller's thread and are cancelled with the coroutine awaiting them; it keeps no idle connection by default and closes its connections when destroyed. For occasional calls from server coroutines; a pooled client (`async_client`) suits many calls to the same host. See [Executor Client](README.md#executor-client-executor_client).
-- `http::io_context_of(executor)`: the io_context of an io_context executor or of a strand of one, null for other executors.
+- `asio::io_context_of(executor)` (`<thinger/asio/io_context_of.hpp>`): the io_context of an io_context executor or of a strand of one, null for other executors.
 
 ### Changed
 
