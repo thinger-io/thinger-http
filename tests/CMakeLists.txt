@@ -178,6 +178,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/async_client_thread_affinity_t
     add_thinger_test(test_integration_async_client_thread_affinity integration/async_client_thread_affinity_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/executor_client_test.cpp)
+    add_thinger_test(test_integration_executor_client integration/executor_client_test.cpp)
+endif()
+
 # Integration tests - Client response framing (malformed responses, connection reuse)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/client_response_framing_test.cpp)
     add_thinger_test(test_integration_client_response_framing integration/client_response_framing_test.cpp)
