@@ -3,6 +3,7 @@
 #pragma once
 
 #include "socket.hpp"
+#include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <chrono>
 #include <deque>
@@ -32,13 +33,13 @@ namespace thinger::asio {
 //   pong is sent as soon as no frame is being written, without holding the reads.
 // - A close frame received is answered, the connection closed, and reads end with
 //   boost::asio::error::eof (as a TCP socket closed by its peer). Writes then fail.
-// - close(), on the io_context of the socket, ends the pending operations and closes the
+// - close(), on the executor of the websocket, ends the pending operations and closes the
 //   socket for its user right away; the closing handshake goes on by itself: the rest of a
 //   frame being written, a close frame (code 1000), and the connection closed once the peer
-//   answers or after CLOSE_TIMEOUT. Called while nothing runs the io_context (e.g. by a
-//   synchronous client), it closes the connection at once instead. close(code) does the same
-//   with another status code. close_graceful() does the handshake, waiting. A websocket
-//   destroyed open on its io_context closes with 1001.
+//   answers or after CLOSE_TIMEOUT. Called anywhere else (e.g. by a synchronous client, while
+//   nothing runs its io_context), it closes the connection at once instead. close(code) does
+//   the same with another status code. close_graceful() does the handshake, waiting. A
+//   websocket destroyed open on its executor closes with 1001.
 // - An optional keepalive pings the peer (one ping at a time) and closes the connection
 //   when it is idle (see set_keepalive()).
 // - Text is not validated as UTF-8 here, neither in text messages nor in close reasons:
@@ -49,7 +50,9 @@ namespace thinger::asio {
 // message-oriented users, such as http::websocket_connection and http::websocket_client.
 //
 // It must be owned by a std::shared_ptr for the keepalive and to answer pings without
-// holding the reads. Not thread-safe, as any socket (see socket.hpp).
+// holding the reads. Not thread-safe, as any socket (see socket.hpp): used on its executor
+// (see get_executor()), where it also runs the work it does on its own (the keepalive, the
+// control frames it sends, the closing handshake), so never at the same time as its user.
 class websocket : public socket, public std::enable_shared_from_this<websocket> {
 
 public:
@@ -69,8 +72,10 @@ public:
     static constexpr uint16_t CLOSE_TRY_AGAIN_LATER = 1013;
 
     // `binary`: frames written are binary (otherwise text); `server`: the server role (frames
-    // received must be masked, frames sent are not)
-    websocket(std::shared_ptr<socket> socket, bool binary = true, bool server = true);
+    // received must be masked, frames sent are not); `executor`: where its user runs it (e.g. a
+    // strand of an io_context run by several threads), the io_context of the socket by default
+    websocket(std::shared_ptr<socket> socket, bool binary = true, bool server = true,
+              boost::asio::any_io_executor executor = {});
     ~websocket() override;
 
     // Socket control
@@ -80,9 +85,9 @@ public:
         std::chrono::seconds timeout) override;
     void close() override;
     // Close the connection with `code`: the closing handshake on its own when called on the
-    // io_context, waiting for the close frame of the peer if `expect_reply`. On the thread of
-    // the io_context, as any operation. A code that may not be sent (RFC 6455, 7.4: e.g. 1005,
-    // 1006 or 1015) is sent as 1000
+    // executor, waiting for the close frame of the peer if `expect_reply`. On the executor, as
+    // any operation. A code that may not be sent (RFC 6455, 7.4: e.g. 1005, 1006 or 1015) is
+    // sent as 1000
     void close(uint16_t code, bool expect_reply = true);
     // Send a close frame (waiting for a pending write), wait for the close frame of the peer
     // (up to CLOSE_TIMEOUT), and close. A code that may not be sent is sent as 1000
@@ -133,6 +138,9 @@ public:
 
     // Socket the WebSocket runs on
     std::shared_ptr<socket> get_socket() const { return socket_; }
+
+    // Executor the WebSocket is used on, and runs its own work on: the one it was created with
+    const boost::asio::any_io_executor& get_executor() const { return executor_; }
 
     // Keepalive: ping the peer once nothing was received from it for `ping_interval`, and
     // close the connection once nothing was received for `idle_timeout` (pongs included).
@@ -207,6 +215,7 @@ private:
                                   std::string input, uint64_t skip, bool expect_reply);
 
     std::shared_ptr<socket> socket_;
+    boost::asio::any_io_executor executor_;
     bool binary_;
     bool server_role_;
     std::string protocol_;
@@ -228,7 +237,7 @@ private:
 
     // Writes waiting for their turn
     struct write_waiter {
-        explicit write_waiter(boost::asio::io_context& io_context) : timer(io_context) {}
+        explicit write_waiter(const boost::asio::any_io_executor& executor) : timer(executor) {}
         boost::asio::steady_timer timer;
         bool control = false;
         bool granted = false;

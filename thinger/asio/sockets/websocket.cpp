@@ -1,4 +1,5 @@
 #include "websocket.hpp"
+#include "../io_context_of.hpp"
 #include "../../util/logger.hpp"
 
 #include <algorithm>
@@ -58,14 +59,15 @@ boost::system::error_code protocol_error() {
 
 std::atomic<unsigned long> websocket::connections{0};
 
-websocket::websocket(std::shared_ptr<socket> sock, bool binary, bool server)
+websocket::websocket(std::shared_ptr<socket> sock, bool binary, bool server, boost::asio::any_io_executor executor)
     : socket("websocket", sock->get_io_context())
     , socket_(std::move(sock))
+    , executor_(executor ? std::move(executor) : boost::asio::any_io_executor(io_context_.get_executor()))
     , binary_(binary)
     , server_role_(server)
     , in_(INPUT_BUFFER_SIZE)
-    , close_timer_(std::make_shared<boost::asio::steady_timer>(io_context_))
-    , keepalive_timer_(std::make_shared<boost::asio::steady_timer>(io_context_))
+    , close_timer_(std::make_shared<boost::asio::steady_timer>(executor_))
+    , keepalive_timer_(std::make_shared<boost::asio::steady_timer>(executor_))
     , last_received_(std::chrono::steady_clock::now()) {
     ++connections;
     LOG_DEBUG("websocket created");
@@ -74,10 +76,10 @@ websocket::websocket(std::shared_ptr<socket> sock, bool binary, bool server)
 websocket::~websocket() {
     --connections;
     LOG_DEBUG("releasing websocket");
-    // A websocket released open on its io_context says goodbye to its peer. Anywhere else no
-    // I/O is started, and nothing shared with the io_context is touched: the socket closes
-    // the connection once released
-    if (!closed_ && !writing_ && io_context_.get_executor().running_in_this_thread()) {
+    // A websocket released open on its executor says goodbye to its peer. Anywhere else no
+    // I/O is started, and nothing shared with the executor is touched: the socket closes the
+    // connection once released
+    if (!closed_ && !writing_ && running_in_this_thread(executor_)) {
         close(CLOSE_GOING_AWAY);
     }
 }
@@ -346,7 +348,7 @@ awaitable<bool> websocket::acquire_write(bool control) {
         co_return true;
     }
     // Wait for the turn: control frames go before the data waiting, after other control frames
-    auto waiter = std::make_shared<write_waiter>(io_context_);
+    auto waiter = std::make_shared<write_waiter>(executor_);
     waiter->timer.expires_at(std::chrono::steady_clock::time_point::max());
     if (control) {
         auto position = std::find_if(write_waiters_.begin(), write_waiters_.end(),
@@ -374,7 +376,7 @@ void websocket::release_write() {
     if (pending_pong_ || pending_ping_) {
         // the turn goes to the control frames queued: writing_ stays set
         if (auto self = weak_from_this().lock()) {
-            co_spawn(io_context_, [self]() -> awaitable<void> { co_await self->flush_control(); }, detached);
+            co_spawn(executor_, [self]() -> awaitable<void> { co_await self->flush_control(); }, detached);
             return;
         }
         pending_pong_.reset();
@@ -555,9 +557,9 @@ void websocket::close(uint16_t code, bool expect_reply) {
     pending_pong_.reset();
     pending_ping_ = false;
 
-    // The closing handshake needs the io_context: without it (e.g. a synchronous client
-    // between its calls) the connection is closed now
-    if (close_sent_ || write_error_ || !socket_->is_open() || !io_context_.get_executor().running_in_this_thread()) {
+    // The closing handshake runs on the executor: called anywhere else (e.g. by a synchronous
+    // client between its calls, while nothing runs its io_context) the connection is closed now
+    if (close_sent_ || write_error_ || !socket_->is_open() || !running_in_this_thread(executor_)) {
         socket_->close();
         return;
     }
@@ -590,14 +592,15 @@ void websocket::start_linger() {
     // The closing handshake goes on without this websocket, on its socket, with what was
     // received but not read yet
     std::string input(reinterpret_cast<const char*>(in_.data() + in_begin_), buffered());
-    co_spawn(io_context_, linger(socket_, std::move(output), std::move(input), frame_remaining_, linger_expect_reply_),
+    co_spawn(executor_, linger(socket_, std::move(output), std::move(input), frame_remaining_, linger_expect_reply_),
              detached);
 }
 
 awaitable<void> websocket::linger(std::shared_ptr<socket> socket, std::vector<uint8_t> output,
                                   std::string input, uint64_t skip, bool expect_reply) {
-    // Close the socket after the timeout, whatever is pending on it
-    auto timer = std::make_shared<boost::asio::steady_timer>(socket->get_io_context(), CLOSE_TIMEOUT);
+    // Close the socket after the timeout, whatever is pending on it: on the executor of the
+    // websocket, as the operations it ends
+    auto timer = std::make_shared<boost::asio::steady_timer>(co_await boost::asio::this_coro::executor, CLOSE_TIMEOUT);
     timer->async_wait([socket](const boost::system::error_code& ec) {
         if (!ec) socket->close();
     });
@@ -679,11 +682,11 @@ void websocket::set_keepalive(std::chrono::milliseconds ping_interval, std::chro
         LOG_ERROR("websocket keepalive requires the websocket to be owned by a std::shared_ptr");
         return;
     }
-    keepalive_timer_ = std::make_shared<boost::asio::steady_timer>(io_context_);
+    keepalive_timer_ = std::make_shared<boost::asio::steady_timer>(executor_);
     last_ping_ = {};
     last_received_ = std::chrono::steady_clock::now();
 
-    co_spawn(io_context_, [weak, timer = keepalive_timer_, generation]() -> awaitable<void> {
+    co_spawn(executor_, [weak, timer = keepalive_timer_, generation]() -> awaitable<void> {
         using clock = std::chrono::steady_clock;
         for (;;) {
             clock::time_point next = clock::time_point::max();
