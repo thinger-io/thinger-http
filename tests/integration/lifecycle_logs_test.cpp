@@ -3,11 +3,15 @@
 #include <thinger/http/server/server_standalone.hpp>
 #include <thinger/util/logger.hpp>
 #include <spdlog/sinks/ringbuffer_sink.h>
+#include <boost/asio.hpp>
+
+#include "server_test_helpers.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -102,6 +106,30 @@ TEST_CASE("A server stopped without a shutdown logs that it stopped, once", "[lo
 
     std::vector<std::string> expected = {"listening on " + url, "server on " + url + " stopped"};
     CHECK(logs.at("info") == expected);
+}
+
+TEST_CASE("A server logs no line per connection at info", "[logging][integration]") {
+    log_capture logs;
+    std::string url;
+    {
+        http::server server;
+        server_test::running_server running(server);
+        url = "http://127.0.0.1:" + std::to_string(running.port);
+
+        boost::asio::io_context context;
+        boost::asio::ip::tcp::socket connection(context);
+        connection.connect({boost::asio::ip::make_address("127.0.0.1"), running.port});
+        auto deadline = std::chrono::steady_clock::now() + 3s;
+        while (server.stats().total_connections == 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(5ms);
+        }
+        REQUIRE(server.stats().total_connections == 1);
+    }
+    INFO("captured logs:\n" << logs.dump());
+
+    std::vector<std::string> expected = {"listening on " + url, "server on " + url + " stopped"};
+    CHECK(logs.at("info") == expected);
+    CHECK(logs.count("debug", "received connection from") == 1);
 }
 
 TEST_CASE("Each server names where it listens in its logs", "[logging][integration]") {

@@ -80,7 +80,7 @@ unix_socket_server::connection_server unix_socket_server::make_connection_server
     return [handler = handler_, unix_path = unix_path_](boost::asio::local::stream_protocol::socket peer) {
         auto sock = std::make_shared<unix_socket>("unix_socket_server", std::move(peer));
 
-        LOG_INFO("received connection on Unix socket: {}", unix_path);
+        LOG_DEBUG("received connection on Unix socket: {}", unix_path);
 
         // Call handler with the connected socket
         if (handler) {

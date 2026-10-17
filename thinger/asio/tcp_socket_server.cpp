@@ -108,7 +108,7 @@ std::shared_ptr<tcp_socket> make_socket(boost::asio::io_context& io_context, con
 
 // Set an accepted connection up and hand it to the handler
 void serve_connection(std::shared_ptr<tcp_socket> sock, const connection_setup& setup) {
-    LOG_INFO("received connection from: ip: {}, port: {}, secure: {}",
+    LOG_DEBUG("received connection from: ip: {}, port: {}, secure: {}",
             sock->get_remote_ip(), sock->get_local_port(), sock->is_secure());
 
     // Fails if the connection is already gone: drop it

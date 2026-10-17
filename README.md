@@ -1797,7 +1797,7 @@ thinger::logging::set_logger(logger);
 
 ### What a Server Logs When It Starts and Stops
 
-At `info`, a server logs one line when it starts listening, one when a graceful shutdown starts (with the connections open and the grace period) and one when it stopped, as Node and Go servers do; the workers log the signal that stops them (`wait()`, `wait_graceful()`). Warnings, as a self-signed certificate generated for want of one, stay. The threads and the steps of starting and stopping (workers, acceptors, worker clients) log at `debug`.
+At `info`, a server logs one line when it starts listening, one when a graceful shutdown starts (with the connections open and the grace period) and one when it stopped, as Node and Go servers do; the workers log the signal that stops them (`wait()`, `wait_graceful()`). Warnings, as a self-signed certificate generated for want of one, stay. Each connection accepted, the threads and the steps of starting and stopping (workers, acceptors, worker clients) log at `debug`; the requests and responses are logged as described below.
 
 ```text
 listening on http://0.0.0.0:8080
