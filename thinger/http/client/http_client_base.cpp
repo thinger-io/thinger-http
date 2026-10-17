@@ -616,7 +616,10 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
     }
     if (!valid_upgrade(*response, key, subprotocol)) co_return std::nullopt;
 
-    auto ws = std::make_shared<asio::websocket>(connection->release_socket(), false, false);
+    // Used, and running its keepalive and closing handshake, where the caller runs: on its
+    // strand, never at the same time as the caller on an io_context run by several threads
+    auto ws = std::make_shared<asio::websocket>(connection->release_socket(), false, false,
+                                                co_await boost::asio::this_coro::executor);
     ws->set_protocol(response->get_header("Sec-WebSocket-Protocol"));
     // Frames the server sent right after its response, read along with it
     ws->set_read_ahead(connection->take_buffered());

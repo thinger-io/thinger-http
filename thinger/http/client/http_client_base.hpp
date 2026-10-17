@@ -146,6 +146,7 @@ public:
     awaitable<std::pair<client_response, std::shared_ptr<client_connection>>>
         send_with_connection(std::shared_ptr<http_request> request);
 
+    // The WebSocket runs on the executor of the coroutine opening it (e.g. its strand)
     awaitable<std::optional<websocket_client>> upgrade_websocket(
         const std::string& url,
         const std::string& subprotocol = "");

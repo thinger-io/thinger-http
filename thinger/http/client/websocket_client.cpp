@@ -56,7 +56,7 @@ bool websocket_client::send_text(std::string_view message) {
     auto& io_context = websocket_->get_io_context();
 
     boost::asio::co_spawn(
-        io_context,
+        websocket_->get_executor(),
         [this, msg = std::string(message), &promise]() -> awaitable<void> {
             bool result = co_await send_text_async(std::move(msg));
             promise.set_value(result);
@@ -90,7 +90,7 @@ bool websocket_client::send_binary(std::string_view data) {
     std::vector<uint8_t> data_vec(data.begin(), data.end());
 
     boost::asio::co_spawn(
-        io_context,
+        websocket_->get_executor(),
         [this, data_vec = std::move(data_vec), &promise]() mutable -> awaitable<void> {
             bool result = co_await send_binary_async(std::move(data_vec));
             promise.set_value(result);
@@ -119,7 +119,7 @@ std::pair<std::string, bool> websocket_client::receive() {
     auto& io_context = websocket_->get_io_context();
 
     boost::asio::co_spawn(
-        io_context,
+        websocket_->get_executor(),
         [this, &promise]() -> awaitable<void> {
             auto result = co_await receive_async();
             promise.set_value(std::move(result));
@@ -148,7 +148,7 @@ void websocket_client::close() {
     auto& io_context = websocket_->get_io_context();
 
     boost::asio::co_spawn(
-        io_context,
+        websocket_->get_executor(),
         [this, &promise]() -> awaitable<void> {
             co_await close_async();
             promise.set_value();
@@ -178,7 +178,7 @@ void websocket_client::run() {
     running_ = true;
 
     boost::asio::co_spawn(
-        websocket_->get_io_context(),
+        websocket_->get_executor(),
         [this]() -> awaitable<void> {
             co_await message_loop();
         },
