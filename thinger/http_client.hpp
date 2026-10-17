@@ -4,6 +4,7 @@
 // HTTP Client functionality
 #include <thinger/http/client/client.hpp>               // client class (standalone sync)
 #include <thinger/http/client/async_client.hpp>          // async_client class (for async with worker threads)
+#include <thinger/http/client/executor_client.hpp>       // executor_client class (async, on an io_context the caller runs)
 #include <thinger/http/client/websocket_client.hpp>     // websocket_client class (returned by client.websocket())
 #include <thinger/http/client/client_response.hpp>
 #include <thinger/http/client/client_error.hpp>         // client_error: why a response could not be read
