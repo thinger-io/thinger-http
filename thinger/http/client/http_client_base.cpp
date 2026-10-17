@@ -38,7 +38,9 @@ namespace {
             std::error_code time_ec, size_ec;
             auto time = std::filesystem::last_write_time(*file, time_ec);
             auto size = std::filesystem::file_size(*file, size_ec);
-            key += "\nfile:" + *file + ":" + (time_ec ? "-" : std::to_string(time.time_since_epoch().count())) +
+            // In nanoseconds: the count of a file time is a 128-bit integer with libc++
+            auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count();
+            key += "\nfile:" + *file + ":" + (time_ec ? "-" : std::to_string(nanoseconds)) +
                    ":" + (size_ec ? "-" : std::to_string(size));
         }
         for (const auto* pem : cas.pems) key += "\npem:" + *pem;

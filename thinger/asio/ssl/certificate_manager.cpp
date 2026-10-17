@@ -212,8 +212,9 @@ void certificate_manager::generate_self_signed_certificate() {
     
     X509_set_pubkey(x509, pkey);
     
-    // Set subject
-    X509_NAME* name = X509_get_subject_name(x509);
+    // Subject, and issuer as it is self-signed: a name of its own, as recent OpenSSL versions
+    // give the name of a certificate as const
+    X509_NAME* name = X509_NAME_new();
     X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC, 
                               reinterpret_cast<const unsigned char*>("US"), -1, -1, 0);
     X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC, 
@@ -221,7 +222,9 @@ void certificate_manager::generate_self_signed_certificate() {
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, 
                               reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
     
+    X509_set_subject_name(x509, name);
     X509_set_issuer_name(x509, name);
+    X509_NAME_free(name);
     X509_sign(x509, pkey, EVP_sha256());
     
     // Create SSL context
