@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <thinger/http/client/client.hpp>
 #include <thinger/http/client/executor_client.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
