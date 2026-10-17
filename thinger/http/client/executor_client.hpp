@@ -26,6 +26,10 @@ namespace thinger::http {
  * on a strand of it), and destroy it there, before the io_context. Cancelling the coroutine
  * awaiting a request (a cancellation slot, or `||` with a timer) cancels the request.
  *
+ * WebSockets opened through it run their keepalive and linger on the io_context of the socket,
+ * not on the caller's strand: with an io_context run by several threads, open them from a
+ * single-threaded io_context, or from one whose work all goes through a strand.
+ *
  * Usage:
  *   server.get("/weather", [](http::response& res) -> thinger::awaitable<void> {
  *       auto client = co_await http::executor_client::for_current_coroutine();
