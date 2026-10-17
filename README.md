@@ -1345,7 +1345,7 @@ server.get("/weather", [](thinger::http::response& res) -> thinger::awaitable<vo
 thinger::http::executor_client client(io_context);
 ```
 
-`for_current_coroutine()` takes the io_context of the calling coroutine, an io_context executor or a strand of one (as server handlers have), and throws `std::logic_error` on any other executor (e.g. a `thread_pool`); `thinger::asio::io_context_of(executor)` (in `<thinger/asio/io_context_of.hpp>`) tells which io_context an executor runs on, or null. Use the client on the threads running its io_context (with several threads, from a strand of it), and destroy it there, before the io_context. Cancelling the coroutine awaiting a request (a cancellation slot, or `||` with a timer) cancels the request and closes its connection. WebSockets opened through it (`websocket()`) run their keepalive and linger on the io_context of the socket, not on the caller's strand: with an io_context run by several threads, open them from a single-threaded io_context, or from one whose work all goes through a strand.
+`for_current_coroutine()` takes the io_context of the calling coroutine, an io_context executor or a strand of one (as server handlers have), and throws `std::logic_error` on any other executor (e.g. a `thread_pool`); `thinger::asio::io_context_of(executor)` (in `<thinger/asio/io_context_of.hpp>`) tells which io_context an executor runs on, or null. Use the client on the threads running its io_context (with several threads, from a strand of it), and destroy it there, before the io_context. Cancelling the coroutine awaiting a request (a cancellation slot, or `||` with a timer) cancels the request and closes its connection. WebSockets opened through it (`websocket()`) run on the executor of the caller, its strand included: their keepalive and closing handshake never run at the same time as the caller.
 
 For many calls to the same host, as a gateway sending most requests to one backend, use a pooled client instead (`async_client`), whose connections are kept alive and shared by every request. `max_idle_connections_per_host()` enables keep-alive here too, but a client created per call does not keep its connections for the next one.
 
@@ -1463,7 +1463,7 @@ As a stream:
 - Each write sends one whole message (unfragmented). Writes may be called while others are pending, from several coroutines: they are sent one after another, in call order, never interleaved. Writing 0 bytes sends nothing. A write interrupted in the middle of its frame (`cancel()`, or the cancellation of the operation) leaves the rest of the frame to be sent before anything else, so the framing is never broken.
 - Pings are answered (and unsolicited pongs ignored) while reading, so some read must be pending, as a protocol reading its socket has. The pong goes out as soon as no frame is being written, without holding the reads. The keepalive counts on reading too: what is not read is not received. It sends one ping at a time, and closes the connection if a ping cannot be sent.
 - A close frame from the client is answered, the connection closed, and reads end with `boost::asio::error::eof`, as on a TCP connection closed by its peer. Writes fail afterwards.
-- `close()` returns at once: pending operations end, the socket is closed for its user, and the closing handshake finishes on its own: the rest of a frame being written, a close frame (code 1000), and the connection closed when the client answers, or after 5 seconds. Called where nothing runs the io_context of the socket (e.g. by the synchronous client between calls), it closes the connection at once instead. `co_await ws->close_graceful()` does the handshake, waiting. A WebSocket destroyed open on its io_context sends 1001 (going away), and so does the idle timeout; protocol errors (an unmasked frame, an unknown opcode...) are answered with 1002.
+- `close()` returns at once: pending operations end, the socket is closed for its user, and the closing handshake finishes on its own: the rest of a frame being written, a close frame (code 1000), and the connection closed when the client answers, or after 5 seconds. Called anywhere else than on the executor of the WebSocket (e.g. by the synchronous client between calls, while nothing runs its io_context), it closes the connection at once instead. `co_await ws->close_graceful()` does the handshake, waiting. A WebSocket destroyed open on its executor sends 1001 (going away), and so does the idle timeout; protocol errors (an unmasked frame, an unknown opcode...) are answered with 1002.
 
 For message-oriented code `upgrade_websocket()` (above) remains; `ws->read_message_some()` with `is_message_complete()` and `is_binary()` gives the message boundaries over the same socket.
 
@@ -1507,7 +1507,7 @@ if (ws) {
 }
 ```
 
-It is used on its io_context (`socket->get_io_context()`): with `async_client`, the one of the coroutine that opened it.
+It is used on its executor (`socket->get_executor()`): the one of the coroutine that opened it, a strand of it included, where the WebSocket also runs its keepalive and closing handshake.
 
 ### WebSocket Client (Sync)
 
@@ -1863,7 +1863,7 @@ See the [examples](examples/) directory for complete working examples:
 - `http::async_client` - Thread-safe, uses internal worker threads
 - `http::websocket_client` - Single connection, thread-safe send operations
 - `http::websocket_connection` - Server-side WebSocket, thread-safe send, callbacks on IO thread
-- `asio::socket` (TCP, TLS, Unix, `asio::websocket`, custom sockets) - Not thread-safe, like the asio objects they wrap: use a socket on a thread running its io_context (`get_io_context()`), dispatching there from other threads. `socket_pipe::cancel()` may be called from any thread
+- `asio::socket` (TCP, TLS, Unix, `asio::websocket`, custom sockets) - Not thread-safe, like the asio objects they wrap: use a socket on a thread running its io_context (`get_io_context()`), dispatching there from other threads; an `asio::websocket` on its executor (`get_executor()`: the io_context of its socket, or the strand of the coroutine that opened it from a client), where it runs its keepalive and closing handshake too. `socket_pipe::cancel()` may be called from any thread
 
 ## License
 

@@ -7,6 +7,14 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- `asio::websocket` takes the executor it is used on (e.g. a strand), the io_context of its socket by default, and `get_executor()` returns it. `asio::running_in_this_thread(executor)` (`<thinger/asio/io_context_of.hpp>`) tells whether the caller runs on an io_context executor or a strand held as an `any_io_executor`.
+
+### Fixed
+
+- A WebSocket runs its keepalive, the control frames it sends (pings and pongs) and its closing handshake on the executor it was created with, and the clients create it with the executor of the coroutine opening it (`client`, `async_client` and `executor_client` `websocket()`). They ran on the io_context of the socket: opened from a strand of an io_context run by several threads, they could use the WebSocket on one thread while the caller used it on another. `websocket_connection` runs on the executor of its WebSocket too. Nothing changes on an io_context run by one thread, nor for the server.
+
 ## [0.5.0] - 2026-10-17
 
 ### Added
