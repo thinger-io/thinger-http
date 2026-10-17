@@ -76,8 +76,10 @@ awaitable<boost::system::error_code> tcp_socket::connect(
         }
     };
 
-    // Wait for connect (timeout will cancel if needed)
-    co_spawn(io_context_, timeout_coro(), detached);
+    // Wait for connect (timeout will cancel if needed). The timeout runs on the executor of
+    // the caller, as the connect: never at the same time on a strand of an io_context run by
+    // several threads
+    co_spawn(co_await boost::asio::this_coro::executor, timeout_coro(), detached);
     co_await connect_coro();
 
     if (connect_ec) {

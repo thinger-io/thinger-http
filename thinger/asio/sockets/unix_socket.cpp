@@ -60,7 +60,9 @@ awaitable<boost::system::error_code> unix_socket::connect(const std::string &pat
         }
     };
 
-    co_spawn(io_context_, timeout_coro(), detached);
+    // On the executor of the caller, as the connect: never at the same time on a strand of an
+    // io_context run by several threads
+    co_spawn(co_await boost::asio::this_coro::executor, timeout_coro(), detached);
     co_await connect_coro();
 
     co_return connect_ec;
