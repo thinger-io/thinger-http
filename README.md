@@ -1774,6 +1774,20 @@ thinger::logging::set_logger(logger);
 | `critical` | Critical errors |
 | `off` | Disable logging |
 
+### What a Server Logs When It Starts and Stops
+
+At `info`, a server logs one line when it starts listening, one when a graceful shutdown starts (with the connections open and the grace period) and one when it stopped, as Node and Go servers do; the workers log the signal that stops them (`wait()`, `wait_graceful()`). Warnings, as a self-signed certificate generated for want of one, stay. The threads and the steps of starting and stopping (workers, acceptors, worker clients) log at `debug`.
+
+```text
+listening on http://0.0.0.0:8080
+listening on https://0.0.0.0:8443
+received signal 15: stopping gracefully, within 30000 ms (a second signal stops at once)
+shutting down the server on http://0.0.0.0:8080: 3 connections open, grace period of 30000 ms
+shutting down the server on https://0.0.0.0:8443: 0 connections open, grace period of 30000 ms
+server on https://0.0.0.0:8443 stopped
+server on http://0.0.0.0:8080 stopped
+```
+
 ### What the Message Logs Show
 
 The client and the server log each request and response: the request line or the status (`info`), the header names (`debug`) and the body size (`trace`). In the request line, the values of query parameters that carry credentials (`access_token`, `authorization`, `token`, `api_key`, `password`...) are shown as `[redacted]`. Header values, bodies and WebSocket messages are never logged by default, as they may hold credentials: tokens, cookies, passwords, private keys.
