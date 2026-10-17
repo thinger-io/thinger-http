@@ -88,7 +88,7 @@ std::optional<boost::asio::ip::tcp::endpoint> tcp_socket_server::listening_endpo
 }
 
 void tcp_socket_server::on_listening() {
-    LOG_INFO("TCP server is now listening on {}:{}", host_, port_);
+    LOG_DEBUG("TCP server is now listening on {}:{}", host_, local_port());
 }
 
 namespace {

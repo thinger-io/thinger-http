@@ -31,6 +31,7 @@ struct http_server_base::shutdown_state {
     std::vector<sync_callback<void(bool)>> callbacks;
 
     // Set once when it starts
+    std::string name;                     // the server, for the logs
     std::shared_ptr<connection_tracker> connections;
     boost::asio::io_context* io_context = nullptr;
     std::chrono::steady_clock::time_point deadline;
@@ -92,6 +93,7 @@ void http_server_base::begin_shutdown(std::chrono::milliseconds grace, sync_call
         } else {
             state = std::make_shared<shutdown_state>();
             state->server = this;
+            state->name = log_name();
             state->connections = connections_;
             state->deadline = std::chrono::steady_clock::now() + grace;
             if (on_done) state->callbacks.push_back(std::move(on_done));
@@ -103,8 +105,8 @@ void http_server_base::begin_shutdown(std::chrono::milliseconds grace, sync_call
         return;
     }
 
-    LOG_INFO("shutting down the server: {} connections open, grace period of {} ms",
-             connections_->active(), grace.count());
+    LOG_INFO("shutting down the {}: {} connections open, grace period of {} ms",
+             state->name, connections_->active(), grace.count());
 
     // New connections are refused, and those accepted meanwhile closed
     connections_->set_phase(connection_tracker::phase::draining);
@@ -187,7 +189,7 @@ void http_server_base::complete_shutdown(const std::shared_ptr<shutdown_state>& 
         callbacks.swap(state->callbacks);
     }
     state->ended.notify_all();
-    LOG_INFO("server shut down{}", clean ? "" : " (connections closed before they finished)");
+    LOG_INFO("{} stopped{}", state->name, clean ? "" : " (connections closed before they finished)");
     for (auto& callback : callbacks) {
         try {
             callback(clean);

@@ -141,6 +141,10 @@ private:
 
     void setup_connection_handler();
     bool stop_listening();
+    // Log where the server listens, once it does (and keep it for the next logs)
+    void log_listening();
+    // The server, for the logs: "server on http://0.0.0.0:8080" ("server" before it listened)
+    std::string log_name() const;
     void reset_shutdown();
     static void check_shutdown(const std::shared_ptr<shutdown_state>& state);
     static void wait_shutdown(const std::shared_ptr<shutdown_state>& state);
@@ -149,6 +153,8 @@ private:
     static void complete_shutdown(const std::shared_ptr<shutdown_state>& state, bool clean);
 
     sync_callback<void()> on_shutdown_;
+    // Where the server listens: http://host:port, https://host:port or unix:/path
+    std::string listening_on_;
     // The last shutdown (guarded by its mutex)
     mutable std::mutex shutdown_mutex_;
     std::shared_ptr<shutdown_state> shutdown_;

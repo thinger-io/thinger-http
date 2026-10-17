@@ -65,7 +65,7 @@ std::optional<boost::asio::local::stream_protocol::endpoint> unix_socket_server:
 }
 
 void unix_socket_server::on_listening() {
-    LOG_INFO("Unix socket server is now listening on {}", unix_path_);
+    LOG_DEBUG("Unix socket server is now listening on {}", unix_path_);
 
     // Set permissions to allow access (you might want to make this configurable)
     std::filesystem::permissions(unix_path_,

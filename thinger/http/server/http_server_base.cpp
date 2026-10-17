@@ -43,7 +43,9 @@ bool http_server_base::listen(const std::string& host, uint16_t port) {
     setup_connection_handler();
     
     // Start listening
-    return socket_server_->start();
+    if (!socket_server_->start()) return false;
+    log_listening();
+    return true;
 }
 
 bool http_server_base::listen_unix(const std::string& unix_path) {
@@ -65,7 +67,9 @@ bool http_server_base::listen_unix(const std::string& unix_path) {
     setup_connection_handler();
     
     // Start listening
-    return socket_server_->start();
+    if (!socket_server_->start()) return false;
+    log_listening();
+    return true;
 }
 
 bool http_server_base::start(uint16_t port) {
@@ -108,7 +112,11 @@ bool http_server_base::start_unix(const std::string& unix_path, const sync_callb
 
 bool http_server_base::stop() {
     end_shutdown();
-    return stop_listening();
+    // Not when a shutdown stops it: it stopped listening already, and the shutdown tells
+    bool listening = is_listening();
+    bool stopped = stop_listening();
+    if (listening) LOG_INFO("{} stopped", log_name());
+    return stopped;
 }
 
 bool http_server_base::stop_listening() {
@@ -130,6 +138,21 @@ uint16_t http_server_base::local_port() const {
 
 
 // Private methods
+void http_server_base::log_listening() {
+    if (use_unix_socket_) {
+        listening_on_ = "unix:" + unix_path_;
+    } else {
+        // The port bound (for port 0, the one chosen), and IPv6 addresses in brackets
+        auto host = host_.find(':') == std::string::npos ? host_ : "[" + host_ + "]";
+        listening_on_ = (ssl_enabled_ ? "https://" : "http://") + host + ":" + std::to_string(local_port());
+    }
+    LOG_INFO("listening on {}", listening_on_);
+}
+
+std::string http_server_base::log_name() const {
+    return listening_on_.empty() ? "server" : "server on " + listening_on_;
+}
+
 void http_server_base::setup_connection_handler() {
     socket_server_->set_handler([this](std::shared_ptr<asio::socket> socket) {
         auto connection = std::make_shared<server_connection>(socket);

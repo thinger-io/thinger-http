@@ -92,7 +92,7 @@ bool server::listen(const std::string& host, uint16_t port) {
     
     // Mark as running
     running_ = true;
-    LOG_INFO("Standalone server listening on {}:{} (single-threaded)", host, port);
+    LOG_DEBUG("Standalone server listening on {}:{} (single-threaded)", host, port);
     
     // Note: io_context_.run() will be called in wait() method
     
@@ -118,7 +118,7 @@ bool server::listen_unix(const std::string& unix_path) {
 
     // Mark as running
     running_ = true;
-    LOG_INFO("Standalone server listening on unix:{} (single-threaded)", unix_path);
+    LOG_DEBUG("Standalone server listening on unix:{} (single-threaded)", unix_path);
 
     return true;
 }
