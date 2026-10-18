@@ -1,4 +1,5 @@
 #include "trusted_proxies.hpp"
+#include "../common/headers.hpp"
 #include <boost/algorithm/string.hpp>
 #include <algorithm>
 #include <charconv>
@@ -169,12 +170,6 @@ const std::string& trusted_proxies::header_name() const {
     return header_ == forwarded_header::forwarded ? forwarded : x_forwarded_for;
 }
 
-const std::string& trusted_proxies::scheme_header_name() const {
-    static const std::string x_forwarded_proto = "X-Forwarded-Proto";
-    static const std::string forwarded = "Forwarded";
-    return header_ == forwarded_header::forwarded ? forwarded : x_forwarded_proto;
-}
-
 std::string trusted_proxies::client_ip(const std::string& peer, const std::vector<std::string>& header_values) const {
     if (!contains(peer)) return peer;
 
@@ -194,29 +189,48 @@ std::string trusted_proxies::client_ip(const std::string& peer, const std::vecto
     return client;
 }
 
-std::string trusted_proxies::client_scheme(const std::string& peer, std::string_view scheme,
-                                           const std::vector<std::string>& header_values) const {
-    if (!contains(peer)) return std::string(scheme);
+forwarded_client trusted_proxies::resolve(const std::string& peer, std::string_view scheme,
+                                          const headers& request) const {
+    forwarded_client client{peer, std::string(scheme)};
+    if (!contains(peer)) return client;
 
-    std::string forwarded;
-    if (header_ == forwarded_header::x_forwarded_for) {
-        // The first value, as Express reads it: the proxies overwrite it rather than append
-        if (!header_values.empty()) forwarded = parse_scheme(split_unquoted(header_values.front(), ',').front());
-    } else {
-        // Elements, left (client) to right (nearest proxy), walked as client_ip() does
-        std::vector<forwarded_element> chain;
-        for (const auto& value : header_values) {
+    // Entries, left (client) to right (nearest proxy), with their scheme
+    std::vector<forwarded_element> chain;
+    // The scheme of every entry with X-Forwarded-For when the counts do not match: the last one
+    std::optional<std::string> nearest_scheme;
+    if (header_ == forwarded_header::forwarded) {
+        for (const auto& value : request.get_headers_with_key(header_name())) {
             auto elements = parse_forwarded_elements(value);
             chain.insert(chain.end(), std::make_move_iterator(elements.begin()), std::make_move_iterator(elements.end()));
         }
-        const forwarded_element* last = nullptr;
-        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-            last = &*it;
-            if (it->address.empty() || !contains(it->address)) break;
+    } else {
+        for (const auto& value : request.get_headers_with_key(header_name())) {
+            for (auto& address : parse_x_forwarded_for(value)) chain.push_back({std::move(address), {}});
         }
-        if (last) forwarded = parse_scheme(last->proto);
+        std::vector<std::string> schemes;
+        for (const auto& value : request.get_headers_with_key("X-Forwarded-Proto")) {
+            if (trim(value).empty()) continue;
+            for (auto entry : split_unquoted(value, ',')) schemes.emplace_back(trim(entry));
+        }
+        if (schemes.size() == chain.size()) {
+            for (size_t i = 0; i < chain.size(); ++i) chain[i].proto = std::move(schemes[i]);
+        } else if (!schemes.empty()) {
+            nearest_scheme = std::move(schemes.back());
+        }
     }
-    return forwarded.empty() ? std::string(scheme) : forwarded;
+
+    // Walked from the right, as client_ip()
+    const forwarded_element* last = nullptr;
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        last = &*it;
+        if (it->address.empty()) break;     // not an address: the proxy after it is the best we know
+        client.ip = it->address;
+        if (!contains(client.ip)) break;
+    }
+
+    auto forwarded = parse_scheme(nearest_scheme ? *nearest_scheme : last ? last->proto : std::string{});
+    if (!forwarded.empty()) client.scheme = std::move(forwarded);
+    return client;
 }
 
 std::string trusted_proxies::parse_scheme(std::string_view value) {

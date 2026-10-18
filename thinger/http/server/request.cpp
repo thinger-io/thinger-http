@@ -140,14 +140,13 @@ namespace thinger::http{
     std::string request::get_request_ip() const{
         auto peer = get_peer_ip();
         if (!trusted_proxies_ || trusted_proxies_->empty() || !http_request_) return peer;
-        return trusted_proxies_->client_ip(peer, http_request_->get_headers_with_key(trusted_proxies_->header_name()));
+        return trusted_proxies_->resolve(peer, "http", *http_request_).ip;
     }
 
     std::string request::get_request_scheme() const{
         std::string scheme = http_request_ && http_request_->is_ssl() ? "https" : "http";
         if (!trusted_proxies_ || trusted_proxies_->empty() || !http_request_) return scheme;
-        return trusted_proxies_->client_scheme(get_peer_ip(), scheme,
-                                               http_request_->get_headers_with_key(trusted_proxies_->scheme_header_name()));
+        return trusted_proxies_->resolve(get_peer_ip(), scheme, *http_request_).scheme;
     }
 
     bool request::keep_alive() const{

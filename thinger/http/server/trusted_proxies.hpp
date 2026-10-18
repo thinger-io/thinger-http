@@ -8,9 +8,18 @@
 
 namespace thinger::http {
 
+class headers;
+
 // Header the trusted proxies use to report the client address. Only one is read: a proxy
 // that appends to one of them passes the other one through, as sent by the client. The
 // scheme comes with it: X-Forwarded-Proto with X-Forwarded-For, proto= with Forwarded.
+//
+// The client of a request, as a trusted proxy reports it (see trusted_proxies::resolve())
+struct forwarded_client {
+    std::string ip;
+    std::string scheme;   // "http" or "https"
+};
+
 enum class forwarded_header {
     x_forwarded_for,    // X-Forwarded-For: client, proxy1, proxy2 (and X-Forwarded-Proto: https)
     forwarded           // Forwarded: for=client;proto=https, for=proxy1 (RFC 7239)
@@ -38,8 +47,6 @@ public:
     // Name of the header read ("X-Forwarded-For" or "Forwarded")
     const std::string& header_name() const;
 
-    // Name of the header read for the scheme ("X-Forwarded-Proto" or "Forwarded")
-    const std::string& scheme_header_name() const;
 
     // Client address of a request received from `peer`, given the values of the forwarding
     // header (all its occurrences, in order). The peer itself unless it is trusted; then the
@@ -48,15 +55,18 @@ public:
     // that is not an IP ("unknown") ends the walk at the address after it.
     std::string client_ip(const std::string& peer, const std::vector<std::string>& header_values) const;
 
-    // Scheme of a request received from `peer` on a connection of `scheme` ("http" or
-    // "https"), given the values of the header reporting it (scheme_header_name(), all its
-    // occurrences, in order). The connection's unless the peer is trusted; then, with
-    // X-Forwarded-For, the first value of X-Forwarded-Proto; with Forwarded, the proto of the
-    // element the walk of client_ip() stops at, the last one a trusted proxy wrote (the one
-    // giving the client address, or one whose address is not an IP). A value other than http
-    // or https (case-insensitive), or none, leaves the scheme of the connection.
-    std::string client_scheme(const std::string& peer, std::string_view scheme,
-                              const std::vector<std::string>& header_values) const;
+    // Client address and scheme of a request received from `peer`, on a connection of
+    // `scheme` ("http" or "https"), with the headers `request` (all the occurrences of the
+    // forwarding headers, in order). The peer and the scheme of the connection unless the peer
+    // is trusted; then one walk, as client_ip() does, gives both: the address where it stops,
+    // and the scheme of the entry it stops at, the last one a trusted proxy wrote (the one
+    // giving the client address, or one whose address is not an IP): its proto= with
+    // Forwarded; with X-Forwarded-For, the X-Forwarded-Proto value in the same position when
+    // both have as many values (each proxy appended to both), else the last one, written by
+    // the nearest proxy (which overwrote it, or did not append to both). So what a client sends
+    // ahead of a trusted proxy is never read, whether the proxy appends or overwrites. A scheme
+    // other than http or https (case-insensitive), or none, leaves the one of the connection.
+    forwarded_client resolve(const std::string& peer, std::string_view scheme, const headers& request) const;
 
     // Addresses in the forwarding headers, left to right, without ports nor brackets;
     // empty strings for entries that are not IP addresses

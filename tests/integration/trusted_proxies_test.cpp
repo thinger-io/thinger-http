@@ -172,7 +172,11 @@ TEST_CASE("Request scheme behind trusted proxies", "[server][proxies][integratio
         REQUIRE(server.set_trusted_proxies({"10.0.0.0/8"}));
         REQUIRE(client_scheme(server, "10.0.0.1", {{"X-Forwarded-For", "1.2.3.4"}, {"X-Forwarded-Proto", "https"}}) == "https");
         REQUIRE(client_scheme(server, "10.0.0.1", {{"X-Forwarded-Proto", "http"}}, "https://localhost/ip") == "http");
-        REQUIRE(client_scheme(server, "10.0.0.1", {{"X-Forwarded-Proto", "https, http"}}) == "https");
+        // the last value without X-Forwarded-For to align it with
+        REQUIRE(client_scheme(server, "10.0.0.1", {{"X-Forwarded-Proto", "https, http"}}) == "http");
+        // a proxy appending to both: the value of the client, not the one it sent
+        REQUIRE(client_scheme(server, "10.0.0.1", {{"X-Forwarded-For", "6.6.6.6, 203.0.113.9"},
+                                                   {"X-Forwarded-Proto", "https, http"}}) == "http");
         REQUIRE(client_scheme(server, "10.0.0.1", {{"X-Forwarded-Proto", "ftp"}}) == "http");
         // spoofed by a peer that is not trusted
         REQUIRE(client_scheme(server, "203.0.113.9", {{"X-Forwarded-Proto", "https"}}) == "http");

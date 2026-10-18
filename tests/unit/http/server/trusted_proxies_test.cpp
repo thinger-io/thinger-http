@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <thinger/http/server/trusted_proxies.hpp>
+#include <thinger/http/common/http_request.hpp>
 
 using namespace thinger::http;
 
@@ -142,43 +143,68 @@ TEST_CASE("Client scheme behind trusted proxies", "[trusted_proxies][unit]") {
         REQUIRE(trusted_proxies::parse_scheme("").empty());
     }
 
+    using header_list = std::vector<std::pair<std::string, std::string>>;
+    // The client of a request from `peer` on a connection of `scheme`, with `headers`
+    auto resolve = [](const trusted_proxies& proxies, const std::string& peer, const std::string& scheme,
+                      const header_list& headers) {
+        auto request = http_request::create_http_request(method::GET, "http://localhost/");
+        for (const auto& [key, value] : headers) request->add_header(key, value);
+        return proxies.resolve(peer, scheme, *request);
+    };
+
     SECTION("X-Forwarded-Proto") {
         trusted_proxies proxies;
         REQUIRE(proxies.add("10.0.0.0/8"));
-        REQUIRE(proxies.scheme_header_name() == "X-Forwarded-Proto");
+        auto scheme = [&](const std::string& peer, const std::string& connection, const header_list& headers) {
+            return resolve(proxies, peer, connection, headers).scheme;
+        };
         // untrusted peer: the connection's, whatever it claims
-        REQUIRE(proxies.client_scheme("203.0.113.9", "http", {"https"}) == "http");
-        REQUIRE(proxies.client_scheme("203.0.113.9", "https", {"http"}) == "https");
-        // trusted peer: the first value
-        REQUIRE(proxies.client_scheme("10.0.0.1", "http", {"https"}) == "https");
-        REQUIRE(proxies.client_scheme("10.0.0.1", "https", {"http"}) == "http");
-        REQUIRE(proxies.client_scheme("10.0.0.1", "http", {"HTTPS, http"}) == "https");
-        REQUIRE(proxies.client_scheme("10.0.0.1", "http", {"https", "http"}) == "https");
+        REQUIRE(scheme("203.0.113.9", "http", {{"X-Forwarded-Proto", "https"}}) == "http");
+        REQUIRE(scheme("203.0.113.9", "https", {{"X-Forwarded-Proto", "http"}}) == "https");
+        // a proxy overwriting it: its value
+        REQUIRE(scheme("10.0.0.1", "http", {{"X-Forwarded-For", "1.2.3.4"}, {"X-Forwarded-Proto", "https"}}) == "https");
+        REQUIRE(scheme("10.0.0.1", "https", {{"X-Forwarded-Proto", "http"}}) == "http");
+        REQUIRE(scheme("10.0.0.1", "http", {{"X-Forwarded-For", "6.6.6.6, 1.2.3.4"}, {"X-Forwarded-Proto", "HTTPS"}}) == "https");
+        // a proxy appending to both: the value of the client, not what the client sent
+        REQUIRE(scheme("10.0.0.1", "http", {{"X-Forwarded-For", "6.6.6.6, 1.2.3.4"}, {"X-Forwarded-Proto", "https, http"}}) == "http");
+        REQUIRE(scheme("10.0.0.1", "http", {{"X-Forwarded-For", "1.2.3.4, 10.0.0.2"}, {"X-Forwarded-Proto", "https"},
+                                            {"X-Forwarded-Proto", "http"}}) == "https");
+        // counts that do not match: the last value, of the nearest proxy
+        REQUIRE(scheme("10.0.0.1", "http", {{"X-Forwarded-For", "1.2.3.4"}, {"X-Forwarded-Proto", "https, http"}}) == "http");
+        REQUIRE(scheme("10.0.0.1", "http", {{"X-Forwarded-Proto", "http, https"}}) == "https");
         // missing, or not http nor https: the connection's
-        REQUIRE(proxies.client_scheme("10.0.0.1", "https", {}) == "https");
-        REQUIRE(proxies.client_scheme("10.0.0.1", "http", {"wss"}) == "http");
-        REQUIRE(proxies.client_scheme("10.0.0.1", "http", {""}) == "http");
+        REQUIRE(scheme("10.0.0.1", "https", {}) == "https");
+        REQUIRE(scheme("10.0.0.1", "http", {{"X-Forwarded-Proto", "wss"}}) == "http");
+        REQUIRE(scheme("10.0.0.1", "http", {{"X-Forwarded-Proto", ""}}) == "http");
+        // and the address of the same walk
+        auto client = resolve(proxies, "10.0.0.1", "http", {{"X-Forwarded-For", "6.6.6.6, 1.2.3.4"},
+                                                            {"X-Forwarded-Proto", "https, http"}});
+        REQUIRE(client.ip == "1.2.3.4");
+        REQUIRE(client.scheme == "http");
     }
 
     SECTION("Forwarded: the proto of the element giving the client address") {
         trusted_proxies proxies(forwarded_header::forwarded);
         REQUIRE(proxies.add("10.0.0.0/8"));
-        REQUIRE(proxies.scheme_header_name() == "Forwarded");
-        REQUIRE(proxies.client_scheme("203.0.113.9", "http", {"for=1.2.3.4;proto=https"}) == "http");
-        REQUIRE(proxies.client_scheme("10.0.0.1", "http", {"for=1.2.3.4;proto=https"}) == "https");
+        auto scheme = [&](const std::string& peer, const std::string& connection, const std::vector<std::string>& values) {
+            header_list headers;
+            for (const auto& value : values) headers.emplace_back("Forwarded", value);
+            return resolve(proxies, peer, connection, headers).scheme;
+        };
+        REQUIRE(scheme("203.0.113.9", "http", {"for=1.2.3.4;proto=https"}) == "http");
+        REQUIRE(scheme("10.0.0.1", "http", {"for=1.2.3.4;proto=https"}) == "https");
         // the walk stops at the client: what the client prepended is not read
-        REQUIRE(proxies.client_scheme("10.0.0.1", "http",
-                                      {"for=5.6.7.8;proto=https, for=1.2.3.4;proto=http, for=10.0.0.2;proto=https"})
+        REQUIRE(scheme("10.0.0.1", "http", {"for=5.6.7.8;proto=https, for=1.2.3.4;proto=http, for=10.0.0.2;proto=https"})
                 == "http");
-        REQUIRE(proxies.client_scheme("10.0.0.1", "https", {R"(for=1.2.3.4;proto="http")", "for=10.0.0.2"}) == "http");
+        REQUIRE(scheme("10.0.0.1", "https", {R"(for=1.2.3.4;proto="http")", "for=10.0.0.2"}) == "http");
         // all of them trusted: the leftmost one
-        REQUIRE(proxies.client_scheme("10.0.0.1", "http", {"for=10.0.0.3;proto=https, for=10.0.0.2;proto=http"}) == "https");
+        REQUIRE(scheme("10.0.0.1", "http", {"for=10.0.0.3;proto=https, for=10.0.0.2;proto=http"}) == "https");
         // an address that is not an IP: the element of the proxy that wrote it
-        REQUIRE(proxies.client_scheme("10.0.0.1", "http", {"for=1.2.3.4;proto=http, for=unknown;proto=https"}) == "https");
+        REQUIRE(scheme("10.0.0.1", "http", {"for=1.2.3.4;proto=http, for=unknown;proto=https"}) == "https");
         // without proto in that element: the connection's
-        REQUIRE(proxies.client_scheme("10.0.0.1", "https", {"for=1.2.3.4, for=10.0.0.2;proto=http"}) == "https");
-        REQUIRE(proxies.client_scheme("10.0.0.1", "http", {}) == "http");
-        // the X-Forwarded-Proto values are not read in this mode (they are not passed)
-        REQUIRE(proxies.client_scheme("10.0.0.1", "http", {"https"}) == "http");
+        REQUIRE(scheme("10.0.0.1", "https", {"for=1.2.3.4, for=10.0.0.2;proto=http"}) == "https");
+        REQUIRE(scheme("10.0.0.1", "http", {}) == "http");
+        // X-Forwarded-Proto is not read in this mode
+        REQUIRE(resolve(proxies, "10.0.0.1", "http", {{"X-Forwarded-Proto", "https"}}).scheme == "http");
     }
 }

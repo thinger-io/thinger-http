@@ -167,8 +167,9 @@ public:
 
     // Proxies (IPs or CIDR ranges: "10.0.0.1", "10.0.0.0/8", "fd00::/8") whose forwarding
     // header gives the client address reported by request::get_request_ip(), and the scheme
-    // reported by request::get_request_scheme() (X-Forwarded-Proto with X-Forwarded-For, the
-    // proto of Forwarded). The headers are ignored for any other peer, so only list proxies
+    // reported by request::get_request_scheme() (the X-Forwarded-Proto value aligned with the
+    // X-Forwarded-For entry of the client, or its last value; the proto of the Forwarded
+    // element of the client). The headers are ignored for any other peer, so only list proxies
     // that overwrite or append to them. None by default; set before serving (listen()): they
     // are read without locks. Returns false if an entry is invalid (then no proxy is trusted).
     bool set_trusted_proxies(const std::vector<std::string>& proxies,

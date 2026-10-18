@@ -71,9 +71,9 @@ namespace thinger::http{
         /// Client scheme, "http" or "https": the one of the connection (TLS or not; for
         /// requests dispatched in memory, the one of the request, see http_request::is_ssl())
         /// or, if the peer is a trusted proxy (see http_application::set_trusted_proxies),
-        /// the one it forwarded: the first value of X-Forwarded-Proto with X-Forwarded-For, or
-        /// the proto of the Forwarded element giving the client address (see
-        /// trusted_proxies::client_scheme())
+        /// the one it forwarded for the client of get_request_ip(): the X-Forwarded-Proto value
+        /// aligned with X-Forwarded-For (or its last one), or the proto of the Forwarded element
+        /// giving the client address (see trusted_proxies::resolve())
         std::string get_request_scheme() const;
 
         /// Peer address of requests without a connection (in-memory dispatch)
