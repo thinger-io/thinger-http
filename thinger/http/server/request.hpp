@@ -59,6 +59,7 @@ namespace thinger::http{
         std::string debug_parameters() const;
 
         std::shared_ptr<http_request> get_http_request();
+        std::shared_ptr<const http_request> get_http_request() const;
 
         /// Client IP: the peer address or, if the peer is a trusted proxy (see
         /// http_application::set_trusted_proxies), the client address it forwarded

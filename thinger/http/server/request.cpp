@@ -61,6 +61,10 @@ namespace thinger::http{
         return http_request_;
     }
 
+    std::shared_ptr<const http_request> request::get_http_request() const{
+        return http_request_;
+    }
+
     std::shared_ptr<server_connection> request::get_http_connection() const {
         return http_connection_.lock();
     }
