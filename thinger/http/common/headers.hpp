@@ -61,6 +61,10 @@ public:
     // constructors
     headers() = default;
     ~headers() override = default;
+    headers(const headers&) = default;
+    headers(headers&&) = default;
+    headers& operator=(const headers&) = default;
+    headers& operator=(headers&&) = default;
 
     // setters
     void add_header(std::string key, std::string value);

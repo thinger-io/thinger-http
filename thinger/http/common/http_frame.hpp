@@ -25,6 +25,15 @@ namespace thinger::http {
             return *this;
         }
 
+        // Moved, as copied: the written callback is not moved (so a message can be moved, not
+        // copied, into another)
+        http_frame(http_frame&& other) noexcept : data::out_data(other), last_frame_(other.last_frame_) {}
+        http_frame& operator=(http_frame&& other) noexcept {
+            data::out_data::operator=(other);
+            last_frame_ = other.last_frame_;
+            return *this;
+        }
+
         // stream information
         void set_last_frame(bool last_frame);
         virtual bool end_stream();

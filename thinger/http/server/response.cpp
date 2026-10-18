@@ -103,18 +103,18 @@ bool response::answer_timeout(http::http_response::status status) {
     if (state_->responded) return false;
     // Set before answering: whoever sees the response sent sees why
     state_->timed_out = true;
-    auto message = new_response();
+    if (state_->responded.exchange(true)) {
+        // Another answer started meanwhile: it was not late
+        state_->timed_out = false;
+        return false;
+    }
+    if (state_->on_start) state_->on_start();
+    auto message = take_draft();
     message->set_status(status);
     format_error(state_->formatter.get(), {status, "No response within the timeout", nullptr}, *message);
-    if (!state_->responded.exchange(true)) {
-        if (state_->on_start) state_->on_start();
-        prepare_body(*message, false);
-        state_->sink->send(std::move(message));
-        return true;
-    }
-    // Another answer started meanwhile: it was not late
-    state_->timed_out = false;
-    return false;
+    prepare_body(*message, false);
+    state_->sink->send(std::move(message));
+    return true;
 }
 
 bool response::timed_out() const {
@@ -122,8 +122,14 @@ bool response::timed_out() const {
     return state_ && state_->timed_out;
 }
 
-std::shared_ptr<http_response> response::new_response() const {
-    auto message = state_->draft ? std::make_shared<http_response>(*state_->draft)
+std::shared_ptr<http_response> response::new_response() {
+    if (!mark_responded()) return nullptr;
+    return take_draft();
+}
+
+std::shared_ptr<http_response> response::take_draft() {
+    // Moved, not copied: only the answer sent reads it, once it is the first one
+    auto message = state_->draft ? std::make_shared<http_response>(std::move(*state_->draft))
                                  : std::make_shared<http_response>();
     // A protocol switch keeps the Connection header set for it (Upgrade)
     if (message->get_status() != http_response::status::switching_protocols) {
@@ -210,7 +216,6 @@ void response::prepare_body(http_response& message, bool compress) const {
 
 void response::send_message(std::shared_ptr<http_response> message, bool compress) {
     prepare_body(*message, compress);
-    if (!mark_responded()) return;
     state_->sink->send(std::move(message));
 }
 
@@ -223,9 +228,13 @@ bool response::reject_takeover(const char* feature) {
 
 void response::json(const nlohmann::json& data, http::http_response::status status) {
     if (!ensure_not_responded()) return;
+    // Before taking the draft: dump() throws for strings that are not UTF-8, and the error
+    // answered then keeps the headers set
+    auto body = data.dump();
     auto message = new_response();
+    if (!message) return;
     message->set_status(status);
-    message->set_content(data.dump(), "application/json");
+    message->set_content(std::move(body), "application/json");
     send_message(std::move(message));
 }
 
@@ -240,9 +249,12 @@ void response::encode(const nlohmann::json& data, http::http_response::status st
         }
     }
     auto encoding = negotiate_response_encoding(accept);
+    // Before taking the draft, as json()
+    auto body = encode_body(data, encoding.format);
     auto message = new_response();
+    if (!message) return;
     message->set_status(status);
-    message->set_content(encode_body(data, encoding.format), encoding.media_type);
+    message->set_content(std::move(body), encoding.media_type);
     message->add_header("Vary", "Accept");
     send_message(std::move(message));
 }
@@ -250,6 +262,7 @@ void response::encode(const nlohmann::json& data, http::http_response::status st
 void response::send(const std::string& text, const std::string& content_type) {
     if (!ensure_not_responded()) return;
     auto message = new_response();
+    if (!message) return;
     message->set_content(text, content_type);
     send_message(std::move(message));
 }
@@ -258,6 +271,7 @@ void response::error(http::http_response::status status, const std::string& mess
                      const nlohmann::json& details) {
     if (!ensure_not_responded()) return;
     auto response = new_response();
+    if (!response) return;
     response->set_status(status);
     format_error(state_->formatter.get(), {status, message, details}, *response);
     send_message(std::move(response));
@@ -272,9 +286,9 @@ void response::status(http::http_response::status s) {
     draft().set_status(s);
 }
 
-void response::header(const std::string& key, const std::string& value) {
+void response::header(std::string key, std::string value) {
     if (!ensure_not_responded()) return;
-    draft().add_header(key, value);
+    draft().add_header(std::move(key), std::move(value));
 }
 
 void response::send_response(const std::shared_ptr<http_response>& response) {
@@ -288,6 +302,7 @@ void response::send_response(const std::shared_ptr<http_response>& response) {
     if (!head_request() && code != 304 && response->has_content_length_header()) {
         response->remove_headers(header::content_length);
     }
+    if (!mark_responded()) return;
     send_message(response);
 }
 
@@ -310,6 +325,7 @@ std::shared_ptr<server_connection> response::get_connection() const {
 void response::redirect(const std::string& url, http::http_response::status redirect_type) {
     if (!ensure_not_responded()) return;
     auto response = new_response();
+    if (!response) return;
     response->set_status(redirect_type);
     response->add_header(header::location, url);
     // Without it, a keep-alive client would read the body until the connection closes
@@ -429,6 +445,7 @@ std::shared_ptr<http_response> response::websocket_handshake(const std::vector<s
     }
 
     auto response = new_response();
+    if (!response) return nullptr;
     response->set_status(http_response::status::switching_protocols);
     response->add_header(header::upgrade, "websocket");
     response->add_header(header::connection, "Upgrade");
@@ -541,7 +558,7 @@ void response::upgrade_websocket_stream(const websocket_options& options, websoc
 void response::take_over(takeover_handler handler) {
     if (!ensure_not_responded()) return;
     if (reject_takeover("Connection takeover")) return;
-    take_over(new_response(), std::move(handler));
+    if (auto message = new_response()) take_over(std::move(message), std::move(handler));
 }
 
 void response::take_over(takeover_coroutine handler) {
@@ -557,7 +574,6 @@ void response::take_over(takeover_coroutine handler) {
 
 void response::take_over(std::shared_ptr<http_response> message, takeover_handler handler) {
     frame_takeover(*message);
-    if (!mark_responded()) return;
     state_->sink->take_over(std::move(message), std::move(handler));
 }
 
@@ -580,6 +596,7 @@ void response::accept_sse(std::function<void(std::shared_ptr<sse_connection>, as
     if (reject_takeover("Server-Sent Events")) return;
 
     auto response = new_response();
+    if (!response) return;
     response->set_status(http_response::status::ok);
     response->set_content_type("text/event-stream");
     response->add_header("Cache-Control", "no-cache");
@@ -607,9 +624,9 @@ void response::accept_sse(std::function<void(std::shared_ptr<sse_connection>, as
 bool response::start_chunked(const std::string& content_type, http::http_response::status status) {
     if (!ensure_not_responded()) return false;
     auto response = new_response();
+    if (!response) return false;
     response->set_status(status);
     response->set_content_type(content_type);
-    if (!mark_responded()) return false;
 
     std::lock_guard lock(state_->chunked_mutex);
     if (head_request()) {
@@ -697,9 +714,9 @@ namespace {
 bool response::start_stream(const http_response& head, std::optional<size_t> content_length) {
     if (!ensure_not_responded()) return false;
     auto message = new_response();
+    if (!message) return false;
     apply_head(*message, head);
     auto framing = frame_stream(*message, *state_->request, content_length);
-    if (!mark_responded()) return false;
 
     std::lock_guard lock(state_->chunked_mutex);
     if (!state_->sink->begin_stream(std::move(message), framing)) return false;

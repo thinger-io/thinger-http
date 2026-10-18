@@ -62,12 +62,32 @@ namespace {
 void send(response& res, const representation& file) {
     const auto& request = res.request_message();
     auto verb = request.get_method();
+    // Conditional request for a file the client has: no body, nor the length of the file
+    bool not_modified = (verb == method::GET || verb == method::HEAD) && file.info.not_modified(request);
+
+    // The body (a byte range of it), read before the message takes the status and headers set:
+    // an error answered instead keeps them
+    auto range = verb == method::GET && !not_modified ? requested_range(request, file.info) : std::nullopt;
+    if (range && range->length == 0) {
+        auto unsatisfiable = res.new_response();
+        if (!unsatisfiable) return;
+        make_unsatisfiable(*unsatisfiable, file.info.size, res.formatter());
+        res.send_message(std::move(unsatisfiable));
+        return;
+    }
+    uint64_t first = range ? range->first : 0;
+    uint64_t length = range ? range->length : file.info.size;
+    std::string content;
+    if (!not_modified && verb != method::HEAD && !read_file(file.path, first, length, content)) {
+        res.error(http_response::status::internal_server_error, "Failed to read file");
+        return;
+    }
 
     auto message = res.new_response();
+    if (!message) return;
     add_validators(*message, file);
 
-    // Conditional request for a file the client has: no body, nor the length of the file
-    if ((verb == method::GET || verb == method::HEAD) && file.info.not_modified(request)) {
+    if (not_modified) {
         message->set_status(http_response::status::not_modified);
         res.send_message(std::move(message), false);
         return;
@@ -82,21 +102,6 @@ void send(response& res, const representation& file) {
         return;
     }
 
-    auto range = verb == method::GET ? requested_range(request, file.info) : std::nullopt;
-    if (range && range->length == 0) {
-        auto unsatisfiable = res.new_response();
-        make_unsatisfiable(*unsatisfiable, file.info.size, res.formatter());
-        res.send_message(std::move(unsatisfiable));
-        return;
-    }
-
-    uint64_t first = range ? range->first : 0;
-    uint64_t length = range ? range->length : file.info.size;
-    std::string content;
-    if (!read_file(file.path, first, length, content)) {
-        res.error(http_response::status::internal_server_error, "Failed to read file");
-        return;
-    }
     message->set_content(std::move(content));
 
     // A range is sent as is: compressing it would change the bytes it refers to

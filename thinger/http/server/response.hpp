@@ -68,6 +68,7 @@ using sse_coroutine = std::function<awaitable<void>(std::shared_ptr<sse_connecti
 // dropped, even when they run at the same time from several threads. Setting the status or
 // headers before answering (status(), header()) is not thread-safe: do it from the thread
 // running the handler, before any answer (a route timeout answers with the headers set so far).
+// The answer sent takes them, moved into its message: once it started, they are gone.
 // A response to a HEAD request is the one to GET without its body: every answer sends its
 // headers, Content-Length included (of the body uncompressed: HEAD is never compressed), and
 // drops the body; chunks and streamed data are dropped too, and SSE sends its headers alone.
@@ -112,8 +113,9 @@ public:
     // their own, such as send() and take_over(); not thread-safe)
     void status(http::http_response::status s);
 
-    // Add a header to the response sent, whatever answer sends it (not thread-safe)
-    void header(const std::string& key, const std::string& value);
+    // Add a header to the response sent, whatever answer sends it (not thread-safe). The key
+    // and value are moved into the response: pass an rvalue (e.g. std::move()) to save a copy
+    void header(std::string key, std::string value);
 
     // Send raw http_response object (for advanced use cases). Its content is sent whole,
     // framed by a Content-Length of its size (any Content-Length or Transfer-Encoding it
@@ -245,8 +247,12 @@ private:
     bool ensure_not_responded() const;
     // Status and headers set before answering, created on first use
     http_response& draft();
-    // New message to answer with: a copy of the draft, if any
-    std::shared_ptr<http_response> new_response() const;
+    // Start answering: the message to send, with the status and headers set so far (the
+    // draft, moved into it), if this is the first answer; otherwise null, and nothing must be
+    // sent. What could fail building the answer (e.g. encoding its body) is done before
+    std::shared_ptr<http_response> new_response();
+    // The message of the answer started, from the draft (once)
+    std::shared_ptr<http_response> take_draft();
     // Whether the request is HEAD: its response has no body
     bool head_request() const;
     // Body of a message about to be sent: framed (see frame_message), dropped for HEAD
@@ -259,9 +265,9 @@ private:
     void frame_takeover(http_response& message) const;
     // Mark the response as sent; false (and nothing must be sent) if it already was
     bool mark_responded();
-    // Send a message (see prepare_body), unless another answer was sent first
+    // Send the message of the answer started (see new_response(), prepare_body)
     void send_message(std::shared_ptr<http_response> message, bool compress = true);
-    // Send a message and take the connection over, unless another answer was sent first
+    // Send the message of the answer started and take the connection over
     void take_over(std::shared_ptr<http_response> message, takeover_handler handler);
     // Answers 501 if the connection cannot be taken over (in-memory requests)
     bool reject_takeover(const char* feature);

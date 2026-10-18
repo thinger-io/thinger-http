@@ -53,6 +53,10 @@ public:
     // constructor
     http_response();
     ~http_response() override = default;
+    http_response(const http_response&) = default;
+    http_response(http_response&&) = default;
+    http_response& operator=(const http_response&) = default;
+    http_response& operator=(http_response&&) = default;
 
     // response to buffer
     void to_buffer(std::vector<boost::asio::const_buffer>&buffer) const override;

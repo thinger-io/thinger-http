@@ -400,6 +400,13 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/coroutine_callbacks_test.cpp)
     add_thinger_test(test_integration_coroutine_callbacks integration/coroutine_callbacks_test.cpp)
 endif()
 
+# Allocations of the responses: it replaces the global operator new, so it is a program of its
+# own (not in the runners below, which take the *_test.cpp files), and not built with the
+# sanitizers, which replace it themselves
+if(NOT THINGER_HTTP_ENABLE_SANITIZERS)
+    add_thinger_test(test_response_allocations unit/http/server/response_allocations.cpp)
+endif()
+
 # ==================== ALL TESTS RUNNER ====================
 
 # Collect all test files
