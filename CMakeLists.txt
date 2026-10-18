@@ -165,10 +165,16 @@ if(THINGER_HTTP_BUILD_BENCHMARKS)
     target_compile_definitions(thinger_http PUBLIC THINGER_NO_AUTO_LOGGER_INIT)
 endif()
 
-# Set properties
+# Set properties. While on 0.x every minor version may break the ABI (semantic versioning), so
+# it is part of the SONAME
+if(PROJECT_VERSION_MAJOR EQUAL 0)
+    set(THINGER_HTTP_SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})
+else()
+    set(THINGER_HTTP_SOVERSION ${PROJECT_VERSION_MAJOR})
+endif()
 set_target_properties(thinger_http PROPERTIES
     VERSION ${PROJECT_VERSION}
-    SOVERSION ${PROJECT_VERSION_MAJOR}
+    SOVERSION ${THINGER_HTTP_SOVERSION}
     PUBLIC_HEADER "${THINGER_HEADERS}"
 )
 
