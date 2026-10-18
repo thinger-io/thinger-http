@@ -74,6 +74,39 @@ namespace {
         return ip ? ip->to_string() : std::string{};
     }
 
+    // An element of a Forwarded header: its address (empty if it is not an IP) and its proto
+    struct forwarded_element {
+        std::string address;
+        std::string proto;
+    };
+
+    std::vector<forwarded_element> parse_forwarded_elements(std::string_view value) {
+        std::vector<forwarded_element> result;
+        if (trim(value).empty()) return result;
+        for (auto element : split_unquoted(value, ',')) {
+            // element: pairs such as for=192.0.2.60;proto=http;by=203.0.113.43
+            std::optional<address> ip;
+            std::string proto;
+            bool has_for = false;
+            bool has_proto = false;
+            for (auto pair : split_unquoted(element, ';')) {
+                auto equals = pair.find('=');
+                if (equals == std::string_view::npos) continue;
+                auto name = trim(pair.substr(0, equals));
+                // the first one of each parameter (each may appear once)
+                if (!has_for && boost::iequals(name, "for")) {
+                    has_for = true;
+                    ip = parse_address(unquote(pair.substr(equals + 1)));
+                } else if (!has_proto && boost::iequals(name, "proto")) {
+                    has_proto = true;
+                    proto = unquote(pair.substr(equals + 1));
+                }
+            }
+            result.push_back({to_entry(ip), std::move(proto)});
+        }
+        return result;
+    }
+
 }
 
 bool trusted_proxies::add(std::string_view value) {
@@ -136,6 +169,12 @@ const std::string& trusted_proxies::header_name() const {
     return header_ == forwarded_header::forwarded ? forwarded : x_forwarded_for;
 }
 
+const std::string& trusted_proxies::scheme_header_name() const {
+    static const std::string x_forwarded_proto = "X-Forwarded-Proto";
+    static const std::string forwarded = "Forwarded";
+    return header_ == forwarded_header::forwarded ? forwarded : x_forwarded_proto;
+}
+
 std::string trusted_proxies::client_ip(const std::string& peer, const std::vector<std::string>& header_values) const {
     if (!contains(peer)) return peer;
 
@@ -155,6 +194,38 @@ std::string trusted_proxies::client_ip(const std::string& peer, const std::vecto
     return client;
 }
 
+std::string trusted_proxies::client_scheme(const std::string& peer, std::string_view scheme,
+                                           const std::vector<std::string>& header_values) const {
+    if (!contains(peer)) return std::string(scheme);
+
+    std::string forwarded;
+    if (header_ == forwarded_header::x_forwarded_for) {
+        // The first value, as Express reads it: the proxies overwrite it rather than append
+        if (!header_values.empty()) forwarded = parse_scheme(split_unquoted(header_values.front(), ',').front());
+    } else {
+        // Elements, left (client) to right (nearest proxy), walked as client_ip() does
+        std::vector<forwarded_element> chain;
+        for (const auto& value : header_values) {
+            auto elements = parse_forwarded_elements(value);
+            chain.insert(chain.end(), std::make_move_iterator(elements.begin()), std::make_move_iterator(elements.end()));
+        }
+        const forwarded_element* last = nullptr;
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+            last = &*it;
+            if (it->address.empty() || !contains(it->address)) break;
+        }
+        if (last) forwarded = parse_scheme(last->proto);
+    }
+    return forwarded.empty() ? std::string(scheme) : forwarded;
+}
+
+std::string trusted_proxies::parse_scheme(std::string_view value) {
+    auto scheme = unquote(value);
+    if (boost::iequals(scheme, "https")) return "https";
+    if (boost::iequals(scheme, "http")) return "http";
+    return {};
+}
+
 std::vector<std::string> trusted_proxies::parse_x_forwarded_for(std::string_view value) {
     std::vector<std::string> result;
     if (trim(value).empty()) return result;
@@ -166,20 +237,7 @@ std::vector<std::string> trusted_proxies::parse_x_forwarded_for(std::string_view
 
 std::vector<std::string> trusted_proxies::parse_forwarded(std::string_view value) {
     std::vector<std::string> result;
-    if (trim(value).empty()) return result;
-    for (auto element : split_unquoted(value, ',')) {
-        // element: pairs such as for=192.0.2.60;proto=http;by=203.0.113.43
-        std::optional<address> ip;
-        for (auto pair : split_unquoted(element, ';')) {
-            auto equals = pair.find('=');
-            if (equals == std::string_view::npos) continue;
-            if (boost::iequals(trim(pair.substr(0, equals)), "for")) {
-                ip = parse_address(unquote(pair.substr(equals + 1)));
-                break;
-            }
-        }
-        result.push_back(to_entry(ip));
-    }
+    for (auto& element : parse_forwarded_elements(value)) result.push_back(std::move(element.address));
     return result;
 }
 

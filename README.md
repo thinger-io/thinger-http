@@ -873,6 +873,13 @@ server.set_trusted_proxies({"10.0.0.1"}, http::forwarded_header::forwarded);
 
 Set them before `listen()` (they are read by every request, without locks). No proxy is trusted by default, and the header of any other peer is ignored, so a client cannot change its address by sending it: code that trusts a local address (e.g. `127.0.0.1` to skip checks) stays safe. List only proxies that append to (or overwrite) the header, and only the header they set: the other one reaches the server as the client sent it.
 
+`req.get_request_scheme()` is `"http"` or `"https"`: the scheme of the connection (for [in-memory dispatch](#in-memory-dispatch), the one of the request URL), unless the peer is a trusted proxy. Then it is the one the proxy forwarded: the first value of `X-Forwarded-Proto` with `X-Forwarded-For` (as Express reads it), or the `proto` of the `Forwarded` element giving the client address (the one where the walk above stops, so what a client prepends is never read). Any other value is ignored, and the scheme of the connection is used, as when the header is missing.
+
+```cpp
+// e.g. to build absolute URLs, or to tell whether a cookie may be Secure
+bool secure = req.get_request_scheme() == "https";
+```
+
 ### Reverse Proxy
 
 `http::reverse_proxy` forwards the request of a route handler to another server (a target) and sends its response back: over TCP, TLS or a Unix socket, streaming both bodies, and turning the connection into a tunnel for protocol upgrades such as WebSockets. Use it from a coroutine handler, before reading the body; the not-found handler of a virtual host forwards everything it receives, whatever the method:

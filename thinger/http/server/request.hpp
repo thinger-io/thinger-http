@@ -67,6 +67,14 @@ namespace thinger::http{
         /// Address of the direct peer (the connection's remote IP), whatever it forwards
         std::string get_peer_ip() const;
 
+        /// Client scheme, "http" or "https": the one of the connection (TLS or not; for
+        /// requests dispatched in memory, the one of the request, see http_request::is_ssl())
+        /// or, if the peer is a trusted proxy (see http_application::set_trusted_proxies),
+        /// the one it forwarded: the first value of X-Forwarded-Proto with X-Forwarded-For, or
+        /// the proto of the Forwarded element giving the client address (see
+        /// trusted_proxies::client_scheme())
+        std::string get_request_scheme() const;
+
         /// Peer address of requests without a connection (in-memory dispatch)
         void set_peer_ip(std::string ip) { peer_ip_ = std::move(ip); }
 
