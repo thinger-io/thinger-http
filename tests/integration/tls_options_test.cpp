@@ -201,3 +201,32 @@ TEST_CASE("HTTPS server applies the TLS options to the certificates selected by 
     REQUIRE(result.subject == "sni.test");
     REQUIRE(manager.remove_certificate("sni.test"));
 }
+
+TEST_CASE("HTTPS server keeps its TLS options for a weaker certificate given ready-made",
+          "[ssl][tls][options][integration]") {
+    http::test::test_ca ca;
+    saved_manager saved;
+    auto& manager = asio::certificate_manager::instance();
+    REQUIRE(manager.set_tls_options({}));
+
+    // A context made elsewhere, allowing TLS 1.0 and every cipher: SNI switches to its
+    // certificate, but the versions and ciphers stay those of the context of the listener
+    auto weak_certificate = ca.issue("weak.test");
+    auto weak = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
+    weak->use_certificate_chain(boost::asio::buffer(weak_certificate.first));
+    weak->use_private_key(boost::asio::buffer(weak_certificate.second), boost::asio::ssl::context::pem);
+    SSL_CTX_set_min_proto_version(weak->native_handle(), TLS1_VERSION);
+    SSL_CTX_set_security_level(weak->native_handle(), 0);
+    SSL_CTX_set_cipher_list(weak->native_handle(), "ALL:@SECLEVEL=0");
+    REQUIRE(manager.set_certificate("weak.test", weak));
+    https_server https(ca.issue("default.test"));
+
+    REQUIRE_FALSE(handshake(https.port, {.max_version = TLS1_1_VERSION, .host = "weak.test"}).connected);
+    REQUIRE_FALSE(handshake(https.port, {.min_version = TLS1_2_VERSION, .max_version = TLS1_2_VERSION,
+                                         .ciphers = "ECDHE-ECDSA-AES128-SHA", .host = "weak.test"}).connected);
+    auto result = handshake(https.port, {.min_version = TLS1_2_VERSION, .max_version = TLS1_2_VERSION, .host = "weak.test"});
+    REQUIRE(result.connected);
+    REQUIRE(result.subject == "weak.test");
+    REQUIRE((result.cipher.find("GCM") != std::string::npos || result.cipher.find("CHACHA20") != std::string::npos));
+    REQUIRE(manager.remove_certificate("weak.test"));
+}

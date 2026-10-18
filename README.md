@@ -989,7 +989,7 @@ options.prefer_server_ciphers = true;                       // in the order of `
 thinger::asio::certificate_manager::instance().set_tls_options(options);   // false if OpenSSL refuses them
 ```
 
-The certificate of each host gets the same options, so SNI cannot weaken them: the versions and ciphers of a handshake are those of the context the server listens with (the default one when it started listening), as OpenSSL takes only the certificate of the context SNI selects. A context given ready-made (`set_default_certificate(context)`, `set_certificate(host, context)`) keeps its own settings; `asio::apply_tls_options(context, options)` sets them on it. `enable_legacy_protocols(true)` still allows TLS 1.0 and 1.1 for old clients.
+The certificate of each host gets the same options, and SNI cannot weaken them: the versions, ciphers and security level of a handshake are those of the context the server listens with (the default one when it started listening), and the context SNI selects gives only its certificate (OpenSSL would take its ciphers and security level too: the manager keeps those of the listener). A context given ready-made (`set_default_certificate(context)`, `set_certificate(host, context)`) keeps its own settings; `asio::apply_tls_options(context, options)` sets them on it. The setters of earlier versions, `set_server_ciphers()` and `enable_legacy_protocols(true)` (which still allows TLS 1.0 and 1.1 for old clients), are deprecated: they change these options, validated as `set_tls_options()` does.
 
 ### Server Lifecycle
 

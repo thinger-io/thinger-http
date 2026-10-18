@@ -68,6 +68,19 @@ namespace {
         return true;
     }
 
+    // The TLS 1.2 (and older) ciphers of a handshake, in OpenSSL's format (empty if none)
+    std::string tls12_cipher_list(const SSL* ssl) {
+        std::string list;
+        auto* ciphers = SSL_get_ciphers(ssl);
+        for (int i = 0; i < sk_SSL_CIPHER_num(ciphers); ++i) {
+            const SSL_CIPHER* cipher = sk_SSL_CIPHER_value(ciphers, i);
+            if (std::string_view(SSL_CIPHER_get_version(cipher)) == "TLSv1.3") continue;
+            if (!list.empty()) list += ':';
+            list += SSL_CIPHER_get_name(cipher);
+        }
+        return list;
+    }
+
     // Whether OpenSSL takes the options, tried on a context of its own
     bool valid_tls_options(const tls_options& options) {
         boost::asio::ssl::context test(boost::asio::ssl::context::tls_server);
@@ -387,11 +400,19 @@ int certificate_manager::sni_callback(SSL* ssl, int* al, void* arg) {
         // connection holds a reference to the context it switches to, which outlives a later
         // replacement
         auto context = certificate_manager::instance().select_context(hostname);
-        if (context && context->native_handle() != SSL_get_SSL_CTX(ssl) &&
-            SSL_set_SSL_CTX(ssl, context->native_handle()) == nullptr) {
-            LOG_ERROR("cannot set the certificate for hostname {}", hostname ? hostname : "");
-            if (al) *al = SSL_AD_INTERNAL_ERROR;
-            return SSL_TLSEXT_ERR_ALERT_FATAL;
+        if (context && context->native_handle() != SSL_get_SSL_CTX(ssl)) {
+            // OpenSSL takes the certificate of the context switched to, but also its cipher
+            // list and security level: the handshake keeps those of the listener (as its
+            // versions and options), so a context given ready-made cannot lower them
+            auto ciphers = tls12_cipher_list(ssl);
+            int level = SSL_get_security_level(ssl);
+            if (SSL_set_SSL_CTX(ssl, context->native_handle()) == nullptr ||
+                (!ciphers.empty() && SSL_set_cipher_list(ssl, ciphers.c_str()) != 1)) {
+                LOG_ERROR("cannot set the certificate for hostname {}", hostname ? hostname : "");
+                if (al) *al = SSL_AD_INTERNAL_ERROR;
+                return SSL_TLSEXT_ERR_ALERT_FATAL;
+            }
+            SSL_set_security_level(ssl, level);
         }
     } catch (const std::exception& e) {
         LOG_ERROR("cannot select the certificate for hostname {}: {}", hostname ? hostname : "", e.what());

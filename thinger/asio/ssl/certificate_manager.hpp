@@ -53,10 +53,12 @@ bool apply_tls_options(boost::asio::ssl::context& context, const tls_options& op
 // Certificates of the TLS servers: a default one, and one per host name selected by SNI (exact
 // or wildcard). The contexts it creates (from PEM, or the self-signed default) have its TLS
 // options (see set_tls_options()), the certificate of a host included, so SNI cannot lower them.
-// The versions, ciphers and options of a handshake are those of the context the server listens
-// with (the default one when it started listening): OpenSSL takes only the certificate (and
-// the security level) of the context SNI switches to. Contexts given ready-made keep their own
-// settings (apply_tls_options() sets these options on one).
+// The versions, ciphers, options and security level of a handshake are those of the context
+// the server listens with (the default one when it started listening): the context SNI switches
+// to gives its certificate only (the SNI callback keeps the cipher list and security level of
+// the listener, which OpenSSL would otherwise take from the context switched to), so neither
+// can a context given ready-made lower them. Those keep their own settings otherwise
+// (apply_tls_options() sets these options on one).
 class certificate_manager {
 private:
     // Private constructor for singleton
