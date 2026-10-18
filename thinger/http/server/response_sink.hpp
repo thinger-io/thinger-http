@@ -5,6 +5,7 @@
 #include "../../util/types.hpp"
 #include "server_connection.hpp"
 #include "http_stream.hpp"
+#include "response_observer.hpp"
 #include <memory>
 #include <string>
 
@@ -62,6 +63,11 @@ public:
 
     // Connection the response is written to, null if none
     virtual std::shared_ptr<server_connection> connection() const { return nullptr; }
+
+    // Tell `observer` about the response written (its head, the bytes written and its end),
+    // for the response hook (see http_application::on_response). Called before the response
+    // is answered. A sink ignoring it, as by default, has its responses reported as aborted
+    virtual void observe(std::shared_ptr<response_observer> /*observer*/) {}
 };
 
 // Response written to a stream of a server connection
@@ -85,6 +91,7 @@ public:
     bool can_take_over() const override { return true; }
     void take_over(std::shared_ptr<http_response> response, takeover_handler handler) override;
     std::shared_ptr<server_connection> connection() const override { return connection_.lock(); }
+    void observe(std::shared_ptr<response_observer> observer) override;
 
 private:
     // Queue a frame on the stream; false if the connection is gone

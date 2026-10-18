@@ -122,6 +122,10 @@ private:
     // hand it over when its response ends, as required
     void frame_written(http_stream& stream, const std::shared_ptr<http_frame>& frame, bool written);
 
+    // A frame of a stream whose response is observed (see http_application::on_response) is
+    // about to be written
+    [[gnu::noinline, gnu::cold]] static void observe_frame(http_stream& stream, http_frame& frame);
+
     // Write the queued frames, in order
     void process_output_queue();
 

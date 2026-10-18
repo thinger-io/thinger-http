@@ -17,6 +17,8 @@ namespace thinger::asio {
 
 namespace thinger::http {
 
+    class response_observer;
+
     typedef uint32_t stream_id;
 
     // Receives a connection taken over from the HTTP server: the socket, and any bytes the
@@ -71,6 +73,12 @@ namespace thinger::http {
         bool responded_ = false;
 
         bool keep_alive_;
+
+        /**
+         * Told about the response (head, bytes written, end) while a response hook is set
+         * (see http_application::on_response)
+         */
+        std::shared_ptr<response_observer> observer_;
 
     public:
         /**
@@ -174,6 +182,18 @@ namespace thinger::http {
 
         void set_keep_alive(bool keep_alive) {
             keep_alive_ = keep_alive;
+        }
+
+        /**
+         * Observer of the response, set before the response is answered (none without a
+         * response hook)
+         */
+        void set_observer(std::shared_ptr<response_observer> observer) {
+            observer_ = std::move(observer);
+        }
+
+        response_observer* observer() const {
+            return observer_.get();
         }
     };
 

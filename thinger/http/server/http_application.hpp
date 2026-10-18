@@ -7,6 +7,7 @@
 #include "openapi.hpp"
 #include "body_decoders.hpp"
 #include "response_sink.hpp"
+#include "response_observer.hpp"
 #include "request_context.hpp"
 #include "../../util/types.hpp"
 #include <chrono>
@@ -173,6 +174,27 @@ public:
     bool set_trusted_proxies(const std::vector<std::string>& proxies,
                              forwarded_header header = forwarded_header::x_forwarded_for);
 
+    // Called once per request, with its response (see response_info: status, bytes, duration,
+    // and whether it completed, handed the connection over, or was aborted), once both the
+    // response ended and the application is done with the request (its handler returned, or
+    // its route timed out), e.g. for access logs, metrics or audit records. Every request the
+    // application receives is reported, whoever answered it: the handler, a middleware, or the
+    // server itself (400 invalid framing or body, 404, 405, 413, 415, 417, 500, a route
+    // timeout...), on a connection or dispatched in memory. Not the requests a connection
+    // cannot parse (400, 431), which never reach the application.
+    //
+    // Streamed responses (start_chunked(), start_stream()) are reported once their end is
+    // written. Upgrades (WebSocket, SSE, take_over()) are reported once the response handing
+    // the connection over is written, as taken_over: what happens on the connection afterwards
+    // is not (see websocket_connection::on_close(), sse_connection::on_close()).
+    //
+    // It runs on the thread of the connection (for in-memory dispatch, the one ending the
+    // request or its response), so it must not block: hand anything slow to another thread.
+    // The request is read-only there, and its connection may be gone (its peer address is
+    // kept). What it throws is logged. Without a hook nothing is allocated or measured. Set it
+    // before serving (listen()): it is read without locks.
+    void on_response(response_hook hook);
+
 private:
     virtual_host& resolve_host(request& req);
     std::shared_ptr<http_response> make_error_response(http_response::status status, const std::string& message) const;
@@ -203,6 +225,9 @@ private:
 
     // Proxies allowed to report the client address (none if null)
     std::shared_ptr<const trusted_proxies> trusted_proxies_;
+
+    // Called with every response (none if null)
+    std::shared_ptr<const response_hook> response_hook_;
 };
 
 } // namespace thinger::http

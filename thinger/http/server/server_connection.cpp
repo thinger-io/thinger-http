@@ -1,5 +1,6 @@
 #include "server_connection.hpp"
 #include "request.hpp"
+#include "response_observer.hpp"
 #include "../../util/logger.hpp"
 
 namespace thinger::http {
@@ -282,9 +283,22 @@ awaitable<server_connection::peer_state> server_connection::wait_peer_closed() {
     co_return co_await socket_->peer_closed() ? peer_state::closed : peer_state::data;
 }
 
+void server_connection::observe_frame(http_stream& stream, http_frame& frame) {
+    // The head of the response (an interim response is not one)
+    if (auto* head = dynamic_cast<http_response*>(&frame)) {
+        stream.observer()->head(head->get_status(), !frame.end_stream() && !stream.takes_over());
+    }
+}
+
 void server_connection::frame_written(http_stream& stream, const std::shared_ptr<http_frame>& frame, bool written) {
     // Whoever waits for the frame (a streamed response) may write the next one
     frame->notify_written(written);
+
+    // The response ended (or cannot be written anymore), for the response hook
+    if (auto* observer = stream.observer(); observer && (frame->end_stream() || !written)) [[unlikely]] {
+        observer->ended(!written ? response_outcome::aborted
+                                 : stream.takes_over() ? response_outcome::taken_over : response_outcome::completed);
+    }
 
     // Reset timeout on activity. The timer holds a weak reference: once the read loop stopped
     // (the connection closes after this response), only a pending write keeps the connection,
@@ -321,6 +335,8 @@ void server_connection::process_output_queue() {
         stream->pop_frame();
 
         frame->log("SERVER RESPONSE", body_logging_);
+        auto* observer = stream->observer();
+        if (observer) [[unlikely]] observe_frame(*stream, *frame);
 
         auto& buffers = write_buffers_;
         buffers.clear();
@@ -330,6 +346,7 @@ void server_connection::process_output_queue() {
         // A write error is left to the read loop, as for a write that waited
         boost::system::error_code ec;
         size_t written = socket_->write_now(buffers, ec);
+        if (observer) [[unlikely]] observer->add_bytes(written);
         if (written == boost::asio::buffer_size(buffers)) {
             frame_written(*stream, frame, true);
             continue;
@@ -353,6 +370,7 @@ void server_connection::process_output_queue() {
             [this, self = shared_from_this(), stream = std::move(stream), frame = std::move(frame),
              buffers = std::move(buffers)]() -> awaitable<void> {
                 auto [ec, bytes] = co_await socket_->write(buffers);
+                if (auto* observer = stream->observer()) [[unlikely]] observer->add_bytes(bytes);
                 frame_written(*stream, frame, !ec);
                 writing_ = false;
 

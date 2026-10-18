@@ -87,6 +87,7 @@ awaitable<bool> connection_sink::end_stream() {
 void connection_sink::abort_stream() {
     // End the stream without ending the body (no last chunk, or fewer bytes than its
     // Content-Length) and close the connection: the client sees the body incomplete
+    if (auto stream = stream_.lock(); stream && stream->observer()) stream->observer()->abort();
     close_after_response();
     auto frame = std::make_shared<http_data>();
     frame->set_last_frame(true);
@@ -136,6 +137,12 @@ awaitable<bool> connection_sink::write_and_wait(std::shared_ptr<http_frame> fram
         if (!state->done && ec == boost::asio::error::operation_aborted) co_return false;
     }
     co_return state->written;
+}
+
+void connection_sink::observe(std::shared_ptr<response_observer> observer) {
+    // The connection tells it, as it writes the frames of the stream (on the connection
+    // thread, as this call)
+    if (auto stream = stream_.lock()) stream->set_observer(std::move(observer));
 }
 
 void connection_sink::take_over(std::shared_ptr<http_response> response, takeover_handler handler) {

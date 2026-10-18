@@ -201,6 +201,11 @@ bool http_application::set_trusted_proxies(const std::vector<std::string>& proxi
     return true;
 }
 
+// Response hook
+void http_application::on_response(response_hook hook) {
+    response_hook_ = hook ? std::make_shared<const response_hook>(std::move(hook)) : nullptr;
+}
+
 // OpenAPI
 route& http_application::serve_openapi(const std::string& path) {
     return get(path, [this](response& res) {
@@ -231,7 +236,27 @@ static void close_after_response(request& req) {
     if (auto http_request = req.get_http_request()) http_request->set_keep_alive(false);
 }
 
+namespace {
+
+    // Tells the observer of a response (if any) that the application is done with its request,
+    // however handle() ends
+    struct handled_guard {
+        std::shared_ptr<response_observer> observer;
+        ~handled_guard() {
+            if (observer) observer->handled();
+        }
+    };
+
+}
+
 awaitable<void> http_application::handle(std::shared_ptr<request> req, std::shared_ptr<response_sink> sink) {
+    // Told when the response ends, while a response hook is set
+    handled_guard handled;
+    if (response_hook_) [[unlikely]] {
+        handled.observer = std::make_shared<response_observer>(req, response_hook_);
+        sink->observe(handled.observer);
+    }
+
     response res(std::move(sink), req->get_http_request(), cors_enabled_);
     auto http_request = req->get_http_request();
 

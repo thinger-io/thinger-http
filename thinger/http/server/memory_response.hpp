@@ -21,10 +21,14 @@ public:
 
     // Whole response
     void send(std::shared_ptr<http_response> response) override {
-        std::lock_guard lock(mutex_);
-        if (complete_) return;
-        response_ = std::move(response);
-        finish_locked();
+        {
+            std::lock_guard lock(mutex_);
+            if (complete_) return;
+            response_ = std::move(response);
+            if (observer_) observer_->head(response_->get_status(), false);
+            finish_locked();
+        }
+        observed_end();
     }
 
     // Chunked response, collected whole: headers first, then the data, then the end
@@ -32,6 +36,7 @@ public:
         std::lock_guard lock(mutex_);
         if (complete_ || response_) return false;
         response_ = std::move(headers);
+        if (observer_) observer_->head(response_->get_status(), true);
         return true;
     }
 
@@ -43,18 +48,27 @@ public:
     }
 
     bool finish() override {
-        std::lock_guard lock(mutex_);
-        if (complete_ || !response_) return false;
-        response_->set_content_length(response_->get_content().size());
-        response_->set_last_frame(true);
-        finish_locked();
+        {
+            std::lock_guard lock(mutex_);
+            if (complete_ || !response_) return false;
+            response_->set_content_length(response_->get_content().size());
+            response_->set_last_frame(true);
+            finish_locked();
+        }
+        observed_end();
         return true;
     }
 
     // A streamed response that could not be completed: its body is incomplete, so the
     // result is a 502 instead
     void abort_stream() override {
+        if (observer_) observer_->abort();
         send(http_response::stock_http_reply(http_response::status::bad_gateway));
+    }
+
+    void observe(std::shared_ptr<response_observer> observer) override {
+        std::lock_guard lock(mutex_);
+        observer_ = std::move(observer);
     }
 
     bool is_complete() const {
@@ -78,9 +92,19 @@ private:
         done_.try_send(boost::system::error_code{});
     }
 
+    // Tell the observer the response is complete (once, by the call completing it), without
+    // the lock: it may call the response hook
+    void observed_end() {
+        if (!observer_) return;
+        observer_->add_bytes(response_->get_content().size());
+        observer_->ended(response_outcome::completed);
+    }
+
     mutable std::mutex mutex_;
     std::shared_ptr<http_response> response_;
     bool complete_ = false;
+    // Told about the response, while a response hook is set (see http_application::on_response)
+    std::shared_ptr<response_observer> observer_;
     boost::asio::experimental::concurrent_channel<void(boost::system::error_code)> done_;
 };
 

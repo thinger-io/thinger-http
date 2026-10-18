@@ -859,6 +859,24 @@ res.error(http::http_response::status::forbidden, "Not allowed");   // {"error":
 
 The formatter sets the body (and any header) of the response, whose status is already set. If it throws, the default format is used. Set it before `listen()`: it is called from every worker thread, and replacing it while serving is a data race.
 
+### Response Hook
+
+`on_response()` is called once per request with its response, for access logs, metrics or audit records: the status, the bytes written (head included), the time since the request arrived, and how it ended. Every request the application receives is reported, whoever answered it: the handler, a middleware, or the server itself (`400` for invalid framing or bodies, `404`, `405`, `413`, `415`, `417`, `500`, route timeouts...), on a connection or [dispatched in memory](#in-memory-dispatch) (where the bytes are the size of the body).
+
+```cpp
+server.on_response([](const http::request& req, const http::response_info& info) {
+    // on the thread of the connection: hand anything slow to another thread
+    access_log.write(req.get_request_ip(), req.get_http_request()->get_path(), static_cast<int>(info.status),
+                     info.bytes, std::chrono::duration_cast<std::chrono::microseconds>(info.duration).count());
+});
+```
+
+- It is called once both the response ended and the application is done with the request (its handler returned, or its route timed out), so the hook sees what the middlewares and the handler stored in the [request context](#request-context).
+- `info.outcome` is `completed`, `aborted` (the connection closed or failed before the response was written, `abort_stream()`, a handler failing once its response started, or nothing answered; `status` is `0` then), or `taken_over`.
+- Streamed responses (`start_chunked()`, `start_stream()`, with `info.streamed` set) are reported once their end is written. WebSocket upgrades, event streams and `take_over()` are reported as `taken_over` once the response handing the connection over is written: what happens on the connection afterwards is not, see `on_close()` of [`websocket_connection`](#websocket-server) and [`sse_connection`](#sse-server).
+- Requests a connection cannot parse (`400`, `431`) never reach the application, and are not reported.
+- What the hook throws is logged. Without a hook, nothing is allocated or measured per request. Set it before `listen()`.
+
 ### Client IP Behind Proxies
 
 `req.get_request_ip()` is the address of the peer (`req.get_peer_ip()`) unless the peer is a trusted proxy. Then the client address is taken from the forwarding header: it is walked from right to left, skipping trusted proxies, and the first untrusted address is returned (the leftmost one if all of them are trusted).
@@ -1020,7 +1038,7 @@ Compared with Node.js: `server.close()` also stops listening, closes idle connec
 
 ### Statistics
 
-`stats()` returns the connections open by what they serve (`http_connections`, `websocket_connections`, `sse_connections`, `tunnel_connections` for reverse proxy upgrades, `taken_over_connections` for other `take_over()`s, and `active_connections()`), and the connections served since the server was created (`total_connections`). Counting costs nothing per request: a connection joins or leaves a list (picked by its io_context, so threads do not contend for it) only when it opens, changes what it serves and closes; `stats()` reads those lists, so it is meant for a monitoring endpoint, not for every request. There is no request counter, nor bytes in and out: they would cost on every request. A connection taken over counts until its socket is destroyed, or until closed for `websocket_connection` and `sse_connection`.
+`stats()` returns the connections open by what they serve (`http_connections`, `websocket_connections`, `sse_connections`, `tunnel_connections` for reverse proxy upgrades, `taken_over_connections` for other `take_over()`s, and `active_connections()`), and the connections served since the server was created (`total_connections`). Counting costs nothing per request: a connection joins or leaves a list (picked by its io_context, so threads do not contend for it) only when it opens, changes what it serves and closes; `stats()` reads those lists, so it is meant for a monitoring endpoint, not for every request. There is no request counter, nor bytes in and out: they would cost on every request (the [response hook](#response-hook) can count them). A connection taken over counts until its socket is destroyed, or until closed for `websocket_connection` and `sse_connection`.
 
 ```cpp
 server.get("/v1/server/statistics", [&server](thinger::http::response& res) {
@@ -1897,6 +1915,7 @@ See the [examples](examples/) directory for complete working examples:
 - `http::async_client` - Thread-safe, uses internal worker threads
 - `http::websocket_client` - Single connection, thread-safe send operations
 - `http::websocket_connection` - Server-side WebSocket, thread-safe send, callbacks on IO thread
+- `http::http_application::on_response()` - The hook runs on the thread of the connection, once per request
 - `asio::socket` (TCP, TLS, Unix, `asio::websocket`, custom sockets) - Not thread-safe, like the asio objects they wrap: use a socket on a thread running its io_context (`get_io_context()`), dispatching there from other threads; an `asio::websocket` on its executor (`get_executor()`: the io_context of its socket, or the strand of the coroutine that opened it from a client), where it runs its keepalive and closing handshake too. `socket_pipe::cancel()` may be called from any thread
 
 ## License
