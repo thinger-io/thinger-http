@@ -30,39 +30,55 @@ namespace {
 
 }
 
-bool apply_tls_options(boost::asio::ssl::context& context, const tls_options& options) {
-    SSL_CTX* handle = context.native_handle();
-    if (SSL_CTX_set_min_proto_version(handle, protocol_version(options.min_version)) != 1 ||
-        SSL_CTX_set_max_proto_version(handle, protocol_version(options.max_version)) != 1) {
-        LOG_ERROR("invalid TLS protocol versions");
-        return false;
-    }
-    if (!options.ciphers.empty() && SSL_CTX_set_cipher_list(handle, options.ciphers.c_str()) != 1) {
-        LOG_ERROR("invalid TLS cipher list: {}", options.ciphers);
-        return false;
-    }
-    if (!options.ciphersuites.empty() &&
-        (SSL_CTX_set_ciphersuites(handle, options.ciphersuites.c_str()) != 1 || !has_tls13_suites(handle))) {
-        LOG_ERROR("invalid TLS 1.3 cipher suites: {}", options.ciphersuites);
-        return false;
-    }
-    if (options.prefer_server_ciphers) {
-        SSL_CTX_set_options(handle, SSL_OP_CIPHER_SERVER_PREFERENCE);
-    } else {
-        SSL_CTX_clear_options(handle, SSL_OP_CIPHER_SERVER_PREFERENCE);
-    }
-    if (!options.groups.empty() && SSL_CTX_set1_groups_list(handle, options.groups.c_str()) != 1) {
-        LOG_ERROR("invalid TLS groups: {}", options.groups);
-        return false;
-    }
-    if (options.security_level) {
-        if (*options.security_level < 0 || *options.security_level > 5) {
-            LOG_ERROR("invalid OpenSSL security level: {}", *options.security_level);
+namespace {
+
+    // Set the options on a context, the security level first (it decides which ciphers and
+    // certificates are allowed): false (logged) at the first one OpenSSL refuses
+    bool set_tls_options(SSL_CTX* handle, const tls_options& options) {
+        if (options.security_level) {
+            if (*options.security_level < 0 || *options.security_level > 5) {
+                LOG_ERROR("invalid OpenSSL security level: {}", *options.security_level);
+                return false;
+            }
+            SSL_CTX_set_security_level(handle, *options.security_level);
+        }
+        if (SSL_CTX_set_min_proto_version(handle, protocol_version(options.min_version)) != 1 ||
+            SSL_CTX_set_max_proto_version(handle, protocol_version(options.max_version)) != 1) {
+            LOG_ERROR("invalid TLS protocol versions");
             return false;
         }
-        SSL_CTX_set_security_level(handle, *options.security_level);
+        if (!options.ciphers.empty() && SSL_CTX_set_cipher_list(handle, options.ciphers.c_str()) != 1) {
+            LOG_ERROR("invalid TLS cipher list: {}", options.ciphers);
+            return false;
+        }
+        if (!options.ciphersuites.empty() &&
+            (SSL_CTX_set_ciphersuites(handle, options.ciphersuites.c_str()) != 1 || !has_tls13_suites(handle))) {
+            LOG_ERROR("invalid TLS 1.3 cipher suites: {}", options.ciphersuites);
+            return false;
+        }
+        if (!options.groups.empty() && SSL_CTX_set1_groups_list(handle, options.groups.c_str()) != 1) {
+            LOG_ERROR("invalid TLS groups: {}", options.groups);
+            return false;
+        }
+        if (options.prefer_server_ciphers) {
+            SSL_CTX_set_options(handle, SSL_OP_CIPHER_SERVER_PREFERENCE);
+        } else {
+            SSL_CTX_clear_options(handle, SSL_OP_CIPHER_SERVER_PREFERENCE);
+        }
+        return true;
     }
-    return true;
+
+    // Whether OpenSSL takes the options, tried on a context of its own
+    bool valid_tls_options(const tls_options& options) {
+        boost::asio::ssl::context test(boost::asio::ssl::context::tls_server);
+        return set_tls_options(test.native_handle(), options);
+    }
+
+}
+
+bool apply_tls_options(boost::asio::ssl::context& context, const tls_options& options) {
+    // Tried first, so a context is never left half set
+    return valid_tls_options(options) && set_tls_options(context.native_handle(), options);
 }
 
 certificate_manager::certificate_manager() 
@@ -82,8 +98,11 @@ std::shared_ptr<boost::asio::ssl::context> certificate_manager::create_base_ssl_
     auto context = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
     context->set_options(boost::asio::ssl::context::single_dh_use);
     install_sni_callback(*context);
-    // Validated when set (see set_tls_options())
-    apply_tls_options(*context, options);
+    // Validated when set (see set_tls_options()), so this fails only if OpenSSL changed its mind
+    if (!apply_tls_options(*context, options)) {
+        LOG_ERROR("cannot set the TLS options of a new context");
+        return nullptr;
+    }
     return context;
 }
 
@@ -97,6 +116,7 @@ std::shared_ptr<boost::asio::ssl::context> certificate_manager::create_ssl_conte
         options = options_;
     }
     auto context = create_base_ssl_context(options);
+    if (!context) return nullptr;
 
     boost::system::error_code ec;
     context->use_certificate_chain(boost::asio::buffer(cert_chain.data(), cert_chain.size()), ec);
@@ -222,12 +242,19 @@ std::set<std::string> certificate_manager::get_registered_hosts() const {
     return ssl_contexts_->keys();
 }
 
-bool certificate_manager::set_tls_options(const tls_options& options) {
+bool certificate_manager::update_tls_options(const tls_options& options) {
     // Tried on a context first, so the contexts created afterwards cannot fail
-    boost::asio::ssl::context test(boost::asio::ssl::context::tls_server);
-    if (!apply_tls_options(test, options)) return false;
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (!valid_tls_options(options)) return false;
     options_ = options;
+    return true;
+}
+
+bool certificate_manager::set_tls_options(const tls_options& options) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!update_tls_options(options)) return false;
+    // They replace what the setters below changed
+    legacy_.reset();
+    ciphers_chosen_ = false;
     return true;
 }
 
@@ -236,24 +263,38 @@ tls_options certificate_manager::get_tls_options() const {
     return options_;
 }
 
-void certificate_manager::set_server_ciphers(const std::string& ciphers, bool prefer_server_ciphers) {
+bool certificate_manager::set_server_ciphers(const std::string& ciphers, bool prefer_server_ciphers) {
     std::lock_guard<std::mutex> lock(mutex_);
-    options_.ciphers = ciphers;
-    options_.prefer_server_ciphers = prefer_server_ciphers;
+    auto options = options_;
+    options.ciphers = ciphers;
+    options.prefer_server_ciphers = prefer_server_ciphers;
+    if (!update_tls_options(options)) return false;
+    ciphers_chosen_ = true;
+    // chosen here: the legacy protocols no longer decide them
+    if (legacy_) legacy_->ciphers.reset();
+    return true;
 }
 
 void certificate_manager::enable_legacy_protocols(bool enable) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const tls_options defaults;
+    if (enable == legacy_.has_value()) return;
+    auto options = options_;
     if (enable) {
-        options_.min_version = tls_version::tls1_0;
-        options_.security_level = 0;
-        // TLS 1.0 and 1.1 have no AEAD ciphers
-        if (options_.ciphers == defaults.ciphers) options_.ciphers.clear();
+        legacy_change change{options.min_version, options.security_level, std::nullopt};
+        options.min_version = tls_version::tls1_0;
+        options.security_level = 0;
+        // TLS 1.0 and 1.1 have no AEAD cipher: OpenSSL's defaults, unless they were chosen
+        if (!ciphers_chosen_) {
+            change.ciphers = options.ciphers;
+            options.ciphers.clear();
+        }
+        if (update_tls_options(options)) legacy_ = std::move(change);
     } else {
-        options_.min_version = defaults.min_version;
-        options_.security_level = defaults.security_level;
-        if (options_.ciphers.empty()) options_.ciphers = defaults.ciphers;
+        // What enabling them changed, and only that
+        options.min_version = legacy_->min_version;
+        options.security_level = legacy_->security_level;
+        if (legacy_->ciphers) options.ciphers = *legacy_->ciphers;
+        if (update_tls_options(options)) legacy_.reset();
     }
 }
 
@@ -301,6 +342,11 @@ void certificate_manager::generate_self_signed_certificate() {
     
     // Create SSL context
     auto context = create_base_ssl_context(options_);
+    if (!context) {
+        X509_free(x509);
+        EVP_PKEY_free(pkey);
+        return;
+    }
     
     // Set certificate and key
     if (SSL_CTX_use_certificate(context->native_handle(), x509) != 1) {

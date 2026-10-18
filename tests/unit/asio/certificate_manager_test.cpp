@@ -601,6 +601,72 @@ TEST_CASE("Certificate manager TLS options", "[certificate_manager][tls]") {
         REQUIRE(mgr.get_tls_options().ciphersuites == tls_options{}.ciphersuites);
     }
 
+    SECTION("The deprecated setters change the options, in any order") {
+        auto legacy_first = [&] {
+            REQUIRE(mgr.set_tls_options({}));
+            mgr.enable_legacy_protocols(true);
+            REQUIRE(mgr.set_server_ciphers("ECDHE-RSA-AES128-GCM-SHA256", true));
+            return mgr.get_tls_options();
+        }();
+        auto ciphers_first = [&] {
+            REQUIRE(mgr.set_tls_options({}));
+            REQUIRE(mgr.set_server_ciphers("ECDHE-RSA-AES128-GCM-SHA256", true));
+            mgr.enable_legacy_protocols(true);
+            return mgr.get_tls_options();
+        }();
+        for (const auto& options : {legacy_first, ciphers_first}) {
+            REQUIRE(options.min_version == tls_version::tls1_0);
+            REQUIRE(options.security_level == 0);
+            REQUIRE(options.ciphers == "ECDHE-RSA-AES128-GCM-SHA256");
+            REQUIRE(options.prefer_server_ciphers);
+        }
+        // undone, keeping the ciphers chosen
+        mgr.enable_legacy_protocols(false);
+        REQUIRE(mgr.get_tls_options().min_version == tls_version::tls1_2);
+        REQUIRE_FALSE(mgr.get_tls_options().security_level);
+        REQUIRE(mgr.get_tls_options().ciphers == "ECDHE-RSA-AES128-GCM-SHA256");
+    }
+
+    SECTION("The deprecated setters are validated") {
+        REQUIRE_FALSE(mgr.set_server_ciphers("NOT-A-CIPHER", true));
+        REQUIRE(mgr.get_tls_options().ciphers == tls_options{}.ciphers);
+        REQUIRE_FALSE(mgr.get_tls_options().prefer_server_ciphers);
+    }
+
+    SECTION("Disabling the legacy protocols undoes only what enabling them did") {
+        tls_options options;
+        options.min_version = tls_version::tls1_3;
+        options.security_level = 3;
+        REQUIRE(mgr.set_tls_options(options));
+        // not enabled: nothing to undo
+        mgr.enable_legacy_protocols(false);
+        REQUIRE(mgr.get_tls_options().min_version == tls_version::tls1_3);
+        REQUIRE(mgr.get_tls_options().security_level == 3);
+        // enabled and disabled: back to what was set
+        mgr.enable_legacy_protocols(true);
+        REQUIRE(mgr.get_tls_options().min_version == tls_version::tls1_0);
+        mgr.enable_legacy_protocols(false);
+        REQUIRE(mgr.get_tls_options().min_version == tls_version::tls1_3);
+        REQUIRE(mgr.get_tls_options().security_level == 3);
+        REQUIRE(mgr.get_tls_options().ciphers == tls_options{}.ciphers);
+        // ciphers chosen while enabled stay, also OpenSSL's defaults chosen explicitly
+        mgr.enable_legacy_protocols(true);
+        REQUIRE(mgr.set_server_ciphers("", false));
+        mgr.enable_legacy_protocols(false);
+        REQUIRE(mgr.get_tls_options().ciphers.empty());
+    }
+
+    SECTION("A context is left as it was when OpenSSL refuses the options") {
+        auto ctx = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
+        REQUIRE(apply_tls_options(*ctx, {}));
+        tls_options refused;
+        refused.min_version = tls_version::tls1_3;
+        refused.ciphers = "NOT-A-CIPHER";
+        REQUIRE_FALSE(apply_tls_options(*ctx, refused));
+        REQUIRE(SSL_CTX_get_min_proto_version(ctx->native_handle()) == TLS1_2_VERSION);
+        REQUIRE(cipher_names(ctx, false).size() == 6);
+    }
+
     SECTION("Applied to a context given") {
         auto ctx = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
         REQUIRE(apply_tls_options(*ctx, mgr.get_tls_options()));

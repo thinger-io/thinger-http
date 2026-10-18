@@ -46,8 +46,8 @@ struct tls_options {
     std::optional<int> security_level;
 };
 
-// Apply `options` to a context: false (logged) if OpenSSL refuses one of them (e.g. a cipher
-// list without any cipher it knows), leaving the context partly set
+// Apply `options` to a context: false (logged), and the context left as it was, if OpenSSL
+// refuses one of them (e.g. a cipher list without any cipher it knows)
 bool apply_tls_options(boost::asio::ssl::context& context, const tls_options& options);
 
 // Certificates of the TLS servers: a default one, and one per host name selected by SNI (exact
@@ -91,6 +91,19 @@ private:
     
     // TLS options of the contexts created
     tls_options options_;
+
+    // What enable_legacy_protocols(true) changed, to undo it (the ciphers only while it decides
+    // them), and whether set_server_ciphers() chose the ciphers
+    struct legacy_change {
+        tls_version min_version;
+        std::optional<int> security_level;
+        std::optional<std::string> ciphers;
+    };
+    std::optional<legacy_change> legacy_;
+    bool ciphers_chosen_ = false;
+
+    // Validate and set the options (with the lock held)
+    bool update_tls_options(const tls_options& options);
     
     // Guards all the above: certificates are set and removed while handshakes look them up
     mutable std::mutex mutex_;
@@ -135,16 +148,22 @@ public:
     
     // TLS options of the contexts created from now on (those created before keep theirs): set
     // them before the certificates, and before listening. False if OpenSSL refuses them, then
-    // the current ones are kept. The defaults are those of tls_options
+    // the current ones are kept. The defaults are those of tls_options. They replace everything
+    // the two setters below changed
     bool set_tls_options(const tls_options& options);
     tls_options get_tls_options() const;
 
+    // Deprecated, use set_tls_options(); they change the options as set_tls_options() would,
+    // and are validated as well (in any order, they give the same options).
+    //
     // The TLS 1.2 ciphers (empty: OpenSSL's defaults) and whether the server's order is
-    // preferred: tls_options::ciphers and tls_options::prefer_server_ciphers
-    void set_server_ciphers(const std::string& ciphers, bool prefer_server_ciphers);
+    // preferred: tls_options::ciphers and tls_options::prefer_server_ciphers. False if OpenSSL
+    // refuses the ciphers (the current ones are kept)
+    bool set_server_ciphers(const std::string& ciphers, bool prefer_server_ciphers);
     // Allow TLS 1.0 and 1.1 (true): the minimum version is TLS 1.0, the OpenSSL security level
-    // 0 (OpenSSL 3 refuses them above), and the ciphers OpenSSL's defaults unless others were
-    // set; false goes back to the defaults of tls_options
+    // 0 (OpenSSL 3 refuses them above), and the ciphers OpenSSL's defaults (TLS 1.0 and 1.1 have
+    // no AEAD cipher) unless set_server_ciphers() chose them. False undoes only what true did,
+    // and does nothing if they were not allowed
     void enable_legacy_protocols(bool enable);
     
     // Server name callback of the handshakes, installed on every context the manager creates
