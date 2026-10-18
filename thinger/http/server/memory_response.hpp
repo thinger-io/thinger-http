@@ -21,14 +21,16 @@ public:
 
     // Whole response
     void send(std::shared_ptr<http_response> response) override {
+        size_t bytes;
         {
             std::lock_guard lock(mutex_);
             if (complete_) return;
             response_ = std::move(response);
             if (observer_) observer_->head(response_->get_status(), false);
+            bytes = response_->get_content().size();
             finish_locked();
         }
-        observed_end();
+        observed_end(bytes);
     }
 
     // Chunked response, collected whole: headers first, then the data, then the end
@@ -48,14 +50,16 @@ public:
     }
 
     bool finish() override {
+        size_t bytes;
         {
             std::lock_guard lock(mutex_);
             if (complete_ || !response_) return false;
-            response_->set_content_length(response_->get_content().size());
+            bytes = response_->get_content().size();
+            response_->set_content_length(bytes);
             response_->set_last_frame(true);
             finish_locked();
         }
-        observed_end();
+        observed_end(bytes);
         return true;
     }
 
@@ -92,11 +96,12 @@ private:
         done_.try_send(boost::system::error_code{});
     }
 
-    // Tell the observer the response is complete (once, by the call completing it), without
-    // the lock: it may call the response hook
-    void observed_end() {
+    // Tell the observer the response is complete, with the size of its body (once, by the call
+    // completing it), without the lock: it may call the response hook. Not reading the response,
+    // which the dispatch may have handed to its caller by then
+    void observed_end(size_t bytes) {
         if (!observer_) return;
-        observer_->add_bytes(response_->get_content().size());
+        observer_->add_bytes(bytes);
         observer_->ended(response_outcome::completed);
     }
 
