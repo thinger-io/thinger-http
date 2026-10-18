@@ -201,6 +201,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/tls_certificates_test.cpp)
     add_thinger_test(test_integration_tls_certificates integration/tls_certificates_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/tls_options_test.cpp)
+    add_thinger_test(test_integration_tls_options integration/tls_options_test.cpp)
+endif()
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/client_keepalive_test.cpp)
     add_thinger_test(test_integration_client_keepalive integration/client_keepalive_test.cpp)
 endif()

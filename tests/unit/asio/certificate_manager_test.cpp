@@ -4,6 +4,7 @@
 #include <openssl/x509.h>
 #include <openssl/rsa.h>
 #include <openssl/evp.h>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -74,6 +75,23 @@ void clear_all_certificates() {
     }
     // Also clear default certificate
     mgr.set_default_certificate(nullptr);
+    // and the TLS options
+    REQUIRE(mgr.set_tls_options({}));
+}
+
+// Names of the ciphers of a context: those of TLS 1.2 and older, or those of TLS 1.3
+std::set<std::string> cipher_names(const std::shared_ptr<boost::asio::ssl::context>& ctx, bool tls13) {
+    std::set<std::string> names;
+    auto* ciphers = SSL_CTX_get_ciphers(ctx->native_handle());
+    for (int i = 0; i < sk_SSL_CIPHER_num(ciphers); ++i) {
+        const SSL_CIPHER* cipher = sk_SSL_CIPHER_value(ciphers, i);
+        if ((std::string(SSL_CIPHER_get_version(cipher)) == "TLSv1.3") == tls13) names.insert(SSL_CIPHER_standard_name(cipher));
+    }
+    return names;
+}
+
+bool prefers_server_ciphers(const std::shared_ptr<boost::asio::ssl::context>& ctx) {
+    return SSL_CTX_get_options(ctx->native_handle()) & SSL_OP_CIPHER_SERVER_PREFERENCE;
 }
 
 // Helper to get the Common Name from an SSL context
@@ -252,6 +270,27 @@ TEST_CASE("Certificate Manager Tests", "[certificate_manager]") {
         
         auto ctx = mgr.get_certificate("example.com");
         REQUIRE(ctx != nullptr);
+        // the setters of earlier versions set the TLS options
+        REQUIRE(cipher_names(ctx, false) == std::set<std::string>{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+                                                                  "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"});
+        REQUIRE(prefers_server_ciphers(ctx));
+        REQUIRE(SSL_CTX_get_min_proto_version(ctx->native_handle()) == TLS1_VERSION);
+        REQUIRE(SSL_CTX_get_security_level(ctx->native_handle()) == 0);
+
+        // back to the defaults, keeping the ciphers set
+        mgr.enable_legacy_protocols(false);
+        REQUIRE(mgr.get_tls_options().min_version == tls_version::tls1_2);
+        REQUIRE_FALSE(mgr.get_tls_options().security_level);
+        REQUIRE(mgr.get_tls_options().ciphers == "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384");
+    }
+
+    SECTION("Legacy protocols with the default ciphers") {
+        auto& mgr = certificate_manager::instance();
+        mgr.enable_legacy_protocols(true);
+        // OpenSSL's defaults, as TLS 1.0 and 1.1 have no AEAD cipher
+        REQUIRE(mgr.get_tls_options().ciphers.empty());
+        mgr.enable_legacy_protocols(false);
+        REQUIRE(mgr.get_tls_options().ciphers == tls_options{}.ciphers);
     }
     
     SECTION("Invalid Certificate") {
@@ -491,4 +530,83 @@ TEST_CASE("Certificate Manager Tests", "[certificate_manager]") {
     
     // Clean up after all tests
     clear_all_certificates();
+}
+TEST_CASE("Certificate manager TLS options", "[certificate_manager][tls]") {
+    clear_all_certificates();
+    auto& mgr = certificate_manager::instance();
+    auto [cert, key] = generate_test_certificate("tls.example.com");
+
+    SECTION("Mozilla intermediate by default, on every context created") {
+        auto options = mgr.get_tls_options();
+        REQUIRE(options.min_version == tls_version::tls1_2);
+        REQUIRE(options.max_version == tls_version::tls1_3);
+        REQUIRE_FALSE(options.prefer_server_ciphers);
+
+        REQUIRE(mgr.set_certificate("tls.example.com", cert, key));
+        REQUIRE(mgr.set_default_certificate(cert, key));
+        auto host = mgr.get_certificate("tls.example.com");
+        auto fallback = mgr.get_default_certificate();
+        mgr.set_default_certificate(nullptr);
+        auto self_signed = mgr.get_default_certificate();
+
+        const std::set<std::string> tls12{
+            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256", "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"};
+        const std::set<std::string> tls13{"TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384",
+                                          "TLS_CHACHA20_POLY1305_SHA256"};
+        for (const auto& ctx : {host, fallback, self_signed}) {
+            REQUIRE(ctx);
+            REQUIRE(SSL_CTX_get_min_proto_version(ctx->native_handle()) == TLS1_2_VERSION);
+            REQUIRE(SSL_CTX_get_max_proto_version(ctx->native_handle()) == TLS1_3_VERSION);
+            REQUIRE(cipher_names(ctx, false) == tls12);
+            REQUIRE(cipher_names(ctx, true) == tls13);
+            REQUIRE_FALSE(prefers_server_ciphers(ctx));
+        }
+    }
+
+    SECTION("Options set apply to the contexts created afterwards") {
+        REQUIRE(mgr.set_certificate("before.example.com", cert, key));
+        tls_options options;
+        options.min_version = tls_version::tls1_3;
+        options.ciphersuites = "TLS_AES_256_GCM_SHA384";
+        options.prefer_server_ciphers = true;
+        options.groups = "X25519:prime256v1";
+        options.security_level = 1;
+        REQUIRE(mgr.set_tls_options(options));
+        REQUIRE(mgr.get_tls_options().security_level == 1);
+        REQUIRE(mgr.set_certificate("tls.example.com", cert, key));
+
+        auto ctx = mgr.get_certificate("tls.example.com");
+        REQUIRE(SSL_CTX_get_min_proto_version(ctx->native_handle()) == TLS1_3_VERSION);
+        REQUIRE(cipher_names(ctx, true) == std::set<std::string>{"TLS_AES_256_GCM_SHA384"});
+        REQUIRE(prefers_server_ciphers(ctx));
+        REQUIRE(SSL_CTX_get_security_level(ctx->native_handle()) == 1);
+        // the ones created before keep theirs
+        auto before = mgr.get_certificate("before.example.com");
+        REQUIRE(SSL_CTX_get_min_proto_version(before->native_handle()) == TLS1_2_VERSION);
+    }
+
+    SECTION("Options OpenSSL refuses are not set") {
+        auto refused = [&](auto change) {
+            tls_options options;
+            change(options);
+            return !mgr.set_tls_options(options);
+        };
+        REQUIRE(refused([](tls_options& options) { options.ciphers = "NOT-A-CIPHER"; }));
+        REQUIRE(refused([](tls_options& options) { options.ciphersuites = "TLS_NOT_A_SUITE"; }));
+        REQUIRE(refused([](tls_options& options) { options.groups = "not-a-curve"; }));
+        REQUIRE(refused([](tls_options& options) { options.security_level = 6; }));
+        REQUIRE(mgr.get_tls_options().ciphers == tls_options{}.ciphers);
+        REQUIRE(mgr.get_tls_options().ciphersuites == tls_options{}.ciphersuites);
+    }
+
+    SECTION("Applied to a context given") {
+        auto ctx = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
+        REQUIRE(apply_tls_options(*ctx, mgr.get_tls_options()));
+        REQUIRE(SSL_CTX_get_min_proto_version(ctx->native_handle()) == TLS1_2_VERSION);
+        REQUIRE(cipher_names(ctx, false).size() == 6);
+    }
+
+    REQUIRE(mgr.set_tls_options({}));
 }

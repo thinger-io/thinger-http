@@ -35,7 +35,7 @@ To reproduce, see [`benchmark/compare`](benchmark/compare/): `benchmark/compare/
 - **HTTP Server & Client** - Full HTTP/1.1 support with connection pooling
 - **WebSocket** - Server and client support with text/binary messages, or as a byte stream socket for other protocols and tunnels
 - **Server-Sent Events (SSE)** - Real-time server push
-- **SSL/TLS** - HTTPS and WSS support via OpenSSL, with per-domain certificates (SNI)
+- **SSL/TLS** - HTTPS and WSS support via OpenSSL, with per-domain certificates (SNI) and Mozilla's "intermediate" settings by default (TLS 1.2 and 1.3)
 - **Virtual Hosts** - Routes per host name, exact or by pattern, on the same listener
 - **Reverse Proxy** - Forward requests to HTTP, HTTPS or Unix socket targets, streaming bodies and tunneling WebSockets
 - **File Uploads** - Streaming multipart/form-data parser, with temporary files and limits
@@ -973,6 +973,23 @@ server.get("/", handler);
 server.enable_ssl(true);
 server.start("0.0.0.0", 443);
 ```
+
+The certificates are kept by `asio::certificate_manager::instance()`: a default one (`set_default_certificate()`, a self-signed one for development if none is set) and one per host name, selected by SNI (`set_certificate(host, certificate, key)`, `*.example.com` for a wildcard).
+
+#### TLS Settings
+
+The contexts the manager creates follow Mozilla's ["intermediate"](https://wiki.mozilla.org/Security/Server_Side_TLS) configuration, as Node and nginx do by default: TLS 1.2 and 1.3, ECDHE key exchange (forward secrecy) with AES-GCM or ChaCha20-Poly1305, and the cipher the client prefers. `set_tls_options()` changes them, for the contexts created afterwards (set it before the certificates and before listening):
+
+```cpp
+thinger::asio::tls_options options;                         // the defaults
+options.min_version = thinger::asio::tls_version::tls1_3;  // TLS 1.3 only
+options.prefer_server_ciphers = true;                       // in the order of `ciphers`
+// options.ciphers (TLS 1.2), options.ciphersuites (TLS 1.3), options.groups (curves),
+// options.security_level (OpenSSL)
+thinger::asio::certificate_manager::instance().set_tls_options(options);   // false if OpenSSL refuses them
+```
+
+The certificate of each host gets the same options, so SNI cannot weaken them: the versions and ciphers of a handshake are those of the context the server listens with (the default one when it started listening), as OpenSSL takes only the certificate of the context SNI selects. A context given ready-made (`set_default_certificate(context)`, `set_certificate(host, context)`) keeps its own settings; `asio::apply_tls_options(context, options)` sets them on it. `enable_legacy_protocols(true)` still allows TLS 1.0 and 1.1 for old clients.
 
 ### Server Lifecycle
 

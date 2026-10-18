@@ -1,6 +1,7 @@
 #ifndef THINGER_ASIO_SSL_CERTIFICATE_MANAGER_HPP
 #define THINGER_ASIO_SSL_CERTIFICATE_MANAGER_HPP
 
+#include <cstdint>
 #include <memory>
 #include <unordered_map>
 #include <string>
@@ -16,6 +17,46 @@ namespace thinger::asio {
 template<typename T>
 class regex_map;
 
+// Versions of the TLS protocol
+enum class tls_version : uint8_t { tls1_0, tls1_1, tls1_2, tls1_3 };
+
+// TLS settings of a server context. The defaults are the "intermediate" configuration of
+// Mozilla's Server Side TLS guidelines, the one Node and nginx default to: TLS 1.2 and 1.3,
+// ECDHE key exchange (forward secrecy) with AES-GCM or ChaCha20-Poly1305 (AEAD), and the cipher
+// preferred by the client (which knows whether it has AES in hardware). Older clients (TLS 1.0
+// and 1.1: Android before 4.4.2, Java 7, IE 10 and older...) are refused.
+struct tls_options {
+    tls_version min_version = tls_version::tls1_2;
+    tls_version max_version = tls_version::tls1_3;
+    // Ciphers of TLS 1.2 and older, in OpenSSL's format; empty: left as they are (OpenSSL's
+    // defaults on a new context)
+    std::string ciphers =
+        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
+    // Cipher suites of TLS 1.3, in OpenSSL's format; empty: left as they are
+    std::string ciphersuites = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256";
+    // Choose the cipher in the order of the server (`ciphers`) instead of the client's
+    bool prefer_server_ciphers = false;
+    // Key exchange groups (curves), e.g. "X25519:prime256v1:secp384r1"; empty: OpenSSL's
+    // defaults, which OpenSSL keeps up to date (from 3.5 they include the post-quantum
+    // X25519MLKEM768)
+    std::string groups;
+    // OpenSSL security level (0 to 5); none: OpenSSL's default (as configured on the system)
+    std::optional<int> security_level;
+};
+
+// Apply `options` to a context: false (logged) if OpenSSL refuses one of them (e.g. a cipher
+// list without any cipher it knows), leaving the context partly set
+bool apply_tls_options(boost::asio::ssl::context& context, const tls_options& options);
+
+// Certificates of the TLS servers: a default one, and one per host name selected by SNI (exact
+// or wildcard). The contexts it creates (from PEM, or the self-signed default) have its TLS
+// options (see set_tls_options()), the certificate of a host included, so SNI cannot lower them.
+// The versions, ciphers and options of a handshake are those of the context the server listens
+// with (the default one when it started listening): OpenSSL takes only the certificate (and
+// the security level) of the context SNI switches to. Contexts given ready-made keep their own
+// settings (apply_tls_options() sets these options on one).
 class certificate_manager {
 private:
     // Private constructor for singleton
@@ -27,19 +68,12 @@ private:
     certificate_manager(certificate_manager&&) = delete;
     certificate_manager& operator=(certificate_manager&&) = delete;
     
-    // Settings of the contexts created
-    struct tls_settings {
-        std::string ciphers;
-        bool prefer_server_ciphers = false;
-        bool legacy_protocols = false;
-    };
-
     // Install the server name callback (see sni_callback()) on a context, before any
     // handshake uses it: listeners do not write it into contexts shared with running servers
     static void install_sni_callback(boost::asio::ssl::context& context);
 
-    // Create base SSL context with common settings
-    static std::shared_ptr<boost::asio::ssl::context> create_base_ssl_context(const tls_settings& settings);
+    // Create base SSL context with common settings, and the TLS options
+    static std::shared_ptr<boost::asio::ssl::context> create_base_ssl_context(const tls_options& options);
     
     // Create SSL context from certificate and key strings
     std::shared_ptr<boost::asio::ssl::context> create_ssl_context(
@@ -55,8 +89,8 @@ private:
     // Default hostname
     std::string default_host_;
     
-    // SSL/TLS configuration
-    tls_settings settings_;
+    // TLS options of the contexts created
+    tls_options options_;
     
     // Guards all the above: certificates are set and removed while handshakes look them up
     mutable std::mutex mutex_;
@@ -99,8 +133,18 @@ public:
     // Get all registered hostnames
     std::set<std::string> get_registered_hosts() const;
     
-    // SSL/TLS configuration
+    // TLS options of the contexts created from now on (those created before keep theirs): set
+    // them before the certificates, and before listening. False if OpenSSL refuses them, then
+    // the current ones are kept. The defaults are those of tls_options
+    bool set_tls_options(const tls_options& options);
+    tls_options get_tls_options() const;
+
+    // The TLS 1.2 ciphers (empty: OpenSSL's defaults) and whether the server's order is
+    // preferred: tls_options::ciphers and tls_options::prefer_server_ciphers
     void set_server_ciphers(const std::string& ciphers, bool prefer_server_ciphers);
+    // Allow TLS 1.0 and 1.1 (true): the minimum version is TLS 1.0, the OpenSSL security level
+    // 0 (OpenSSL 3 refuses them above), and the ciphers OpenSSL's defaults unless others were
+    // set; false goes back to the defaults of tls_options
     void enable_legacy_protocols(bool enable);
     
     // Server name callback of the handshakes, installed on every context the manager creates
