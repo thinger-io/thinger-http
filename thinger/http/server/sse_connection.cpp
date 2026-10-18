@@ -16,13 +16,22 @@ namespace thinger::http {
         flow_.clear();
         // no longer counts for the server
         if(tracking_) tracking_->closed();
-        // told last, once (released before: it may own this connection)
-        auto on_close = std::move(on_close_callback_);
-        on_close_callback_ = nullptr;
-        if(on_close) on_close();
+        // told last, once, posted (the callback is released here: it may own this connection)
+        on_close_.notify();
     }
 
     awaitable<void> sse_connection::read_loop([[maybe_unused]] std::shared_ptr<sse_connection> self){
+        // The callbacks are released however the loop ends, also when its frame is destroyed
+        // with the io_context: a callback holding the connection would keep it forever
+        struct cycle_guard {
+            sse_connection& connection;
+            ~cycle_guard() {
+                connection.on_shutdown_callback_ = nullptr;
+                connection.on_close_.release();
+                connection.flow_.close();
+            }
+        } guard{*this};
+
         uint8_t buffer[512];
         while(!closed_){
             auto [ec, bytes] = co_await socket_->read_some(buffer, sizeof(buffer));

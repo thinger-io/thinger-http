@@ -30,6 +30,7 @@ namespace thinger::http{
     websocket_connection::websocket_connection(std::shared_ptr<asio::websocket> socket) :
         ws_(std::move(socket)),
         flow_(ws_->get_executor(), write_limits{.max_messages = MAX_OUTPUT_MESSAGES}),
+        on_close_(ws_->get_executor()),
         resume_timer_(ws_->get_executor(), boost::asio::steady_timer::time_point::max())
     {
         LOG_LEVEL(2, "websocket connection created");
@@ -67,7 +68,7 @@ namespace thinger::http{
     }
 
     void websocket_connection::on_close(sync_callback<void(const websocket_close&)> callback){
-        on_close_callback_ = std::move(callback);
+        on_close_.set(std::move(callback));
     }
 
     void websocket_connection::start_read_loop()
@@ -83,7 +84,8 @@ namespace thinger::http{
                     ~cycle_guard() {
                         connection.on_frame_callback_ = nullptr;
                         connection.on_shutdown_callback_ = nullptr;
-                        connection.on_close_callback_ = nullptr;
+                        // never told if destroyed open (e.g. with the io_context)
+                        connection.on_close_.release();
                         // the watermark callbacks too, and producers waiting are told
                         connection.flow_.close();
                         // closed: no longer counts for the server
@@ -91,16 +93,11 @@ namespace thinger::http{
                     }
                 };
 
-                sync_callback<void(const websocket_close&)> on_close;
-                {
-                    cycle_guard guard{*this};
-                    co_await read_messages();
-                    // Ended here, on the executor (not by the teardown of the io_context):
-                    // closed, unless released
-                    if (!released_) on_close = std::move(on_close_callback_);
-                }
-                // Told once everything is released
-                if (on_close) on_close(close_status());
+                cycle_guard guard{*this};
+                co_await read_messages();
+                // Ended here, on the executor (not by the teardown of the io_context): closed,
+                // unless released. Told after the cleanup of the guard, as it is posted
+                if (!released_) on_close_.notify(close_status());
             },
             detached);
     }

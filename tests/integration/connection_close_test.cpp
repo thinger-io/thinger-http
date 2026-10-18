@@ -11,6 +11,7 @@
 #include <future>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <thread>
 
@@ -378,10 +379,10 @@ TEST_CASE("SSE on_close on a server shutdown", "[sse][close][shutdown][integrati
     REQUIRE(client.read_until("never").closed);
 }
 
-TEST_CASE("SSE on_close set once closed is called at once", "[sse][close][integration]") {
+TEST_CASE("SSE on_close set once closed is posted at once", "[sse][close][integration]") {
     http::server server;
     std::atomic<bool> left{false};
-    std::promise<bool> called_at_once;
+    std::promise<std::pair<bool, bool>> called;   // within the call setting it, and afterwards
     server.get("/events", [&](http::response& res) {
         res.start_sse([&](sse_ptr sse) -> awaitable<void> {
             // a coroutine handler running late: the client left meanwhile
@@ -392,9 +393,12 @@ TEST_CASE("SSE on_close set once closed is called at once", "[sse][close][integr
             }
             timer.expires_after(200ms);
             co_await timer.async_wait(use_nothrow_awaitable);
-            bool called = false;
-            sse->on_close([&called] { called = true; });
-            called_at_once.set_value(called);
+            auto told = std::make_shared<bool>(false);
+            sse->on_close([told] { *told = true; });
+            bool inline_call = *told;
+            // posted: run once this coroutine yields
+            co_await boost::asio::post(co_await boost::asio::this_coro::executor, use_awaitable);
+            called.set_value({inline_call, *told});
         });
     });
     running_server running(server);
@@ -402,7 +406,115 @@ TEST_CASE("SSE on_close set once closed is called at once", "[sse][close][integr
     REQUIRE(eventually([&] { return server.stats().sse_connections == 1; }));
     client.close();
     left = true;
-    auto future = called_at_once.get_future();
+    auto future = called.get_future();
     REQUIRE(future.wait_for(3s) == std::future_status::ready);
-    REQUIRE(future.get());
+    auto [inline_call, told] = future.get();
+    REQUIRE_FALSE(inline_call);
+    REQUIRE(told);
+}
+
+TEST_CASE("SSE on_close is never called from within the call closing it", "[sse][close][integration]") {
+    // A broadcaster sending to its subscribers under a lock, which on_close takes to remove
+    // the one closing: the overflow policy closes it within send_data()
+    http::server server;
+    std::mutex mutex;
+    std::set<sse_ptr> subscribers;
+    std::atomic<int> removed{0};
+    server.get("/events", [&](http::response& res) {
+        res.start_sse([&](sse_ptr sse) {
+            sse->set_write_limits({.max_messages = 2, .policy = http::overflow_policy::close});
+            std::weak_ptr<http::sse_connection> weak = sse;
+            sse->on_close([&, weak] {
+                std::scoped_lock lock(mutex);
+                if (auto closed = weak.lock()) subscribers.erase(closed);
+                ++removed;
+            });
+            std::scoped_lock lock(mutex);
+            subscribers.insert(sse);
+        });
+    });
+    server.get("/broadcast", [&](http::response& res) {
+        {
+            std::scoped_lock lock(mutex);
+            for (const auto& subscriber : subscribers) {
+                for (int i = 0; i < 10; ++i) subscriber->send_data(std::string(100, 'x'));
+            }
+        }
+        res.send("sent");
+    });
+    running_server running(server);
+    sse_client client(running.port);
+    REQUIRE(eventually([&] { std::scoped_lock lock(mutex); return subscribers.size() == 1; }));
+    auto result = server_test::raw_exchange(running.port, "GET /broadcast HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    REQUIRE(result.data.ends_with("sent"));
+    REQUIRE(eventually([&] { return removed.load() == 1; }));
+    std::scoped_lock lock(mutex);
+    REQUIRE(subscribers.empty());
+}
+
+TEST_CASE("Close callbacks that throw are logged", "[websocket][sse][close][integration]") {
+    http::server server;
+    std::atomic<int> calls{0};
+    server.get("/ws", [&](http::response& res) {
+        res.upgrade_websocket([&](ws_ptr ws) {
+            ws->on_message([](std::string, bool) {});
+            ws->on_close([&](const http::websocket_close&) {
+                ++calls;
+                throw std::runtime_error("websocket close callback failed");
+            });
+        });
+    });
+    server.get("/events", [&](http::response& res) {
+        res.start_sse([&](sse_ptr sse) {
+            sse->on_close([&] {
+                ++calls;
+                throw std::runtime_error("sse close callback failed");
+            });
+        });
+    });
+    server.get("/hello", [](http::response& res) { res.send("hello"); });
+    running_server running(server);
+    {
+        raw_ws_client ws_client(running.port);
+        REQUIRE(ws_client.handshake("/ws").starts_with("HTTP/1.1 101"));
+        sse_client events(running.port);
+        REQUIRE(eventually([&] { return server.stats().sse_connections == 1; }));
+        ws_client.close();
+        events.close();
+    }
+    REQUIRE(eventually([&] { return calls.load() == 2; }));
+    // the server goes on
+    auto result = server_test::raw_exchange(running.port, "GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    REQUIRE(result.data.ends_with("hello"));
+}
+
+TEST_CASE("WebSocket on_close set once closed is posted at once", "[websocket][close][integration]") {
+    http::server server;
+    auto record = std::make_shared<close_record>();
+    std::promise<std::weak_ptr<http::websocket_connection>> created;
+    server.get("/ws", [&](http::response& res) {
+        res.upgrade_websocket([&](ws_ptr ws) {
+            record->opened();
+            ws->on_message([](std::string, bool) {});
+            created.set_value(ws);
+        });
+    });
+    running_server running(server);
+    raw_ws_client client(running.port);
+    REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
+    auto weak = created.get_future().get();
+    auto ws = weak.lock();
+    REQUIRE(ws);
+    client.send_frame(OP_CLOSE, close_payload(4001, "late"));
+    REQUIRE(client.closed_within(3s));
+    std::this_thread::sleep_for(100ms);
+    ws->execute([ws, record] {
+        ws->on_close([record](const http::websocket_close& close) { record->closed(close); });
+    });
+    auto status = record->wait();
+    REQUIRE(status.code == 4001);
+    REQUIRE(status.reason == "late");
+    REQUIRE(status.remote);
+    ws->execute([ws] {});   // released on its thread
+    ws.reset();
 }

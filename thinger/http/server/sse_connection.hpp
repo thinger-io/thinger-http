@@ -11,6 +11,7 @@
 #include "../../util/types.hpp"
 #include "connection_tracker.hpp"
 #include "flow_control.hpp"
+#include "close_notifier.hpp"
 
 namespace thinger::http{
 
@@ -38,7 +39,8 @@ public:
             socket_(socket),
             timer_(socket->get_io_context()),
             idle_(false),
-            flow_(socket->get_io_context().get_executor(), write_limits{.max_messages = MAX_OUTPUT_MESSAGES + 1})
+            flow_(socket->get_io_context().get_executor(), write_limits{.max_messages = MAX_OUTPUT_MESSAGES + 1}),
+            on_close_(socket->get_io_context().get_executor())
     {
         LOG_DEBUG("created sse connection");
     }
@@ -121,15 +123,13 @@ public:
 
     /// Once the connection closed, whatever closed it: the client left (or the connection
     /// failed), stop(), the server shutdown, the overflow policy, a write timeout, or 60 seconds
-    /// without sending anything. Called once, on the connection thread; nothing can be sent
-    /// anymore. Set once the connection already closed (e.g. by a coroutine handler that ran
-    /// late), it is called at once
+    /// without sending anything. Called once; nothing can be sent anymore. Always posted to the
+    /// connection thread, never called from within the call closing it (e.g. a send from a loop
+    /// over the connections, which may then remove this one); what it throws is logged. Set
+    /// once the connection already closed (e.g. by a coroutine handler that ran late), it is
+    /// posted at once. Not called if the io_context is stopped and destroyed with it open
     void on_close(sync_callback<void()> callback){
-        if(closed_){
-            if(callback) callback();
-            return;
-        }
-        on_close_callback_ = std::move(callback);
+        on_close_.set(std::move(callback));
     }
 
     void send_retry(unsigned long millis){
@@ -182,7 +182,7 @@ private:
     write_flow flow_;
 
     sync_callback<void()> on_shutdown_callback_;
-    sync_callback<void()> on_close_callback_;
+    close_notifier<> on_close_;
 
     bool closed_ = false;
 

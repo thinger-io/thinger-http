@@ -135,7 +135,9 @@ void http_server_base::check_shutdown(const std::shared_ptr<shutdown_state>& sta
         if (state->done || state->finishing != std::thread::id()) return;
     }
     if (state->connections->active() == 0) {
-        finish_shutdown(state, true);
+        // After what the connections posted as they closed (their close callbacks, see
+        // websocket_connection::on_close()), which a server stopping its io_context would drop
+        boost::asio::post(*state->io_context, [state] { finish_shutdown(state, true); });
     } else if (std::chrono::steady_clock::now() >= state->deadline) {
         force_shutdown(state);
     } else {

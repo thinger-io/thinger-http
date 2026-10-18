@@ -1429,7 +1429,7 @@ A client offering several subprotocols (`Sec-WebSocket-Protocol: a, b`) gets the
 
 ### WebSocket Close
 
-`on_close()` is called once the WebSocket closed, whatever closed it (the client, a lost connection, `stop()`, the server shutdown, the overflow policy...), once, on the thread of the connection, after its last message: nothing can be sent anymore. It tells how, as Node's `ws` `'close'` event: the status code of the client's close frame and its reason, or the code the server closed with, or `1006` when no close frame was exchanged (the connection was lost, or closed by the server at the end of a shutdown's grace period).
+`on_close()` is called once the WebSocket closed, whatever closed it (the client, a lost connection, `stop()`, the server shutdown, the overflow policy...), once, after its last message: nothing can be sent anymore. It tells how, as Node's `ws` `'close'` event: the status code of the client's close frame and its reason (when the server closed first and the client answered, the code of the answer, normally its echo), or the code the server closed with, or `1006` when no close frame was exchanged (the connection was lost, or closed by the server at the end of a shutdown's grace period).
 
 ```cpp
 res.upgrade_websocket([&](std::shared_ptr<http::websocket_connection> ws) {
@@ -1441,7 +1441,7 @@ res.upgrade_websocket([&](std::shared_ptr<http::websocket_connection> ws) {
 });
 ```
 
-Set it in the handler, as `on_message()`. It is not called once the socket is released (`release_socket()`), nor when the io_context is stopped and destroyed with the connection open (e.g. by `stop()` of an `http::server`, which stops its io_context). A server WebSocket whose `on_message()` throws is closed with `1011`.
+It is always posted to the thread of the connection, never called from within the call that closed it, so a loop sending to every connection can remove the ones closing; what it throws is logged. Set it in the handler, or later on the thread of the connection: set once the WebSocket closed, it is posted at once. It is not called once the socket is released (`release_socket()`), nor when the io_context is stopped and destroyed with the connection open (e.g. by `stop()` of an `http::server`, which stops its io_context). A server WebSocket whose `on_message()` throws is closed with `1011`.
 
 ### WebSocket Flow Control
 
@@ -1803,7 +1803,7 @@ res.start_sse([](std::shared_ptr<http::sse_connection> sse) -> thinger::awaitabl
 });
 ```
 
-`on_close()` tells when the stream closed: the client left (the connection reads the client, which sends nothing after its request, only to notice it closing), `stop()`, the server shutdown, the overflow policy or the write timeout. It is called once, on the thread of the connection; set once the connection already closed (e.g. by a coroutine handler running late), it is called at once.
+`on_close()` tells when the stream closed: the client left (the connection reads the client, which sends nothing after its request, only to notice it closing), `stop()`, the server shutdown, the overflow policy or the write timeout. It is called once, as the WebSocket one: posted to the thread of the connection, never from within the call closing it (a send overflowing the queue, `stop()`), what it throws logged; set once the connection already closed (e.g. by a coroutine handler running late), it is posted at once. A client half-closing the connection has left.
 
 ```cpp
 res.start_sse([&](std::shared_ptr<http::sse_connection> sse) {
