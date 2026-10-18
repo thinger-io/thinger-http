@@ -256,9 +256,12 @@ int main(int argc, char* argv[]) {
                 }
             });
             
-            // Note: Since websocket_connection doesn't have an on_close callback,
-            // dead connections will be cleaned up when we try to send to them
-            // and the send operation fails
+            // Remove it from the active connections once it closes, whatever closed it
+            ws->on_close([weak = std::weak_ptr<http::websocket_connection>(ws)](const http::websocket_close& close) {
+                LOG_INFO("WebSocket connection closed: {} {}", close.code, close.remote ? "by the client" : "by the server");
+                std::lock_guard<std::mutex> lock(connections_mutex);
+                if (auto closed = weak.lock()) active_connections.erase(closed);
+            });
             
             // Send welcome message
             ws->send_text("Welcome to the WebSocket echo server!");

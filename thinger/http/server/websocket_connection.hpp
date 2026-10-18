@@ -16,6 +16,21 @@
 
 namespace thinger::http{
 
+/// How a server WebSocket closed (see websocket_connection::on_close())
+struct websocket_close {
+    /// Status code of the closing handshake (RFC 6455, 7.4): the one of the peer's close frame
+    /// (1005 if it had none, 1002 if it was not valid); else the one this end closed with, as
+    /// 1000 (stop()), 1001 (server shutdown, or idle), 1007 or 1009 (a message not valid, or too
+    /// large), 1011 (on_message() threw) or 1013 (it did not keep up, see write_limits); 1006
+    /// if no close frame was exchanged: the connection was lost, or closed by the server at the
+    /// end of a shutdown's grace period
+    uint16_t code = asio::websocket::CLOSE_ABNORMAL;
+    /// Reason of the peer's close frame, if any (not validated as UTF-8)
+    std::string reason;
+    /// Whether the peer closed first (sent its close frame before this end did)
+    bool remote = false;
+};
+
 /**
  * A server WebSocket exchanging whole messages: received with on_message(), sent with
  * send_text()/send_binary() (queued, without waiting) or send_text_async()/send_binary_async()
@@ -29,8 +44,8 @@ namespace thinger::http{
  * set_write_limits(), on_high_watermark(), on_low_watermark(), pause_reading(),
  * resume_reading(), stop(), execute(), queued_bytes() and queued_messages(). On the websocket
  * thread only (e.g. from its callbacks, or execute()): get_write_limits(), queue_full(),
- * is_reading_paused() and release_socket(). on_message() and on_shutdown() are set before
- * start(), in the handler that accepts it.
+ * is_reading_paused() and release_socket(). on_message(), on_shutdown() and on_close() are set
+ * before start(), in the handler that accepts it.
  */
 class websocket_connection : public std::enable_shared_from_this<websocket_connection>{
 
@@ -54,6 +69,12 @@ public:
     /// e.g. send a last message and stop(). By default it closes with 1001 (Going Away);
     /// whatever is open at the end of the grace period is closed anyway
     void on_shutdown(sync_callback<void()> callback);
+
+    /// Once the WebSocket closed, whatever closed it (the peer, an error, stop(), the server
+    /// shutdown, the overflow policy...), and how: called once, on the websocket thread, after
+    /// its last on_message(); nothing can be sent anymore. Not called once released
+    /// (release_socket()), nor if the io_context is stopped and destroyed with it open
+    void on_close(sync_callback<void(const websocket_close&)> callback);
 
     /// Run `callback` on the websocket thread
     inline void execute(sync_callback<void()> callback){
@@ -124,6 +145,12 @@ private:
     void start_read_loop();
     awaitable<void> read_loop();
 
+    /// The read loop, closing the websocket if on_message() throws
+    awaitable<void> read_messages();
+
+    /// How the websocket closed (see on_close())
+    websocket_close close_status() const;
+
     /// Deliver the message read whole: false if it is not valid
     bool deliver_message();
 
@@ -188,6 +215,7 @@ private:
 
     sync_callback<void(std::string, bool)> on_frame_callback_;
     sync_callback<void()> on_shutdown_callback_;
+    sync_callback<void(const websocket_close&)> on_close_callback_;
 
     /// The server tracking this connection, if any (see connection_tracker.hpp)
     std::shared_ptr<taken_over_connection> tracking_;
@@ -201,6 +229,9 @@ private:
     /// Started (start()), and released (release_socket())
     bool started_ = false;
     bool released_ = false;
+
+    /// The connection was lost: a read failed while the websocket was open
+    bool lost_ = false;
 
     /// Keepalive settings while suspended
     std::chrono::milliseconds keepalive_ping_{0};

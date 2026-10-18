@@ -66,11 +66,15 @@ namespace thinger::http{
         on_frame_callback_ = std::move(callback);
     }
 
+    void websocket_connection::on_close(sync_callback<void(const websocket_close&)> callback){
+        on_close_callback_ = std::move(callback);
+    }
+
     void websocket_connection::start_read_loop()
     {
         co_spawn(ws_->get_executor(),
             [this, self = shared_from_this()]() -> awaitable<void> {
-                // RAII guard: clears the on_message callback when the coroutine
+                // RAII guard: clears the callbacks when the coroutine
                 // frame is destroyed (normal exit, exception, or io_context
                 // teardown). This breaks shared_ptr cycles that occur when the
                 // user captures shared_ptr<websocket_connection> in the callback.
@@ -79,23 +83,50 @@ namespace thinger::http{
                     ~cycle_guard() {
                         connection.on_frame_callback_ = nullptr;
                         connection.on_shutdown_callback_ = nullptr;
+                        connection.on_close_callback_ = nullptr;
                         // the watermark callbacks too, and producers waiting are told
                         connection.flow_.close();
                         // closed: no longer counts for the server
                         if (connection.tracking_) connection.tracking_->closed();
                     }
-                } guard{*this};
+                };
 
-                co_await read_loop();
+                sync_callback<void(const websocket_close&)> on_close;
+                {
+                    cycle_guard guard{*this};
+                    co_await read_messages();
+                    // Ended here, on the executor (not by the teardown of the io_context):
+                    // closed, unless released
+                    if (!released_) on_close = std::move(on_close_callback_);
+                }
+                // Told once everything is released
+                if (on_close) on_close(close_status());
             },
             detached);
+    }
+
+    awaitable<void> websocket_connection::read_messages()
+    {
+        try {
+            co_await read_loop();
+        } catch (const std::exception& e) {
+            LOG_ERROR("closing websocket: error handling a message: {}", e.what());
+            ws_->close(asio::websocket::CLOSE_INTERNAL_ERROR);
+        }
+    }
+
+    websocket_close websocket_connection::close_status() const
+    {
+        if (lost_) return websocket_close{};
+        return websocket_close{ws_->get_close_code(), ws_->get_close_reason(), ws_->closed_by_peer()};
     }
 
     awaitable<void> websocket_connection::read_loop()
     {
         size_t next_read_size = DEFAULT_BUFFER_SIZE;
 
-        while (ws_->is_open()) {
+        // (released from a callback, e.g. on_message(): the socket belongs to someone else)
+        while (ws_->is_open() && !released_) {
             // nothing is read while paused
             if (paused_ && !co_await wait_resumed()) break;
 
@@ -106,6 +137,12 @@ namespace thinger::http{
                 static_cast<uint8_t*>(buf.data()), buf.size());
 
             if (ec) {
+                // The connection is lost (reset, or ended without a close frame): closed
+                if (!released_ && ws_->is_open()) {
+                    LOG_LEVEL(1, "websocket connection lost: {}", ec.message());
+                    lost_ = true;
+                    ws_->close();
+                }
                 break;
             }
 

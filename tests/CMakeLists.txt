@@ -290,6 +290,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/sse_flow_control_test.cpp)
     add_thinger_test(test_integration_sse_flow_control integration/sse_flow_control_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/connection_close_test.cpp)
+    add_thinger_test(test_integration_connection_close integration/connection_close_test.cpp)
+endif()
+
 # Integration tests - Schema validation
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/schema_validation_test.cpp)
     add_thinger_test(test_integration_schema_validation integration/schema_validation_test.cpp)

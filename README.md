@@ -1385,6 +1385,22 @@ res.upgrade_websocket([](auto ws) {
 
 A client offering several subprotocols (`Sec-WebSocket-Protocol: a, b`) gets the first one it offers that is in the set; one offering none of them, or none at all when the set is not empty, is answered with `400`.
 
+### WebSocket Close
+
+`on_close()` is called once the WebSocket closed, whatever closed it (the client, a lost connection, `stop()`, the server shutdown, the overflow policy...), once, on the thread of the connection, after its last message: nothing can be sent anymore. It tells how, as Node's `ws` `'close'` event: the status code of the client's close frame and its reason, or the code the server closed with, or `1006` when no close frame was exchanged (the connection was lost, or closed by the server at the end of a shutdown's grace period).
+
+```cpp
+res.upgrade_websocket([&](std::shared_ptr<http::websocket_connection> ws) {
+    auto id = subscribers.add(ws);
+    ws->on_close([&, id](const http::websocket_close& close) {
+        // close.code (1000, 1001, 1006...), close.reason, close.remote (the client closed first)
+        subscribers.remove(id);
+    });
+});
+```
+
+Set it in the handler, as `on_message()`. It is not called once the socket is released (`release_socket()`), nor when the io_context is stopped and destroyed with the connection open (e.g. by `stop()` of an `http::server`, which stops its io_context). A server WebSocket whose `on_message()` throws is closed with `1011`.
+
 ### WebSocket Flow Control
 
 `send_text()` and `send_binary()` queue the message and return. The queue holds up to 100 messages; one sent to a full queue is dropped (the newest), which suits sampled telemetry but not a stream that must arrive whole. For those, the server can follow the pace of the client, and stop reading a client whose data it cannot forward yet:
