@@ -99,7 +99,7 @@ void response::on_start(std::function<void()> hook) {
     state_->on_start = std::move(hook);
 }
 
-bool response::answer_timeout(http::http_response::status status) {
+bool response::answer_timeout(http::http_response::status status, bool with_headers) {
     if (state_->responded) return false;
     // Set before answering: whoever sees the response sent sees why
     state_->timed_out = true;
@@ -109,7 +109,7 @@ bool response::answer_timeout(http::http_response::status status) {
         return false;
     }
     if (state_->on_start) state_->on_start();
-    auto message = take_draft();
+    auto message = take_draft(with_headers);
     message->set_status(status);
     format_error(state_->formatter.get(), {status, "No response within the timeout", nullptr}, *message);
     prepare_body(*message, false);
@@ -127,15 +127,16 @@ std::shared_ptr<http_response> response::new_response() {
     return take_draft();
 }
 
-std::shared_ptr<http_response> response::take_draft() {
+std::shared_ptr<http_response> response::take_draft(bool with_draft) {
     // Moved, not copied: only the answer sent reads it, once it is the first one
-    auto message = state_->draft ? std::make_shared<http_response>(std::move(*state_->draft))
-                                 : std::make_shared<http_response>();
+    bool drafted = with_draft && state_->draft;
+    auto message = drafted ? std::make_shared<http_response>(std::move(*state_->draft))
+                           : std::make_shared<http_response>();
     // A protocol switch keeps the Connection header set for it (Upgrade)
     if (message->get_status() != http_response::status::switching_protocols) {
         message->set_keep_alive(state_->request->keep_alive());
     }
-    if (!state_->draft && state_->cors_enabled) add_cors_headers(*message);
+    if (!drafted && state_->cors_enabled) add_cors_headers(*message);
     return message;
 }
 

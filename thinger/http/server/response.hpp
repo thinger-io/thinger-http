@@ -235,7 +235,9 @@ private:
 
     // Answer the request as timed out, with an error of `status`, unless another answer
     // started first (false then). Later answers are dropped quietly.
-    bool answer_timeout(http::http_response::status status);
+    // `with_headers`: with the status and headers set so far (false when another thread may
+    // still be setting them, as for a request dispatched in memory)
+    bool answer_timeout(http::http_response::status status, bool with_headers = true);
 
     // Whether the response was answered by answer_timeout()
     bool timed_out() const;
@@ -251,8 +253,8 @@ private:
     // draft, moved into it), if this is the first answer; otherwise null, and nothing must be
     // sent. What could fail building the answer (e.g. encoding its body) is done before
     std::shared_ptr<http_response> new_response();
-    // The message of the answer started, from the draft (once)
-    std::shared_ptr<http_response> take_draft();
+    // The message of the answer started, from the draft (once), or without it
+    std::shared_ptr<http_response> take_draft(bool with_draft = true);
     // Whether the request is HEAD: its response has no body
     bool head_request() const;
     // Body of a message about to be sent: framed (see frame_message), dropped for HEAD

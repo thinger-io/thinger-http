@@ -197,6 +197,10 @@ public:
     void on_response(response_hook hook);
 
 private:
+    // handle(), telling `created` the response once created (for in-memory dispatch, which
+    // answers its timeout)
+    awaitable<void> handle(std::shared_ptr<request> req, std::shared_ptr<response_sink> sink,
+                           std::function<void(const response&)> created);
     virtual_host& resolve_host(request& req);
     std::shared_ptr<http_response> make_error_response(http_response::status status, const std::string& message) const;
     // Middlewares, body reading and handler of a matched request, then what is left of its body

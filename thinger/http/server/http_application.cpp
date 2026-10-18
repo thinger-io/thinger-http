@@ -6,6 +6,7 @@
 #include "../../util/base64.hpp"
 #include "../../util/ascii.hpp"
 #include <boost/algorithm/string.hpp>
+#include <mutex>
 #include <optional>
 
 namespace thinger::http {
@@ -250,6 +251,11 @@ namespace {
 }
 
 awaitable<void> http_application::handle(std::shared_ptr<request> req, std::shared_ptr<response_sink> sink) {
+    co_await handle(std::move(req), std::move(sink), nullptr);
+}
+
+awaitable<void> http_application::handle(std::shared_ptr<request> req, std::shared_ptr<response_sink> sink,
+                                         std::function<void(const response&)> created) {
     // Told when the response ends, while a response hook is set
     handled_guard handled;
     if (response_hook_) [[unlikely]] {
@@ -262,6 +268,7 @@ awaitable<void> http_application::handle(std::shared_ptr<request> req, std::shar
 
     // Server settings the request and its response depend on
     res.set_error_formatter(error_formatter_);
+    if (created) created(res);
     req->set_trusted_proxies(trusted_proxies_);
     req->set_max_body_size(max_body_size_);
     req->set_body_settings(&body_settings_);
@@ -486,10 +493,19 @@ awaitable<std::shared_ptr<http_response>> http_application::dispatch(std::shared
     // handle() answers whatever the middlewares, body reading or handler throw.
     auto strand = boost::asio::make_strand(executor);
     auto cancel = std::make_shared<boost::asio::cancellation_signal>();
+    // The response, once created on the strand, to answer the timeout through it
+    struct created_response {
+        std::mutex mutex;
+        std::optional<response> res;
+    };
+    auto created = std::make_shared<created_response>();
     // (the coroutine keeps the cancellation signal alive while its slot is in use)
     co_spawn(strand,
-        [this, req, memory, cancel]() -> awaitable<void> {
-            co_await handle(req, memory);
+        [this, req, memory, cancel, created]() -> awaitable<void> {
+            co_await handle(req, memory, [created](const response& res) {
+                std::scoped_lock lock(created->mutex);
+                created->res.emplace(res);
+            });
         },
         boost::asio::bind_cancellation_slot(cancel->slot(), boost::asio::detached));
 
@@ -497,10 +513,22 @@ awaitable<std::shared_ptr<http_response>> http_application::dispatch(std::shared
     if (!result) {
         // Abort what the handler is waiting for (timers, sockets...)
         boost::asio::post(strand, [cancel]() { cancel->emit(boost::asio::cancellation_type::terminal); });
-        // Answered with the timeout (a later answer is dropped), unless the response just
-        // completed
-        memory->send(make_error_response(http_response::status::gateway_timeout, "No response within the timeout"));
+        // Answered with the timeout as a route timeout does (a later answer is dropped, and
+        // logged as late), without the headers the handler may still be setting on the strand;
+        // unless an answer started first. Before the response exists, the 504 is collected alone
+        std::optional<response> res;
+        {
+            std::scoped_lock lock(created->mutex);
+            res = created->res;
+        }
+        if (res) {
+            res->answer_timeout(http_response::status::gateway_timeout, false);
+        } else {
+            memory->send(make_error_response(http_response::status::gateway_timeout, "No response within the timeout"));
+        }
         result = co_await memory->wait(std::chrono::milliseconds(0));
+        // An answer that started first and is not complete
+        if (!result) result = make_error_response(http_response::status::gateway_timeout, "No response within the timeout");
     }
     co_return result;
 }
