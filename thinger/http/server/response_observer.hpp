@@ -31,7 +31,9 @@ struct response_info {
     // Status of the response head (0 if nothing was answered)
     http_response::status status{};
     response_outcome outcome = response_outcome::completed;
-    // The body was sent in parts as it was produced: start_chunked() or start_stream()
+    // The response that ended had its body sent in parts as it was produced: start_chunked()
+    // or start_stream() (not for HEAD, answered with the head alone, nor for a response that
+    // replaced it, as the 502 of a stream aborted in memory)
     bool streamed = false;
     // Bytes of this response written to the connection, head included (and an interim
     // 100 Continue), before any TLS; for a request dispatched in memory, the size of the body

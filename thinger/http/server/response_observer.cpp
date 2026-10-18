@@ -19,8 +19,9 @@ response_observer::~response_observer() {
 }
 
 void response_observer::head(http_response::status status, bool streamed) {
+    // The last head is the response that ends (e.g. the 502 replacing a stream aborted in memory)
     info_.status = status;
-    info_.streamed = info_.streamed || streamed;
+    info_.streamed = streamed;
 }
 
 void response_observer::ended(response_outcome outcome) {

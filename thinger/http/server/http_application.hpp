@@ -191,9 +191,12 @@ public:
     //
     // It runs on the thread of the connection (for in-memory dispatch, the one ending the
     // request or its response), so it must not block: hand anything slow to another thread.
-    // The request is read-only there, and its connection may be gone (its peer address is
-    // kept). What it throws is logged. Without a hook nothing is allocated or measured. Set it
-    // before serving (listen()): it is read without locks.
+    // It may run synchronously within the call that ends the response, when the application
+    // was already done (e.g. a late end_chunked() or abort_stream()), and, for a response that
+    // never ended, from the destructor of what held it, as the connection being released (also
+    // at the teardown of the io_context). The request is read-only there, and its connection
+    // may be gone (its peer address is kept). What it throws is logged. Without a hook nothing
+    // is allocated or measured. Set it before serving (listen()): it is read without locks.
     void on_response(response_hook hook);
 
 private:

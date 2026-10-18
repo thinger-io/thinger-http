@@ -272,6 +272,8 @@ TEST_CASE("Response hook reports streamed responses once they end", "[server][re
         auto reported = log.single();
         REQUIRE(reported.info.status == http::http_response::status::bad_gateway);
         REQUIRE(reported.info.outcome == http::response_outcome::aborted);
+        // the 502 that ended it is whole
+        REQUIRE_FALSE(reported.info.streamed);
     }
 }
 
