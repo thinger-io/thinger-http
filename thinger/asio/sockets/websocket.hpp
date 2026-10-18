@@ -68,8 +68,12 @@ public:
     static constexpr uint16_t CLOSE_NORMAL = 1000;
     static constexpr uint16_t CLOSE_GOING_AWAY = 1001;
     static constexpr uint16_t CLOSE_PROTOCOL_ERROR = 1002;
+    // Never sent: a close frame without a status code, and a connection closed without close frames
+    static constexpr uint16_t CLOSE_NO_STATUS = 1005;
+    static constexpr uint16_t CLOSE_ABNORMAL = 1006;
     static constexpr uint16_t CLOSE_INVALID_PAYLOAD = 1007;
     static constexpr uint16_t CLOSE_MESSAGE_TOO_BIG = 1009;
+    static constexpr uint16_t CLOSE_INTERNAL_ERROR = 1011;
     // IANA registry: the server sheds a client (e.g. one that does not keep up); it may retry
     static constexpr uint16_t CLOSE_TRY_AGAIN_LATER = 1013;
 
@@ -121,6 +125,15 @@ public:
     // until sent
     awaitable<void> send_ping(uint8_t buffer[] = nullptr, size_t size = 0);
     awaitable<void> send_pong(uint8_t buffer[] = nullptr, size_t size = 0);
+
+    // Closing handshake: the status code of the close frame received from the peer
+    // (CLOSE_NO_STATUS if it had none, CLOSE_PROTOCOL_ERROR if it was not valid), else of the
+    // one this end sent; CLOSE_ABNORMAL if neither was, e.g. when the connection was lost
+    uint16_t get_close_code() const;
+    // The reason of the close frame received, if any (not validated as UTF-8)
+    const std::string& get_close_reason() const { return close_reason_; }
+    // Whether the peer started the closing handshake (its close frame came first)
+    bool closed_by_peer() const { return closed_by_peer_; }
 
     // State getters
     bool is_open() const override;
@@ -263,6 +276,10 @@ private:
     bool linger_pending_ = false;
     bool linger_expect_reply_ = true;
     uint16_t close_code_ = CLOSE_NORMAL;
+    // Close frame received: its code and reason, and whether it came first
+    uint16_t received_close_code_ = CLOSE_NO_STATUS;
+    std::string close_reason_;
+    bool closed_by_peer_ = false;
     std::shared_ptr<boost::asio::steady_timer> close_timer_;
 
     // Keepalive

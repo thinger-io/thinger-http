@@ -251,10 +251,14 @@ awaitable<boost::system::error_code> websocket::handle_control(const frame_heade
             LOG_DEBUG("received close frame");
             if (size == 1) co_return fail("invalid close frame payload");
             close_received_ = true;
+            closed_by_peer_ = !close_sent_;
             uint16_t code = size >= 2 ? uint16_t((payload[0] << 8) | payload[1]) : CLOSE_NORMAL;
+            if (!valid_close_code(code)) code = CLOSE_PROTOCOL_ERROR;
+            received_close_code_ = size >= 2 ? code : CLOSE_NO_STATUS;
+            if (size > 2) close_reason_.assign(reinterpret_cast<const char*>(payload) + 2, size - 2);
             // Answered (unless this end closed first), and the connection closed: the server
             // closes it first, and a client does not need to wait for it
-            close(valid_close_code(code) ? code : CLOSE_PROTOCOL_ERROR, false);
+            close(code, false);
             co_return boost::asio::error::eof;
         }
         default:
@@ -509,6 +513,7 @@ awaitable<io_result> websocket::send_frame(uint8_t opcode, const std::vector<boo
 
 awaitable<boost::system::error_code> websocket::send_close(uint16_t code) {
     LOG_DEBUG("sending close frame: {}", code);
+    close_code_ = code;
     uint8_t payload[2] = {uint8_t(code >> 8), uint8_t(code & 0xFF)};
     auto [ec, bytes] = co_await send_frame(OPCODE_CLOSE, {boost::asio::buffer(payload)}, true);
     co_return ec;
@@ -753,6 +758,12 @@ bool websocket::requires_handshake() const {
 
 awaitable<boost::system::error_code> websocket::handshake(const std::string& host) {
     co_return co_await socket_->handshake(host);
+}
+
+uint16_t websocket::get_close_code() const {
+    if (close_received_) return received_close_code_;
+    if (close_sent_) return close_code_;
+    return CLOSE_ABNORMAL;
 }
 
 bool websocket::is_open() const {
