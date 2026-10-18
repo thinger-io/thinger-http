@@ -518,3 +518,29 @@ TEST_CASE("WebSocket on_close set once closed is posted at once", "[websocket][c
     ws->execute([ws] {});   // released on its thread
     ws.reset();
 }
+
+TEST_CASE("WebSocket released by on_message before it throws is not closed", "[websocket][close][integration]") {
+    http::server server;
+    auto record = std::make_shared<close_record>();
+    std::promise<std::shared_ptr<asio::socket>> released;
+    websocket_route(server, record, [&](const ws_ptr& ws) {
+        ws->on_message([&, weak = std::weak_ptr<http::websocket_connection>(ws)](std::string, bool) {
+            if (auto self = weak.lock()) released.set_value(self->release_socket());
+            throw std::runtime_error("after the release");
+        });
+    });
+    running_server running(server);
+    raw_ws_client client(running.port);
+    REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
+
+    client.send_frame(OP_TEXT, "release");
+    auto future = released.get_future();
+    REQUIRE(future.wait_for(3s) == std::future_status::ready);
+    auto socket = future.get();
+    // no close frame: the socket belongs to someone else
+    REQUIRE_FALSE(client.read_frame(300ms));
+    REQUIRE(socket->is_open());
+    REQUIRE(record->calls.load() == 0);
+    auto& io_context = socket->get_io_context();
+    boost::asio::post(io_context, [socket = std::move(socket)] {});
+}

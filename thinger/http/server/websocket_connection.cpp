@@ -107,8 +107,9 @@ namespace thinger::http{
         try {
             co_await read_loop();
         } catch (const std::exception& e) {
-            LOG_ERROR("closing websocket: error handling a message: {}", e.what());
-            ws_->close(asio::websocket::CLOSE_INTERNAL_ERROR);
+            LOG_ERROR("error handling a websocket message: {}", e.what());
+            // (not the socket released by on_message(): it belongs to someone else)
+            if (!released_) ws_->close(asio::websocket::CLOSE_INTERNAL_ERROR);
         }
     }
 
