@@ -472,7 +472,10 @@ awaitable<std::shared_ptr<http_response>> http_application::dispatch(std::shared
     if (!result) {
         // Abort what the handler is waiting for (timers, sockets...)
         boost::asio::post(strand, [cancel]() { cancel->emit(boost::asio::cancellation_type::terminal); });
-        co_return make_error_response(http_response::status::gateway_timeout, "No response within the timeout");
+        // Answered with the timeout (a later answer is dropped), unless the response just
+        // completed
+        memory->send(make_error_response(http_response::status::gateway_timeout, "No response within the timeout"));
+        result = co_await memory->wait(std::chrono::milliseconds(0));
     }
     co_return result;
 }
