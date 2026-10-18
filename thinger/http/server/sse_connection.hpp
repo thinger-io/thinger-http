@@ -19,10 +19,13 @@ namespace thinger::http{
  * queued without waiting, with the flow control of websocket_connection (see write_limits),
  * counted in fields. drop_oldest drops whole events; close closes, and EventSource reconnects.
  *
+ * The connection reads what the client sends, only to learn when it leaves (it sends nothing
+ * after its request; anything it sends is discarded): on_close() tells it.
+ *
  * Threads. From any thread: send_*(), stop(), wait_writable(), set_write_limits(),
  * on_high_watermark(), on_low_watermark(), queued_bytes() and queued_messages(). On the
- * connection thread only: get_write_limits(). on_shutdown() is set in the handler that
- * accepts it.
+ * connection thread only: get_write_limits(). on_shutdown() and on_close() are set in the
+ * handler that accepts it.
  */
 class sse_connection : public std::enable_shared_from_this<sse_connection>, public boost::noncopyable{
 
@@ -86,8 +89,11 @@ private:
     /// Past the end of the event `it` is in: its data field (or the end of the queue)
     std::deque<out_field>::iterator next_event(std::deque<out_field>::iterator it);
 
-    /// Close the connection (on its thread)
+    /// Close the connection (on its thread), once
     void close();
+
+    /// Read until the client leaves (`self` keeps the connection alive)
+    awaitable<void> read_loop(std::shared_ptr<sse_connection> self);
 
     /// Taken over from a server: told when it shuts down
     void track_shutdown();
@@ -97,6 +103,7 @@ public:
     void start(){
         track_shutdown();
         handle_timeout();
+        co_spawn(socket_->get_io_context(), read_loop(shared_from_this()), detached);
     }
 
     void stop(){
@@ -110,6 +117,19 @@ public:
     /// is open at the end of the grace period is closed anyway
     void on_shutdown(sync_callback<void()> callback){
         on_shutdown_callback_ = std::move(callback);
+    }
+
+    /// Once the connection closed, whatever closed it: the client left (or the connection
+    /// failed), stop(), the server shutdown, the overflow policy, a write timeout, or 60 seconds
+    /// without sending anything. Called once, on the connection thread; nothing can be sent
+    /// anymore. Set once the connection already closed (e.g. by a coroutine handler that ran
+    /// late), it is called at once
+    void on_close(sync_callback<void()> callback){
+        if(closed_){
+            if(callback) callback();
+            return;
+        }
+        on_close_callback_ = std::move(callback);
     }
 
     void send_retry(unsigned long millis){
@@ -162,6 +182,9 @@ private:
     write_flow flow_;
 
     sync_callback<void()> on_shutdown_callback_;
+    sync_callback<void()> on_close_callback_;
+
+    bool closed_ = false;
 
     /// The server tracking this connection, if any (see connection_tracker.hpp)
     std::shared_ptr<taken_over_connection> tracking_;

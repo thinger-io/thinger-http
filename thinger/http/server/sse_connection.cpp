@@ -4,6 +4,8 @@
 namespace thinger::http {
 
     void sse_connection::close(){
+        if(closed_) return;
+        closed_ = true;
         timer_.cancel();
         socket_->close();
         on_shutdown_callback_ = nullptr;
@@ -14,6 +16,22 @@ namespace thinger::http {
         flow_.clear();
         // no longer counts for the server
         if(tracking_) tracking_->closed();
+        // told last, once (released before: it may own this connection)
+        auto on_close = std::move(on_close_callback_);
+        on_close_callback_ = nullptr;
+        if(on_close) on_close();
+    }
+
+    awaitable<void> sse_connection::read_loop([[maybe_unused]] std::shared_ptr<sse_connection> self){
+        uint8_t buffer[512];
+        while(!closed_){
+            auto [ec, bytes] = co_await socket_->read_some(buffer, sizeof(buffer));
+            if(ec) break;
+        }
+        if(!closed_){
+            LOG_DEBUG("sse client left");
+            close();
+        }
     }
 
     void sse_connection::track_shutdown(){

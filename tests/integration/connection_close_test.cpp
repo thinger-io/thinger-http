@@ -14,8 +14,8 @@
 #include <stdexcept>
 #include <thread>
 
-// on_close() of the server WebSocket (websocket_connection): called once, on the thread of the
-// connection, whatever closed it
+// on_close() of the server WebSocket (websocket_connection) and SSE (sse_connection)
+// connections: called once, on the thread of the connection, whatever closed it
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -25,6 +25,7 @@ using server_test::running_server;
 namespace {
 
     using ws_ptr = std::shared_ptr<http::websocket_connection>;
+    using sse_ptr = std::shared_ptr<http::sse_connection>;
 
     template<typename F>
     bool eventually(F condition, std::chrono::milliseconds timeout = 5s) {
@@ -88,6 +89,60 @@ namespace {
         REQUIRE(frame);
         REQUIRE(frame->close_code() == expected);
         client.send_frame(OP_CLOSE, close_payload(expected));
+    }
+
+    // Raw SSE client: sends the request and reads the response headers
+    struct sse_client {
+        net::io_context ioc;
+        tcp::socket sock{ioc};
+
+        explicit sse_client(uint16_t port, const std::string& path = "/events") {
+            sock.connect({net::ip::make_address("127.0.0.1"), port});
+            net::write(sock, net::buffer("GET " + path + " HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+        }
+
+        // What arrives until `needle`, the server closes the connection, or the timeout expires
+        server_test::exchange_result read_until(const std::string& needle, std::chrono::milliseconds timeout = 3s) {
+            server_test::exchange_result result;
+            std::array<char, 4096> buffer{};
+            auto deadline = std::chrono::steady_clock::now() + timeout;
+            while (result.data.find(needle) == std::string::npos && !result.closed) {
+                bool done = false;
+                sock.async_read_some(net::buffer(buffer), [&](boost::system::error_code ec, size_t bytes) {
+                    result.data.append(buffer.data(), bytes);
+                    if (ec) result.closed = true;
+                    done = true;
+                });
+                ioc.restart();
+                ioc.run_until(deadline);
+                if (!done) {
+                    sock.cancel();
+                    ioc.restart();
+                    ioc.run();
+                    break;
+                }
+            }
+            return result;
+        }
+
+        void close() {
+            boost::system::error_code ec;
+            sock.shutdown(tcp::socket::shutdown_both, ec);
+            sock.close(ec);
+        }
+    };
+
+    // An SSE route recording on_close(), after `setup`
+    void sse_route(http::http_application& app, const std::shared_ptr<close_record>& record,
+                   std::function<void(const sse_ptr&)> setup = {}) {
+        app.get("/events", [record, setup](http::response& res) {
+            res.start_sse([record, setup](sse_ptr sse) {
+                record->opened();
+                sse->on_close([record] { record->closed(); });
+                sse->send_data("hello");
+                if (setup) setup(sse);
+            });
+        });
     }
 
 }
@@ -259,4 +314,95 @@ TEST_CASE("WebSocket on_close is not called once released", "[websocket][close][
     // released on its thread
     auto& io_context = socket->get_io_context();
     boost::asio::post(io_context, [socket = std::move(socket)] {});
+}
+
+TEST_CASE("SSE on_close tells the client left", "[sse][close][integration]") {
+    http::server server;
+    auto record = std::make_shared<close_record>();
+    std::function<void(const sse_ptr&)> setup;
+    sse_route(server, record, [&](const sse_ptr& sse) { if (setup) setup(sse); });
+    running_server running(server);
+
+    SECTION("The client leaves, while nothing is sent") {
+        sse_client client(running.port);
+        REQUIRE(client.read_until("data: hello").data.find("data: hello") != std::string::npos);
+        client.close();
+        // at once, not when the next event fails or the idle timer expires
+        record->wait();
+        REQUIRE(eventually([&] { return server.stats().sse_connections == 0; }));
+    }
+
+    SECTION("stop()") {
+        setup = [](const sse_ptr& sse) { sse->stop(); };
+        sse_client client(running.port);
+        REQUIRE(client.read_until("never").closed);
+        record->wait();
+    }
+
+    SECTION("The overflow policy") {
+        setup = [](const sse_ptr& sse) {
+            sse->set_write_limits({.max_messages = 2, .policy = http::overflow_policy::close});
+            for (int i = 0; i < 10; ++i) sse->send_data(std::string(100, 'x'));
+        };
+        sse_client client(running.port);
+        REQUIRE(client.read_until("never").closed);
+        record->wait();
+    }
+
+    SECTION("Called once") {
+        std::promise<std::weak_ptr<http::sse_connection>> created;
+        setup = [&](const sse_ptr& sse) { created.set_value(sse); };
+        sse_client client(running.port);
+        auto weak = created.get_future().get();
+        if (auto sse = weak.lock()) {
+            sse->stop();
+            sse->stop();
+        }
+        client.close();
+        record->wait();
+        REQUIRE(eventually([&] { return weak.expired(); }));
+    }
+}
+
+TEST_CASE("SSE on_close on a server shutdown", "[sse][close][shutdown][integration]") {
+    http::server server;
+    auto record = std::make_shared<close_record>();
+    sse_route(server, record);
+    running_server running(server);
+    sse_client client(running.port);
+    REQUIRE(client.read_until("data: hello").data.find("data: hello") != std::string::npos);
+    REQUIRE(eventually([&] { return server.stats().sse_connections == 1; }));
+
+    server.begin_shutdown(5s);
+    record->wait();
+    REQUIRE(client.read_until("never").closed);
+}
+
+TEST_CASE("SSE on_close set once closed is called at once", "[sse][close][integration]") {
+    http::server server;
+    std::atomic<bool> left{false};
+    std::promise<bool> called_at_once;
+    server.get("/events", [&](http::response& res) {
+        res.start_sse([&](sse_ptr sse) -> awaitable<void> {
+            // a coroutine handler running late: the client left meanwhile
+            boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor);
+            while (!left) {
+                timer.expires_after(5ms);
+                co_await timer.async_wait(use_nothrow_awaitable);
+            }
+            timer.expires_after(200ms);
+            co_await timer.async_wait(use_nothrow_awaitable);
+            bool called = false;
+            sse->on_close([&called] { called = true; });
+            called_at_once.set_value(called);
+        });
+    });
+    running_server running(server);
+    sse_client client(running.port);
+    REQUIRE(eventually([&] { return server.stats().sse_connections == 1; }));
+    client.close();
+    left = true;
+    auto future = called_at_once.get_future();
+    REQUIRE(future.wait_for(3s) == std::future_status::ready);
+    REQUIRE(future.get());
 }

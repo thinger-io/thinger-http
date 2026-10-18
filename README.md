@@ -975,7 +975,7 @@ Configure the server before `listen()`/`start()`: routes, [virtual hosts](#virtu
 - it stops listening right away: new connections are refused (TCP and Unix sockets; the socket file is removed);
 - idle keep-alive connections are closed at once;
 - a connection handling a request finishes it: its response tells the client with `Connection: close` (unless the response already started: then the connection is closed after it), and the connection closes after it;
-- connections taken over are told (once, on their thread): a `websocket_connection` closes with 1001 (Going Away), an `sse_connection` closes, and others call what the application set with `on_shutdown()` (`websocket_connection`, `sse_connection`), or with `http::on_server_shutdown(socket, callback)` for the socket of `take_over()` or `upgrade_websocket_stream()`. Proxied WebSockets (reverse proxy tunnels) are not told: they end when either side closes. The server calls `on_shutdown()` once when the shutdown starts, for anything else the application runs;
+- connections taken over are told (once, on their thread): a `websocket_connection` closes with 1001 (Going Away), an `sse_connection` closes, and others call what the application set with `on_shutdown()` (`websocket_connection`, `sse_connection`), or with `http::on_server_shutdown(socket, callback)` for the socket of `take_over()` or `upgrade_websocket_stream()`. Their `on_close()` tells when they closed. Proxied WebSockets (reverse proxy tunnels) are not told: they end when either side closes. The server calls `on_shutdown()` once when the shutdown starts, for anything else the application runs;
 - once every connection is gone, or the grace period passes, whatever is left is closed, and the server stops as with `stop()` (`wait()` returns).
 
 `shutdown()` waits for that end, and returns whether every connection finished in time. `begin_shutdown(grace, on_done)` returns at once, and calls `on_done(clean)` at the end. Both can be called from any thread, several times (later calls wait for the same end), and from an `asio::signal_set` handler (not from a raw signal handler: they lock and allocate). On a thread of the server (a handler, or a worker of a `pool_server`) only `begin_shutdown()` can be used: `shutdown()` cannot wait there, so it starts it and returns `false`. `stop()` during a shutdown ends it at once (`false`).
@@ -1758,6 +1758,15 @@ res.start_sse([](std::shared_ptr<http::sse_connection> sse) -> thinger::awaitabl
         sse->send_data(update);
         if (!co_await sse->wait_writable()) co_return;   // closed
     }
+});
+```
+
+`on_close()` tells when the stream closed: the client left (the connection reads the client, which sends nothing after its request, only to notice it closing), `stop()`, the server shutdown, the overflow policy or the write timeout. It is called once, on the thread of the connection; set once the connection already closed (e.g. by a coroutine handler running late), it is called at once.
+
+```cpp
+res.start_sse([&](std::shared_ptr<http::sse_connection> sse) {
+    auto id = feed.subscribe([sse](const std::string& event) { sse->send_data(event); });
+    sse->on_close([&, id] { feed.unsubscribe(id); });
 });
 ```
 

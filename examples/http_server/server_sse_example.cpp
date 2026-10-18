@@ -248,6 +248,13 @@ int main(int argc, char* argv[]) {
                 std::lock_guard<std::mutex> lock(connections_mutex);
                 active_connections.insert(sse);
             }
+
+            // Removed once the client leaves (or the connection closes for any other reason)
+            sse->on_close([weak = std::weak_ptr<http::sse_connection>(sse)] {
+                LOG_INFO("SSE connection closed");
+                std::lock_guard<std::mutex> lock(connections_mutex);
+                if (auto closed = weak.lock()) active_connections.erase(closed);
+            });
             
             // Send initial connection message
             sse->send_event("custom");
