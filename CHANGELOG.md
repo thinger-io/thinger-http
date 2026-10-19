@@ -7,6 +7,8 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-19
+
 ### Added
 
 - `on_close()` on the server WebSocket (`websocket_connection`) and SSE (`sse_connection`) connections: called once the connection closed, whatever closed it (the peer, a lost connection, `stop()`, the server shutdown, the overflow policy, a write timeout...), once, posted to the thread of the connection (never from within the call closing it), what it throws logged; set once the connection closed, it is posted at once. The WebSocket one receives a `http::websocket_close`: the status code of the peer's close frame and its reason, or the code the server closed with, or 1006 if no close frame was exchanged, and whether the peer closed first. An `sse_connection` reads its client, only to notice when it leaves, so the producer learns it at once, not at its next event: a client half-closing the connection (EOF) has left too. See [WebSocket Close](README.md#websocket-close).
@@ -195,7 +197,8 @@ These changes of the last weeks can be noticed by code written against an earlie
 - Client: connections are kept alive between requests (see the README to tune or disable the pool).
 - The unused `request_handler` interface was removed.
 
-[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/thinger-io/thinger-http/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/thinger-io/thinger-http/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/thinger-io/thinger-http/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/thinger-io/thinger-http/compare/v0.3.0...v0.4.0
