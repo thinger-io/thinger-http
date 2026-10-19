@@ -7,6 +7,8 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-19
+
 ### Added
 
 - `http::server::set_lingering_close(max_bytes, timeout)` (static, for every server of the process, so that the classes keep the layout of 0.7.0 and its ABI): how long a connection closing with its request still arriving reads and drops it (see Fixed). 8 MiB and 5 s by default; 0 for either closes at once, as before.
@@ -206,7 +208,8 @@ These changes of the last weeks can be noticed by code written against an earlie
 - Client: connections are kept alive between requests (see the README to tune or disable the pool).
 - The unused `request_handler` interface was removed.
 
-[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/thinger-io/thinger-http/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/thinger-io/thinger-http/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/thinger-io/thinger-http/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/thinger-io/thinger-http/compare/v0.4.0...v0.5.0
