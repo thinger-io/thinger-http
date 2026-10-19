@@ -75,7 +75,8 @@ public:
     // reads and drops what arrives until the client closes, `max_bytes` were dropped or `timeout`
     // passed, whatever comes first, and closes. Closed at once instead, the unread data makes the
     // system reset the connection, and a client still sending may never read the response. Zero
-    // for either closes at once (also on sockets that cannot half-close, such as custom ones)
+    // for either closes at once (also on sockets that cannot half-close, such as custom ones).
+    // A graceful shutdown of the server closes the connections lingering at once
     static constexpr size_t default_linger_max_bytes = 8 * 1024 * 1024;
     static constexpr std::chrono::milliseconds default_linger_timeout{5000};
     static void set_lingering_close(size_t max_bytes, std::chrono::milliseconds timeout);

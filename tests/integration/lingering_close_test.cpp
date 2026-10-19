@@ -6,6 +6,9 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -151,12 +154,17 @@ namespace {
         http::server server;
         std::unique_ptr<running_server> running;
 
-        explicit limited_server(bool tls = false) {
+        // `setup` sets what else the server needs, before it serves
+        explicit limited_server(bool tls = false, const std::function<void(http::server&)>& setup = {}) {
+            if (setup) setup(server);
             server.enable_ssl(tls);
             server.set_max_body_size(64 * KiB);
             server.post("/limited", [](http::request& req, http::response& res) {
                 res.send("size=" + std::to_string(req.body().size()));
             }).max_body_size(64 * KiB);
+            server.post("/tiny", [](http::request& req, http::response& res) {
+                res.send("size=" + std::to_string(req.body().size()));
+            }).max_body_size(16);
             // Waits without reading the body, past its timeout
             server.post("/slow", [](http::request&, http::response&) -> awaitable<void> {
                 boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 30s);
@@ -200,9 +208,29 @@ TEST_CASE("A body over the limit gets its 413 before the connection closes", "[s
     }
 
     SECTION("Within the limit, the body is read and the connection kept") {
-        auto result = raw_exchange(fixture.port(), length_head("/limited", 1000, "Connection: close\r\n") + std::string(1000, 'x'));
+        auto result = raw_exchange(fixture.port(), length_head("/limited", 1000) + std::string(1000, 'x') +
+                                                   "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        INFO("response: " << result.data);
         REQUIRE(result.data.starts_with("HTTP/1.1 200"));
         REQUIRE(result.data.find("size=1000") != std::string::npos);
+        REQUIRE(count(result.data, "HTTP/1.1 ") == 2);
+        REQUIRE(result.data.find("healthy") != std::string::npos);
+    }
+
+    SECTION("A body that arrived whole with the head: nothing to linger for") {
+        boost::asio::io_context ioc;
+        boost::asio::ip::tcp::socket socket(ioc);
+        socket.connect({boost::asio::ip::make_address("127.0.0.1"), fixture.port()});
+        boost::asio::write(socket, boost::asio::buffer(length_head("/tiny", 1000) + std::string(1000, 'x')));
+        auto result = read_until_closed(ioc, socket, 3s);
+        REQUIRE(result.data.starts_with("HTTP/1.1 413"));
+        REQUIRE(result.closed);
+        // Closed at once, while the client keeps its end open
+        auto deadline = std::chrono::steady_clock::now() + 1s;
+        while (fixture.server.stats().http_connections > 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(10ms);
+        }
+        REQUIRE(fixture.server.stats().http_connections == 0);
     }
 }
 
@@ -239,13 +267,76 @@ TEST_CASE("Other answers sent before the body was read reach the client", "[serv
         REQUIRE(result.sent == 4 * MiB);
     }
 
-    SECTION("400 for a request that cannot be parsed, with data after it") {
+    SECTION("431 for a header section too large, still arriving") {
+        auto result = upload(fixture.port(), {.head = length_head("/limited", 1 * MiB, "X-Big: " + std::string(256 * KiB, 'a') + "\r\n"),
+                                              .body_size = 1 * MiB});
+        INFO("response: " << result.response.substr(0, 200));
+        REQUIRE(result.response.starts_with("HTTP/1.1 431"));
+        REQUIRE(result.read_error == boost::asio::error::eof);
+        REQUIRE_FALSE(result.write_error);
+    }
+
+    SECTION("400 for a request that is not HTTP: closed at once, as Go does") {
         auto result = upload(fixture.port(), {.head = "POST /limited HTTP/1.1\r\nHost: localhost\r\nBad Header\r\n\r\n",
                                               .body_size = 4 * MiB});
-        INFO("response: " << result.response.substr(0, 200));
-        REQUIRE(result.response.starts_with("HTTP/1.1 400"));
-        REQUIRE(result.read_error == boost::asio::error::eof);
+        REQUIRE(result.read_ended);
+        auto deadline = std::chrono::steady_clock::now() + 1s;
+        while (fixture.server.stats().http_connections > 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(10ms);
+        }
+        REQUIRE(fixture.server.stats().http_connections == 0);
     }
+}
+
+TEST_CASE("The response hook tells a response answered before the body completed", "[server][linger][hook][integration]") {
+    std::mutex mutex;
+    std::vector<http::response_info> infos;
+    limited_server fixture(false, [&](http::server& server) {
+        server.on_response([&](const http::request&, const http::response_info& info) {
+            std::lock_guard lock(mutex);
+            infos.push_back(info);
+        });
+    });
+    auto result = upload(fixture.port(), {.head = length_head("/limited", 4 * MiB), .body_size = 4 * MiB});
+    require_answered(result, "413");
+    auto deadline = std::chrono::steady_clock::now() + 2s;
+    for (;;) {
+        {
+            std::lock_guard lock(mutex);
+            if (!infos.empty() || std::chrono::steady_clock::now() > deadline) break;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    std::lock_guard lock(mutex);
+    REQUIRE(infos.size() == 1);
+    REQUIRE(infos[0].status == http::http_response::status::payload_too_large);
+    REQUIRE(infos[0].outcome == http::response_outcome::completed);
+}
+
+TEST_CASE("A graceful shutdown does not wait for a lingering close", "[server][linger][shutdown][integration]") {
+    linger_settings settings(1024 * MiB, 30s);
+    limited_server fixture;
+    std::atomic<bool> clean{false};
+    std::chrono::milliseconds took{-1};
+    // Once the client got its 413 and keeps sending slowly, the connection lingers
+    std::thread stopper([&] {
+        std::this_thread::sleep_for(500ms);
+        auto start = std::chrono::steady_clock::now();
+        clean = fixture.server.shutdown(10s);
+        took = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+    });
+    auto result = upload(fixture.port(), {.head = length_head("/limited", 1024 * MiB), .body_size = 1024 * MiB,
+                                          .piece = 1 * KiB, .pace = 20ms, .timeout = 5s});
+    stopper.join();
+    INFO("shutdown took " << took.count() << " ms | write error: " << result.write_error.message());
+    REQUIRE(result.response.starts_with("HTTP/1.1 413"));
+    REQUIRE(result.read_error == boost::asio::error::eof);
+    REQUIRE(clean);
+    REQUIRE(took >= 0ms);
+    REQUIRE(took < 2s);
+    // Closed by the shutdown: the client sending more fails, long before the 30 s
+    REQUIRE(result.write_error);
+    REQUIRE(result.write_failed_after < 3s);
 }
 
 TEST_CASE("Expect: 100-continue over the limit is answered without the body", "[server][linger][expect][integration]") {
@@ -288,20 +379,22 @@ TEST_CASE("A lingering close is bounded", "[server][linger][integration]") {
         INFO("sent: " << result.sent << " | write error: " << result.write_error.message());
         REQUIRE(result.response.starts_with("HTTP/1.1 413"));
         REQUIRE(result.write_error);
-        // What the server dropped, and what the socket buffers of both ends held
-        REQUIRE(result.sent < 64 * MiB);
+        // Cut long before the whole body (what the server dropped, and what the socket
+        // buffers of both ends held, were sent), soon after the response
+        REQUIRE(result.sent < 1024 * MiB);
+        REQUIRE(result.write_failed_after >= 0ms);
         REQUIRE(result.write_failed_after < 5s);
     }
 
     SECTION("Disabled: the connection closes at once") {
         linger_settings settings(0, 0ms);
         limited_server fixture;
-        auto result = upload(fixture.port(), {.head = length_head("/limited", 64 * MiB), .body_size = 64 * MiB,
+        auto result = upload(fixture.port(), {.head = length_head("/limited", 1024 * MiB), .body_size = 1024 * MiB,
                                               .timeout = 10s});
         INFO("sent: " << result.sent << " | write error: " << result.write_error.message());
         // The unread body resets the connection
         REQUIRE(result.write_error);
-        REQUIRE(result.sent < 64 * MiB);
+        REQUIRE(result.sent < 1024 * MiB);
     }
 }
 
@@ -327,18 +420,23 @@ TEST_CASE("The client reads a response sent before its request was written whole
     limited_server fixture;
     http::client client;
     client.timeout(10s);
-    std::string body(32 * MiB, 'x');
     auto url = "http://127.0.0.1:" + std::to_string(fixture.port()) + "/limited";
 
-    SECTION("The server drops the body: the request is written whole") {
-        auto response = client.post(url, body, "application/octet-stream");
+    SECTION("The server drops the body, within its byte limit: the request is written whole") {
+        auto response = client.post(url, std::string(4 * MiB, 'x'), "application/octet-stream");
+        INFO("error: " << response.error());
+        REQUIRE(response.status() == 413);
+    }
+
+    SECTION("The body goes past the byte limit: writing fails, and the response is read anyway") {
+        auto response = client.post(url, std::string(32 * MiB, 'x'), "application/octet-stream");
         INFO("error: " << response.error());
         REQUIRE(response.status() == 413);
     }
 
     SECTION("The server closes at once: writing fails, and the response is read anyway") {
         linger_settings settings(0, 0ms);
-        auto response = client.post(url, body, "application/octet-stream");
+        auto response = client.post(url, std::string(32 * MiB, 'x'), "application/octet-stream");
         INFO("error: " << response.error());
         REQUIRE(response.status() == 413);
     }

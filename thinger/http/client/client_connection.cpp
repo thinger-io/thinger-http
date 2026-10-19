@@ -411,6 +411,16 @@ awaitable<std::shared_ptr<http_response>> client_connection::exchange(std::share
                 error_ = write_ec;
                 co_return;
             }
+            // A 408 on a reused connection is most likely the server closing it while idle,
+            // before this request arrived: not its answer, and it may be sent again (see
+            // http_client_base::can_retry()), as Go does
+            if (reused_ && response->get_status_code() == 408) {
+                response.reset();
+                error_ = write_ec;
+                response_started_ = false;
+                request_unsent_ = true;
+                co_return;
+            }
             error_ = {};
             reusable_ = false;
             socket_->close();

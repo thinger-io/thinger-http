@@ -27,6 +27,9 @@ namespace {
         }
     };
 
+    // Lingering close once the server shuts down: brief, not to hold it
+    constexpr std::chrono::milliseconds shutdown_linger_timeout{500};
+
     // Lingering close of every connection (see server_connection::set_lingering_close())
     std::atomic<size_t> linger_max_bytes{server_connection::default_linger_max_bytes};
     std::atomic<std::chrono::milliseconds::rep> linger_timeout{server_connection::default_linger_timeout.count()};
@@ -150,6 +153,8 @@ void server_connection::linger() {
     if (lingering_) return;
     size_t max_bytes = linger_max_bytes.load(std::memory_order_relaxed);
     std::chrono::milliseconds timeout{linger_timeout.load(std::memory_order_relaxed)};
+    // The server shuts down: briefly, so it does not hold the shutdown
+    if (frame_watch_ & watch_draining) timeout = std::min(timeout, shutdown_linger_timeout);
     if (max_bytes == 0 || timeout.count() <= 0 || !socket_->is_open() || !shutdown_send(*socket_)) {
         close();
         return;
@@ -271,8 +276,10 @@ std::pair<std::shared_ptr<http_stream>, std::shared_ptr<request>> server_connect
 
     auto stream = std::make_shared<http_stream>(++request_id_, http_req->keep_alive());
     in_progress_ = stream.get();
-    // Its body is on the connection until read to its end (where it ends may be unknown)
-    stream->set_input_pending(http_req->has_pending_body() || !http_req->has_valid_framing());
+    // Its body is on the connection until read to its end (where it ends may be unknown),
+    // unless it arrived whole with the head
+    stream->set_input_pending(!http_req->has_valid_framing() || http_req->is_chunked_transfer() ||
+                              read_ahead_size < http_req->pending_body_size());
 
     // The client may wait for 100 Continue before sending the body: sent once the body is
     // read, unless the client already started sending it
@@ -304,8 +311,9 @@ void server_connection::reject_request() {
         LOG_ERROR("invalid http request");
     }
     auto stream = std::make_shared<http_stream>(++request_id_, false);
-    // The rest of the request may still be arriving
-    stream->set_input_pending(true);
+    // The rest of a header section too large may still be arriving (big cookies, say), and its
+    // client is worth an answer; not that of a request that is not HTTP, as Go does
+    stream->set_input_pending(status == http_response::status::request_header_fields_too_large);
     request_queue_.push(stream);
     handle_stock_error(stream, status);
 }
@@ -529,6 +537,11 @@ void server_connection::send_continue(http_stream& stream) {
 void server_connection::shutdown_drain() {
     if (!tracked() || (frame_watch_ & watch_draining)) return;
     frame_watch_ |= watch_draining;
+    // Closing gracefully: its response was written whole, so it does not hold the shutdown
+    if (lingering_) {
+        close();
+        return;
+    }
     if (!running_) return;
 
     // Handling a request: the connection is closed after its response (whose head tells the
