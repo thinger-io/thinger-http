@@ -135,7 +135,6 @@ namespace {
         session_ptr session;                // an earlier session to resume
         bool tickets = true;                // false: TLS 1.2 resumption by session id
         std::function<void(SSL_CTX*)> tamper;
-        std::chrono::seconds timeout = 5s;
     };
 
     // A TLS client (OpenSSL through Boost.Asio, synchronous)
@@ -162,8 +161,6 @@ namespace {
             boost::system::error_code ec;
             stream->next_layer().connect({boost::asio::ip::make_address("127.0.0.1"), port}, ec);
             if (ec) return false;
-            timeval timeout{static_cast<time_t>(options.timeout.count()), 0};
-            ::setsockopt(stream->next_layer().native_handle(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
             if (!options.server_name.empty()) SSL_set_tlsext_host_name(stream->native_handle(), options.server_name.c_str());
             if (options.session) SSL_set_session(stream->native_handle(), options.session.get());
             stream->handshake(boost::asio::ssl::stream_base::client, ec);
@@ -375,9 +372,10 @@ TEST_CASE("Client certificates: deferred and trusted validation", "[tls][mtls][i
         for (std::string pem : {std::string("not a certificate"), ca_a.pem().substr(0, 100)}) {
             tls_server server(verify(asio::client_verify::optional, pem));
             REQUIRE_FALSE(server.enabled);
-            tls_client_options options;
-            options.timeout = 1s;
-            REQUIRE_FALSE(connect_tls(server.port(), options).accepted);
+            // the connection is never served: no answer to its ClientHello
+            stalled_client client(server.port(), partial_client_hello);
+            pollfd descriptor{client.fd, POLLIN, 0};
+            REQUIRE(::poll(&descriptor, 1, 500) == 0);
             REQUIRE(server.handled == 0);
         }
     }

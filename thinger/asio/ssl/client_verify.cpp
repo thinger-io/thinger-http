@@ -24,10 +24,10 @@ namespace {
     // there is none, or one cannot be read
     X509_STORE* load_store(const std::string& pem) {
         boost::asio::ssl::context context(boost::asio::ssl::context::tls_server);
-        boost::system::error_code ec;
-        context.add_certificate_authority(boost::asio::buffer(pem), ec);
-        if (ec) {
-            LOG_ERROR("cannot read the trusted CAs of the client certificates: {}", ec.message());
+        try {
+            context.add_certificate_authority(boost::asio::buffer(pem));
+        } catch (const boost::system::system_error& e) {
+            LOG_ERROR("cannot read the trusted CAs of the client certificates: {}", e.code().message());
             return nullptr;
         }
         X509_STORE* store = SSL_CTX_get_cert_store(context.native_handle());

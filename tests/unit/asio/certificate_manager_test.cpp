@@ -703,8 +703,9 @@ TEST_CASE("Certificate manager client certificate modes per host", "[certificate
     }
 
     SECTION("Names that are not host names are refused") {
-        for (std::string name : {"", "*", "*.", "bad host", "a*.example.com", "a..example.com", ".example.com",
-                                 "example.com.", "host/path", std::string(64, 'a') + ".com"}) {
+        for (const auto& name : std::vector<std::string>{"", "*", "*.", "bad host", "a*.example.com", "a..example.com",
+                                                         ".example.com", "example.com.", "host/path",
+                                                         std::string(64, 'a') + ".com"}) {
             REQUIRE_FALSE(manager.set_client_verify(name, client_verify::required));
         }
         REQUIRE(manager.set_client_verify("under_score-1.example.com", client_verify::none));

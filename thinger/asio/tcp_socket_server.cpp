@@ -38,10 +38,10 @@ public:
             stopped_ = true;
             sockets.swap(sockets_);
         }
-        for (auto& [key, weak] : sockets) {
-            auto sock = weak.lock();
+        for (const auto& entry : sockets) {
+            auto sock = entry.second.lock();
             if (!sock) continue;
-            boost::asio::post(sock->get_io_context(), [weak] {
+            boost::asio::post(sock->get_io_context(), [weak = entry.second] {
                 if (auto pending = weak.lock()) pending->close();
             });
         }
@@ -86,8 +86,13 @@ tcp_socket_server::tcp_socket_server(std::string host,
 }
 
 tcp_socket_server::~tcp_socket_server() {
-    // Before the acceptor thread could use what is destroyed here
-    stop();
+    // Before the acceptor thread could use what is destroyed here (the stop() of this class:
+    // derived classes are gone by now)
+    try {
+        tcp_socket_server::stop();
+    } catch (const std::exception& e) {
+        LOG_ERROR("cannot stop a TCP server: {}", e.what());
+    }
 }
 
 void tcp_socket_server::set_tcp_no_delay(bool tcp_no_delay) {
@@ -254,8 +259,8 @@ tcp_socket_server::connection_server tcp_socket_server::make_connection_server()
         return {};
     }
     handshakes_ = std::make_shared<detail::pending_handshakes>();
-    connection_setup setup{ssl_enabled_ ? ssl_context_ : nullptr, client_verify_,
-                                               handshake_timeout_, handshakes_, tcp_no_delay_, handler_};
+    connection_setup setup{ssl_enabled_ ? ssl_context_ : nullptr, client_verify_, handshake_timeout_, handshakes_,
+                           tcp_no_delay_, handler_};
     return [setup = std::move(setup)]
         (boost::asio::ip::tcp::socket peer) {
             auto sock = make_socket(static_cast<boost::asio::io_context&>(peer.get_executor().context()), setup);

@@ -6,6 +6,8 @@
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
+#include <thinger/http/server/pool_server.hpp>
+#include <thinger/http/server/connection_tracker.hpp>
 #include <thinger/http/client/client.hpp>
 #include <thinger/util/base64.hpp>
 #include <thinger/util/sha1.hpp>
@@ -643,6 +645,14 @@ TEST_CASE("WebSocket stream: on_close", "[websocket][stream][on-close][integrati
             watch(ws);
         });
     });
+    server.get("/shutdown", [&](http::request&, http::response& res) {
+        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+            watch(ws);
+            http::on_server_shutdown(*ws, [weak = std::weak_ptr<asio::websocket>(ws)] {
+                if (auto self = weak.lock()) self->close(asio::websocket::CLOSE_GOING_AWAY);
+            });
+        });
+    });
     std::atomic<int> thrown{0};
     server.get("/throw", [&](http::request&, http::response& res) {
         res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
@@ -718,14 +728,36 @@ TEST_CASE("WebSocket stream: on_close", "[websocket][stream][on-close][integrati
         REQUIRE(next.handshake("/watch").starts_with("HTTP/1.1 101"));
     }
 
-    SECTION("The server shutting down closes it") {
+    SECTION("The server shutting down: closed when the handler is told") {
         raw_ws_client client(running.port);
+        REQUIRE(client.handshake("/shutdown").starts_with("HTTP/1.1 101"));
+        server.begin_shutdown(5s);
+        auto frame = client.read_frame();
+        REQUIRE(frame);
+        REQUIRE(frame->close_code() == asio::websocket::CLOSE_GOING_AWAY);
+        client.send_frame(OP_CLOSE, close_payload(asio::websocket::CLOSE_GOING_AWAY));
+        auto close = told_once();
+        REQUIRE(close);
+        REQUIRE(close->code == asio::websocket::CLOSE_GOING_AWAY);
+        REQUIRE_FALSE(close->remote);
+    }
+
+    SECTION("The server shutting down: closed at the end of the grace period") {
+        // A pool server: its workers still run once it stopped
+        http::pool_server pool;
+        pool.get("/watch", [&](http::request&, http::response& res) {
+            res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) { watch(ws); });
+        });
+        REQUIRE(pool.listen("127.0.0.1", 0));
+        auto waiting = std::async(std::launch::async, [&] { pool.wait(); });
+        raw_ws_client client(pool.local_port());
         REQUIRE(client.handshake("/watch").starts_with("HTTP/1.1 101"));
-        // the websocket ignores the shutdown: closed at the end of the grace period
-        server.shutdown(200ms);
+        // the websocket ignores the shutdown
+        REQUIRE_FALSE(pool.shutdown(200ms));
         auto close = told_once();
         REQUIRE(close);
         REQUIRE(close->code == asio::websocket::CLOSE_ABNORMAL);
+        REQUIRE(waiting.wait_for(3s) == std::future_status::ready);
     }
 }
 
@@ -733,11 +765,14 @@ TEST_CASE("WebSocket stream: on_close is not called once destroyed open", "[webs
     auto calls = std::make_shared<std::atomic<int>>(0);
     {
         auto io_context = std::make_unique<boost::asio::io_context>();
-        tcp::acceptor acceptor(*io_context, {boost::asio::ip::make_address("127.0.0.1"), 0});
-        tcp::socket peer(*io_context);
-        peer.connect(acceptor.local_endpoint());
         auto sock = std::make_shared<asio::tcp_socket>("on_close test", *io_context);
-        sock->get_socket() = acceptor.accept();
+        std::optional<tcp::socket> peer;
+        {
+            tcp::acceptor acceptor(*io_context, {boost::asio::ip::make_address("127.0.0.1"), 0});
+            peer.emplace(*io_context);
+            peer->connect(acceptor.local_endpoint());
+            sock->get_socket() = acceptor.accept();
+        }
         {
             auto ws = std::make_shared<asio::websocket>(sock);
             ws->on_close([calls](const asio::websocket_close&) { ++*calls; });
@@ -749,6 +784,8 @@ TEST_CASE("WebSocket stream: on_close is not called once destroyed open", "[webs
         }
         io_context->poll();
         sock.reset();
+        peer.reset();
+        // destroys the read pending, and the websocket with it
         io_context.reset();
     }
     REQUIRE(*calls == 0);
