@@ -1036,7 +1036,7 @@ if (auto tls = socket->tls()) {
 }
 ```
 
-Sessions are resumed with client certificates: every context of the manager has the same session id context, and a listener asking for certificates one of its own (a digest of its options), so a session is only resumed on a listener with the same policy. A resumed session asks for no certificate: it keeps the one of the session it resumes, but OpenSSL keeps its leaf only, not the rest of the chain, so `peer_chain_der` holds the leaf alone then. A session resumed without a certificate on a host name that requires one fails the handshake.
+Sessions are resumed with client certificates: every context of the manager has the same session id context, and a listener asking for certificates one of its own (a digest of its options), so a session is only resumed on a listener with the same policy. A resumed session asks for no certificate: it keeps the one of the session it resumes, but OpenSSL keeps its leaf only, not the rest of the chain, so `peer_chain_der` holds the leaf alone then. A session resumed without a certificate on a host name that requires one fails the handshake. Sessions are resumed with tickets (TLS 1.3, and TLS 1.2 unless the client disables them): the session cache of the server, for resumption by session id, drops the session of a connection closed without a close_notify alert, as a closed `ssl_socket` does.
 
 #### Handshake Deadline
 

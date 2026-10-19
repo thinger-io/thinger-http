@@ -132,8 +132,7 @@ namespace {
         std::string key;
         std::string server_name;            // SNI (none if empty)
         int version = 0;                    // TLS1_2_VERSION or TLS1_3_VERSION (0: any)
-        session_ptr session;                // an earlier session to resume
-        bool tickets = true;                // false: TLS 1.2 resumption by session id
+        session_ptr session;                // an earlier session to resume (a ticket)
         std::function<void(SSL_CTX*)> tamper;
     };
 
@@ -143,6 +142,12 @@ namespace {
         boost::asio::ssl::context context{boost::asio::ssl::context::tls_client};
         std::unique_ptr<boost::asio::ssl::stream<boost::asio::ip::tcp::socket>> stream;
 
+        // As a client closing cleanly (close_notify, written to the stream's buffer only): OpenSSL
+        // makes the session of a connection freed without it not resumable
+        ~tls_client() {
+            if (stream && SSL_is_init_finished(stream->native_handle())) SSL_shutdown(stream->native_handle());
+        }
+
         // Connect and do the handshake; then the server answers "ok" if it accepted the client
         // (TLS 1.3 refuses a client certificate after the client finished its handshake)
         bool connect(uint16_t port, const tls_client_options& options) {
@@ -151,7 +156,6 @@ namespace {
                 SSL_CTX_set_min_proto_version(handle, options.version);
                 SSL_CTX_set_max_proto_version(handle, options.version);
             }
-            if (!options.tickets) SSL_CTX_set_options(handle, SSL_OP_NO_TICKET);
             if (!options.certificate.empty()) {
                 context.use_certificate_chain(boost::asio::buffer(options.certificate));
                 context.use_private_key(boost::asio::buffer(options.key), boost::asio::ssl::context::pem);
@@ -162,7 +166,12 @@ namespace {
             stream->next_layer().connect({boost::asio::ip::make_address("127.0.0.1"), port}, ec);
             if (ec) return false;
             if (!options.server_name.empty()) SSL_set_tlsext_host_name(stream->native_handle(), options.server_name.c_str());
-            if (options.session) SSL_set_session(stream->native_handle(), options.session.get());
+            if (options.session) {
+                // a copy: a connection that fails makes its session not resumable
+                SSL_SESSION* copy = SSL_SESSION_dup(options.session.get());
+                SSL_set_session(stream->native_handle(), copy);
+                SSL_SESSION_free(copy);
+            }
             stream->handshake(boost::asio::ssl::stream_base::client, ec);
             return !ec && read(2) == "ok";
         }
@@ -411,10 +420,14 @@ TEST_CASE("Client certificates: chain depth and size", "[tls][mtls][integration]
     }
 
     SECTION("max_cert_list: a larger chain fails the handshake") {
+        std::string large_chain = deep_chain + root.pem();
+        REQUIRE(certificate_message_size({test_ca::der_of(leaf.first), test_ca::der_of(second->pem()),
+                                          test_ca::der_of(intermediate->pem()), test_ca::der_of(root.pem())},
+                                         false) > 1024);
         auto options = verify(asio::client_verify::optional);
         options.max_cert_list = 1024;
         tls_server server(options);
-        REQUIRE_FALSE(connect_tls(server.port(), with_certificate(leaf, 0, chain)).accepted);
+        REQUIRE_FALSE(connect_tls(server.port(), with_certificate(leaf, 0, large_chain)).accepted);
         REQUIRE(server.handled == 0);
     }
 
@@ -615,19 +628,16 @@ TEST_CASE("Client certificates: session resumption", "[tls][mtls][resumption][in
     auto leaf = test_ca::der_of(certificate.first);
     http::test::server_certificate own("resume.example.com", ca.issue("resume.example.com"));
 
+    // Resumed with tickets (the server's cache drops the sessions closed without close_notify)
     struct variant {
         const char* name;
         int version;
-        bool tickets;
     };
-    for (auto [name, version, tickets] : {variant{"TLS 1.2 ticket", TLS1_2_VERSION, true},
-                                          variant{"TLS 1.2 session id", TLS1_2_VERSION, false},
-                                          variant{"TLS 1.3", TLS1_3_VERSION, true}}) {
+    for (auto [name, version] : {variant{"TLS 1.2", TLS1_2_VERSION}, variant{"TLS 1.3", TLS1_3_VERSION}}) {
         for (std::string host : {"", "resume.example.com"}) {
             DYNAMIC_SECTION("Resumed with a client certificate: " << name << ", host '" << host << "'") {
                 tls_server server(verify(asio::client_verify::optional));
                 auto options = with_certificate(certificate, version);
-                options.tickets = tickets;
                 options.server_name = host;
                 auto first = connect_tls(server.port(), options);
                 REQUIRE(first.accepted);
@@ -649,7 +659,6 @@ TEST_CASE("Client certificates: session resumption", "[tls][mtls][resumption][in
             REQUIRE(devices.set);
             tls_client_options options;
             options.version = version;
-            options.tickets = tickets;
             options.server_name = "console.example.com";
             auto first = connect_tls(server.port(), options);
             REQUIRE(first.accepted);
@@ -664,7 +673,6 @@ TEST_CASE("Client certificates: session resumption", "[tls][mtls][resumption][in
         DYNAMIC_SECTION("A session of a listener with deferred validation is not resumed on one with trusted CAs: " << name) {
             test_ca other("Other CA");
             auto untrusted = with_certificate(other.issue_client("device"), version);
-            untrusted.tickets = tickets;
             tls_server deferred(verify(asio::client_verify::optional));
             tls_server trusted(verify(asio::client_verify::optional, ca.pem()));
             auto first = connect_tls(deferred.port(), untrusted);
