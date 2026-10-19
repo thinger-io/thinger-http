@@ -1811,6 +1811,16 @@ res.start_sse([](std::shared_ptr<http::sse_connection> sse) -> thinger::awaitabl
 });
 ```
 
+`send_data()` sends each line of its value (split on CRLF, CR or LF) as a `data:` field of its own, so the client gets the value as sent (pretty-printed JSON included), with its line breaks as LF; a value cannot inject fields or events. `send_event()` and `send_id()` take one line: a value with CR or LF (or NUL, for an ID) is refused, an error logged, and they return `false`.
+
+A quiet stream is kept alive with a comment (`: keep-alive`, ignored by `EventSource`) every 15 seconds nothing else was sent, so proxies and load balancers with an idle timeout do not close it; `set_keepalive(interval)` changes it, and 0 disables it. The stream is not closed for being quiet: a client that left is noticed by reading the connection, and one that stopped reading by the write timeout (see `set_write_limits()`).
+
+```cpp
+res.start_sse([](std::shared_ptr<http::sse_connection> sse) {
+    sse->set_keepalive(std::chrono::seconds(30));
+});
+```
+
 `on_close()` tells when the stream closed: the client left (the connection reads the client, which sends nothing after its request, only to notice it closing), `stop()`, the server shutdown, the overflow policy or the write timeout. It is called once, as the WebSocket one: posted to the thread of the connection, never from within the call closing it (a send overflowing the queue, `stop()`), what it throws logged; set once the connection already closed (e.g. by a coroutine handler running late), it is posted at once. A client half-closing the connection has left.
 
 ```cpp

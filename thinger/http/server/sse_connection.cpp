@@ -1,5 +1,6 @@
 #include "sse_connection.hpp"
 #include <algorithm>
+#include <string_view>
 
 namespace thinger::http {
 
@@ -13,6 +14,7 @@ namespace thinger::http {
         // waiting are told it closed), then emptied
         flow_.close();
         out_queue_.clear();
+        keepalive_pending_ = false;
         flow_.clear();
         // no longer counts for the server
         if(tracking_) tracking_->closed();
@@ -55,16 +57,76 @@ namespace thinger::http {
         });
     }
 
-    void sse_connection::handle_write(const std::string& type, const std::string& value){
+    namespace {
+        /// Whether `value` holds a character that would end a field
+        bool breaks_field(std::string_view value, bool nul = false){
+            return value.find_first_of(nul ? std::string_view("\r\n\0", 3) : std::string_view("\r\n")) != std::string_view::npos;
+        }
+    }
+
+    bool sse_connection::handle_write(const std::string& type, const std::string& value){
+        // a field name is a name: no line breaks, nor the colon separating its value
+        if(type.empty() || breaks_field(type) || type.find(':') != std::string::npos){
+            LOG_ERROR("sse field refused: invalid field name");
+            return false;
+        }
+
         out_field field;
-        field.data.reserve(type.size() + value.size() + 4);
-        field.data.append(type).append(misc_strings::name_value_separator).append(value).append(misc_strings::lf);
         // a data field ends its event
         field.ends_event = type == "data";
-        if(field.ends_event) field.data.append(misc_strings::lf);
+        if(field.ends_event){
+            // one data field per line: CRLF, CR or LF end a line (WHATWG HTML, 9.2.6)
+            field.data.reserve(value.size() + 8);
+            std::string_view rest(value);
+            for(;;){
+                auto end = rest.find_first_of("\r\n");
+                field.data.append(type).append(misc_strings::name_value_separator)
+                     .append(rest.substr(0, end)).append(misc_strings::lf);
+                if(end == std::string_view::npos) break;
+                auto next = end + 1;
+                if(rest[end] == '\r' && next < rest.size() && rest[next] == '\n') ++next;
+                rest.remove_prefix(next);
+            }
+            field.data.append(misc_strings::lf);
+        }else{
+            // anything else is one line: a line break would end it and inject fields or events
+            if(breaks_field(value, type == "id")){
+                LOG_ERROR("sse field refused: the value of '{}' holds a line break{}", type,
+                          type == "id" ? " or NUL" : "");
+                return false;
+            }
+            field.data.reserve(type.size() + value.size() + 3);
+            field.data.append(type).append(misc_strings::name_value_separator).append(value).append(misc_strings::lf);
+        }
 
         boost::asio::dispatch(socket_->get_io_context(), [this, self = shared_from_this(), field = std::move(field)]() mutable {
             push_field(std::move(field));
+        });
+        return true;
+    }
+
+    void sse_connection::set_keepalive(std::chrono::milliseconds interval){
+        boost::asio::dispatch(socket_->get_io_context(), [this, self = shared_from_this(), interval]{
+            keepalive_ = interval;
+            arm_keepalive();
+        });
+    }
+
+    void sse_connection::arm_keepalive(){
+        // a previous timer, if any, is stale
+        auto generation = ++keepalive_generation_;
+        timer_.cancel();
+        if(closed_ || keepalive_.count() <= 0) return;
+        idle_ = true;
+        timer_.expires_after(keepalive_);
+        timer_.async_wait([this, self = shared_from_this(), generation](const boost::system::error_code& ec){
+            if(ec || closed_ || generation != keepalive_generation_) return;
+            // only when the stream was quiet, and nothing is waiting to be written
+            if(idle_ && !writing_ && out_queue_.empty()){
+                keepalive_pending_ = true;
+                process_out_queue();
+            }
+            arm_keepalive();
         });
     }
 
@@ -112,16 +174,25 @@ namespace thinger::http {
     }
 
     void sse_connection::process_out_queue(){
-        if(writing_ || out_queue_.empty()) return;
+        if(writing_ || (out_queue_.empty() && !keepalive_pending_)) return;
         writing_ = true;
         co_spawn(socket_->get_io_context(), write_loop(shared_from_this()), detached);
     }
 
     awaitable<void> sse_connection::write_loop([[maybe_unused]] std::shared_ptr<sse_connection> self){
-        while(!out_queue_.empty()){
-            auto field = std::move(out_queue_.front());
-            out_queue_.pop_front();
-            event_open_ = !field.ends_event;
+        while(!out_queue_.empty() || keepalive_pending_){
+            out_field field;
+            if(keepalive_pending_){
+                // never queued, so neither dropped nor counted against the limits
+                keepalive_pending_ = false;
+                field.data = ": keep-alive\n";
+                field.comment = true;
+            }else{
+                field = std::move(out_queue_.front());
+                out_queue_.pop_front();
+            }
+            // a comment is written between fields: the event being written stays as it was
+            if(!field.comment) event_open_ = !field.ends_event;
 
             flow_.write_started(*this, [](sse_connection& self){
                 LOG_WARNING("closing sse connection: its write timed out");
@@ -130,13 +201,13 @@ namespace thinger::http {
             auto [write_ec, write_bytes] = co_await socket_->write(std::string_view(field.data));
             flow_.write_finished();
 
-            flow_.remove(field.data.size());
+            if(!field.comment) flow_.remove(field.data.size());
             if(write_ec){
                 // nothing else can be sent
                 close();
                 break;
             }
-            idle_ = false;
+            if(!field.comment) idle_ = false;
         }
         writing_ = false;
     }

@@ -1,6 +1,7 @@
 #ifndef SSE_CONNECTION_HPP
 #define SSE_CONNECTION_HPP
 
+#include <chrono>
 #include <deque>
 #include <memory>
 #include "../common/http_request.hpp"
@@ -38,7 +39,6 @@ public:
     sse_connection(std::shared_ptr<asio::socket> socket) :
             socket_(socket),
             timer_(socket->get_io_context()),
-            idle_(false),
             flow_(socket->get_io_context().get_executor(), write_limits{.max_messages = MAX_OUTPUT_MESSAGES + 1}),
             on_close_(socket->get_io_context().get_executor())
     {
@@ -50,30 +50,21 @@ public:
         LOG_DEBUG("releasing sse connection");
     }
 
+    /// Default interval of the keep-alive comments (see set_keepalive())
+    static constexpr std::chrono::milliseconds DEFAULT_KEEPALIVE_INTERVAL{15000};
+
 private:
 
-    void handle_timeout()
-    {
-        idle_ = true;
-        timer_.expires_after(std::chrono::seconds(60));
-        timer_.async_wait(
-            [this, self = shared_from_this()](const boost::system::error_code& e){
-                // if timer was not cancelled (just expired by itself)
-                if(e != boost::asio::error::operation_aborted && !idle_){
-                    handle_timeout();
-                }else if(idle_){
-                    // will terminate any pending async reads or writes
-                    close();
-                }
-            }
-        );
-    }
+    /// Arm the keep-alive timer for the interval set (nothing if 0)
+    void arm_keepalive();
 
     struct out_field {
         /// The field as sent: "name: value\n", and the empty line ending an event after data
         std::string data;
         /// A data field, which ends its event
         bool ends_event = false;
+        /// A keep-alive comment: never queued, outside the events and the write limits
+        bool comment = false;
     };
 
     void process_out_queue();
@@ -104,7 +95,7 @@ public:
 
     void start(){
         track_shutdown();
-        handle_timeout();
+        arm_keepalive();
         co_spawn(socket_->get_io_context(), read_loop(shared_from_this()), detached);
     }
 
@@ -122,12 +113,13 @@ public:
     }
 
     /// Once the connection closed, whatever closed it: the client left (or the connection
-    /// failed), stop(), the server shutdown, the overflow policy, a write timeout, or 60 seconds
-    /// without sending anything. Called once; nothing can be sent anymore. Always posted to the
-    /// connection thread, never called from within the call closing it (e.g. a send from a loop
-    /// over the connections, which may then remove this one); what it throws is logged. Set
-    /// once the connection already closed (e.g. by a coroutine handler that ran late), it is
-    /// posted at once. Not called if the io_context is stopped and destroyed with it open
+    /// failed), stop(), the server shutdown, the overflow policy or a write timeout (a quiet
+    /// stream is not closed, see set_keepalive()). Called once; nothing can be sent anymore.
+    /// Always posted to the connection thread, never called from within the call closing it
+    /// (e.g. a send from a loop over the connections, which may then remove this one); what it
+    /// throws is logged. Set once the connection already closed (e.g. by a coroutine handler
+    /// that ran late), it is posted at once. Not called if the io_context is stopped and
+    /// destroyed with it open
     void on_close(sync_callback<void()> callback){
         on_close_.set(std::move(callback));
     }
@@ -136,15 +128,34 @@ public:
         handle_write("retry", boost::lexical_cast<std::string>(millis));
     }
 
-    void send_event(const std::string& event_name){
-        handle_write("event", event_name);
+    /// The type of the event whose data follows. Refused (false, an error logged) if it holds
+    /// a CR or LF, which would end the field and inject others
+    bool send_event(const std::string& event_name){
+        return handle_write("event", event_name);
     }
 
+    /// The last event ID of the event whose data follows. Refused (false, an error logged) if
+    /// it holds a CR, LF or NUL (a browser ignores an ID with NUL)
+    bool send_id(const std::string& id){
+        return handle_write("id", id);
+    }
+
+    /// The data of an event, which ends it: each line (split on CRLF, CR or LF) is sent as a
+    /// data field of its own, so the client gets the value as it was sent, line breaks as LF
+    /// (WHATWG HTML, Server-sent events)
     void send_data(const std::string& data){
         handle_write("data", data);
     }
 
-    void handle_write(const std::string& type, const std::string& value);
+    /// Send a field: `data` as send_data(), any other type with a value without CR or LF.
+    /// False if refused (a type or value that would break the framing), an error logged
+    bool handle_write(const std::string& type, const std::string& value);
+
+    /// Send a comment (": keep-alive", a line the client ignores) every `interval` nothing
+    /// else was sent, so proxies and clients do not take a quiet stream as dead
+    /// (DEFAULT_KEEPALIVE_INTERVAL, 15 seconds, by default); 0 disables it. A client gone is
+    /// noticed by reading the connection, whatever this is set to. From any thread
+    void set_keepalive(std::chrono::milliseconds interval);
 
     void set_write_limits(const write_limits& limits);
     write_limits get_write_limits() const { return flow_.limits(); }
@@ -173,10 +184,14 @@ private:
     /// belong to it
     bool event_open_ = false;
 
-    /// Closes the connection when nothing is written for 60 seconds
+    /// Keep-alive comments: every keepalive_ without anything else written
     boost::asio::steady_timer timer_;
-
-    bool idle_;
+    std::chrono::milliseconds keepalive_ = DEFAULT_KEEPALIVE_INTERVAL;
+    uint64_t keepalive_generation_ = 0;
+    /// Nothing but comments written since the last tick of the keep-alive timer
+    bool idle_ = true;
+    /// A keep-alive comment to write, before the fields queued
+    bool keepalive_pending_ = false;
 
     /// Bytes queued against the write limits
     write_flow flow_;
