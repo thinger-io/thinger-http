@@ -1,4 +1,5 @@
 #include "unix_socket.hpp"
+#include "../with_timeout.hpp"
 #include "../../util/logger.hpp"
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
@@ -39,39 +40,15 @@ bool unix_socket::shutdown_send() {
 awaitable<boost::system::error_code> unix_socket::connect(const std::string &path, std::chrono::seconds timeout) {
     close();
 
-    // Setup timeout timer
-    boost::asio::steady_timer timer(io_context_);
-    timer.expires_after(timeout);
-
-    bool timed_out = false;
-    boost::system::error_code connect_ec;
-
-    // Start timeout
-    auto timeout_coro = [&]() -> awaitable<void> {
-        auto [ec] = co_await timer.async_wait(use_nothrow_awaitable);
-        if (!ec) {
-            timed_out = true;
-            socket_.cancel();
-        }
-    };
-
-    // Start connect
-    auto connect_coro = [&]() -> awaitable<void> {
-        auto [ec] = co_await socket_.async_connect(
-            boost::asio::local::stream_protocol::endpoint(path),
-            use_nothrow_awaitable);
-        timer.cancel();
-        if (ec) {
-            connect_ec = timed_out ? boost::asio::error::timed_out : ec;
-        }
-    };
-
-    // On the executor of the caller, as the connect: never at the same time on a strand of an
-    // io_context run by several threads
-    co_spawn(co_await boost::asio::this_coro::executor, timeout_coro(), detached);
-    co_await connect_coro();
-
-    co_return connect_ec;
+    // Race between connect and timeout: a connect not done in time is cancelled
+    auto connected = co_await with_timeout(
+        socket_.async_connect(boost::asio::local::stream_protocol::endpoint(path), use_nothrow_awaitable),
+        timeout);
+    if (!connected) {
+        close();
+        co_return boost::asio::error::timed_out;
+    }
+    co_return std::get<0>(*connected);
 }
 
 awaitable<boost::system::error_code> unix_socket::connect(

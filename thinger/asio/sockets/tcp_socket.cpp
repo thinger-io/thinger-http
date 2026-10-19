@@ -1,5 +1,6 @@
 #include <iostream>
 #include "tcp_socket.hpp"
+#include "../with_timeout.hpp"
 
 namespace thinger::asio {
 
@@ -55,39 +56,14 @@ awaitable<boost::system::error_code> tcp_socket::connect(
         co_return ec_resolve;
     }
 
-    // Setup timeout timer
-    boost::asio::steady_timer timer(io_context_);
-    timer.expires_after(timeout);
-
-    // Race between connect and timeout
-    bool timed_out = false;
-    boost::system::error_code connect_ec;
-
-    // Start timeout
-    auto timeout_coro = [&]() -> awaitable<void> {
-        auto [ec] = co_await timer.async_wait(use_nothrow_awaitable);
-        if (!ec) {
-            timed_out = true;
-            socket_.cancel();
-        }
-    };
-
-    // Start connect
-    auto connect_coro = [&]() -> awaitable<void> {
-        auto [ec, endpoint] = co_await boost::asio::async_connect(
-            socket_, endpoints, use_nothrow_awaitable);
-        timer.cancel();
-        if (ec) {
-            connect_ec = timed_out ? boost::asio::error::timed_out : ec;
-        }
-    };
-
-    // Wait for connect (timeout will cancel if needed). The timeout runs on the executor of
-    // the caller, as the connect: never at the same time on a strand of an io_context run by
-    // several threads
-    co_spawn(co_await boost::asio::this_coro::executor, timeout_coro(), detached);
-    co_await connect_coro();
-
+    // Race between connect and timeout: a connect not done in time is cancelled
+    auto connected = co_await with_timeout(
+        boost::asio::async_connect(socket_, endpoints, use_nothrow_awaitable), timeout);
+    if (!connected) {
+        close();
+        co_return boost::asio::error::timed_out;
+    }
+    auto connect_ec = std::get<0>(*connected);
     if (connect_ec) {
         co_return connect_ec;
     }
