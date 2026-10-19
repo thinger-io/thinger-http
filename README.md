@@ -738,6 +738,13 @@ The limit of a request is the one of its route, else of the group it was registe
 - [In-memory dispatch](#in-memory-dispatch): the same, from the body of the request.
 - A body left unread by the handler (e.g. a middleware answered `401` before it was read) is discarded only up to the smaller of `set_max_body_size()` and the route limit; a larger one closes the connection instead of being read, so a route accepting large bodies does not make the server read them for nothing.
 
+**Closing with the body unread**: when the connection closes after a response while the client may still be sending its request (`413`, `417`, a `401` before a body too large to discard, a request timeout, a request that cannot be parsed...), it closes gracefully, as RFC 9112 (section 9.6) describes. Once the response is written, the server stops sending, so the client sees the end of the connection. It then reads and drops what keeps arriving until the client closes, 8 MiB were dropped, or 5 s passed, whichever comes first, and closes. Closed at once, the unread data would make the system reset the connection, and a client still sending its body would get `EPIPE` or a reset instead of the response. Meanwhile the connection timeout does not apply, and the connection holds no more memory than its read buffer. A body within the limit that the handler left unread is still read and dropped to keep the connection alive, as Node does (Node reads any body to its end); a larger one is read only so the client gets its answer, as Go does.
+
+```cpp
+// Up to 1 MiB or 2 s; 0 for either closes at once. It applies to every server of the process
+http::server::set_lingering_close(1024 * 1024, std::chrono::seconds(2));
+```
+
 **Timeout** (`.timeout(duration, status = 504)`, none by default) is the maximum time from the dispatch of a request (its headers received and its route matched) until its response **starts**, middlewares and body reading included. If no answer has started by then, the request is answered with `504 Gateway Timeout` (or the status given, e.g. `503 Service Unavailable`) through the [error formatter](#error-format), with the message `No response within the timeout` and the headers set on the response so far (e.g. CORS headers of a middleware). As for any answer, set the status and headers (`res.status()`, `res.header()`) from the thread running the handler, before answering: a handler with a timeout that sets headers later, from another thread, would race with the timeout copying them.
 
 - **Handlers are not cancelled**: a coroutine goes on until it ends, and anything it sends afterwards (or a copy of the response, from another thread) is dropped: `has_responded()` is `true` for every copy, and late answers are logged at debug level only. Keep handlers bounded on their own (their own timeouts on what they wait for).
@@ -1300,6 +1307,7 @@ Responses are parsed as strictly as the server parses requests, so a response is
   Other codings, empty bodies (responses to `HEAD`), and every body with `auto_decompress(false)`, are kept as they are. Streamed bodies (the stream callback, `download()`) and the chunks of `http_request::set_chunked_callback()` are handed as received, never decoded, so they are never inflated: streaming asks for `Accept-Encoding: identity`, unless the request sets its own, and then the body is what the server sent (compressed if its `Content-Encoding` says so). The limit is on the decoded size, as `maxOutputLength` bounds a buffered inflate in Node's `zlib`; there is no limit on the compression ratio (neither Node, Go nor curl has one).
 - **Interim responses** (`100 Continue`, `103 Early Hints`) are skipped. `101 Switching Protocols` ends the response, and is accepted only for a request with `Upgrade` (`unexpected_upgrade`).
 - **Connection reuse**: only after a response delimited by its length or chunked, kept alive, and with nothing received past its end (see [Connection Pool](#connection-pool-keep-alive)).
+- **Early responses**: a server may answer before the request is written whole and close the connection (e.g. `413` for a body over its limit). If writing the request then fails (`EPIPE` or a reset), the response the server sent is still read and returned, as curl does; the connection is not reused.
 
 ### Async Client (async_client)
 

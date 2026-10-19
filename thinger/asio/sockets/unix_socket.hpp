@@ -24,6 +24,8 @@ public:
     awaitable<boost::system::error_code> connect(const std::string &path, std::chrono::seconds timeout);
     void close() override;
     void cancel() override;
+    // Stop sending, reading on: the half-close of a graceful close. False if it failed
+    bool shutdown_send();
 
     // read operations
     awaitable<io_result> read_some(uint8_t buffer[], size_t max_size) override;

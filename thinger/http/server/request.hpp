@@ -213,6 +213,10 @@ namespace thinger::http{
 
     private:
 
+        /// After reading the body: once read to its end, none of it is left on the connection
+        /// (see http_stream::input_pending())
+        void note_body_read();
+
         /**
          * HTTP connection is the wrapper for a raw socket, being able to parse request and to
          * pipeline HTTP responses

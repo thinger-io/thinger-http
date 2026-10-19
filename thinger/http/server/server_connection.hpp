@@ -69,6 +69,21 @@ public:
     // connection timeout (on the connection thread)
     void hold_until(std::chrono::steady_clock::time_point time);
 
+    // Lingering close (RFC 9112 section 9.6), for the connections of every server in the
+    // process: a connection closed after a response while input of its request may still be
+    // arriving (e.g. a body over the limit, answered 413 before it was read) stops sending, then
+    // reads and drops what arrives until the client closes, `max_bytes` were dropped or `timeout`
+    // passed, whatever comes first, and closes. Closed at once instead, the unread data makes the
+    // system reset the connection, and a client still sending may never read the response. Zero
+    // for either closes at once (also on sockets that cannot half-close, such as custom ones)
+    static constexpr size_t default_linger_max_bytes = 8 * 1024 * 1024;
+    static constexpr std::chrono::milliseconds default_linger_timeout{5000};
+    static void set_lingering_close(size_t max_bytes, std::chrono::milliseconds timeout);
+
+    // Whether the connection closes gracefully (see set_lingering_close()): nothing more is read
+    // from it but by itself (on the connection thread)
+    bool lingering() const { return lingering_; }
+
     void set_handler(std::function<awaitable<void>(std::shared_ptr<request>)> handler) {
         handler_ = std::move(handler);
     }
@@ -144,6 +159,15 @@ private:
     // Close connection
     void close();
 
+    // Close the connection once the response of `stream` ended: gracefully if input of its
+    // request may still be arriving (see linger()), else at once
+    void close_after(const http_stream& stream);
+
+    // Close gracefully (RFC 9112 section 9.6): stop sending, drop what keeps arriving (see
+    // set_lingering_close()), then close. At once if the socket cannot half-close
+    void linger();
+    awaitable<void> drop_input(size_t max_bytes, std::chrono::milliseconds timeout);
+
     // Hand the socket over once the response is written and the read loop has stopped
     void complete_takeover(http_stream& stream);
 
@@ -190,6 +214,8 @@ private:
     bool running_{false};
     // The read loop stopped without handing the connection over: it cannot be taken over
     bool reader_stopped_{false};
+    // Closing gracefully (see linger()). Where it takes no room
+    bool lingering_{false};
     stream_id request_id_{0};
 };
 

@@ -58,6 +58,10 @@ public:
     std::string get_local_port() const override;
     std::string get_remote_port() const override;
 
+    // Stop sending (a FIN), reading on: the half-close of a graceful close. Under TLS, no
+    // close_notify is sent. False if it failed (e.g. the socket is closed)
+    bool shutdown_send();
+
     // other methods: false if the option could not be set (e.g. the socket is closed)
     bool enable_tcp_no_delay();
     bool disable_tcp_no_delay();

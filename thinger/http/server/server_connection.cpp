@@ -1,7 +1,10 @@
 #include "server_connection.hpp"
 #include "request.hpp"
 #include "response_observer.hpp"
+#include "../../asio/sockets/tcp_socket.hpp"
+#include "../../asio/sockets/unix_socket.hpp"
 #include "../../util/logger.hpp"
+#include <atomic>
 
 namespace thinger::http {
 
@@ -24,6 +27,32 @@ namespace {
         }
     };
 
+    // Lingering close of every connection (see server_connection::set_lingering_close())
+    std::atomic<size_t> linger_max_bytes{server_connection::default_linger_max_bytes};
+    std::atomic<std::chrono::milliseconds::rep> linger_timeout{server_connection::default_linger_timeout.count()};
+
+    // Stop sending on the connection, reading on: TCP (TLS included) and Unix sockets
+    bool shutdown_send(asio::socket& socket) {
+        if (auto* tcp = dynamic_cast<asio::tcp_socket*>(&socket)) return tcp->shutdown_send();
+        if (auto* local = dynamic_cast<asio::unix_socket*>(&socket)) return local->shutdown_send();
+        return false;
+    }
+
+    // Read what arrives to drop it: from the TCP stream itself under TLS, whose records are
+    // not decrypted (nor read by the TLS stream, whose reads were cancelled)
+    awaitable<io_result> read_to_drop(asio::socket& socket, uint8_t* buffer, size_t size) {
+        if (auto* tcp = dynamic_cast<asio::tcp_socket*>(&socket)) {
+            co_return co_await tcp->get_socket().async_read_some(boost::asio::buffer(buffer, size),
+                                                                 use_nothrow_awaitable);
+        }
+        co_return co_await socket.read_some(buffer, size);
+    }
+
+}
+
+void server_connection::set_lingering_close(size_t max_bytes, std::chrono::milliseconds timeout) {
+    linger_max_bytes.store(max_bytes, std::memory_order_relaxed);
+    linger_timeout.store(timeout.count(), std::memory_order_relaxed);
 }
 
 server_connection::server_connection(std::shared_ptr<asio::socket> socket)
@@ -109,6 +138,55 @@ void server_connection::close() {
     untrack();
 }
 
+void server_connection::close_after(const http_stream& stream) {
+    if (stream.input_pending()) {
+        linger();
+    } else {
+        close();
+    }
+}
+
+void server_connection::linger() {
+    if (lingering_) return;
+    size_t max_bytes = linger_max_bytes.load(std::memory_order_relaxed);
+    std::chrono::milliseconds timeout{linger_timeout.load(std::memory_order_relaxed)};
+    if (max_bytes == 0 || timeout.count() <= 0 || !socket_->is_open() || !shutdown_send(*socket_)) {
+        close();
+        return;
+    }
+    // The connection stops serving: no more requests, nor its timeout. Whatever reads it ends
+    // now (the read loop, or a handler still reading the body, which reads nothing more), so
+    // only the graceful close reads it from now on
+    lingering_ = true;
+    running_ = false;
+    cancel_timeout();
+    response_started_.cancel();
+    socket_->cancel();
+    co_spawn(socket_->get_io_context(),
+        [self = shared_from_this(), max_bytes, timeout]() -> awaitable<void> {
+            co_await self->drop_input(max_bytes, timeout);
+        },
+        detached);
+}
+
+awaitable<void> server_connection::drop_input(size_t max_bytes, std::chrono::milliseconds timeout) {
+    // Into the connection buffer, which the read loop no longer uses: the memory of a
+    // connection does not grow while it drops input
+    size_t dropped = 0;
+    auto drop = [&]() -> awaitable<void> {
+        while (dropped < max_bytes) {
+            auto [ec, bytes] = co_await read_to_drop(*socket_, buffer_, std::min(MAX_BUFFER_SIZE, max_bytes - dropped));
+            if (ec) co_return;  // the client closed (or reset) the connection
+            dropped += bytes;
+        }
+    };
+    boost::asio::steady_timer timer(socket_->get_io_context(), timeout);
+    auto result = co_await (timer.async_wait(use_nothrow_awaitable) || drop());
+    LOG_DEBUG("http server connection closed gracefully: {} bytes dropped{}", dropped,
+              result.index() == 0 ? ", until the timeout" : dropped >= max_bytes ? ", up to the limit" : "");
+    close();
+}
+
 awaitable<void> server_connection::read_loop() {
     auto self = shared_from_this();
 
@@ -163,7 +241,13 @@ awaitable<void> server_connection::read_loop() {
         // Without keep-alive, reading stops after this request. The leftover stays with the
         // request: its handler may still be reading the body (e.g. the request was answered
         // by its timeout)
-        if (!stream->keep_alive() || !keep_pipelined(*req, buffered)) break;
+        if (!stream->keep_alive() || !keep_pipelined(*req, buffered)) {
+            // The response ended before the connection was to close (e.g. a body left unread
+            // turned out too large to drop): close it now, gracefully if the body still comes.
+            // A response not ended yet closes it once it ends
+            if (request_queue_.empty() && stream->input_pending()) linger();
+            break;
+        }
     }
 
     stop_reading();
@@ -176,8 +260,8 @@ void server_connection::stop_reading() {
     cancel_timeout();
 
     // Draining, with every response written: done now, even if something still holds the
-    // connection (e.g. a copy of the request)
-    if ((frame_watch_ & watch_draining) && request_queue_.empty()) close();
+    // connection (e.g. a copy of the request). Unless it closes gracefully already
+    if ((frame_watch_ & watch_draining) && request_queue_.empty() && !lingering_) close();
 }
 
 std::pair<std::shared_ptr<http_stream>, std::shared_ptr<request>> server_connection::start_request(
@@ -187,6 +271,8 @@ std::pair<std::shared_ptr<http_stream>, std::shared_ptr<request>> server_connect
 
     auto stream = std::make_shared<http_stream>(++request_id_, http_req->keep_alive());
     in_progress_ = stream.get();
+    // Its body is on the connection until read to its end (where it ends may be unknown)
+    stream->set_input_pending(http_req->has_pending_body() || !http_req->has_valid_framing());
 
     // The client may wait for 100 Continue before sending the body: sent once the body is
     // read, unless the client already started sending it
@@ -218,6 +304,8 @@ void server_connection::reject_request() {
         LOG_ERROR("invalid http request");
     }
     auto stream = std::make_shared<http_stream>(++request_id_, false);
+    // The rest of the request may still be arriving
+    stream->set_input_pending(true);
     request_queue_.push(stream);
     handle_stock_error(stream, status);
 }
@@ -263,9 +351,12 @@ awaitable<void> server_connection::wait_response(const http_stream& stream) {
         if (result.index() == 0) continue;
 
         if (std::get<1>(result) == peer_state::closed) {
-            LOG_DEBUG("http client left while waiting for a response");
             frame_watch_ &= ~watch_response_start;
-            close();
+            // (or the wait was cancelled as the connection closes gracefully)
+            if (!lingering_) {
+                LOG_DEBUG("http client left while waiting for a response");
+                close();
+            }
             co_return;
         }
 
@@ -316,7 +407,11 @@ void server_connection::frame_written(http_stream& stream, const std::shared_ptr
         }
 
         if (!stream.keep_alive()) {
-            close();
+            if (written) {
+                close_after(stream);
+            } else {
+                close();
+            }
         } else {
             if (!request_queue_.empty()) {
                 request_queue_.pop();

@@ -7,6 +7,15 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- `http::server::set_lingering_close(max_bytes, timeout)` (static, for every server of the process, so that the classes keep the layout of 0.7.0 and its ABI): how long a connection closing with its request still arriving reads and drops it (see Fixed). 8 MiB and 5 s by default; 0 for either closes at once, as before.
+
+### Fixed
+
+- A connection closed after a response while the client was still sending its request (a body over the limit answered `413` before it was read, `417`, a `401` from a middleware before a body too large to discard, a request timeout, a chunked body going past the limit, a request that cannot be parsed) was closed with the body unread: the system answered the data still arriving with a reset, so a client still sending got `EPIPE` or a connection reset, and never read the response (e.g. 4 MiB sent to a route limited to 64 KiB). The server now closes such a connection gracefully (RFC 9112 section 9.6): once the response is written it stops sending, reads and drops what keeps arriving until the client closes, up to 8 MiB or for 5 s at most, and then closes. Its memory does not grow meanwhile. A body within the limit left unread is still dropped to keep the connection alive, as before. See [Limits and Timeouts per Route](README.md#limits-and-timeouts-per-route).
+- The client reads the response a server sent before the request was written whole, when writing the rest fails because the server closed the connection (`EPIPE` or a reset), as curl does: it returned the write error.
+
 ## [0.7.0] - 2026-10-19
 
 ### Added

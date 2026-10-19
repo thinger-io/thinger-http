@@ -51,6 +51,15 @@ public:
     void set_connection_timeout(std::chrono::seconds timeout);
     void set_max_listening_attempts(int attempts);
 
+    // Lingering close (RFC 9112 section 9.6): a connection closed after a response while the
+    // client may still be sending its request (e.g. a body over the limit, answered 413 before
+    // it was read) stops sending, then reads and drops what arrives, until the client closes,
+    // `max_bytes` were dropped or `timeout` passed (8 MiB and 5 s by default), and closes. Closed
+    // at once instead, the unread data makes the system reset the connection, and a client still
+    // sending may never read the response. Zero for either closes at once. It applies to every
+    // server of the process: set it before serving
+    static void set_lingering_close(size_t max_bytes, std::chrono::milliseconds timeout);
+
     // Log the header values and the start of the bodies (up to `max_length` bytes) of the
     // requests and responses: an opt-in for debugging, off by default (see body_logging).
     // Set it before the server starts, as the other settings

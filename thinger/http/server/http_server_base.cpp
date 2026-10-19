@@ -18,6 +18,10 @@ void http_server_base::set_max_listening_attempts(int attempts) {
     max_listening_attempts_ = attempts;
 }
 
+void http_server_base::set_lingering_close(size_t max_bytes, std::chrono::milliseconds timeout) {
+    server_connection::set_lingering_close(max_bytes, timeout);
+}
+
 void http_server_base::log_bodies(bool enabled, size_t max_length) {
     body_logging_ = {enabled, max_length};
 }

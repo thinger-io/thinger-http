@@ -30,6 +30,12 @@ void unix_socket::cancel() {
     socket_.cancel();
 }
 
+bool unix_socket::shutdown_send() {
+    boost::system::error_code ec;
+    socket_.shutdown(boost::asio::local::stream_protocol::socket::shutdown_send, ec);
+    return !ec;
+}
+
 awaitable<boost::system::error_code> unix_socket::connect(const std::string &path, std::chrono::seconds timeout) {
     close();
 

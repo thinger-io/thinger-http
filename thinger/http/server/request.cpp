@@ -29,7 +29,9 @@ namespace thinger::http{
             // (capturing only `this` fits in the function, without allocating)
             body_reader_.set_source([this](uint8_t* buffer, size_t size) -> thinger::awaitable<size_t> {
                 auto conn = http_connection_.lock();
-                if (!conn) co_return 0;
+                // Nothing more is read once the connection closes gracefully: it drops the
+                // rest itself (see server_connection::linger())
+                if (!conn || conn->lingering()) co_return 0;
                 // The body is needed now: ask the client for it (Expect: 100-continue)
                 if (expect_continue_) [[unlikely]] {
                     expect_continue_ = false;
@@ -223,12 +225,21 @@ namespace thinger::http{
         return body_reader_.read_ahead_available();
     }
 
+    void request::note_body_read() {
+        if (body_reader_.has_pending() || body_reader_.error() != body_error::none) return;
+        if (auto stream = http_stream_.lock()) stream->set_input_pending(false);
+    }
+
     thinger::awaitable<size_t> request::read(uint8_t* buffer, size_t size) {
-        co_return co_await body_reader_.read(buffer, size);
+        size_t bytes = co_await body_reader_.read(buffer, size);
+        note_body_read();
+        co_return bytes;
     }
 
     thinger::awaitable<size_t> request::read_some(uint8_t* buffer, size_t max_size) {
-        co_return co_await body_reader_.read_some(buffer, max_size);
+        size_t bytes = co_await body_reader_.read_some(buffer, max_size);
+        note_body_read();
+        co_return bytes;
     }
 
     // Decode the body in place according to its Content-Encoding (gzip, x-gzip, deflate, or
@@ -265,7 +276,9 @@ namespace thinger::http{
         // Nothing left to read (already read, or no body)
         if (!body_reader_.has_pending()) co_return body_reader_.error() == body_error::none;
 
-        if (!co_await body_reader_.read_all(http_request_->get_body(), body_reader_.limit())) co_return false;
+        bool read = co_await body_reader_.read_all(http_request_->get_body(), body_reader_.limit());
+        note_body_read();
+        if (!read) co_return false;
 
         auto error = decode_content_encoding(*http_request_, body_reader_.limit());
         if (error != body_error::none) {
@@ -288,7 +301,9 @@ namespace thinger::http{
     }
 
     thinger::awaitable<bool> request::discard_body(size_t max_size) {
-        co_return co_await body_reader_.discard(max_size);
+        bool discarded = co_await body_reader_.discard(max_size);
+        note_body_read();
+        co_return discarded;
     }
 
 }

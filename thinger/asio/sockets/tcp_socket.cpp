@@ -29,6 +29,12 @@ void tcp_socket::close() {
     LOG_TRACE("closing tcp socket result: {}", ec.message());
 }
 
+bool tcp_socket::shutdown_send() {
+    boost::system::error_code ec;
+    socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_send, ec);
+    return !ec;
+}
+
 void tcp_socket::cancel() {
     socket_.cancel();
 }

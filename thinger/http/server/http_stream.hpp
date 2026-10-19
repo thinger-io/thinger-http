@@ -62,6 +62,14 @@ namespace thinger::http {
         bool takeover_reader_stopped_ = false;
 
         /**
+         * Whether input of the request may still be unread on the connection: its body, until
+         * read to the end, or the rest of a request that could not be parsed. A connection
+         * closed after the response then closes gracefully (see server_connection::linger()).
+         * Here, where it takes no room
+         */
+        bool input_pending_ = false;
+
+        /**
          * Frames posted to the connection thread and not queued yet (frames are queued in
          * call order: none runs inline while one is posted)
          */
@@ -119,6 +127,14 @@ namespace thinger::http {
 
         void set_continue(continue_state state) {
             continue_ = state;
+        }
+
+        bool input_pending() const {
+            return input_pending_;
+        }
+
+        void set_input_pending(bool pending) {
+            input_pending_ = pending;
         }
 
         size_t get_queued_frames() const;

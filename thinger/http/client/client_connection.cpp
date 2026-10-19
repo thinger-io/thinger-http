@@ -398,6 +398,22 @@ awaitable<std::shared_ptr<http_response>> client_connection::exchange(std::share
         if (auto [write_ec, bytes] = written; write_ec) {
             error_ = write_ec;
             request_unsent_ = bytes == 0;
+            // The server may have answered before taking the whole request, and closed the
+            // connection (e.g. 413 for a body over its limit): its answer may be there to read,
+            // as curl does. The connection is never reused then
+            if (bytes == 0 || (write_ec != boost::asio::error::broken_pipe &&
+                               write_ec != boost::asio::error::connection_reset)) {
+                co_return;
+            }
+            response = co_await read_response(*request);
+            if (!response || response->get_status_code() == 101) {
+                response.reset();
+                error_ = write_ec;
+                co_return;
+            }
+            error_ = {};
+            reusable_ = false;
+            socket_->close();
             co_return;
         }
         response = co_await read_response(*request);
