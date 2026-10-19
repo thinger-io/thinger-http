@@ -7,6 +7,19 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- `sse_connection::set_keepalive(interval)`: a comment (`: keep-alive`) sent every `interval` the stream was quiet, 15 s by default (`DEFAULT_KEEPALIVE_INTERVAL`), 0 to disable; `send_id()`. See [SSE Server](README.md#sse-server).
+- `asio::websocket::write_message()`: one message, as `write()`, an empty one included.
+
+### Fixed
+
+- SSE fields were written unchanged, so a value with a line break (pretty-printed JSON, user text, a device payload) broke the framing: the client took each following line as a field, and `"x\nevent: admin\ndata: ..."` injected an event. `send_data()` now sends each line of its value (split on CRLF, CR or LF) as a `data:` field of its own, as the WHATWG specification requires, so the client gets the value as sent (line breaks as LF). `send_event()`, `send_id()` and `handle_write()` refuse a value with CR or LF (and an ID with NUL), logging an error and returning `false`, instead of sending it.
+- An SSE stream was closed after 60 s without sending anything, so a quiet stream (e.g. an IoT dashboard waiting for changes) died every minute. It now sends a keep-alive comment instead (see Added); a client gone is still noticed by reading the connection.
+- The connect timeout of `tcp_socket` and `unix_socket` was a coroutine detached from `connect()` holding references to its frame: when the timer completed along with the connection, it could run after `connect()` returned, writing to the freed frame and cancelling the next operation on the socket (the TLS handshake of an `ssl_socket`). The connect and its timer now race with `||`, both ended before `connect()` returns, in one helper (`asio::with_timeout()`); a connect timed out closes the socket.
+- An empty WebSocket message (a frame without payload, valid per RFC 6455) could not be sent: `websocket_connection::send_text("")` and `send_binary("")`, and the client's `send_text("")` and `send_binary()` of nothing, sent nothing. They now send it.
+- The WebSocket client took an empty message from the server as the end of the stream: `run()` stopped reading and called `on_close()` while the connection was open. It now delivers it to `on_message()`, and ends when reading fails (the connection closed or lost).
+
 ## [0.7.1] - 2026-10-19
 
 ### Added
