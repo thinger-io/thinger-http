@@ -6,7 +6,9 @@
 #include <openssl/evp.h>
 #include <set>
 #include <thread>
+#include <string>
 #include <vector>
+#include "../../fixtures/test_ca.hpp"
 
 using namespace thinger::asio;
 
@@ -675,4 +677,66 @@ TEST_CASE("Certificate manager TLS options", "[certificate_manager][tls]") {
     }
 
     REQUIRE(mgr.set_tls_options({}));
+}
+
+TEST_CASE("Certificate manager client certificate modes per host", "[certificate_manager][mtls]") {
+    auto& manager = certificate_manager::instance();
+
+    SECTION("Exact names and wildcards, case-insensitive") {
+        REQUIRE(manager.set_client_verify("Devices.Example.com", client_verify::required));
+        REQUIRE(manager.get_client_verify("devices.example.com") == client_verify::required);
+        REQUIRE(manager.get_client_verify("DEVICES.EXAMPLE.COM") == client_verify::required);
+        REQUIRE(manager.set_client_verify("*.wild.example.com", client_verify::optional));
+        REQUIRE(manager.get_client_verify("a.wild.example.com") == client_verify::optional);
+        REQUIRE_FALSE(manager.get_client_verify("a.b.wild.example.com"));
+        REQUIRE_FALSE(manager.get_client_verify("wild.example.com"));
+        REQUIRE_FALSE(manager.get_client_verify("other.example.com"));
+        // replaced
+        REQUIRE(manager.set_client_verify("devices.example.com", client_verify::optional));
+        REQUIRE(manager.get_client_verify("devices.example.com") == client_verify::optional);
+
+        REQUIRE(manager.remove_client_verify("devices.example.com"));
+        REQUIRE(manager.remove_client_verify("*.wild.example.com"));
+        REQUIRE_FALSE(manager.get_client_verify("devices.example.com"));
+        REQUIRE_FALSE(manager.get_client_verify("a.wild.example.com"));
+        REQUIRE_FALSE(manager.remove_client_verify("devices.example.com"));
+    }
+
+    SECTION("Names that are not host names are refused") {
+        for (std::string name : {"", "*", "*.", "bad host", "a*.example.com", "a..example.com", ".example.com",
+                                 "example.com.", "host/path", std::string(64, 'a') + ".com"}) {
+            REQUIRE_FALSE(manager.set_client_verify(name, client_verify::required));
+        }
+        REQUIRE(manager.set_client_verify("under_score-1.example.com", client_verify::none));
+        REQUIRE(manager.remove_client_verify("under_score-1.example.com"));
+    }
+
+    SECTION("Set and read from several threads") {
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 4; ++t) {
+            threads.emplace_back([&manager, t] {
+                for (int i = 0; i < 200; ++i) {
+                    auto host = "host" + std::to_string(t) + "-" + std::to_string(i % 10) + ".example.com";
+                    manager.set_client_verify(host, client_verify::optional);
+                    manager.get_client_verify(host);
+                    manager.remove_client_verify(host);
+                }
+            });
+        }
+        for (auto& thread : threads) thread.join();
+        REQUIRE_FALSE(manager.get_client_verify("host0-0.example.com"));
+    }
+}
+
+TEST_CASE("use_certificate checks the certificate and its key", "[certificate_manager][mtls]") {
+    thinger::http::test::test_ca ca;
+    auto certificate = ca.issue("localhost");
+    auto other = ca.issue("other");
+    boost::asio::ssl::context context(boost::asio::ssl::context::tls_server);
+    REQUIRE(use_certificate(context, certificate.first, certificate.second) == certificate_error::none);
+    REQUIRE(use_certificate(context, "garbage", certificate.second) == certificate_error::invalid_certificate);
+    boost::asio::ssl::context mismatched(boost::asio::ssl::context::tls_server);
+    REQUIRE(use_certificate(mismatched, certificate.first, other.second) == certificate_error::key_mismatch);
+    boost::asio::ssl::context unreadable(boost::asio::ssl::context::tls_server);
+    REQUIRE(use_certificate(unreadable, certificate.first, "garbage") == certificate_error::invalid_private_key);
 }

@@ -4,8 +4,31 @@
 #include <cstring>
 
 #include <boost/asio/ssl/host_name_verification.hpp>
+#include <openssl/x509.h>
 
 namespace thinger::asio {
+
+namespace {
+
+    // A certificate, DER encoded
+    std::string to_der(X509* certificate) {
+        int size = i2d_X509(certificate, nullptr);
+        if (size <= 0) return {};
+        std::string der(static_cast<size_t>(size), '\0');
+        auto* data = reinterpret_cast<unsigned char*>(der.data());
+        i2d_X509(certificate, &data);
+        return der;
+    }
+
+    // An earlier session resumed without a client certificate, where the host name (SNI)
+    // requires one: no certificate is asked for when a session is resumed, and the mode of the
+    // host is set once OpenSSL decided to resume it
+    bool resumed_without_certificate(SSL* ssl) {
+        return SSL_session_reused(ssl) && (SSL_get_verify_mode(ssl) & SSL_VERIFY_FAIL_IF_NO_PEER_CERT) &&
+               SSL_get0_peer_certificate(ssl) == nullptr;
+    }
+
+}
 
 ssl_socket::ssl_socket(const std::string& context, boost::asio::io_context& io_context,
                        const std::shared_ptr<boost::asio::ssl::context>& ssl_context)
@@ -63,8 +86,47 @@ awaitable<boost::system::error_code> ssl_socket::handshake(const std::string& ho
         auto [ec] = co_await ssl_stream_.async_handshake(
             boost::asio::ssl::stream_base::server,
             use_nothrow_awaitable);
+        if (!ec && resumed_without_certificate(ssl_stream_.native_handle())) {
+            close();
+            co_return boost::asio::error::access_denied;
+        }
         co_return ec;
     }
+}
+
+void ssl_socket::set_client_verify(std::shared_ptr<const client_verify_policy> policy) {
+    client_verify_ = std::move(policy);
+    if (client_verify_) client_verify_->apply(ssl_stream_.native_handle());
+}
+
+X509* ssl_socket::peer_certificate() const {
+    return SSL_get0_peer_certificate(const_cast<ssl_socket*>(this)->ssl_stream_.native_handle());
+}
+
+STACK_OF(X509)* ssl_socket::peer_chain() const {
+    return SSL_get_peer_cert_chain(const_cast<ssl_socket*>(this)->ssl_stream_.native_handle());
+}
+
+std::optional<tls_session> ssl_socket::tls() const {
+    SSL* ssl = const_cast<ssl_socket*>(this)->ssl_stream_.native_handle();
+    if (!SSL_is_init_finished(ssl)) return std::nullopt;
+    tls_session session;
+    session.version = SSL_get_version(ssl);
+    if (const SSL_CIPHER* cipher = SSL_get_current_cipher(ssl)) session.cipher = SSL_CIPHER_get_name(cipher);
+    if (const char* name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)) session.server_name = name;
+    session.resumed = SSL_session_reused(ssl) == 1;
+    session.verify_result = SSL_get_verify_result(ssl);
+    X509* leaf = SSL_get0_peer_certificate(ssl);
+    if (!leaf) return session;
+    session.peer_chain_der.push_back(to_der(leaf));
+    // The chain of the client has no leaf; the one of the server does
+    STACK_OF(X509)* chain = SSL_get_peer_cert_chain(ssl);
+    for (int i = 0; i < sk_X509_num(chain); ++i) {
+        X509* certificate = sk_X509_value(chain, i);
+        if (i == 0 && X509_cmp(certificate, leaf) == 0) continue;
+        session.peer_chain_der.push_back(to_der(certificate));
+    }
+    return session;
 }
 
 size_t ssl_socket::take_read_ahead(uint8_t buffer[], size_t size) {

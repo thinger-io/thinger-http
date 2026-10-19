@@ -9,7 +9,10 @@
 #include <regex>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <boost/asio/ssl/context.hpp>
+#include <openssl/ssl.h>
+#include "tls_session.hpp"
 
 namespace thinger::asio {
 
@@ -50,6 +53,22 @@ struct tls_options {
 // refuses one of them (e.g. a cipher list without any cipher it knows)
 bool apply_tls_options(boost::asio::ssl::context& context, const tls_options& options);
 
+// Why a certificate and its key cannot be used (see use_certificate())
+enum class certificate_error : uint8_t {
+    none,
+    invalid_certificate,    // the certificate, or a certificate of its chain, cannot be read
+    invalid_private_key,    // the key cannot be read (an encrypted key included)
+    key_mismatch,           // the key is not the one of the certificate
+};
+
+// Use a certificate on `context`: its chain (PEM: the certificate first, then the intermediate
+// certificates sent along with it) and its private key (PEM, not encrypted: the context is
+// given a password callback that answers none, so an encrypted key fails instead of asking
+// for its password on the terminal). Checks that the key is the certificate's. Why not, if
+// they cannot be used, and logged (never the key itself); the context may be half set then
+certificate_error use_certificate(boost::asio::ssl::context& context, std::string_view certificate_chain,
+                                  std::string_view private_key);
+
 // Certificates of the TLS servers: a default one, and one per host name selected by SNI (exact
 // or wildcard). The contexts it creates (from PEM, or the self-signed default) have its TLS
 // options (see set_tls_options()), the certificate of a host included, so SNI cannot lower them.
@@ -59,6 +78,11 @@ bool apply_tls_options(boost::asio::ssl::context& context, const tls_options& op
 // the listener, which OpenSSL would otherwise take from the context switched to), so neither
 // can a context given ready-made lower them. Those keep their own settings otherwise
 // (apply_tls_options() sets these options on one).
+//
+// A host name may also ask for client certificates in a mode of its own (see
+// set_client_verify()), e.g. the host of the devices in a listener that asks for none. Every
+// context it creates or is given has the same session id context, so that sessions with client
+// certificates can be resumed.
 class certificate_manager {
 private:
     // Private constructor for singleton
@@ -70,9 +94,13 @@ private:
     certificate_manager(certificate_manager&&) = delete;
     certificate_manager& operator=(certificate_manager&&) = delete;
     
-    // Install the server name callback (see sni_callback()) on a context, before any
-    // handshake uses it: listeners do not write it into contexts shared with running servers
-    static void install_sni_callback(boost::asio::ssl::context& context);
+    // Install the server name callback (see sni_callback()), the client hello callback (which
+    // keeps the host name asked for) and the session id context on a context, before any
+    // handshake uses it: listeners do not write them into contexts shared with running servers
+    static void prepare_context(boost::asio::ssl::context& context);
+
+    // The key a host name is stored with: itself, or a regex for a wildcard (*.domain)
+    static std::string host_key(const std::string& hostname);
 
     // Create base SSL context with common settings, and the TLS options
     static std::shared_ptr<boost::asio::ssl::context> create_base_ssl_context(const tls_options& options);
@@ -84,6 +112,9 @@ private:
     
     // Certificate storage with regex support for wildcards
     std::unique_ptr<regex_map<std::shared_ptr<boost::asio::ssl::context>>> ssl_contexts_;
+
+    // Client certificate modes by host name (lowercase), as the certificates
+    std::unique_ptr<regex_map<client_verify>> client_verify_;
     
     // Default certificate context
     std::shared_ptr<boost::asio::ssl::context> default_context_;
@@ -116,6 +147,11 @@ private:
     // The context of a handshake: the certificate of the host name (SNI), or the default one
     // (none if there is no default yet)
     std::shared_ptr<boost::asio::ssl::context> select_context(const char* hostname) const;
+
+    // Ask the client of a handshake for its certificate in the mode of its host name, if it
+    // has one, or in the mode of the listener, with the CAs and limits of the listener (which
+    // switching the context dropped). Nothing if neither asks: the SSL keeps its settings
+    void apply_client_verify(SSL* ssl, const char* hostname) const;
     
 public:
     // Singleton instance
@@ -147,6 +183,19 @@ public:
     
     // Get all registered hostnames
     std::set<std::string> get_registered_hosts() const;
+
+    // Client certificates of the handshakes whose host name (SNI) is `hostname`: exact or a
+    // wildcard ("*.domain"), as the certificates, but case-insensitive. Other hosts keep the
+    // mode of their listener (see tcp_socket_server::enable_ssl()), whose trusted CAs and limits
+    // apply (deferred validation on a listener that asks for none). Applies to the next
+    // handshakes of the servers already listening. False if `hostname` is not a host name.
+    // A session is never resumed without a certificate on a host that requires one
+    bool set_client_verify(const std::string& hostname, client_verify mode);
+    // Back to the mode of the listener: false if `hostname` had no mode of its own
+    bool remove_client_verify(const std::string& hostname);
+    // The mode of the handshakes with the host name `hostname` (wildcards resolved), if it has
+    // one of its own
+    std::optional<client_verify> get_client_verify(const std::string& hostname) const;
     
     // TLS options of the contexts created from now on (those created before keep theirs): set
     // them before the certificates, and before listening. False if OpenSSL refuses them, then
@@ -170,8 +219,9 @@ public:
     
     // Server name callback of the handshakes, installed on every context the manager creates
     // or is given: switches to the certificate of the host name, or to the default certificate
-    // when it is not the one the listener was created with. OpenSSL calls it with or without
-    // SNI, from the context of the listener
+    // when it is not the one the listener was created with, and asks for the client
+    // certificate in the mode of the host name (see set_client_verify()). OpenSSL calls it with
+    // or without SNI, from the context of the listener
     static int sni_callback(SSL* ssl, int* al, void* arg);
 };
 

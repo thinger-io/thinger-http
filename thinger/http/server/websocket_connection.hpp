@@ -17,22 +17,16 @@
 
 namespace thinger::http{
 
-/// How a server WebSocket closed (see websocket_connection::on_close())
-struct websocket_close {
-    /// Status code of the closing handshake (RFC 6455, 7.4): the one of the peer's close frame
-    /// (1005 if it had none, 1002 if it was not valid); else the one this end closed with, as
-    /// 1000 (stop()), 1001 (server shutdown, or idle), 1007 or 1009 (a message not valid, or too
-    /// large), 1011 (on_message() threw) or 1013 (it did not keep up, see write_limits); 1006
-    /// if no close frame was exchanged: the connection was lost, or closed by the server at the
-    /// end of a shutdown's grace period. When this end closed first and the peer answered
-    /// while the websocket was still reading (stop(), the shutdown), it is the code of the
-    /// peer's answer, its echo, as Node's ws reports it
-    uint16_t code = asio::websocket::CLOSE_ABNORMAL;
-    /// Reason of the peer's close frame, if any (not validated as UTF-8)
-    std::string reason;
-    /// Whether the peer closed first (sent its close frame before this end did)
-    bool remote = false;
-};
+/// How a server WebSocket closed (see websocket_connection::on_close() and
+/// asio::websocket_close). The status code (RFC 6455, 7.4) is the one of the peer's close frame
+/// (1005 if it had none, 1002 if it was not valid); else the one this end closed with, as 1000
+/// (stop()), 1001 (server shutdown, or idle), 1007 or 1009 (a message not valid, or too large),
+/// 1011 (on_message() threw) or 1013 (it did not keep up, see write_limits); 1006 if no close
+/// frame was exchanged: the connection was lost, or closed by the server at the end of a
+/// shutdown's grace period. When this end closed first and the peer answered while the
+/// websocket was still reading (stop(), the shutdown), it is the code of the peer's answer, its
+/// echo, as Node's ws reports it
+using websocket_close = asio::websocket_close;
 
 /**
  * A server WebSocket exchanging whole messages: received with on_message(), sent with

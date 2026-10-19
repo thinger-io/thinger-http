@@ -23,7 +23,10 @@ namespace thinger::http {
         proxy_authentication_required,  // the proxy answered CONNECT with 407 (see client_response::status())
         proxy_tunnel_failed,        // the proxy answered CONNECT with another status than 2xx, or sent data before the origin
         invalid_proxy,              // the proxy URL is invalid or not supported (only http:// proxies are)
-        bad_content_encoding        // the body is not valid gzip or deflate, as its Content-Encoding says (corrupt or truncated)
+        bad_content_encoding,       // the body is not valid gzip or deflate, as its Content-Encoding says (corrupt or truncated)
+        invalid_client_certificate, // the client certificate, or a certificate of its chain, could not be read (file or PEM)
+        invalid_client_key,         // the private key of the client certificate could not be read (file or PEM), or is encrypted
+        client_key_mismatch         // the private key is not the one of the client certificate
     };
 
     const boost::system::error_category& client_error_category();

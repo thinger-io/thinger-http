@@ -1,5 +1,8 @@
 #include "certificate_manager.hpp"
+#include "client_verify.hpp"
+#include "../../util/ascii.hpp"
 #include "../../util/logger.hpp"
+#include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <string_view>
@@ -87,6 +90,119 @@ namespace {
         return set_tls_options(test.native_handle(), options);
     }
 
+    // The session id context of every context of the manager
+    constexpr std::string_view SESSION_ID_CONTEXT = "thinger-http";
+
+    // Where an SSL keeps the host name its client asked for (see client_hello_callback())
+    int requested_name_index() {
+        static const int index = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr,
+            [](void* /*parent*/, void* name, CRYPTO_EX_DATA* /*data*/, int /*index*/, long /*argl*/, void* /*argp*/) {
+                delete static_cast<std::string*>(name);
+            });
+        return index;
+    }
+
+    // The first host name of the server_name extension of a ClientHello (RFC 6066, 3), if any
+    std::optional<std::string> client_hello_server_name(SSL* ssl) {
+        const unsigned char* data = nullptr;
+        size_t size = 0;
+        if (SSL_client_hello_get0_ext(ssl, TLSEXT_TYPE_server_name, &data, &size) != 1 || size < 2) return std::nullopt;
+        if (((size_t(data[0]) << 8) | data[1]) != size - 2) return std::nullopt;
+        for (size_t i = 2; i + 3 <= size;) {
+            size_t length = (size_t(data[i + 1]) << 8) | data[i + 2];
+            if (i + 3 + length > size) return std::nullopt;
+            if (data[i] == TLSEXT_NAMETYPE_host_name) return std::string(reinterpret_cast<const char*>(data) + i + 3, length);
+            i += 3 + length;
+        }
+        return std::nullopt;
+    }
+
+    // Keep the host name the client asks for: the SNI callback gets the one of the session
+    // instead when a TLS 1.2 session is resumed (see SSL_get_servername()), and the mode of the
+    // host asked for must apply (see certificate_manager::set_client_verify())
+    int client_hello_callback(SSL* ssl, int* alert, void* /*arg*/) {
+        try {
+            auto name = client_hello_server_name(ssl);
+            // called again after a HelloRetryRequest
+            delete static_cast<std::string*>(SSL_get_ex_data(ssl, requested_name_index()));
+            SSL_set_ex_data(ssl, requested_name_index(), name ? new std::string(std::move(*name)) : nullptr);
+            return SSL_CLIENT_HELLO_SUCCESS;
+        } catch (const std::exception&) {
+            if (alert) *alert = SSL_AD_INTERNAL_ERROR;
+            return SSL_CLIENT_HELLO_ERROR;
+        }
+    }
+
+    // The host name the client of a handshake asked for, as it sent it (none if none)
+    const char* requested_name(const SSL* ssl) {
+        if (const auto* name = static_cast<const std::string*>(SSL_get_ex_data(ssl, requested_name_index()))) {
+            return name->c_str();
+        }
+        return SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    }
+
+    // Password callback of the keys: none, so an encrypted key fails
+    int no_password(char* /*buffer*/, int /*size*/, int /*rwflag*/, void* /*user_data*/) {
+        return -1;
+    }
+
+    // Whether an error loading a key says it is not the key of the certificate
+    bool key_mismatch(const boost::system::error_code& ec) {
+        auto error = static_cast<unsigned long>(ec.value());
+        return ec.category() == boost::asio::error::get_ssl_category() && ERR_GET_LIB(error) == ERR_LIB_X509 &&
+               (ERR_GET_REASON(error) == X509_R_KEY_VALUES_MISMATCH || ERR_GET_REASON(error) == X509_R_KEY_TYPE_MISMATCH);
+    }
+
+    // Letters, digits, hyphens and underscores
+    bool host_label_char(char c) {
+        c = util::ascii::to_lower(c);
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+    }
+
+    // A host name, or a wildcard (*.domain): labels of up to 63 characters
+    bool valid_host_name(std::string_view hostname) {
+        if (hostname.starts_with("*.")) hostname.remove_prefix(2);
+        if (hostname.empty() || hostname.size() > 253) return false;
+        size_t label = 0;
+        for (char c : hostname) {
+            if (c != '.') {
+                if (!host_label_char(c) || ++label > 63) return false;
+            } else if (std::exchange(label, 0) == 0) {
+                return false;
+            }
+        }
+        return label > 0;
+    }
+
+}
+
+certificate_error use_certificate(boost::asio::ssl::context& context, std::string_view certificate_chain,
+                                  std::string_view private_key) {
+    boost::system::error_code ec;
+    context.use_certificate_chain(boost::asio::buffer(certificate_chain.data(), certificate_chain.size()), ec);
+    if (ec) {
+        LOG_ERROR("cannot read the certificate chain: {}", ec.message());
+        return certificate_error::invalid_certificate;
+    }
+    SSL_CTX_set_default_passwd_cb(context.native_handle(), no_password);
+    context.use_private_key(boost::asio::buffer(private_key.data(), private_key.size()),
+                            boost::asio::ssl::context::pem, ec);
+    if (ec && key_mismatch(ec)) {
+        LOG_ERROR("the private key is not the one of the certificate");
+        return certificate_error::key_mismatch;
+    }
+    if (ec) {
+        LOG_ERROR("cannot read the private key: {}", ec.message());
+        return certificate_error::invalid_private_key;
+    }
+    // A key of another type than the certificate's is taken without error, for another
+    // certificate: the key in use has no certificate then
+    if (SSL_CTX_check_private_key(context.native_handle()) != 1) {
+        ERR_clear_error();
+        LOG_ERROR("the private key is not the one of the certificate");
+        return certificate_error::key_mismatch;
+    }
+    return certificate_error::none;
 }
 
 bool apply_tls_options(boost::asio::ssl::context& context, const tls_options& options) {
@@ -95,7 +211,8 @@ bool apply_tls_options(boost::asio::ssl::context& context, const tls_options& op
 }
 
 certificate_manager::certificate_manager() 
-    : ssl_contexts_(std::make_unique<regex_map<std::shared_ptr<boost::asio::ssl::context>>>()) {
+    : ssl_contexts_(std::make_unique<regex_map<std::shared_ptr<boost::asio::ssl::context>>>())
+    , client_verify_(std::make_unique<regex_map<client_verify>>()) {
 }
 
 certificate_manager& certificate_manager::instance() {
@@ -103,14 +220,34 @@ certificate_manager& certificate_manager::instance() {
     return instance;
 }
 
-void certificate_manager::install_sni_callback(boost::asio::ssl::context& context) {
+void certificate_manager::prepare_context(boost::asio::ssl::context& context) {
     SSL_CTX_set_tlsext_servername_callback(context.native_handle(), sni_callback);
+    SSL_CTX_set_client_hello_cb(context.native_handle(), client_hello_callback, nullptr);
+    SSL_CTX_set_session_id_context(context.native_handle(),
+                                   reinterpret_cast<const unsigned char*>(SESSION_ID_CONTEXT.data()),
+                                   SESSION_ID_CONTEXT.size());
+}
+
+std::string certificate_manager::host_key(const std::string& hostname) {
+    // Check if the hostname is a wildcard (e.g., *.example.com)
+    static const std::regex wildcard_regex(R"(^\*\.(.*)$)");
+    std::smatch match;
+    if (!std::regex_search(hostname, match, wildcard_regex)) return hostname;
+    // Get domain (e.g., example.com)
+    std::string wildcard_domain = match[1].str();
+    // Replace domain dots with "\." for the regex
+    wildcard_domain = std::regex_replace(wildcard_domain, std::regex("\\."), "\\.");
+    // Compute wildcard regex hostname (std::regex doesn't support named groups)
+    // This will match any subdomain followed by the domain
+    std::string key = "^[^.]+\\." + wildcard_domain + "$";
+    LOG_DEBUG("Computed wildcard regex: {}", key);
+    return key;
 }
 
 std::shared_ptr<boost::asio::ssl::context> certificate_manager::create_base_ssl_context(const tls_options& options) {
     auto context = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
     context->set_options(boost::asio::ssl::context::single_dh_use);
-    install_sni_callback(*context);
+    prepare_context(*context);
     // Validated when set (see set_tls_options()), so this fails only if OpenSSL changed its mind
     if (!apply_tls_options(*context, options)) {
         LOG_ERROR("cannot set the TLS options of a new context");
@@ -130,21 +267,7 @@ std::shared_ptr<boost::asio::ssl::context> certificate_manager::create_ssl_conte
     }
     auto context = create_base_ssl_context(options);
     if (!context) return nullptr;
-
-    boost::system::error_code ec;
-    context->use_certificate_chain(boost::asio::buffer(cert_chain.data(), cert_chain.size()), ec);
-    if (ec) {
-        LOG_ERROR("Cannot set certificate chain: {}", ec.message());
-        return nullptr;
-    }
-
-    context->use_private_key(boost::asio::buffer(private_key.data(), private_key.size()),
-                           boost::asio::ssl::context::pem, ec);
-    if (ec) {
-        LOG_ERROR("Cannot set private key: {}", ec.message());
-        return nullptr;
-    }
-
+    if (use_certificate(*context, cert_chain, private_key) != certificate_error::none) return nullptr;
     return context;
 }
 
@@ -163,26 +286,10 @@ bool certificate_manager::set_certificate(const std::string& hostname,
         return false;
     }
     // It may become the default one (default host)
-    install_sni_callback(*ssl_context);
-    
+    prepare_context(*ssl_context);
+    std::string computed_hostname = host_key(hostname);
+
     std::lock_guard<std::mutex> lock(mutex_);
-    
-    std::string computed_hostname = hostname;
-    
-    // Check if the hostname is a wildcard (e.g., *.example.com)
-    static std::regex wildcard_regex(R"(^\*\.(.*)$)");
-    std::smatch match;
-    if (std::regex_search(hostname, match, wildcard_regex)) {
-        // Get domain (e.g., example.com)
-        std::string wildcard_domain = match[1].str();
-        // Replace domain dots with "\." for the regex
-        wildcard_domain = std::regex_replace(wildcard_domain, std::regex("\\."), "\\.");
-        // Compute wildcard regex hostname (std::regex doesn't support named groups)
-        // This will match any subdomain followed by the domain
-        computed_hostname = "^[^.]+\\." + wildcard_domain + "$";
-        LOG_DEBUG("Computed wildcard certificate regex: {}", computed_hostname);
-    }
-    
     ssl_contexts_->set(computed_hostname, ssl_context, hostname);
     
     if (default_host_ == hostname) {
@@ -216,7 +323,7 @@ bool certificate_manager::remove_certificate(const std::string& hostname) {
 
 void certificate_manager::set_default_certificate(std::shared_ptr<boost::asio::ssl::context> ssl_context) {
     LOG_INFO("Setting default SSL certificate");
-    if (ssl_context) install_sni_callback(*ssl_context);
+    if (ssl_context) prepare_context(*ssl_context);
     std::lock_guard<std::mutex> lock(mutex_);
     default_context_ = ssl_context;
 }
@@ -253,6 +360,44 @@ std::string certificate_manager::get_default_host() const {
 std::set<std::string> certificate_manager::get_registered_hosts() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return ssl_contexts_->keys();
+}
+
+bool certificate_manager::set_client_verify(const std::string& hostname, client_verify mode) {
+    if (!valid_host_name(hostname)) {
+        LOG_ERROR("invalid host name for client certificates: {}", hostname);
+        return false;
+    }
+    std::string name = hostname;
+    util::ascii::to_lower(name);
+    LOG_INFO("Client certificates of {}: {}", name, static_cast<int>(mode));
+    auto key = host_key(name);
+    std::lock_guard<std::mutex> lock(mutex_);
+    client_verify_->set(key, mode, name);
+    return true;
+}
+
+bool certificate_manager::remove_client_verify(const std::string& hostname) {
+    std::string name = hostname;
+    util::ascii::to_lower(name);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!client_verify_->keys().contains(name)) return false;
+    client_verify_->erase(name);
+    return true;
+}
+
+std::optional<client_verify> certificate_manager::get_client_verify(const std::string& hostname) const {
+    std::string name = hostname;
+    util::ascii::to_lower(name);
+    std::lock_guard<std::mutex> lock(mutex_);
+    return client_verify_->get(name);
+}
+
+void certificate_manager::apply_client_verify(SSL* ssl, const char* hostname) const {
+    auto mode = hostname ? get_client_verify(hostname) : std::nullopt;
+    const auto* policy = client_verify_policy::of(ssl);
+    if (!policy && !mode) return;
+    if (!policy) policy = &client_verify_policy::deferred();
+    policy->set_mode(ssl, mode.value_or(policy->options().mode));
 }
 
 bool certificate_manager::update_tls_options(const tls_options& options) {
@@ -399,7 +544,8 @@ int certificate_manager::sni_callback(SSL* ssl, int* al, void* arg) {
         // The default certificate may have been replaced since the listener took it. The
         // connection holds a reference to the context it switches to, which outlives a later
         // replacement
-        auto context = certificate_manager::instance().select_context(hostname);
+        auto& manager = certificate_manager::instance();
+        auto context = manager.select_context(hostname);
         if (context && context->native_handle() != SSL_get_SSL_CTX(ssl)) {
             // OpenSSL takes the certificate of the context switched to, but also its cipher
             // list and security level: the handshake keeps those of the listener (as its
@@ -414,6 +560,7 @@ int certificate_manager::sni_callback(SSL* ssl, int* al, void* arg) {
             }
             SSL_set_security_level(ssl, level);
         }
+        manager.apply_client_verify(ssl, requested_name(ssl));
     } catch (const std::exception& e) {
         LOG_ERROR("cannot select the certificate for hostname {}: {}", hostname ? hostname : "", e.what());
         return SSL_TLSEXT_ERR_ALERT_FATAL;

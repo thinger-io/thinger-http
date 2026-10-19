@@ -98,6 +98,24 @@ public:
     // Trust the system CAs (the default); false trusts only those added
     http_client_base& use_system_ca(bool enabled) { system_ca_ = enabled; return *this; }
 
+    // Certificate the client presents to the servers that ask for one (TLS client
+    // authentication), on every TLS connection: requests, WebSockets and proxy tunnels. The
+    // certificate (PEM), its private key (PEM, not encrypted) and, optionally, the
+    // intermediate certificates sent along with it (PEM, one or more). Checked now: an error
+    // if one cannot be read (client_error::invalid_client_certificate or invalid_client_key,
+    // an encrypted key included) or the key is not the certificate's (client_key_mismatch),
+    // and the current one is kept; logged, never the key. Files are read now: set it again to
+    // read them again. It may be replaced while requests run: connections already open (and
+    // pooled) keep the one they were opened with, new ones take the new one
+    boost::system::error_code client_certificate(const std::string& certificate, const std::string& private_key,
+                                                 const std::string& chain = "");
+    boost::system::error_code client_certificate_file(const std::string& certificate_path,
+                                                      const std::string& private_key_path,
+                                                      const std::string& chain_path = "");
+    // Present no certificate (the default)
+    void clear_client_certificate();
+    bool has_client_certificate() const;
+
     // Keep-alive pool (see connection_pool): idle connections kept per origin (0 disables
     // it: a new connection for each request), in total, and for how long
     http_client_base& max_idle_connections_per_host(size_t max);
@@ -177,9 +195,20 @@ private:
         std::shared_ptr<boost::asio::ssl::context> context;
     };
     static constexpr size_t MAX_TLS_CONTEXTS = 32;
-    std::mutex tls_mutex_;
+    mutable std::mutex tls_mutex_;
     std::map<std::string, tls_entry> tls_contexts_;
     uint64_t next_tls_id_{0};
+
+    // The client certificate (see client_certificate()): its chain (PEM, the certificate
+    // first) and key, and what tells it apart in the TLS contexts (0: none). Guarded by
+    // tls_mutex_
+    struct client_identity {
+        std::string chain;
+        std::string key;
+        uint64_t id = 0;
+    };
+    client_identity identity_;
+    uint64_t next_identity_id_{0};
 
     // The proxy of a request: none, with an error if it is set but cannot be used
     proxy_resolver::choice select_proxy(const http_request& request) const;

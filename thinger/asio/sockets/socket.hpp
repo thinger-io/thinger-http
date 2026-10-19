@@ -5,6 +5,7 @@
 #include <mutex>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string_view>
 
 #include <boost/asio.hpp>
@@ -12,6 +13,7 @@
 #include <boost/system/error_code.hpp>
 
 #include "../../util/types.hpp"
+#include "../ssl/tls_session.hpp"
 
 namespace thinger::asio {
 
@@ -115,6 +117,10 @@ public:
     virtual std::string get_remote_ip() const;
     virtual std::string get_local_port() const;
     virtual std::string get_remote_port() const;
+    // TLS details of the connection once its handshake is done: none for a plain socket (the
+    // default), or before the handshake or once closed. A socket running on another one (a
+    // websocket) answers for it, so the caller never casts
+    virtual std::optional<tls_session> tls() const;
 
     // other methods
     boost::asio::io_context &get_io_context() const;

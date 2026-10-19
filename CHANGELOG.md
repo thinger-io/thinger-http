@@ -7,6 +7,28 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- Client certificates on TLS servers (mutual TLS): `tcp_socket_server::enable_ssl(bool, asio::client_verify_options)`, with the mode (`asio::client_verify`: `none`, `optional`, `required`), the trusted CAs (PEM; none for deferred validation: the handshake accepts any well-formed chain once the client proves it holds the key of its certificate, and the application validates the chain), `max_depth` (4) and `max_cert_list` (16 KiB, the memory a client may use before it is authenticated). With trusted CAs a certificate presented that does not validate fails the handshake, also in `optional` mode. It returns `false` if the trusted CAs cannot be read, and the server then serves no connection. The mode is set on each connection, never on the context listened with, which other listeners may share. See [Client Certificates](README.md#client-certificates).
+- `certificate_manager::set_client_verify(hostname, mode)`, `remove_client_verify()` and `get_client_verify()`: a mode of its own for a host name (SNI), exact or `*.domain` as the certificates, case-insensitive, applied in the SNI callback; other hosts keep the mode of their listener. A session resumed without a certificate on a host that requires one fails the handshake.
+- `asio::tls_session` and the virtual `socket::tls()`: the version, cipher, server name (SNI), whether the session was resumed, the certificates of the peer (DER, its leaf first) and the result of their validation, once the handshake is done; `std::nullopt` for a plain socket. A WebSocket answers for the socket it runs on. `ssl_socket::peer_certificate()` and `peer_chain()`: the certificate and chain of the peer, without copies.
+- `tcp_socket_server::set_handshake_timeout()` and `get_handshake_timeout()`: how long a TLS client has to complete its handshake (see Changed).
+- `on_close()` on the WebSocket used as a socket (`asio::websocket`, `upgrade_websocket_stream()`), with an `asio::websocket_close` (`http::websocket_close` is now an alias of it): called once, whatever closed it (its close frame, `close()`, the keepalive, a protocol error, a lost connection, the socket closed by a server shutting down), with the guarantees of `websocket_connection::on_close()`. See [WebSocket Close](README.md#websocket-close).
+- Client certificates on the HTTP and WebSocket clients: `client_certificate(certificate, key, chain)`, `client_certificate_file(...)`, `clear_client_certificate()` and `has_client_certificate()`, presented on every TLS connection of the client (requests, WebSockets, proxy tunnels). Checked when set: `client_error::invalid_client_certificate`, `invalid_client_key` (an encrypted key included) or `client_key_mismatch`, and the current one is kept. See [Client Certificates](README.md#client-certificates-1).
+- `asio::use_certificate(context, chain, key)`: the loader of a certificate and its key the server and the client share, which checks that the key is the certificate's.
+
+### Changed
+
+- A TLS client has 60 seconds (nginx's `ssl_handshake_timeout`) to complete its handshake once accepted by a `tcp_socket_server`, the HTTPS servers included: the connection is closed otherwise, without reaching the handler. There was no limit, so a client that sent nothing held its connection until it left. `stop()` also closes the connections whose handshake is pending, which no longer reach the handler once it returns.
+- Handshakes that fail are logged as warnings (they were errors), and those that time out at debug level: any client causes them.
+- Every context of `certificate_manager` (created, or given with `set_certificate()` and `set_default_certificate()`) gets the session id context `thinger-http`, so sessions with client certificates can be resumed; a listener asking for certificates sets one of its own on each connection.
+- Private keys are read without a password callback: an encrypted key fails with an error instead of asking for its password on the terminal (OpenSSL's default), in `certificate_manager` too.
+- `close_notifier` moved to `thinger/util/close_notifier.hpp` (`thinger::util`); the old header still includes it, as an alias.
+
+### Deprecated
+
+- `tcp_socket_server::enable_ssl(bool, bool client_certificate)`: use `enable_ssl(bool, client_verify_options)`. `true` asks for an optional certificate with deferred validation (it did nothing before); `enable_ssl()` and `enable_ssl(true)` take the new overload.
+
 ## [0.7.1] - 2026-10-19
 
 ### Added
