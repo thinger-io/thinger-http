@@ -1610,6 +1610,8 @@ if (auto ws = client.request("wss://server.com/ws")
 
 The synchronous calls (`send_text()`, `send_binary()`, `receive()`, `close()`) wait running the io_context of the socket. On the strand a WebSocket was opened from (e.g. by `executor_client` from a coroutine on a strand), where they would wait forever, they throw `std::logic_error`: use the coroutine API there (`send_text_async()`, `receive_async()`...).
 
+Empty messages are messages, both ways (RFC 6455 allows them): `send_text("")` sends one, and `receive()` returns one as an empty string while `is_open()` stays `true` (an empty string with the connection closed is the end). With `run()`, `on_message()` gets them, and `on_close()` is called only once the connection closed.
+
 ### WebSocket Client (Async Callback)
 
 ```cpp

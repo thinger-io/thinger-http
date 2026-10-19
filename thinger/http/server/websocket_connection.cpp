@@ -260,7 +260,7 @@ namespace thinger::http{
             ws_->set_binary(message.binary);
 
             flow_.write_started(*this, [](websocket_connection& self){ self.close_congested("its write timed out"); });
-            auto [write_ec, write_bytes] = co_await ws_->write(std::string_view(message.data));
+            auto [write_ec, write_bytes] = co_await ws_->write_message(message.data);
             flow_.write_finished();
 
             flow_.remove(message.data.size());

@@ -25,7 +25,8 @@ namespace thinger::asio {
 //   returns data from one frame at most, and never 0 bytes (empty frames are skipped).
 // - Each write sends one message (unfragmented), binary by default (see set_binary()). Writes
 //   may be called while another one is pending, from several coroutines: they are sent one
-//   after another, in call order. Writing 0 bytes sends nothing. A write interrupted in the
+//   after another, in call order. Writing 0 bytes sends nothing (write_message() sends an
+//   empty message). A write interrupted in the
 //   middle of its frame (cancel(), or the cancellation of the operation) leaves the rest of
 //   the frame to be sent before anything else, so the framing is never broken.
 // - Pings are answered, pongs and unexpected control frames handled, while reading: some
@@ -109,6 +110,9 @@ public:
     awaitable<io_result> write(const uint8_t buffer[], size_t size) override;
     awaitable<io_result> write(std::string_view str) override;
     awaitable<io_result> write(const std::vector<boost::asio::const_buffer> &buffers) override;
+    // One message of the type set with set_binary(), as write(), but an empty one is sent too
+    // (a frame without payload), for message-oriented users
+    awaitable<io_result> write_message(std::string_view data);
 
     // Wait
     awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type) override;

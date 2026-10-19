@@ -543,6 +543,12 @@ awaitable<io_result> websocket::write(const std::vector<boost::asio::const_buffe
     co_return co_await send_frame(binary_ ? OPCODE_BINARY : OPCODE_TEXT, buffers, false);
 }
 
+awaitable<io_result> websocket::write_message(std::string_view data) {
+    // An empty message is a valid message (RFC 6455, 5.6): a frame without payload
+    co_return co_await send_frame(binary_ ? OPCODE_BINARY : OPCODE_TEXT,
+                                  {boost::asio::buffer(data.data(), data.size())}, false);
+}
+
 // ---------------------------------------------------------------------------
 // Closing
 // ---------------------------------------------------------------------------

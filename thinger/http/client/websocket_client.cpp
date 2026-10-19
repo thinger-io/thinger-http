@@ -216,19 +216,12 @@ void websocket_client::stop() {
 
 awaitable<void> websocket_client::message_loop() {
     while (running_ && is_open()) {
-        auto [message, is_binary] = co_await receive_async();
-
-        if (message.empty() && !is_open()) {
-            break;
-        }
-
-        if (message.empty()) {
-            // Error or connection closed
-            break;
-        }
+        // An empty message is a message: the loop ends when reading fails (closed or lost)
+        auto message = co_await read_message();
+        if (!message) break;
 
         if (on_message_) {
-            on_message_(message, is_binary);
+            on_message_(message->first, message->second);
         }
     }
 
@@ -247,7 +240,7 @@ awaitable<bool> websocket_client::send_text_async(std::string message) {
     if (!is_open()) co_return false;
 
     websocket_->set_binary(false);
-    auto [ec, bytes] = co_await websocket_->write(message);
+    auto [ec, bytes] = co_await websocket_->write_message(message);
     co_return !ec;
 }
 
@@ -255,28 +248,31 @@ awaitable<bool> websocket_client::send_binary_async(std::vector<uint8_t> data) {
     if (!is_open()) co_return false;
 
     websocket_->set_binary(true);
-    auto [ec, bytes] = co_await websocket_->write(data.data(), data.size());
+    auto [ec, bytes] = co_await websocket_->write_message(
+        std::string_view(reinterpret_cast<const char*>(data.data()), data.size()));
     co_return !ec;
 }
 
 awaitable<std::pair<std::string, bool>> websocket_client::receive_async() {
-    if (!is_open()) {
-        co_return std::make_pair(std::string{}, false);
-    }
+    auto message = co_await read_message();
+    if (!message) co_return std::make_pair(std::string{}, false);
+    co_return std::move(*message);
+}
 
-    // A whole message: every frame of it, read in pieces
+awaitable<std::optional<std::pair<std::string, bool>>> websocket_client::read_message() {
+    if (!is_open()) co_return std::nullopt;
+
+    // A whole message: every frame of it, read in pieces (it may be empty)
     std::string message;
     std::array<uint8_t, 65536> buffer;
     for (;;) {
         auto [ec, bytes_read] = co_await websocket_->read_message_some(buffer.data(), buffer.size());
-        if (ec) {
-            co_return std::make_pair(std::string{}, false);
-        }
+        if (ec) co_return std::nullopt;
         message.append(reinterpret_cast<const char*>(buffer.data()), bytes_read);
         if (message.size() > MAX_MESSAGE_SIZE) {
             LOG_ERROR("websocket message larger than {} bytes, closing", MAX_MESSAGE_SIZE);
             websocket_->close();
-            co_return std::make_pair(std::string{}, false);
+            co_return std::nullopt;
         }
         if (websocket_->remaining_in_frame() == 0 && websocket_->is_message_complete()) break;
     }

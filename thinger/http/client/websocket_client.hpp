@@ -76,7 +76,8 @@ public:
     /**
      * Receive the next message.
      * Blocks until a message is received or connection closes.
-     * @return {message, is_binary} pair, empty message on error/close
+     * @return {message, is_binary} pair, empty message on error/close (an empty message
+     * received is valid too: is_open() tells them apart)
      */
     std::pair<std::string, bool> receive();
 
@@ -156,7 +157,7 @@ public:
     awaitable<bool> send_binary_async(std::vector<uint8_t> data);
 
     /**
-     * Receive message asynchronously.
+     * Receive message asynchronously: as receive().
      */
     awaitable<std::pair<std::string, bool>> receive_async();
 
@@ -176,6 +177,10 @@ private:
 
     // Internal message loop coroutine
     awaitable<void> message_loop();
+
+    // The next whole message (it may be empty) and whether it is binary, or nothing once
+    // reading fails (closed or lost)
+    awaitable<std::optional<std::pair<std::string, bool>>> read_message();
 };
 
 } // namespace thinger::http

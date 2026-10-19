@@ -233,6 +233,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_message_test.cpp)
     add_thinger_test(test_integration_websocket_message integration/websocket_message_test.cpp)
 endif()
 
+# Integration tests - Empty WebSocket messages, server and client
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_empty_message_test.cpp)
+    add_thinger_test(test_integration_websocket_empty_message integration/websocket_empty_message_test.cpp)
+endif()
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_flow_control_test.cpp)
     add_thinger_test(test_integration_websocket_flow_control integration/websocket_flow_control_test.cpp)
 endif()
