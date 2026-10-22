@@ -205,6 +205,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/tls_options_test.cpp)
     add_thinger_test(test_integration_tls_options integration/tls_options_test.cpp)
 endif()
 
+# Integration tests - Client certificates on TLS servers, and the deadline of the handshake
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/tls_client_verify_test.cpp)
+    add_thinger_test(test_integration_tls_client_verify integration/tls_client_verify_test.cpp)
+endif()
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/client_keepalive_test.cpp)
     add_thinger_test(test_integration_client_keepalive integration/client_keepalive_test.cpp)
 endif()

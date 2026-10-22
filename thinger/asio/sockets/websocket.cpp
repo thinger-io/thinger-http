@@ -67,6 +67,7 @@ websocket::websocket(std::shared_ptr<socket> sock, bool binary, bool server, boo
     , server_role_(server)
     , in_(INPUT_BUFFER_SIZE)
     , close_timer_(std::make_shared<boost::asio::steady_timer>(executor_))
+    , on_close_(executor_)
     , keepalive_timer_(std::make_shared<boost::asio::steady_timer>(executor_))
     , last_received_(std::chrono::steady_clock::now()) {
     ++connections;
@@ -76,6 +77,8 @@ websocket::websocket(std::shared_ptr<socket> sock, bool binary, bool server, boo
 websocket::~websocket() {
     --connections;
     LOG_DEBUG("releasing websocket");
+    // Destroyed open: never told closed
+    on_close_.release();
     // A websocket released open on its executor says goodbye to its peer. Anywhere else no
     // I/O is started, and nothing shared with the executor is touched: the socket closes the
     // connection once released
@@ -184,8 +187,11 @@ awaitable<boost::system::error_code> websocket::fill(size_t size) {
         auto [ec, bytes] = co_await socket_->read_some(in_.data() + in_end_, in_.size() - in_end_);
         // closed meanwhile: the socket is not this websocket's anymore
         if (closed_) co_return boost::asio::error::operation_aborted;
-        if (ec) co_return ec;
-        if (bytes == 0) co_return boost::asio::error::eof;   // a socket breaking its guarantees
+        if (bytes == 0 && !ec) ec = boost::asio::error::eof;   // a socket breaking its guarantees
+        if (ec) {
+            check_lost(ec);
+            co_return ec;
+        }
         in_end_ += bytes;
         last_received_ = std::chrono::steady_clock::now();
     }
@@ -199,8 +205,11 @@ awaitable<io_result> websocket::read_payload(uint8_t buffer[], size_t max_size) 
         // Large reads go straight to the reader's buffer, never past this frame
         auto [ec, read] = co_await socket_->read_some(buffer, wanted);
         if (closed_) co_return io_result{boost::asio::error::operation_aborted, 0};
-        if (ec) co_return io_result{ec, 0};
-        if (read == 0) co_return io_result{boost::asio::error::eof, 0};   // a socket breaking its guarantees
+        if (read == 0 && !ec) ec = boost::asio::error::eof;   // a socket breaking its guarantees
+        if (ec) {
+            check_lost(ec);
+            co_return io_result{ec, 0};
+        }
         last_received_ = std::chrono::steady_clock::now();
         bytes = read;
     } else {
@@ -219,6 +228,20 @@ boost::system::error_code websocket::fail(const char* reason) {
     LOG_WARNING("websocket protocol error: {}", reason);
     close(CLOSE_PROTOCOL_ERROR);
     return protocol_error();
+}
+
+websocket_close websocket::close_status() const {
+    return websocket_close{get_close_code(), close_reason_, closed_by_peer_};
+}
+
+void websocket::check_lost(const boost::system::error_code& ec) {
+    if (!ec || closed_) return;
+    if (ec == boost::asio::error::operation_aborted && socket_->is_open()) return;
+    on_close_.notify(close_status());
+}
+
+void websocket::on_close(sync_callback<void(const websocket_close&)> callback) {
+    on_close_.set(std::move(callback));
 }
 
 awaitable<boost::system::error_code> websocket::handle_control(const frame_header& header) {
@@ -440,6 +463,7 @@ awaitable<boost::system::error_code> websocket::write_frame(uint8_t opcode,
         tail_.erase(tail_.begin(), tail_.begin() + static_cast<std::ptrdiff_t>(std::min(bytes, tail_.size())));
         if (ec) {
             if (ec != boost::asio::error::operation_aborted) write_error_ = ec;
+            check_lost(ec);
             co_return ec;
         }
     }
@@ -464,6 +488,7 @@ awaitable<boost::system::error_code> websocket::write_frame(uint8_t opcode,
     }
 
     auto [ec, bytes] = co_await socket_->write(output);
+    check_lost(ec);
     if (ec) {
         if (ec != boost::asio::error::operation_aborted) {
             write_error_ = ec;
@@ -572,6 +597,7 @@ void websocket::close(uint16_t code, bool expect_reply) {
     // client between its calls, while nothing runs its io_context) the connection is closed now
     if (close_sent_ || write_error_ || !socket_->is_open() || !running_in_this_thread(executor_)) {
         socket_->close();
+        on_close_.notify(close_status());
         return;
     }
     close_sent_ = true;
@@ -586,6 +612,7 @@ void websocket::close(uint16_t code, bool expect_reply) {
     } else {
         start_linger();
     }
+    on_close_.notify(close_status());
 }
 
 void websocket::start_linger() {
@@ -778,6 +805,10 @@ bool websocket::is_open() const {
 
 bool websocket::is_secure() const {
     return socket_->is_secure();
+}
+
+std::optional<tls_session> websocket::tls() const {
+    return socket_->tls();
 }
 
 size_t websocket::available() const {

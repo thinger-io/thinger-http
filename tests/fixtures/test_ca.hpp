@@ -8,24 +8,21 @@
 #include <openssl/x509v3.h>
 #include <atomic>
 #include <ctime>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace thinger::http::test {
 
-// A private certificate authority for TLS tests: its certificate (to trust it) and server
-// certificates it issues
+// Key types of the certificates issued
+enum class key_type { ec_p256, rsa2048, rsa3072 };
+
+// A private certificate authority for TLS tests: its certificate (to trust it), server and
+// client certificates it issues, and intermediate CAs below it
 class test_ca {
 public:
-    explicit test_ca(const std::string& name = "Thinger Test CA") {
-        key_ = EVP_EC_gen("P-256");
-        certificate_ = make(name, key_, nullptr, nullptr, {
-            {NID_basic_constraints, "critical,CA:TRUE"},
-            {NID_key_usage, "critical,keyCertSign,cRLSign"},
-        });
-        pem_ = to_pem([&](BIO* bio) { PEM_write_bio_X509(bio, certificate_); });
-    }
+    explicit test_ca(const std::string& name = "Thinger Test CA") : test_ca(name, nullptr) {}
 
     ~test_ca() {
         X509_free(certificate_);
@@ -40,16 +37,70 @@ public:
 
     // A server certificate for `host` (a DNS name or an IP address): certificate and key PEM
     std::pair<std::string, std::string> issue(const std::string& host) const {
-        EVP_PKEY* key = EVP_EC_gen("P-256");
         boost::system::error_code ec;
         boost::asio::ip::make_address(host, ec);
         std::string san = (ec ? "DNS:" : "IP:") + host;
-        X509* certificate = make(host, key, certificate_, key_, {
+        return issue_leaf(host, key_type::ec_p256, {
             {NID_subject_alt_name, san},
             {NID_basic_constraints, "CA:FALSE"},
             {NID_key_usage, "critical,digitalSignature"},
             {NID_ext_key_usage, "serverAuth"},
         });
+    }
+
+    // A client certificate (TLS client authentication) with the common name `name`:
+    // certificate and key PEM
+    std::pair<std::string, std::string> issue_client(const std::string& name, key_type type = key_type::ec_p256) const {
+        return issue_leaf(name, type, {
+            {NID_basic_constraints, "CA:FALSE"},
+            {NID_key_usage, "critical,digitalSignature"},
+            {NID_ext_key_usage, "clientAuth"},
+        });
+    }
+
+    // An intermediate CA issued by this one
+    std::unique_ptr<test_ca> issue_intermediate(const std::string& name) const {
+        return std::unique_ptr<test_ca>(new test_ca(name, this));
+    }
+
+    // The DER encoding of the first certificate of a PEM
+    static std::string der_of(const std::string& pem) {
+        BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+        X509* certificate = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+        BIO_free(bio);
+        if (!certificate) return {};
+        unsigned char* data = nullptr;
+        int size = i2d_X509(certificate, &data);
+        std::string der(reinterpret_cast<const char*>(data), static_cast<size_t>(size > 0 ? size : 0));
+        OPENSSL_free(data);
+        X509_free(certificate);
+        return der;
+    }
+
+private:
+    // A root CA (without issuer), or an intermediate one
+    test_ca(const std::string& name, const test_ca* issuer) {
+        key_ = EVP_EC_gen("P-256");
+        certificate_ = make(name, key_, issuer ? issuer->certificate_ : nullptr, issuer ? issuer->key_ : nullptr, {
+            {NID_basic_constraints, "critical,CA:TRUE"},
+            {NID_key_usage, "critical,keyCertSign,cRLSign"},
+        });
+        pem_ = to_pem([&](BIO* bio) { PEM_write_bio_X509(bio, certificate_); });
+    }
+
+    static EVP_PKEY* make_key(key_type type) {
+        switch (type) {
+            case key_type::rsa2048: return EVP_RSA_gen(2048);
+            case key_type::rsa3072: return EVP_RSA_gen(3072);
+            case key_type::ec_p256: break;
+        }
+        return EVP_EC_gen("P-256");
+    }
+
+    std::pair<std::string, std::string> issue_leaf(const std::string& name, key_type type,
+                                                   const std::vector<std::pair<int, std::string>>& extensions) const {
+        EVP_PKEY* key = make_key(type);
+        X509* certificate = make(name, key, certificate_, key_, extensions);
         auto certificate_pem = to_pem([&](BIO* bio) { PEM_write_bio_X509(bio, certificate); });
         auto key_pem = to_pem([&](BIO* bio) { PEM_write_bio_PrivateKey(bio, key, nullptr, nullptr, 0, nullptr, nullptr); });
         X509_free(certificate);
@@ -57,7 +108,6 @@ public:
         return {certificate_pem, key_pem};
     }
 
-private:
     template<typename Write>
     static std::string to_pem(Write write) {
         BIO* bio = BIO_new(BIO_s_mem());
@@ -115,6 +165,23 @@ struct server_certificate {
 
     server_certificate(const server_certificate&) = delete;
     server_certificate& operator=(const server_certificate&) = delete;
+};
+
+// The client certificate mode of a host name (see certificate_manager::set_client_verify())
+// while it exists: the manager is shared by the servers of the process
+struct client_verify_host {
+    std::string host;
+    bool set;
+
+    client_verify_host(std::string name, asio::client_verify mode)
+        : host(std::move(name)), set(asio::certificate_manager::instance().set_client_verify(host, mode)) {}
+
+    ~client_verify_host() {
+        asio::certificate_manager::instance().remove_client_verify(host);
+    }
+
+    client_verify_host(const client_verify_host&) = delete;
+    client_verify_host& operator=(const client_verify_host&) = delete;
 };
 
 } // namespace thinger::http::test

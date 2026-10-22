@@ -5,9 +5,12 @@
 #include "../../asio/sockets/ssl_socket.hpp"
 #include "../../asio/sockets/unix_socket.hpp"
 #include "../../asio/sockets/websocket.hpp"
+#include "../../asio/ssl/certificate_manager.hpp"
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <boost/algorithm/string.hpp>
 
 namespace thinger::http {
@@ -69,6 +72,29 @@ namespace {
             }
         }
         return true;
+    }
+
+    // The content of a PEM file of the client certificate: false (logged) if it cannot be read
+    bool read_pem_file(const std::string& path, std::string& content) {
+        std::ifstream file(path, std::ios::binary);
+        std::ostringstream stream;
+        if (file) stream << file.rdbuf();
+        if (!file || file.bad()) {
+            LOG_ERROR("cannot read the file {} of the client certificate", path);
+            return false;
+        }
+        content = stream.str();
+        return true;
+    }
+
+    boost::system::error_code certificate_error_code(asio::certificate_error error) {
+        switch (error) {
+            case asio::certificate_error::none: return {};
+            case asio::certificate_error::invalid_certificate: return client_error::invalid_client_certificate;
+            case asio::certificate_error::invalid_private_key: return client_error::invalid_client_key;
+            case asio::certificate_error::key_mismatch: return client_error::client_key_mismatch;
+        }
+        return client_error::invalid_client_certificate;
     }
 
     // 303 always changes the method to GET, and 301 and 302 change POST, PUT and DELETE to GET,
@@ -201,6 +227,42 @@ std::string http_client_base::proxy_for(const std::string& url) const {
     return proxy_for(request);
 }
 
+boost::system::error_code http_client_base::client_certificate(const std::string& certificate,
+                                                               const std::string& private_key,
+                                                               const std::string& chain) {
+    std::string full_chain = certificate;
+    if (!chain.empty() && !full_chain.empty() && full_chain.back() != '\n') full_chain += '\n';
+    full_chain += chain;
+    // Checked as the contexts of the connections will take it
+    boost::asio::ssl::context test(boost::asio::ssl::context::tls_client);
+    if (auto ec = certificate_error_code(asio::use_certificate(test, full_chain, private_key))) return ec;
+    std::lock_guard lock(tls_mutex_);
+    identity_ = client_identity{std::move(full_chain), private_key, ++next_identity_id_};
+    return {};
+}
+
+boost::system::error_code http_client_base::client_certificate_file(const std::string& certificate_path,
+                                                                    const std::string& private_key_path,
+                                                                    const std::string& chain_path) {
+    std::string certificate, key, chain;
+    if (!read_pem_file(certificate_path, certificate)) return client_error::invalid_client_certificate;
+    if (!read_pem_file(private_key_path, key)) return client_error::invalid_client_key;
+    if (!chain_path.empty() && !read_pem_file(chain_path, chain)) return client_error::invalid_client_certificate;
+    auto ec = client_certificate(certificate, key, chain);
+    if (ec) LOG_ERROR("cannot use the client certificate {} with the key {}: {}", certificate_path, private_key_path, ec.message());
+    return ec;
+}
+
+void http_client_base::clear_client_certificate() {
+    std::lock_guard lock(tls_mutex_);
+    identity_ = client_identity{};
+}
+
+bool http_client_base::has_client_certificate() const {
+    std::lock_guard lock(tls_mutex_);
+    return identity_.id != 0;
+}
+
 std::shared_ptr<boost::asio::ssl::context> http_client_base::tls_context(
     const http_request& request, uint64_t& id, boost::system::error_code& ec) {
     trusted_cas cas;
@@ -211,6 +273,8 @@ std::shared_ptr<boost::asio::ssl::context> http_client_base::tls_context(
     }
 
     std::lock_guard lock(tls_mutex_);
+    // The certificate presented tells contexts apart too (by its id, never by the key)
+    if (identity_.id != 0) key += "\nclient:" + std::to_string(identity_.id);
     if (auto it = tls_contexts_.find(key); it != tls_contexts_.end()) {
         id = it->second.id;
         return it->second.context;
@@ -225,6 +289,11 @@ std::shared_ptr<boost::asio::ssl::context> http_client_base::tls_context(
             ec = client_error::invalid_ca_certificate;
             return nullptr;
         }
+    }
+    // Checked when set, so this fails only if OpenSSL changed its mind
+    if (identity_.id != 0) {
+        ec = certificate_error_code(asio::use_certificate(*context, identity_.chain, identity_.key));
+        if (ec) return nullptr;
     }
 
     // Bounded: CAs that change, or many per-request sets, would grow it forever. The

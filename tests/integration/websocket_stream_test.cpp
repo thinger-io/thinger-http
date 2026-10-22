@@ -6,6 +6,8 @@
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
+#include <thinger/http/server/pool_server.hpp>
+#include <thinger/http/server/connection_tracker.hpp>
 #include <thinger/http/client/client.hpp>
 #include <thinger/util/base64.hpp>
 #include <thinger/util/sha1.hpp>
@@ -591,6 +593,202 @@ TEST_CASE("WebSocket stream: closing", "[websocket][stream][integration]") {
         client.send_frame(OP_CLOSE, close_payload(1002));
         REQUIRE(client.closed_within(2s));
     }
+}
+
+TEST_CASE("WebSocket stream: on_close", "[websocket][stream][on-close][integration]") {
+    // What on_close() told: how many times, how, and whether from within the call to close()
+    struct close_record {
+        std::atomic<int> calls{0};
+        std::atomic<bool> closing{false};
+        std::atomic<bool> called_while_closing{false};
+        result_slot<asio::websocket_close> close;
+    };
+    auto record = std::make_shared<close_record>();
+    // The callback does not own the websocket; a read is pending, as a protocol has one
+    auto watch = [record](const std::shared_ptr<asio::websocket>& ws) {
+        ws->on_close([record](const asio::websocket_close& close) {
+            ++record->calls;
+            record->called_while_closing = record->closing.load();
+            record->close.set(close);
+        });
+        co_spawn(ws->get_io_context(), [ws]() -> awaitable<void> {
+            uint8_t buffer[64];
+            for (;;) {
+                auto [ec, bytes] = co_await ws->read_some(buffer, sizeof(buffer));
+                if (ec) co_return;
+            }
+        }, detached);
+    };
+    // Waits for the callback, and a while for a second call that must not come
+    auto told_once = [record]() -> std::optional<asio::websocket_close> {
+        auto close = record->close.wait();
+        std::this_thread::sleep_for(100ms);
+        if (record->calls != 1) return std::nullopt;
+        return close;
+    };
+
+    http::server server;
+    server.get("/watch", [&](http::request&, http::response& res) {
+        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) { watch(ws); });
+    });
+    server.get("/close", [&](http::request&, http::response& res) {
+        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+            watch(ws);
+            record->closing = true;
+            ws->close();
+            record->closing = false;
+        });
+    });
+    server.get("/late", [&](http::request&, http::response& res) {
+        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+            ws->close(4001);
+            watch(ws);
+        });
+    });
+    server.get("/shutdown", [&](http::request&, http::response& res) {
+        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+            watch(ws);
+            http::on_server_shutdown(*ws, [weak = std::weak_ptr<asio::websocket>(ws)] {
+                if (auto self = weak.lock()) self->close(asio::websocket::CLOSE_GOING_AWAY);
+            });
+        });
+    });
+    std::atomic<int> thrown{0};
+    server.get("/throw", [&](http::request&, http::response& res) {
+        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+            ws->on_close([&thrown](const asio::websocket_close&) {
+                ++thrown;
+                throw std::runtime_error("close callback failure");
+            });
+            co_spawn(ws->get_io_context(), length_prefixed_echo(ws), detached);
+        });
+    });
+    running_server running(server);
+
+    SECTION("The close frame of the peer: its code and reason") {
+        raw_ws_client client(running.port);
+        REQUIRE(client.handshake("/watch").starts_with("HTTP/1.1 101"));
+        client.send_frame(OP_CLOSE, close_payload(4000, "bye"));
+        auto answer = client.read_frame();
+        REQUIRE(answer);
+        REQUIRE(answer->close_code() == 4000);
+        auto close = told_once();
+        REQUIRE(close);
+        REQUIRE(close->code == 4000);
+        REQUIRE(close->reason == "bye");
+        REQUIRE(close->remote);
+    }
+
+    for (bool reset : {true, false}) {
+        DYNAMIC_SECTION("The connection lost without a close frame: " << (reset ? "reset" : "end of the stream")) {
+            raw_ws_client client(running.port);
+            REQUIRE(client.handshake("/watch").starts_with("HTTP/1.1 101"));
+            if (reset) {
+                client.reset();
+            } else {
+                client.close();
+            }
+            auto close = told_once();
+            REQUIRE(close);
+            REQUIRE(close->code == asio::websocket::CLOSE_ABNORMAL);
+            REQUIRE_FALSE(close->remote);
+        }
+    }
+
+    SECTION("close(): told afterwards, never from within it") {
+        raw_ws_client client(running.port);
+        REQUIRE(client.handshake("/close").starts_with("HTTP/1.1 101"));
+        auto frame = client.read_frame();
+        REQUIRE(frame);
+        REQUIRE(frame->opcode == OP_CLOSE);
+        client.send_frame(OP_CLOSE, close_payload(1000));
+        auto close = told_once();
+        REQUIRE(close);
+        REQUIRE(close->code == 1000);
+        REQUIRE_FALSE(close->remote);
+        REQUIRE_FALSE(record->called_while_closing);
+    }
+
+    SECTION("Set once closed: told at once") {
+        raw_ws_client client(running.port);
+        REQUIRE(client.handshake("/late").starts_with("HTTP/1.1 101"));
+        auto close = told_once();
+        REQUIRE(close);
+        REQUIRE(close->code == 4001);
+    }
+
+    SECTION("What the callback throws is logged, and the server goes on") {
+        raw_ws_client client(running.port);
+        REQUIRE(client.handshake("/throw").starts_with("HTTP/1.1 101"));
+        client.send_frame(OP_CLOSE, close_payload(1000));
+        REQUIRE(client.closed_within(2s));
+        for (int i = 0; i < 200 && thrown == 0; ++i) std::this_thread::sleep_for(10ms);
+        REQUIRE(thrown == 1);
+        raw_ws_client next(running.port);
+        REQUIRE(next.handshake("/watch").starts_with("HTTP/1.1 101"));
+    }
+
+    SECTION("The server shutting down: closed when the handler is told") {
+        raw_ws_client client(running.port);
+        REQUIRE(client.handshake("/shutdown").starts_with("HTTP/1.1 101"));
+        server.begin_shutdown(5s);
+        auto frame = client.read_frame();
+        REQUIRE(frame);
+        REQUIRE(frame->close_code() == asio::websocket::CLOSE_GOING_AWAY);
+        client.send_frame(OP_CLOSE, close_payload(asio::websocket::CLOSE_GOING_AWAY));
+        auto close = told_once();
+        REQUIRE(close);
+        REQUIRE(close->code == asio::websocket::CLOSE_GOING_AWAY);
+        REQUIRE_FALSE(close->remote);
+    }
+
+    SECTION("The server shutting down: closed at the end of the grace period") {
+        // A pool server: its workers still run once it stopped
+        http::pool_server pool;
+        pool.get("/watch", [&](http::request&, http::response& res) {
+            res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) { watch(ws); });
+        });
+        REQUIRE(pool.listen("127.0.0.1", 0));
+        auto waiting = std::async(std::launch::async, [&] { pool.wait(); });
+        raw_ws_client client(pool.local_port());
+        REQUIRE(client.handshake("/watch").starts_with("HTTP/1.1 101"));
+        // the websocket ignores the shutdown
+        REQUIRE_FALSE(pool.shutdown(200ms));
+        auto close = told_once();
+        REQUIRE(close);
+        REQUIRE(close->code == asio::websocket::CLOSE_ABNORMAL);
+        REQUIRE(waiting.wait_for(3s) == std::future_status::ready);
+    }
+}
+
+TEST_CASE("WebSocket stream: on_close is not called once destroyed open", "[websocket][stream][on-close]") {
+    auto calls = std::make_shared<std::atomic<int>>(0);
+    {
+        auto io_context = std::make_unique<boost::asio::io_context>();
+        auto sock = std::make_shared<asio::tcp_socket>("on_close test", *io_context);
+        std::optional<tcp::socket> peer;
+        {
+            tcp::acceptor acceptor(*io_context, {boost::asio::ip::make_address("127.0.0.1"), 0});
+            peer.emplace(*io_context);
+            peer->connect(acceptor.local_endpoint());
+            sock->get_socket() = acceptor.accept();
+        }
+        {
+            auto ws = std::make_shared<asio::websocket>(sock);
+            ws->on_close([calls](const asio::websocket_close&) { ++*calls; });
+            // a read pending, which owns the websocket until the io_context is destroyed
+            co_spawn(*io_context, [ws]() -> awaitable<void> {
+                uint8_t buffer[64];
+                co_await ws->read_some(buffer, sizeof(buffer));
+            }, detached);
+        }
+        io_context->poll();
+        sock.reset();
+        peer.reset();
+        // destroys the read pending, and the websocket with it
+        io_context.reset();
+    }
+    REQUIRE(*calls == 0);
 }
 
 TEST_CASE("WebSocket stream: tunnel to a TCP server", "[websocket][stream][socket-pipe][integration]") {

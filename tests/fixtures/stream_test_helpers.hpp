@@ -158,6 +158,13 @@ namespace stream_test {
             sock_.close(ec);
         }
 
+        // Close the connection with a reset (RST), as a peer that is lost
+        void reset() {
+            boost::system::error_code ec;
+            sock_.set_option(net::socket_base::linger(true, 0), ec);
+            sock_.close(ec);
+        }
+
     private:
         std::optional<ws_frame> parse() {
             if (buffer_.size() < 2) return std::nullopt;

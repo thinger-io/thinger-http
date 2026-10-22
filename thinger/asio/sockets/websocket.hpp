@@ -3,6 +3,7 @@
 #pragma once
 
 #include "socket.hpp"
+#include "../../util/close_notifier.hpp"
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <chrono>
@@ -14,6 +15,19 @@
 #include <vector>
 
 namespace thinger::asio {
+
+// How a WebSocket closed (see websocket::on_close())
+struct websocket_close {
+    // Status code of the closing handshake (RFC 6455, 7.4), as websocket::get_close_code():
+    // the one of the peer's close frame (1005 if it had none, 1002 if it was not valid), else
+    // the one this end closed with; 1006 (websocket::CLOSE_ABNORMAL) if no close frame was
+    // exchanged, e.g. when the connection was lost
+    uint16_t code = 1006;
+    // Reason of the peer's close frame, if any (not validated as UTF-8)
+    std::string reason;
+    // Whether the peer closed first (sent its close frame before this end did)
+    bool remote = false;
+};
 
 // WebSocket (RFC 6455) over another socket, once the HTTP handshake is done (see
 // http::response::upgrade_websocket_stream() and the client websocket()).
@@ -45,6 +59,7 @@ namespace thinger::asio {
 //   asio::running_in_this_thread()): close() then closes at once, without the handshake.
 // - An optional keepalive pings the peer (one ping at a time) and closes the connection
 //   when it is idle (see set_keepalive()).
+// - on_close() tells once the connection closed, whatever closed it.
 // - Text is not validated as UTF-8 here, neither in text messages nor in close reasons:
 //   the stream may cut a character anywhere (http::websocket_connection validates whole
 //   messages).
@@ -139,6 +154,18 @@ public:
     // Whether the peer started the closing handshake (its close frame came first)
     bool closed_by_peer() const { return closed_by_peer_; }
 
+    // Called once the connection closed, with how (see websocket_close): close() (by its user,
+    // the keepalive, a protocol error, or the close frame of the peer answered), or the
+    // connection lost (an error reading or writing other than a cancellation, the end of the
+    // stream without a close frame, or the socket closed under it, e.g. by a server at the end
+    // of its shutdown): then with 1006 unless close frames were exchanged. Once, posted to the
+    // executor (never from within the call that closed it), what it throws logged; set once
+    // closed, it is posted at once. A websocket destroyed open does not call it. The connection
+    // is noticed lost by the operations running on it (a pending read, the keepalive). Unlike
+    // http::websocket_connection, nothing breaks a cycle here: the callback must not own the
+    // websocket (capture a std::weak_ptr). On the executor
+    void on_close(sync_callback<void(const websocket_close&)> callback);
+
     // State getters
     bool is_open() const override;
     bool is_secure() const override;
@@ -157,6 +184,8 @@ public:
 
     // Socket the WebSocket runs on
     std::shared_ptr<socket> get_socket() const { return socket_; }
+    // The TLS details of the socket it runs on
+    std::optional<tls_session> tls() const override;
 
     // Executor the WebSocket is used on, and runs its own work on: the one it was created with
     const boost::asio::any_io_executor& get_executor() const { return executor_; }
@@ -207,6 +236,11 @@ private:
     static void apply_mask(uint8_t* data, size_t size, const uint8_t mask[MASK_SIZE_BYTES], size_t offset);
     // Fail the connection on a protocol error: close frame (1002, best effort) and close
     boost::system::error_code fail(const char* reason);
+    // How it closed, for on_close()
+    websocket_close close_status() const;
+    // An operation on the socket ended with `ec`: the connection is lost if it is an error
+    // other than a cancellation, or the socket was closed under it (told to on_close())
+    void check_lost(const boost::system::error_code& ec);
 
     // Write side: one frame at a time (the writer holding the turn), in order: the rest of an
     // interrupted frame first, then the pong and ping queued, then the writes waiting
@@ -285,6 +319,7 @@ private:
     std::string close_reason_;
     bool closed_by_peer_ = false;
     std::shared_ptr<boost::asio::steady_timer> close_timer_;
+    util::close_notifier<websocket_close> on_close_;
 
     // Keepalive
     std::shared_ptr<boost::asio::steady_timer> keepalive_timer_;

@@ -4,8 +4,56 @@
 #include "../util/types.hpp"
 #include <boost/asio/ssl.hpp>
 #include <sys/socket.h>
+#include <mutex>
+#include <unordered_map>
 
 namespace thinger::asio {
+
+namespace detail {
+
+// What the connections whose handshake is pending share with the server: stop() closes them,
+// on their io_contexts, and those done afterwards are not served. Each one is removed once its
+// handshake ends, so it holds no more than the connections open
+class pending_handshakes {
+public:
+    // False if the server stopped
+    bool add(const std::shared_ptr<tcp_socket>& sock) {
+        std::scoped_lock lock(mutex_);
+        if (stopped_) return false;
+        sockets_.emplace(sock.get(), sock);
+        return true;
+    }
+
+    // Its handshake ended: whether to serve it (false if the server stopped)
+    bool remove(const tcp_socket* sock) {
+        std::scoped_lock lock(mutex_);
+        sockets_.erase(sock);
+        return !stopped_;
+    }
+
+    void stop() {
+        std::unordered_map<const tcp_socket*, std::weak_ptr<tcp_socket>> sockets;
+        {
+            std::scoped_lock lock(mutex_);
+            stopped_ = true;
+            sockets.swap(sockets_);
+        }
+        for (const auto& entry : sockets) {
+            auto sock = entry.second.lock();
+            if (!sock) continue;
+            boost::asio::post(sock->get_io_context(), [weak = entry.second] {
+                if (auto pending = weak.lock()) pending->close();
+            });
+        }
+    }
+
+private:
+    std::mutex mutex_;
+    bool stopped_ = false;
+    std::unordered_map<const tcp_socket*, std::weak_ptr<tcp_socket>> sockets_;
+};
+
+} // namespace detail
 
 // Constructor with io_context providers
 tcp_socket_server::tcp_socket_server(std::string host, 
@@ -38,17 +86,37 @@ tcp_socket_server::tcp_socket_server(std::string host,
 }
 
 tcp_socket_server::~tcp_socket_server() {
-    // Before the acceptor thread could use what is destroyed here
-    stop();
+    // Before the acceptor thread could use what is destroyed here (the stop() of this class:
+    // derived classes are gone by now)
+    try {
+        tcp_socket_server::stop();
+    } catch (const std::exception& e) {
+        LOG_ERROR("cannot stop a TCP server: {}", e.what());
+    }
 }
 
 void tcp_socket_server::set_tcp_no_delay(bool tcp_no_delay) {
     tcp_no_delay_ = tcp_no_delay;
 }
 
-void tcp_socket_server::enable_ssl(bool ssl, bool client_certificate) {
+bool tcp_socket_server::enable_ssl(bool ssl, client_verify_options verify) {
     ssl_enabled_ = ssl;
-    client_certificate_ = client_certificate;
+    client_verify_ = client_verify_policy::create(verify);
+    return client_verify_ != nullptr;
+}
+
+void tcp_socket_server::enable_ssl(bool ssl, bool client_certificate) {
+    enable_ssl(ssl, client_verify_options{client_certificate ? client_verify::optional : client_verify::none});
+}
+
+void tcp_socket_server::set_handshake_timeout(std::chrono::milliseconds timeout) {
+    handshake_timeout_ = timeout;
+}
+
+bool tcp_socket_server::stop() {
+    auto result = basic_socket_server::stop();
+    if (handshakes_) handshakes_->stop();
+    return result;
 }
 
 void tcp_socket_server::set_ssl_context(std::shared_ptr<boost::asio::ssl::context> context) {
@@ -97,13 +165,56 @@ namespace {
 // by then
 struct connection_setup {
     std::shared_ptr<boost::asio::ssl::context> ssl_context; // none without TLS
+    std::shared_ptr<const client_verify_policy> client_verify;
+    std::chrono::milliseconds handshake_timeout;
+    std::shared_ptr<detail::pending_handshakes> handshakes;
     bool tcp_no_delay;
     sync_callback<void(std::shared_ptr<socket>)> handler;
 };
 
 std::shared_ptr<tcp_socket> make_socket(boost::asio::io_context& io_context, const connection_setup& setup) {
-    if (setup.ssl_context) return std::make_shared<ssl_socket>("ssl_socket_server", io_context, setup.ssl_context);
-    return std::make_shared<tcp_socket>("tcp_socket_server", io_context);
+    if (!setup.ssl_context) return std::make_shared<tcp_socket>("tcp_socket_server", io_context);
+    auto sock = std::make_shared<ssl_socket>("ssl_socket_server", io_context, setup.ssl_context);
+    sock->set_client_verify(setup.client_verify);
+    return sock;
+}
+
+// The handshake of a TLS connection, closed if it does not end within `timeout` (0: no limit)
+awaitable<boost::system::error_code> handshake_within(std::shared_ptr<tcp_socket> sock,
+                                                      std::chrono::milliseconds timeout) {
+    if (timeout.count() <= 0) co_return co_await sock->handshake();
+    // On the io_context of the socket, as the handshake. The handler does not own the socket
+    auto timer = std::make_shared<boost::asio::steady_timer>(sock->get_io_context(), timeout);
+    auto expired = std::make_shared<bool>(false);
+    timer->async_wait([weak = std::weak_ptr<tcp_socket>(sock), expired](const boost::system::error_code& ec) {
+        if (ec) return;
+        *expired = true;
+        if (auto pending = weak.lock()) pending->close();
+    });
+    auto ec = co_await sock->handshake();
+    timer->cancel();
+    co_return *expired ? boost::system::error_code(boost::asio::error::timed_out) : ec;
+}
+
+// The handshake of a TLS connection, then the handler, unless the server stopped meanwhile
+awaitable<void> serve_tls(std::shared_ptr<tcp_socket> sock, connection_setup setup) {
+    if (!setup.handshakes->add(sock)) co_return;
+    auto ec = co_await handshake_within(sock, setup.handshake_timeout);
+    bool serve = setup.handshakes->remove(sock.get());
+    // Not errors of the server: any client (or scanner) may cause them
+    if (ec == boost::asio::error::timed_out) {
+        LOG_DEBUG("TLS handshake not done in time, remote ip: {}", sock->get_remote_ip());
+        co_return;
+    }
+    if (ec) {
+        LOG_WARNING("error while handling SSL handshake: {}, remote ip: {}", ec.message(), sock->get_remote_ip());
+        co_return;
+    }
+    if (!serve) {
+        sock->close();
+        co_return;
+    }
+    if (setup.handler) setup.handler(sock);
 }
 
 // Set an accepted connection up and hand it to the handler
@@ -119,16 +230,8 @@ void serve_connection(std::shared_ptr<tcp_socket> sock, const connection_setup& 
     if (sock->requires_handshake()) {
         // Use co_spawn to run the coroutine-based handshake. What the handler throws is
         // logged, as when it is called right away (see basic_socket_server)
-        co_spawn(sock->get_io_context(),
-            [sock, handler = setup.handler]() -> awaitable<void> {
-                auto ec = co_await sock->handshake();
-                if (ec) {
-                    LOG_ERROR("error while handling SSL handshake: {}, remote ip: {}",
-                             ec.message(), sock->get_remote_ip());
-                    co_return;
-                }
-                if (handler) handler(sock);
-            },
+        auto& io_context = sock->get_io_context();
+        co_spawn(io_context, serve_tls(std::move(sock), setup),
             [](std::exception_ptr error) {
                 if (!error) return;
                 try {
@@ -151,7 +254,14 @@ tcp_socket_server::connection_server tcp_socket_server::make_connection_server()
         LOG_ERROR("SSL enabled but no SSL context configured");
         return {};
     }
-    return [setup = connection_setup{ssl_enabled_ ? ssl_context_ : nullptr, tcp_no_delay_, handler_}]
+    if (ssl_enabled_ && !client_verify_) {
+        LOG_ERROR("SSL enabled but the client certificates cannot be validated: the trusted CAs are not valid");
+        return {};
+    }
+    handshakes_ = std::make_shared<detail::pending_handshakes>();
+    connection_setup setup{ssl_enabled_ ? ssl_context_ : nullptr, client_verify_, handshake_timeout_, handshakes_,
+                           tcp_no_delay_, handler_};
+    return [setup = std::move(setup)]
         (boost::asio::ip::tcp::socket peer) {
             auto sock = make_socket(static_cast<boost::asio::io_context&>(peer.get_executor().context()), setup);
             sock->get_socket() = std::move(peer);

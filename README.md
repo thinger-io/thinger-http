@@ -115,7 +115,7 @@ include(FetchContent)
 FetchContent_Declare(
     thinger-http
     GIT_REPOSITORY https://github.com/thinger-io/thinger-http.git
-    GIT_TAG v0.7.1
+    GIT_TAG v0.8.0
 )
 FetchContent_MakeAvailable(thinger-http)
 
@@ -998,6 +998,56 @@ thinger::asio::certificate_manager::instance().set_tls_options(options);   // fa
 
 The certificate of each host gets the same options, and SNI cannot weaken them: the versions, ciphers and security level of a handshake are those of the context the server listens with (the default one when it started listening), and the context SNI selects gives only its certificate (OpenSSL would take its ciphers and security level too: the manager keeps those of the listener). A context given ready-made (`set_default_certificate(context)`, `set_certificate(host, context)`) keeps its own settings; `asio::apply_tls_options(context, options)` sets them on it. The setters of earlier versions, `set_server_ciphers()` and `enable_legacy_protocols(true)` (which still allows TLS 1.0 and 1.1 for old clients), are deprecated: they change these options, validated as `set_tls_options()` does.
 
+#### Client Certificates
+
+A TLS listener may ask its clients for a certificate (mutual TLS), in one of three modes (`asio::client_verify`): `none` (the default: no certificate is asked for), `optional` (asked for; a client without one goes on) or `required` (the handshake fails without one; in TLS 1.3 the client learns it at its first read, from a `certificate_required` alert). A `tcp_socket_server` (e.g. the listener of a protocol such as MQTT) sets it with `enable_ssl()`:
+
+```cpp
+thinger::asio::client_verify_options verify;
+verify.mode = thinger::asio::client_verify::optional;
+// verify.trusted_cas = pem;      // validate against these CAs during the handshake
+// verify.max_depth = 4;          // intermediate CAs allowed (with trusted CAs)
+// verify.max_cert_list = 16384;  // bytes of the chain a client may send
+if (!listener.enable_ssl(true, verify)) { /* the trusted CAs cannot be read */ }
+```
+
+- **Deferred validation** (no `trusted_cas`, the usual case when each account brings its own CAs): the handshake accepts any well-formed chain, as long as the client proves it holds the key of its certificate, and the application validates the chain afterwards, from `socket->tls()->peer_chain_der` (or `ssl_socket::peer_certificate()` and `peer_chain()`, without copies). The library judges neither the issuer nor the dates, key types or algorithms: that policy belongs to the application.
+- **Trusted CAs**: OpenSSL validates the chain during the handshake, and a certificate presented that does not validate fails it, in `optional` mode too (a client without a certificate goes on in `optional`). `tls()->verify_result` is `X509_V_OK` then. Trusted CAs that cannot be read make `enable_ssl()` return `false`, and the server serves no connection rather than serve them without the validation asked for.
+- **Limits**: `max_cert_list` bounds the memory a client uses before it is authenticated (16 KiB by default); `max_depth` the intermediate CAs between the certificate and a trusted CA, as OpenSSL counts them (`SSL_set_verify_depth`: 1 allows one intermediate).
+
+The mode is set on each connection, never on the context the server listens with, which may be the default context of the `certificate_manager`, shared with other listeners (e.g. the HTTPS server keeps asking for none). A host name may ask for a mode of its own, e.g. the host of the devices on a port shared with a web console:
+
+```cpp
+auto& manager = thinger::asio::certificate_manager::instance();
+manager.set_client_verify("devices.example.com", thinger::asio::client_verify::required);  // false if not a host name
+manager.set_client_verify("*.devices.example.com", thinger::asio::client_verify::optional);
+manager.remove_client_verify("devices.example.com");   // back to the mode of the listener
+```
+
+Host names (SNI) are matched as the certificates (exact, or `*.domain` for one more label), case-insensitive; other hosts keep the mode of their listener, whose trusted CAs and limits apply (deferred validation on a listener that asks for none, as an `http::server`). They apply to the next handshakes of the servers already listening.
+
+What a connection tells of TLS once its handshake is done, for any socket (`std::nullopt` for a plain one; a WebSocket answers for the socket it runs on, so there is nothing to cast):
+
+```cpp
+if (auto tls = socket->tls()) {
+    // tls->version ("TLSv1.3"), tls->cipher, tls->server_name (SNI, "" if none),
+    // tls->resumed, tls->peer_chain_der (DER, the client's certificate first; empty if it
+    // sent none), tls->verify_result (with trusted CAs)
+}
+```
+
+Sessions are resumed with client certificates: every context of the manager has the same session id context, and a listener asking for certificates one of its own (a digest of its options), so a session is only resumed on a listener with the same policy. A resumed session asks for no certificate: it keeps the one of the session it resumes, but OpenSSL keeps its leaf only, not the rest of the chain, so `peer_chain_der` holds the leaf alone then. A session resumed without a certificate on a host name that requires one fails the handshake. Sessions are resumed with tickets (TLS 1.3, and TLS 1.2 unless the client disables them): the session cache of the server, for resumption by session id, drops the session of a connection closed without a close_notify alert, as a closed `ssl_socket` does.
+
+#### Handshake Deadline
+
+A TLS client has 60 seconds to complete its handshake once accepted, as nginx's `ssl_handshake_timeout` (Node waits 120): otherwise the server closes the connection, which never reaches the handler, so a client that connects and sends nothing (or half a ClientHello) cannot hold a connection. `tcp_socket_server::set_handshake_timeout()` changes it for the connections accepted afterwards (0 disables it). `stop()` also closes the connections whose handshake is still pending.
+
+```cpp
+listener.set_handshake_timeout(std::chrono::seconds(10));
+```
+
+Handshakes that fail or time out are logged as warnings and at debug level, not as errors of the server: any client, or scanner, causes them.
+
 ### Server Lifecycle
 
 ```cpp
@@ -1229,6 +1279,27 @@ auto res = client.request("https://kubernetes.default.svc/api")
 
 The certificate is still verified for the host of the URL. A CA that cannot be loaded fails the requests needing it (`client_error::invalid_ca_certificate`). TLS contexts are built once per set of trusted CAs and shared by the connections of the client; a CA file is loaded again when it changes (its modification time or size).
 
+### Client Certificates
+
+A client presents a certificate to the servers that ask for one (mutual TLS) once it is given one, with its private key (PEM, not encrypted) and, optionally, the intermediate certificates sent along with it: on every TLS connection of the client, requests, WebSockets (`websocket()`, `upgrade_websocket()`) and proxy tunnels alike. From PEM text or from files:
+
+```cpp
+thinger::http::client client;
+if (auto ec = client.client_certificate(certificate_pem, key_pem, intermediates_pem)) {
+    // client_error::invalid_client_certificate, invalid_client_key or client_key_mismatch
+}
+auto res = client.get("https://api.example.com/devices");
+
+// or files, read now
+client.client_certificate_file("/etc/agent/device.pem", "/etc/agent/device.key", "/etc/agent/chain.pem");
+if (auto ws = client.websocket("wss://devices.example.com/agent")) {
+    ws->send_text("hello");
+}
+client.clear_client_certificate();   // present none again
+```
+
+They are checked when set, not at the first handshake: a certificate, chain or key that cannot be read (an encrypted key included: it fails, the password is never asked for on the terminal) or a key that is not the certificate's returns the error, and the current certificate is kept. The key itself is never logged. Files are read once, when set: set them again to read them again. Replacing the certificate while requests run is safe: the connections already open, and kept alive in the pool, keep the one they were opened with, and new connections take the new one. A server that asks for no certificate gets none.
+
 ### Request Builder (Fluent API)
 
 For complex requests with custom headers, body, and other options:
@@ -1450,6 +1521,17 @@ res.upgrade_websocket([&](std::shared_ptr<http::websocket_connection> ws) {
 ```
 
 It is always posted to the thread of the connection, never called from within the call that closed it, so a loop sending to every connection can remove the ones closing; what it throws is logged. Set it in the handler, or later on the thread of the connection: set once the WebSocket closed, it is posted at once. It is not called once the socket is released (`release_socket()`), nor when the io_context is stopped and destroyed with the connection open (e.g. by `stop()` of an `http::server`, which stops its io_context). A server WebSocket whose `on_message()` throws is closed with `1011`.
+
+The WebSocket used as a socket (`upgrade_websocket_stream()`, `thinger::asio::websocket`, see [WebSocket as a Socket](#websocket-as-a-socket)) has the same `on_close()`, with an `asio::websocket_close` (`http::websocket_close` is the same type): called once, whatever closed it, with the same guarantees. It has no read loop of its own: the connection is noticed lost by the operations running on it (a protocol always has a read pending; the keepalive), with `1006` when no close frame was exchanged, and closing the socket under it (the end of a server's shutdown) counts too. The callback must not own the WebSocket, which nothing would release: capture a `std::weak_ptr`.
+
+```cpp
+res.upgrade_websocket_stream([&](std::shared_ptr<thinger::asio::websocket> ws, std::string protocol) {
+    ws->on_close([&sessions, id = sessions.add()](const thinger::asio::websocket_close& close) {
+        sessions.remove(id);   // close.code, close.reason, close.remote
+    });
+    co_spawn(ws->get_io_context(), run_protocol(ws), thinger::detached);
+});
+```
 
 ### WebSocket Flow Control
 

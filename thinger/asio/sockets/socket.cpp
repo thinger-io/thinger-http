@@ -124,6 +124,10 @@ namespace thinger::asio {
         return {};
     }
 
+    std::optional<tls_session> socket::tls() const {
+        return std::nullopt;
+    }
+
     awaitable<io_result> socket::read(uint8_t buffer[], size_t size) {
         size_t total = 0;
         while (total < size) {
