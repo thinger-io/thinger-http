@@ -7,6 +7,8 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-22
+
 ### Added
 
 - `sse_connection::set_keepalive(interval)`: a comment (`: keep-alive`) sent every `interval` the stream was quiet, 15 s by default (`DEFAULT_KEEPALIVE_INTERVAL`), 0 to disable; `send_id()`. See [SSE Server](README.md#sse-server).
@@ -245,7 +247,8 @@ These changes of the last weeks can be noticed by code written against an earlie
 - Client: connections are kept alive between requests (see the README to tune or disable the pool).
 - The unused `request_handler` interface was removed.
 
-[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/thinger-io/thinger-http/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/thinger-io/thinger-http/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/thinger-io/thinger-http/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/thinger-io/thinger-http/compare/v0.6.0...v0.7.0
