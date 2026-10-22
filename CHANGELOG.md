@@ -7,6 +7,8 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-22
+
 ### Added
 
 - Client certificates on TLS servers (mutual TLS): `tcp_socket_server::enable_ssl(bool, asio::client_verify_options)`, with the mode (`asio::client_verify`: `none`, `optional`, `required`), the trusted CAs (PEM; none for deferred validation: the handshake accepts any well-formed chain once the client proves it holds the key of its certificate, and the application validates the chain), `max_depth` (4) and `max_cert_list` (16 KiB, the memory a client may use before it is authenticated). With trusted CAs a certificate presented that does not validate fails the handshake, also in `optional` mode. It returns `false` if the trusted CAs cannot be read, and the server then serves no connection. The mode is set on each connection, never on the context listened with, which other listeners may share. See [Client Certificates](README.md#client-certificates).
@@ -230,7 +232,8 @@ These changes of the last weeks can be noticed by code written against an earlie
 - Client: connections are kept alive between requests (see the README to tune or disable the pool).
 - The unused `request_handler` interface was removed.
 
-[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/thinger-io/thinger-http/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/thinger-io/thinger-http/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/thinger-io/thinger-http/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/thinger-io/thinger-http/compare/v0.5.0...v0.6.0
