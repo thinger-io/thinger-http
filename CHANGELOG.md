@@ -7,6 +7,10 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Fixed
+
+- `asio::websocket::cancel()` could leave the pending read waiting forever. When the socket read under it had completed already, its handler not run yet (e.g. with a ping from the peer), the socket had nothing left to cancel, and the websocket handled the control frame and read the socket again: a `read_some()` cancelled while the peer kept pinging never returned, and a `websocket_connection` released with `release_socket()` could go on reading the socket handed to its new owner. The read now ends with `operation_aborted` before it reads the socket again (or returns the data it received meanwhile). It made the test of client WebSockets on strands of a multi-threaded `io_context` hang now and then, in 0.8.0 as in 0.8.1.
+
 ## [0.8.1] - 2026-10-22
 
 ### Added
