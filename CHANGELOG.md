@@ -7,11 +7,7 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
-### Fixed
-
-- `asio::websocket::cancel()` could leave the pending read waiting forever. When the socket read under it had completed already, its handler not run yet (e.g. with a ping from the peer), the socket had nothing left to cancel, and the websocket handled the control frame and read the socket again: a `read_some()` cancelled while the peer kept pinging never returned, and a `websocket_connection` released with `release_socket()` could go on reading the socket handed to its new owner. The read now ends with `operation_aborted` before it reads the socket again (or returns the data it received meanwhile). It made the test of client WebSockets on strands of a multi-threaded `io_context` hang now and then, in 0.8.0 as in 0.8.1.
-
-## [0.8.1] - 2026-10-22
+## [0.8.1] - 2026-10-23
 
 ### Added
 
@@ -25,6 +21,7 @@ All notable changes to thinger-http are documented in this file. The format foll
 - The connect timeout of `tcp_socket` and `unix_socket` was a coroutine detached from `connect()` holding references to its frame: when the timer completed along with the connection, it could run after `connect()` returned, writing to the freed frame and cancelling the next operation on the socket (the TLS handshake of an `ssl_socket`). The connect and its timer now race with `||`, both ended before `connect()` returns, in one helper (`asio::with_timeout()`); a connect timed out closes the socket.
 - An empty WebSocket message (a frame without payload, valid per RFC 6455) could not be sent: `websocket_connection::send_text("")` and `send_binary("")`, and the client's `send_text("")` and `send_binary()` of nothing, sent nothing. They now send it.
 - The WebSocket client took an empty message from the server as the end of the stream: `run()` stopped reading and called `on_close()` while the connection was open. It now delivers it to `on_message()`, and ends when reading fails (the connection closed or lost).
+- `asio::websocket::cancel()` could leave the pending read waiting forever. When the socket read under it had completed already, its handler not run yet (e.g. with a ping from the peer), the socket had nothing left to cancel, and the websocket handled the control frame and read the socket again: a `read_some()` cancelled while the peer kept pinging never returned, and a `websocket_connection` released with `release_socket()` could go on reading the socket handed to its new owner. The read now ends with `operation_aborted` before it reads the socket again (or returns the data it received meanwhile). It made the test of client WebSockets on strands of a multi-threaded `io_context` hang now and then, in 0.8.0 as in 0.8.1.
 
 ## [0.8.0] - 2026-10-22
 
