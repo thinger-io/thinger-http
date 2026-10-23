@@ -184,6 +184,7 @@ awaitable<boost::system::error_code> websocket::fill(size_t size) {
             in_end_ -= in_begin_;
             in_begin_ = 0;
         }
+        if (read_cancelled_) co_return boost::asio::error::operation_aborted;
         auto [ec, bytes] = co_await socket_->read_some(in_.data() + in_end_, in_.size() - in_end_);
         // closed meanwhile: the socket is not this websocket's anymore
         if (closed_) co_return boost::asio::error::operation_aborted;
@@ -203,6 +204,7 @@ awaitable<io_result> websocket::read_payload(uint8_t buffer[], size_t max_size) 
     size_t bytes;
     if (buffered() == 0 && wanted >= DIRECT_READ_SIZE) {
         // Large reads go straight to the reader's buffer, never past this frame
+        if (read_cancelled_) co_return io_result{boost::asio::error::operation_aborted, 0};
         auto [ec, read] = co_await socket_->read_some(buffer, wanted);
         if (closed_) co_return io_result{boost::asio::error::operation_aborted, 0};
         if (read == 0 && !ec) ec = boost::asio::error::eof;   // a socket breaking its guarantees
@@ -354,6 +356,7 @@ awaitable<io_result> websocket::read_some(uint8_t buffer[], size_t max_size) {
     reading_ = true;
     auto result = co_await read_frame_data(buffer, max_size, true);
     reading_ = false;
+    read_cancelled_ = false;
     co_return result;
 }
 
@@ -361,6 +364,7 @@ awaitable<io_result> websocket::read_message_some(uint8_t buffer[], size_t max_s
     reading_ = true;
     auto result = co_await read_frame_data(buffer, max_size, false);
     reading_ = false;
+    read_cancelled_ = false;
     co_return result;
 }
 
@@ -700,6 +704,7 @@ awaitable<void> websocket::close_graceful(uint16_t code) {
 }
 
 void websocket::cancel() {
+    if (reading_) read_cancelled_ = true;
     socket_->cancel();
     wake_writers();
 }

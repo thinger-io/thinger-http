@@ -114,6 +114,9 @@ public:
     // Send a close frame (waiting for a pending write), wait for the close frame of the peer
     // (up to CLOSE_TIMEOUT), and close. A code that may not be sent is sent as 1000
     awaitable<void> close_graceful(uint16_t code = CLOSE_NORMAL);
+    // The pending read and writes end with boost::asio::error::operation_aborted; the
+    // websocket stays usable. A read that received data meanwhile may return it instead, but
+    // never reads on: e.g. after a control frame received just before
     void cancel() override;
     bool requires_handshake() const override;
     awaitable<boost::system::error_code> handshake(const std::string& host = "") override;
@@ -287,6 +290,11 @@ private:
     uint8_t mask_[MASK_SIZE_BYTES]{};
     size_t mask_offset_ = 0;
     bool reading_ = false;
+    // cancel() called during the pending read: it ends before reading from the socket again.
+    // Cancelling the socket is not enough: a read of it that completed already (its handler
+    // waiting to run on the executor) is not cancelled, and a control frame received then
+    // is handled and the socket read again
+    bool read_cancelled_ = false;
 
     // Writes waiting for their turn
     struct write_waiter {

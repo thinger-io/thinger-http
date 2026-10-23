@@ -15,6 +15,7 @@
 #include "server_test_helpers.hpp"
 #include "../fixtures/stream_test_helpers.hpp"
 
+#include <cstring>
 #include <future>
 #include <mutex>
 #include <vector>
@@ -148,6 +149,70 @@ namespace {
         position += name.size() + 2;
         return response.substr(position, response.find("\r\n", position) - position);
     }
+
+    // A socket cancelled as the asio sockets are: cancel() ends the read still waiting for data,
+    // not one that received it already (completed, its handler waiting to run)
+    class completing_socket : public asio::socket {
+    public:
+        explicit completing_socket(boost::asio::io_context& io_context)
+            : socket("completing", io_context), signal_(io_context) {}
+
+        using socket::read;
+        using socket::write;
+
+        // The pending read receives `data`: from now on it is done, whatever cancel() does
+        void complete_read(std::string data) {
+            inbox_ += data;
+            if (pending_) {
+                pending_ = false;
+                signal_.cancel();
+            }
+        }
+
+        awaitable<io_result> read_some(uint8_t buffer[], size_t max_size) override {
+            if (!open_) co_return io_result{boost::asio::error::bad_descriptor, 0};
+            if (inbox_.empty()) {
+                pending_ = true;
+                aborted_ = false;
+                signal_.expires_at(std::chrono::steady_clock::time_point::max());
+                co_await signal_.async_wait(use_nothrow_awaitable);
+                if (aborted_) co_return io_result{boost::asio::error::operation_aborted, 0};
+            }
+            size_t bytes = std::min(max_size, inbox_.size());
+            std::memcpy(buffer, inbox_.data(), bytes);
+            inbox_.erase(0, bytes);
+            co_return io_result{boost::system::error_code{}, bytes};
+        }
+
+        awaitable<io_result> write(const uint8_t buffer[], size_t size) override {
+            if (!open_) co_return io_result{boost::asio::error::bad_descriptor, 0};
+            written.append(reinterpret_cast<const char*>(buffer), size);
+            co_return io_result{boost::system::error_code{}, size};
+        }
+
+        void cancel() override {
+            if (!pending_) return;
+            pending_ = false;
+            aborted_ = true;
+            signal_.cancel();
+        }
+
+        void close() override {
+            cancel();
+            open_ = false;
+        }
+
+        bool is_open() const override { return open_; }
+
+        std::string written;
+
+    private:
+        boost::asio::steady_timer signal_;
+        std::string inbox_;
+        bool pending_ = false;
+        bool aborted_ = false;
+        bool open_ = true;
+    };
 
 }
 
@@ -1148,6 +1213,44 @@ TEST_CASE("WebSocket stream: interrupted writes keep the framing", "[websocket][
         auto intervals = (std::chrono::steady_clock::now() - start) / 300ms;
         REQUIRE(pings <= 2 + intervals);
     }
+}
+
+TEST_CASE("WebSocket stream: cancel() ends a read whose socket read completed already", "[websocket][stream]") {
+    // The socket read of the pending read_some() gets a ping, and cancel() comes before the
+    // websocket handles it: the socket has nothing left to cancel, and the websocket, having
+    // handled the ping, must not read again
+    boost::asio::io_context ioc;
+    auto socket = std::make_shared<completing_socket>(ioc);
+    auto ws = std::make_shared<asio::websocket>(socket, true, false);
+    boost::system::error_code cancelled;
+    std::string data;
+    bool ended = false;
+
+    co_spawn(ioc, [&]() -> awaitable<void> {
+        uint8_t buffer[64];
+        boost::asio::post(ioc, [&] {
+            socket->complete_read(std::string("\x89\x00", 2));   // a ping
+            ws->cancel();
+        });
+        auto [ec, bytes] = co_await ws->read_some(buffer, sizeof(buffer));
+        cancelled = ec;
+
+        // still usable: the next read gets the next message
+        boost::asio::post(ioc, [&] { socket->complete_read(std::string("\x82\x03" "abc", 5)); });
+        auto [data_ec, data_bytes] = co_await ws->read_some(buffer, sizeof(buffer));
+        if (!data_ec) data.assign(reinterpret_cast<char*>(buffer), data_bytes);
+        ws->close(asio::websocket::CLOSE_NORMAL, false);
+        ended = true;
+    }, detached);
+    ioc.run_for(5s);
+
+    REQUIRE(ended);
+    REQUIRE(cancelled == boost::asio::error::operation_aborted);
+    REQUIRE(data == "abc");
+    // the ping was answered: a masked pong without payload, then the close frame
+    REQUIRE(socket->written.size() >= 2);
+    REQUIRE(uint8_t(socket->written[0]) == 0x8A);
+    REQUIRE(uint8_t(socket->written[1]) == 0x80);
 }
 
 TEST_CASE("WebSocket stream: handshake checks", "[websocket][stream][integration]") {
