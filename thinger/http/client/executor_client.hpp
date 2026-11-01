@@ -45,8 +45,9 @@ public:
     executor_client(const executor_client&) = delete;
     executor_client& operator=(const executor_client&) = delete;
 
-    // A client on the io_context of the calling coroutine (see asio::io_context_of()). Throws
-    // std::logic_error if the coroutine runs on another kind of executor (e.g. a thread_pool)
+    // A client on the io_context of the calling coroutine (see asio::io_context_of()), or of
+    // its worker in a coroutine of async_client::run(). Throws std::logic_error if the
+    // coroutine runs on another kind of executor (e.g. a thread_pool)
     static awaitable<std::unique_ptr<executor_client>> for_current_coroutine();
 
     /**

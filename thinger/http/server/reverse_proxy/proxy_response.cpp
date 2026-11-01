@@ -208,7 +208,10 @@ awaitable<void> proxy_exchange::relay_response() {
         co_return;
     }
     response_ended_ = true;
-    if (!co_await res_.end_stream()) {
+    bool written = co_await res_.end_stream();
+    // Posted to watch_client(), if it waits: what follows does not suspend
+    response_written_->set();
+    if (!written) {
         result_.error = "client connection lost";
         co_return;
     }

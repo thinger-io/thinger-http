@@ -11,6 +11,7 @@
 #include <fstream>
 #include <future>
 #include <thread>
+#include "../fixtures/server_listen.hpp"
 
 using namespace thinger;
 
@@ -23,8 +24,8 @@ namespace {
         uint16_t port = 0;
 
         void start() {
-            REQUIRE(server.listen("127.0.0.1", 0));
-            port = server.local_port();
+            REQUIRE_FALSE(server.listen("127.0.0.1", 0));
+            port = http::test::listening_port(server);
             thread = std::thread([this]() { server.wait(); });
         }
 

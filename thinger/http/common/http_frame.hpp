@@ -1,11 +1,16 @@
 #ifndef THINGER_HTTP_FRAME_HPP
 #define THINGER_HTTP_FRAME_HPP
 
+#include <cstdint>
 #include <functional>
 #include "../data/out_data.hpp"
 #include "body_logging.hpp"
 
 namespace thinger::http {
+
+    // What a frame is on the wire: the head of a message, an interim response (100 Continue),
+    // or part of a body
+    enum class frame_kind : uint8_t { head, interim, data };
 
     class http_frame : public data::out_data {
     public:
@@ -33,6 +38,9 @@ namespace thinger::http {
             last_frame_ = other.last_frame_;
             return *this;
         }
+
+        // What the frame is (see frame_kind)
+        virtual frame_kind kind() const = 0;
 
         // stream information
         void set_last_frame(bool last_frame);

@@ -1,4 +1,5 @@
 #include "executor_client.hpp"
+#include "async_client.hpp"
 #include <boost/asio/this_coro.hpp>
 #include <stdexcept>
 
@@ -16,7 +17,10 @@ executor_client::~executor_client() {
 }
 
 awaitable<std::unique_ptr<executor_client>> executor_client::for_current_coroutine() {
-    auto* io_context = asio::io_context_of(co_await boost::asio::this_coro::executor);
+    auto executor = co_await boost::asio::this_coro::executor;
+    // A coroutine of async_client::run() runs on an executor of the client, over its worker's
+    auto* io_context = asio::io_context_of(executor);
+    if (!io_context) io_context = detail::request_io_context(executor);
     if (!io_context) {
         throw std::logic_error("executor_client: the coroutine does not run on an io_context, "
                                "nor on a strand of one");

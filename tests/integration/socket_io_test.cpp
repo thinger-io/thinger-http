@@ -2,8 +2,7 @@
 
 #include <thinger/asio/sockets/tcp_socket.hpp>
 #include <thinger/asio/sockets/unix_socket.hpp>
-#include <thinger/asio/tcp_socket_server.hpp>
-#include <thinger/asio/unix_socket_server.hpp>
+#include <thinger/asio/listener.hpp>
 
 #include <boost/asio/steady_timer.hpp>
 
@@ -36,45 +35,60 @@ void run_client(CoroFactory&& factory) {
 }
 
 // ============================================================================
+// Echo listener: every connection writes back what it reads
+// ============================================================================
+
+namespace {
+
+std::unique_ptr<listener> echo_listener(boost::asio::io_context& io_ctx,
+                                        std::variant<tcp_endpoint, unix_endpoint> endpoint) {
+    listener_options options;
+    options.endpoint = std::move(endpoint);
+    options.max_listening_attempts = 1;
+    auto executor = [&io_ctx]() -> boost::asio::any_io_executor { return io_ctx.get_executor(); };
+    auto server = std::make_unique<listener>(std::move(options), executor, executor);
+    REQUIRE_FALSE(server->open());
+    server->start([&io_ctx](std::shared_ptr<asio::socket> sock) {
+        co_spawn(io_ctx, [sock]() -> awaitable<void> {
+            uint8_t buf[4096];
+            while (sock->is_open()) {
+                auto [ec, n] = co_await sock->read_some(buf, sizeof(buf));
+                if (ec) break;
+                co_await sock->write(buf, n);
+            }
+        }, detached);
+    });
+    return server;
+}
+
+} // namespace
+
+// ============================================================================
 // TCP Echo Fixture
 // ============================================================================
 
 struct TcpEchoFixture {
     boost::asio::io_context io_ctx;
     boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work;
-    tcp_socket_server server;
+    std::unique_ptr<listener> server;
     std::thread io_thread;
 
     TcpEchoFixture()
         : work(io_ctx.get_executor())
-        , server("127.0.0.1", "0",
-                 [this]() -> boost::asio::io_context& { return io_ctx; },
-                 [this]() -> boost::asio::io_context& { return io_ctx; })
+        , server(echo_listener(io_ctx, tcp_endpoint{"127.0.0.1", 0}))
     {
-        server.set_max_listening_attempts(1);
-        server.set_handler([this](std::shared_ptr<asio::socket> sock) {
-            co_spawn(io_ctx, [sock]() -> awaitable<void> {
-                uint8_t buf[4096];
-                while (sock->is_open()) {
-                    auto [ec, n] = co_await sock->read_some(buf, sizeof(buf));
-                    if (ec) break;
-                    co_await sock->write(buf, n);
-                }
-            }, detached);
-        });
-        REQUIRE(server.start());
         io_thread = std::thread([this]() { io_ctx.run(); });
     }
 
     ~TcpEchoFixture() {
-        server.stop();
+        server->stop();
         work.reset();
         io_ctx.stop();
         if (io_thread.joinable()) io_thread.join();
     }
 
     std::string port_str() const {
-        return std::to_string(server.local_port());
+        return std::to_string(server->local_port());
     }
 };
 
@@ -86,7 +100,7 @@ struct UnixEchoFixture {
     boost::asio::io_context io_ctx;
     boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work;
     std::string socket_path;
-    unix_socket_server server;
+    std::unique_ptr<listener> server;
     std::thread io_thread;
 
     UnixEchoFixture()
@@ -94,28 +108,14 @@ struct UnixEchoFixture {
         , socket_path((std::filesystem::temp_directory_path() /
                        ("thinger_io_test_" + std::to_string(getpid()) + "_" +
                         std::to_string(reinterpret_cast<uintptr_t>(this)) + ".sock")).string())
-        , server(socket_path,
-                 [this]() -> boost::asio::io_context& { return io_ctx; },
-                 [this]() -> boost::asio::io_context& { return io_ctx; })
     {
         std::filesystem::remove(socket_path);
-        server.set_max_listening_attempts(1);
-        server.set_handler([this](std::shared_ptr<asio::socket> sock) {
-            co_spawn(io_ctx, [sock]() -> awaitable<void> {
-                uint8_t buf[4096];
-                while (sock->is_open()) {
-                    auto [ec, n] = co_await sock->read_some(buf, sizeof(buf));
-                    if (ec) break;
-                    co_await sock->write(buf, n);
-                }
-            }, detached);
-        });
-        REQUIRE(server.start());
+        server = echo_listener(io_ctx, unix_endpoint{socket_path});
         io_thread = std::thread([this]() { io_ctx.run(); });
     }
 
     ~UnixEchoFixture() {
-        server.stop();
+        server->stop();
         work.reset();
         io_ctx.stop();
         if (io_thread.joinable()) io_thread.join();

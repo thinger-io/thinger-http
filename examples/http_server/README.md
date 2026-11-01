@@ -29,7 +29,7 @@ server.start("0.0.0.0", 8080);
 
 ### simple_https_server
 
-HTTPS server with TLS certificates.
+HTTPS server with TLS certificates: a `pool_server` listening with `listener_options`, its `tls` holding a `certificate_manager` (a self-signed certificate for development).
 
 ```bash
 ./simple_https_server [port]
@@ -46,7 +46,7 @@ WebSocket server with echo and broadcast functionality.
 
 ```cpp
 server.get("/ws/echo", [](auto& req, auto& res) {
-    res.upgrade_websocket([](auto ws) {
+    res.upgrade_websocket({}, [](auto ws) {
         ws->on_message([ws](const std::string& msg, bool binary) {
             ws->send_text("Echo: " + msg);
         });
@@ -124,7 +124,7 @@ server.enable_cors({
 
 ### server_shutdown_example
 
-Graceful server shutdown handling.
+Graceful server shutdown from a handler: `POST /api/shutdown` answers, then runs `co_await server.shutdown(by)` on the handler's thread, letting the requests in flight finish within 5 seconds.
 
 ```bash
 ./server_shutdown_example [port]
@@ -197,11 +197,21 @@ server.post("/path", handler);
 server.put("/path", handler);
 server.del("/path", handler);
 
+// Connection settings (idle timeout, lingering close, logging), before listen()
+http::connection_options options;
+options.idle_timeout = std::chrono::seconds(60);
+server.set_connection_options(options);
+
 // Start
 server.start("0.0.0.0", 8080);  // Blocking
-server.listen("0.0.0.0", 8080); // Non-blocking
+server.listen("0.0.0.0", 8080); // Non-blocking: an error_code, empty on success
+asio::listener_options tls;     // Another listener, HTTPS, serving the same routes
+tls.endpoint = asio::tcp_endpoint{"0.0.0.0", 8443};
+tls.tls = std::make_shared<asio::certificate_manager>();
+server.listen(tls);
+server.listening_on();           // {"http://0.0.0.0:8080", "https://0.0.0.0:8443"}
 server.wait();                   // Wait for shutdown
-server.stop();                   // Stop server
+server.stop();                   // Stop server (every listener)
 ```
 
 ### Request Object
@@ -236,7 +246,7 @@ void handler(http::request& req, http::response& res) {
 ### WebSocket Upgrade
 
 ```cpp
-res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) {
+res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection> ws) {
     ws->on_message([ws](const std::string& msg, bool binary) {
         ws->send_text("response");
         ws->send_binary("data");

@@ -12,12 +12,13 @@ using namespace std::chrono_literals;
 
 // wait() functionality only applies to async_client (http::client is synchronous)
 TEST_CASE("HTTP Async Client wait() functionality", "[http][client][wait]") {
+    thinger::http::test::running_workers workers;
 
     thinger::http::test::TestServerFixture fixture;
     auto& base_url = fixture.base_url;
 
     SECTION("wait() blocks until all requests complete") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<int> completed_requests{0};
         const int total_requests = 5;
 
@@ -39,7 +40,7 @@ TEST_CASE("HTTP Async Client wait() functionality", "[http][client][wait]") {
     }
 
     SECTION("wait() returns immediately when no active requests") {
-        http::async_client client;
+        http::async_client client(workers);
 
         auto start = std::chrono::steady_clock::now();
         client.wait();
@@ -49,7 +50,7 @@ TEST_CASE("HTTP Async Client wait() functionality", "[http][client][wait]") {
     }
 
     SECTION("wait() can be called multiple times") {
-        http::async_client client;
+        http::async_client client(workers);
 
         // First batch of requests
         std::atomic<int> batch1_completed{0};
@@ -75,11 +76,13 @@ TEST_CASE("HTTP Async Client wait() functionality", "[http][client][wait]") {
     }
 
     SECTION("wait() unblocks when client is stopped") {
-        http::async_client client;
+        http::async_client client(workers);
 
         // Start a long-running request
+        std::atomic<int> callbacks{0};
         client.get(base_url + "/delay/10", [&](http::client_response& res) {
-            // Callback may or may not be called depending on stop() timing
+            // Not called: stop() cancels the request, and returns once it ended
+            callbacks++;
         });
 
         // Stop the client in another thread after a short delay
@@ -96,17 +99,21 @@ TEST_CASE("HTTP Async Client wait() functionality", "[http][client][wait]") {
 
         // Should have unblocked after ~500ms, not 10s
         REQUIRE(elapsed < 2s);
-        // Note: callback may not be called if stop() cancels the request before it completes
+        // stop() returned once the request ended, cancelled: nothing of it runs anymore (the
+        // client is then destroyed, at the end of the section)
+        REQUIRE(client.pending_requests() == 0);
+        REQUIRE(callbacks == 0);
     }
 }
 
 TEST_CASE("HTTP Async Client wait_for() functionality", "[http][client][wait_for]") {
+    thinger::http::test::running_workers workers;
 
     thinger::http::test::TestServerFixture fixture;
     auto& base_url = fixture.base_url;
 
     SECTION("wait_for() returns true when requests complete in time") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<bool> completed{false};
 
         client.get(base_url + "/delay/1", [&](http::client_response& res) {
@@ -121,7 +128,7 @@ TEST_CASE("HTTP Async Client wait_for() functionality", "[http][client][wait_for
     }
 
     SECTION("wait_for() returns false on timeout") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<bool> completed{false};
 
         client.get(base_url + "/delay/5", [&](http::client_response& res) {
@@ -142,7 +149,7 @@ TEST_CASE("HTTP Async Client wait_for() functionality", "[http][client][wait_for
     }
 
     SECTION("pending_requests() returns count of active requests") {
-        http::async_client client;
+        http::async_client client(workers);
 
         // Initially no pending requests
         REQUIRE(client.pending_requests() == 0);

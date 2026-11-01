@@ -15,6 +15,7 @@
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
+#include <thinger/http/server/websocket_connection.hpp>
 #include <boost/asio.hpp>
 
 #include <atomic>
@@ -141,15 +142,17 @@ int main(int argc, char* argv[]) {
 
     http::server server;
     server.get("/push", [&](http::request&, http::response& res) {
-        res.upgrade_websocket([&](std::shared_ptr<http::websocket_connection> ws) -> awaitable<void> {
+        res.upgrade_websocket({}, [&](std::shared_ptr<http::websocket_connection> ws) -> awaitable<void> {
             configure(ws, mode);
             auto executor = co_await net::this_coro::executor;
             co_spawn(executor, sampler(ws, counters), detached);
             co_spawn(executor, producer(ws, mode, producer_rate, counters), detached);
         });
     });
-    if (!server.listen("127.0.0.1", 0)) return 1;
-    uint16_t port = server.local_port();
+    if (server.listen("127.0.0.1", 0)) return 1;
+    // The port the system chose: the end of "http://127.0.0.1:<port>"
+    auto url = server.listening_on().front();
+    auto port = static_cast<uint16_t>(std::stoul(url.substr(url.rfind(':') + 1)));
     std::thread server_thread([&] { server.wait(); });
     std::thread reader([&] { slow_reader(port, reader_rate, counters); });
 

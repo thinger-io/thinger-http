@@ -15,7 +15,7 @@ enum class client_verify : std::uint8_t {
     required,   // CertificateRequest; the handshake fails without one (TLS 1.3: certificate_required)
 };
 
-// What a TLS server asks of its clients' certificates (see tcp_socket_server::enable_ssl())
+// What a TLS listener asks of its clients' certificates (see listener_options::client_verify)
 struct client_verify_options {
     client_verify mode = client_verify::none;
     // CAs (PEM, one or more certificates) OpenSSL validates the chain of the client against
@@ -30,6 +30,15 @@ struct client_verify_options {
     // Bytes of the certificate chain a client may send (SSL_set_max_cert_list): the memory a
     // client may use before it is authenticated
     std::size_t max_cert_list = std::size_t{16} * 1024;
+};
+
+// The TLS session cache of the contexts of a certificate_manager (see
+// listener_options::session_cache): resumption of earlier sessions, by session id and by ticket
+struct session_cache_options {
+    bool enabled = true;            // false: no resumption (no server cache, no tickets)
+    std::size_t size = 20480;       // sessions in the server cache: OpenSSL's default
+
+    bool operator==(const session_cache_options&) const = default;
 };
 
 // What the application may read of a TLS connection once its handshake is done (see

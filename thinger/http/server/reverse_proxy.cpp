@@ -1,6 +1,7 @@
 // The reverse proxy, and the course of an exchange: the connection to the target, and the
 // timeouts. The request, its body, the response and the tunnels are in reverse_proxy/.
 #include "reverse_proxy/proxy_exchange.hpp"
+#include "server_connection.hpp"
 #include "../../asio/sockets/ssl_socket.hpp"
 #include "../../asio/sockets/tcp_socket.hpp"
 #include "../../asio/sockets/unix_socket.hpp"
@@ -35,7 +36,7 @@ namespace {
 }
 
 boost::asio::io_context* proxy_exchange::io_context() {
-    if (auto socket = req_.get_socket()) return &socket->get_io_context();
+    if (auto* io = req_.source_ ? req_.source_->io_context() : nullptr) return io;
     // A request dispatched in memory: the context running the handler, if it is an
     // io_context (null otherwise: the sockets need one)
     return io_context_of(executor_);
@@ -166,10 +167,11 @@ awaitable<void> proxy_exchange::exchange() {
     bool target_open = co_await send_head();
     if (target_open && body_mode_ != body_mode::none && !body_buffered_) {
         // The response is read while the body is sent: a target may answer before reading
-        // it all (e.g. 401, 413), and stop reading it
-        auto result = co_await (read_head() || stream_body());
+        // it all (e.g. 401, 413), and stop reading it. Which one ends first does not tell:
+        // the body waits for the head, which is there if it was read
+        co_await (read_head_while_streaming() || stream_body());
         if (stopped_ != stop_reason::none) co_return;
-        if (result.index() != 0 || !std::get<0>(result)) co_return;
+        if (!head_) co_return;
         // Answered before the end of the body: what is left of it is not read
         if (!request_sent_) close_client_after_response();
     } else {
@@ -183,52 +185,71 @@ awaitable<void> proxy_exchange::exchange() {
     co_await relay_response();
 }
 
-awaitable<void> proxy_exchange::wait_forever() {
-    boost::asio::steady_timer timer(executor_, clock::time_point::max());
-    co_await timer.async_wait(use_nothrow_awaitable);
+awaitable<bool> proxy_exchange::read_head_while_streaming() {
+    bool read = co_await read_head();
+    head_read_->set();
+    co_return read;
 }
 
 awaitable<void> proxy_exchange::watch_client() {
-    // Only once the client sent the whole request: then reading from its connection
-    // tells whether it closed it, without taking anything that belongs to the request
-    if (!request_sent_) {
-        co_await request_sent_signal_->async_wait(use_nothrow_awaitable);
-        if (!request_sent_) co_return;  // the exchange ended
-    }
-    auto socket = req_.get_socket();
-    // Data of the next request already read: the client is there
-    if (!socket || req_.read_ahead_available() > 0) {
-        co_await wait_forever();
-        co_return;
-    }
-    auto ec = co_await socket->wait(boost::asio::socket_base::wait_read);
-    bool closed = ec || co_await socket->peer_closed();
+    // The scope of the request ends the exchange once cancelled: its client is gone (it reset
+    // the connection, or a read or write on it failed; not a client that only closed its
+    // sending side), its route timed out, or the server reached its shutdown deadline. Nobody
+    // would take the response then (e.g. an event stream that stays silent). The connection of
+    // the client is not read here: the server watches it
+    auto reason = co_await req_.client_gone();
     // The exchange ended meanwhile: the wait was cancelled
-    auto state = co_await boost::asio::this_coro::cancellation_state;
-    if (state.cancelled() != boost::asio::cancellation_type::none) co_return;
-    // Not closed: the next request (pipelined), kept for the server, so the client is there.
-    // Or the server closed the connection itself once the whole response was queued
-    if (!closed || response_ended_) {
-        co_await wait_forever();
+    if (reason == cancel_reason::none) co_return;
+    // The whole response is queued: the exchange is done with the client, and ends once it is
+    // written
+    if (response_ended_) {
+        co_await response_written_->wait();
         co_return;
     }
-    // Gone: nobody would take the response (e.g. an event stream that stays silent)
-    if (stopped_ == stop_reason::none) stopped_ = stop_reason::client_left;
+    if (stopped_ == stop_reason::none) {
+        stopped_ = reason == cancel_reason::client_gone ? stop_reason::client_left : stop_reason::timeout;
+    }
     close_target();
+    // A response started is incomplete: the connection of the client is closed after it
+    if (reason != cancel_reason::client_gone && response_started_) {
+        if (auto connection = res_.get_connection()) connection->release();
+    }
 }
 
-awaitable<void> proxy_exchange::watchdog() {
-    boost::asio::steady_timer timer(executor_);
-    while (true) {
-        auto deadline = clock::time_point::max();
-        if (options_.idle_timeout.count() > 0) deadline = last_activity_ + options_.idle_timeout;
-        if (options_.total_timeout.count() > 0) deadline = std::min(deadline, start_ + options_.total_timeout);
-        if (clock::now() >= deadline) break;
-        timer.expires_at(deadline);
-        auto [ec] = co_await timer.async_wait(use_nothrow_awaitable);
-        if (ec) co_return;  // the exchange ended
-    }
+bool proxy_exchange::has_deadline() const {
+    return options_.idle_timeout.count() > 0 || options_.total_timeout.count() > 0;
+}
 
+// The earliest of the idle and total deadlines, or none when neither timeout is set
+std::optional<clock::time_point> proxy_exchange::next_deadline() const {
+    std::optional<clock::time_point> deadline;
+    if (options_.idle_timeout.count() > 0) deadline = last_activity_ + options_.idle_timeout;
+    if (options_.total_timeout.count() > 0) {
+        auto total = start_ + options_.total_timeout;
+        deadline = deadline ? std::min(*deadline, total) : total;
+    }
+    return deadline;
+}
+
+void proxy_exchange::touch() {
+    last_activity_ = clock::now();
+    // Later: the watchdog checks it when it expires
+    if (deadline_) deadline_->expires_at(*next_deadline());
+}
+
+void proxy_exchange::start_deadline() {
+    deadline_passed_.emplace(executor_);
+    deadline_.emplace(executor_, [this] { deadline_passed_->set(); });
+    deadline_->expires_at(*next_deadline());
+}
+
+awaitable<void> proxy_exchange::stop_at_deadline() {
+    // Cancelled: the exchange ended
+    if (!co_await deadline_passed_->wait()) co_return;
+    stop_for_timeout();
+}
+
+void proxy_exchange::stop_for_timeout() {
     // Make whatever the exchange waits for fail: the target, and a client that does
     // not take the response (its connection is closed, as the response is incomplete)
     if (stopped_ == stop_reason::none) stopped_ = stop_reason::timeout;
@@ -279,8 +300,16 @@ awaitable<proxy_result> proxy_exchange::run() {
     }
     if (!co_await connect()) co_return result_;
 
-    request_sent_signal_.emplace(executor_, clock::time_point::max());
-    co_await (exchange() || watchdog() || watch_client());
+    head_read_.emplace(executor_);
+    response_written_.emplace(executor_);
+    if (has_deadline()) {
+        start_deadline();
+        co_await (exchange() || stop_at_deadline() || watch_client());
+        deadline_.reset();
+    } else {
+        // No timeout: nothing to watch but the client
+        co_await (exchange() || watch_client());
+    }
     finish_stopped();
     close_target();
     co_return result_;

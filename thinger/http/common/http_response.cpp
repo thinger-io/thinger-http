@@ -70,6 +70,8 @@ namespace thinger::http{
                 "HTTP/1.1 416 Range Not Satisfiable";
         const std::string expectation_failed =
                 "HTTP/1.1 417 Expectation Failed";
+        const std::string misdirected_request =
+                "HTTP/1.1 421 Misdirected Request";
         const std::string request_header_fields_too_large =
                 "HTTP/1.1 431 Request Header Fields Too Large";
         const std::string unknown =
@@ -137,6 +139,8 @@ namespace thinger::http{
                     return range_not_satisfiable;
                 case http_response::status::expectation_failed:
                     return expectation_failed;
+                case http_response::status::misdirected_request:
+                    return misdirected_request;
                 case http_response::status::request_header_fields_too_large:
                     return request_header_fields_too_large;
                 default:
@@ -326,6 +330,12 @@ namespace thinger::http{
                 "<body><h1>417 Expectation Failed</h1></body>"
                 "</html>");
 
+        static const std::string misdirected_request(
+                "<html>"
+                "<head><title>Misdirected Request</title></head>"
+                "<body><h1>421 Misdirected Request</h1></body>"
+                "</html>");
+
         static const std::string request_header_fields_too_large(
                 "<html>"
                 "<head><title>Request Header Fields Too Large</title></head>"
@@ -382,6 +392,8 @@ namespace thinger::http{
                     return unsupported_media_type;
                 case http_response::status::expectation_failed:
                     return expectation_failed;
+                case http_response::status::misdirected_request:
+                    return misdirected_request;
                 case http_response::status::request_header_fields_too_large:
                     return request_header_fields_too_large;
                 default:

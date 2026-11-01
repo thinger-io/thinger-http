@@ -4,7 +4,6 @@
 #include "http_client_base.hpp"
 #include "stream_types.hpp"
 #include "request_builder.hpp"
-#include "../../asio/worker_client.hpp"
 #include "../../asio/workers.hpp"
 #include <concepts>
 #include <condition_variable>
@@ -17,75 +16,143 @@ namespace thinger::http {
 
 /**
  * Asynchronous HTTP client with callback-based API.
- * Uses worker thread pool for optimal performance.
+ * Runs its requests and callbacks on a pool of workers, which the application owns, starts,
+ * and keeps alive longer than the client (stop the client, or destroy it, before the workers).
  * Perfect for concurrent requests and non-blocking I/O.
  *
+ * stop() and the destructor end the requests in flight before returning: they cancel them
+ * (their callbacks are not called; the coroutines of run() see them fail with
+ * operation_aborted) and, called from a thread that is not one of the workers, wait until none
+ * of them runs, nor any callback of the client (see stop()). Once the destructor returned,
+ * called from any thread (a callback of the client included), no callback or coroutine of the
+ * client runs, so what they captured may be destroyed. The WebSockets handed out outlive the
+ * client. The coroutines of run() run on an executor of the client (that of their worker,
+ * wrapped), which drops them once stopped: work spawned on it (this_coro::executor) is dropped
+ * with them.
+ *
  * Usage with callbacks:
- *   http::async_client client;
+ *   asio::workers workers;
+ *   workers.start();
+ *   http::async_client client(workers);
  *   client.get("https://api.example.com/data", [](auto& response) {
  *       std::cout << response.body() << std::endl;
  *   });
  *   client.wait();  // Wait for all requests to complete
  *
  * Usage with coroutines:
- *   http::async_client client;
+ *   http::async_client client(workers);
  *   client.run([&]() -> awaitable<void> {
  *       auto response = co_await client.get("https://api.example.com/data");
  *   });
  *   client.wait();
  */
-class async_client : public http_client_base, public asio::worker_client {
-private:
-    std::condition_variable requests_cv_;
-    std::mutex requests_mutex_;
-    std::atomic<size_t> active_requests_{0};
+namespace detail {
+    // What the requests of an async_client share with it, kept alive by them: they may outlive
+    // the client (see async_client.cpp)
+    class request_scope;
+    // A request of an async_client, from run() to its end
+    class client_request;
+    // The io_context of the executor of a request of an async_client (that of a coroutine of
+    // run()): its worker's; null for any other executor
+    boost::asio::io_context* request_io_context(const boost::asio::any_io_executor& executor);
+}
 
-protected:
-    boost::asio::io_context& get_io_context() override {
-        return asio::get_workers().get_thread_io_context();
+class async_client : public http_client_base {
+private:
+    asio::workers& workers_;
+    std::shared_ptr<detail::request_scope> scope_;
+    std::atomic<bool> running_{true};
+
+    // The end of a request run by run(): the completion of its coroutine, which releases the
+    // request when destroyed, whether it was called or not (it is not once the client closed
+    // the request: see stop()). It touches only the state the requests share with the client
+    class request_end {
+    public:
+        explicit request_end(std::shared_ptr<detail::client_request> request) noexcept;
+        request_end(request_end&&) noexcept = default;
+        request_end& operator=(request_end&&) noexcept = default;
+        ~request_end();
+
+        void operator()(const std::exception_ptr&, auto&&...) const noexcept {}
+
+    private:
+        std::shared_ptr<detail::client_request> request_;
+    };
+
+    // A request about to run, registered: null while stop() or the destructor runs, when it
+    // is not run
+    std::shared_ptr<detail::client_request> start_request();
+    // Where it runs (the executor of the caller's worker, or of one of the pool, which drops
+    // the request once the client closed it), and what cancels it
+    static boost::asio::any_io_executor executor_of(const detail::client_request& request);
+    static boost::asio::cancellation_slot slot_of(detail::client_request& request);
+    // Once its coroutine is spawned: it may be cancelled from then on
+    static void spawned(const std::shared_ptr<detail::client_request>& request);
+
+    // Cancel the requests in flight and close them (see stop()); with `final`, for good
+    void close_requests(bool final);
+
+    template<typename F>
+    void spawn(F&& coro) {
+        auto request = start_request();
+        if (!request) return;
+        co_spawn(executor_of(*request), std::forward<F>(coro),
+                 boost::asio::bind_cancellation_slot(slot_of(*request), request_end(request)));
+        spawned(request);
     }
 
+protected:
+    // The worker of the calling thread, or else one of the pool
+    boost::asio::io_context& get_io_context() override {
+        return workers_.get_thread_io_context();
+    }
+
+    // The WebSockets handed out run on the worker, not on the executor of the requests: they
+    // belong to the application, and outlive the client
+    boost::asio::any_io_executor websocket_executor(const boost::asio::any_io_executor& executor) override;
+
 public:
-    async_client();
+    explicit async_client(asio::workers& workers);
+    // Ends the requests in flight as stop() does, for good: none of them (no callback, no
+    // coroutine of run()) runs once it returns, and those it could not wait for touch nothing of
+    // the client
     ~async_client() override;
 
-    // Track active requests for synchronization
+    // Count a request the application tracks itself (wait() waits for it), and its end
     void track_request_start();
     void track_request_end();
 
-    // worker_client interface
-    bool stop() override;
-    void wait() override;
+    // Stop: release wait(), cancel the requests in flight and end them, and close the idle
+    // connections. Returns whether it was running. The callbacks of the requests cancelled
+    // are not called (one that completed meanwhile may still call its own), and the
+    // coroutines of run() see their requests fail with operation_aborted. From a thread that
+    // is not one of the workers, it returns once no request of the client runs, nor any of its
+    // callbacks; from one of them (e.g. in a callback), it does not wait, but none of those
+    // requests resumes anymore. Requests started while it runs are not run; those started
+    // afterwards are
+    bool stop();
+    bool is_running() const { return running_; }
+
+    // Wait until no request is active, or the client stops
+    void wait();
 
     // Wait with timeout
     bool wait_for(std::chrono::milliseconds timeout);
 
     // Query
-    size_t pending_requests() const { return active_requests_.load(); }
-    bool has_pending_requests() const { return active_requests_.load() > 0; }
+    size_t pending_requests() const;
+    bool has_pending_requests() const { return pending_requests() > 0; }
 
-    // Run an awaitable on the worker pool
+    // Run an awaitable on the worker pool (counted until it ends, also by an exception)
     template<typename T>
     void run(awaitable<T> coro) {
-        track_request_start();
-        co_spawn(get_io_context(),
-            [this, coro = std::move(coro)]() mutable -> awaitable<void> {
-                co_await std::move(coro);
-                track_request_end();
-            },
-            detached);
+        spawn(std::move(coro));
     }
 
-    // Run a coroutine factory on the worker pool
+    // Run a coroutine factory on the worker pool (counted until it ends, also by an exception)
     template<typename F>
     void run(F&& coro_factory) {
-        track_request_start();
-        co_spawn(get_io_context(),
-            [this, factory = std::forward<F>(coro_factory)]() mutable -> awaitable<void> {
-                co_await factory();
-                track_request_end();
-            },
-            detached);
+        spawn(std::forward<F>(coro_factory));
     }
 
     // ============================================

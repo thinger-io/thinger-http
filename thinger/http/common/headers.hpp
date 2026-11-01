@@ -66,6 +66,9 @@ public:
     headers& operator=(const headers&) = default;
     headers& operator=(headers&&) = default;
 
+    // The head of a message
+    frame_kind kind() const override { return frame_kind::head; }
+
     // setters
     void add_header(std::string key, std::string value);
     void set_header(std::string key, std::string value);

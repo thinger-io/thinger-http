@@ -6,6 +6,7 @@
 #include "trusted_proxies.hpp"
 #include "body_decoders.hpp"
 #include "routing/route.hpp"
+#include "virtual_host.hpp"
 
 namespace thinger::http{
 
@@ -13,34 +14,22 @@ namespace thinger::http{
     using std::string;
 
     request::request(
-        const std::shared_ptr<server_connection>& http_connection,
-        const std::shared_ptr<http_stream>& http_stream,
+        std::unique_ptr<detail::request_source> source,
+        std::shared_ptr<http_stream> http_stream,
         std::shared_ptr<http_request> http_request) :
-        http_connection_{http_connection},
-        http_stream_{http_stream},
+        http_stream_{std::move(http_stream)},
+        source_{std::move(source)},
         http_request_{std::move(http_request)}
     {
         if (http_request_) {
             body_reader_.set_framing(http_request_->is_chunked_transfer(), http_request_->pending_body_size());
         }
         body_reader_.set_limit(default_max_body_size);
-        if (http_connection) {
-            expect_continue_ = http_stream && http_stream->get_continue() == http_stream::continue_state::pending;
-            // (capturing only `this` fits in the function, without allocating)
-            body_reader_.set_source([this](uint8_t* buffer, size_t size) -> thinger::awaitable<size_t> {
-                auto conn = http_connection_.lock();
-                // Nothing more is read once the connection closes gracefully: it drops the
-                // rest itself (see server_connection::linger())
-                if (!conn || conn->lingering()) co_return 0;
-                // The body is needed now: ask the client for it (Expect: 100-continue)
-                if (expect_continue_) [[unlikely]] {
-                    expect_continue_ = false;
-                    if (auto stream = http_stream_.lock()) conn->send_continue(*stream);
-                }
-                auto [ec, bytes] = co_await conn->get_socket()->read_some(buffer, size);
-                // a body that keeps arriving keeps the connection alive (e.g. a long upload)
-                if (bytes > 0) conn->extend_timeout();
-                co_return bytes;
+        if (source_) {
+            // (capturing only `this` fits in the function, without allocating; the source's
+            // coroutine is the read itself)
+            body_reader_.set_source([this](uint8_t* buffer, size_t size) {
+                return source_->read_body_some(buffer, size);
             });
         }
     }
@@ -67,12 +56,8 @@ namespace thinger::http{
         return http_request_;
     }
 
-    std::shared_ptr<server_connection> request::get_http_connection() const {
-        return http_connection_.lock();
-    }
-    
     std::shared_ptr<http_stream> request::get_http_stream() const {
-        return http_stream_.lock();
+        return http_stream_;
     }
 
     void request::set_auth_user(const std::string& auth_user){
@@ -135,8 +120,22 @@ namespace thinger::http{
 
     std::string request::get_peer_ip() const{
         if (!peer_ip_.empty()) return peer_ip_;
-        auto http_connection = http_connection_.lock();
-        return http_connection ? http_connection->get_socket()->get_remote_ip() : "";
+        return source_ ? source_->info().peer_ip : "";
+    }
+
+    connection_info request::connection() const {
+        return source_ ? source_->info() : connection_info{};
+    }
+
+    std::optional<asio::tls_session> request::tls() const {
+        return source_ ? source_->tls() : std::nullopt;
+    }
+
+    bool request::misdirected() const {
+        if (!source_ || !http_request_ || !http_request_->is_ssl()) return false;
+        // The name of the virtual host (see http_application::resolve_host())
+        const auto& host = http_request_->get_header(header::host);
+        return source_->misdirected(virtual_host::host_name(host.empty() ? http_request_->get_host() : host));
     }
 
     std::string request::get_request_ip() const{
@@ -153,6 +152,22 @@ namespace thinger::http{
 
     bool request::keep_alive() const{
         return http_request_ && http_request_->keep_alive();
+    }
+
+    cancel_reason request::cancelled() const {
+        return http_stream_ ? http_stream_->cancelled() : cancel_reason::none;
+    }
+
+    thinger::awaitable<cancel_reason> request::client_gone() {
+        if (http_stream_) co_return co_await http_stream_->wait_cancelled();
+        // Never set: the wait ends when it is cancelled
+        asio::async_event never(co_await boost::asio::this_coro::executor);
+        co_await never.wait();
+        co_return cancel_reason::none;
+    }
+
+    boost::asio::cancellation_slot request::cancellation_slot() {
+        return http_stream_ ? http_stream_->observer_slot() : boost::asio::cancellation_slot{};
     }
 
     // Convenience methods implementation
@@ -212,22 +227,14 @@ namespace thinger::http{
         return http_request_ && http_request_->is_chunked_transfer();
     }
 
-    std::shared_ptr<asio::socket> request::get_socket() const {
-        auto conn = http_connection_.lock();
-        return conn ? conn->get_socket() : nullptr;
-    }
-
     std::vector<uint8_t> request::take_read_ahead() {
         return body_reader_.take_read_ahead();
     }
 
-    size_t request::read_ahead_available() const {
-        return body_reader_.read_ahead_available();
-    }
-
     void request::note_body_read() {
         if (body_reader_.has_pending() || body_reader_.error() != body_error::none) return;
-        if (auto stream = http_stream_.lock()) stream->set_input_pending(false);
+        // What is left in the read-ahead follows the request (a pipelined request)
+        if (http_stream_) http_stream_->end_input(body_reader_.buffered() > 0);
     }
 
     thinger::awaitable<size_t> request::read(uint8_t* buffer, size_t size) {

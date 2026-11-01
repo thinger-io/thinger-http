@@ -1,37 +1,33 @@
 #include "../../util/logger.hpp"
 #include "../../util/types.hpp"
 #include "websocket_connection.hpp"
+#include "connection_tracker.hpp"
+#include <algorithm>
 #include <utility>
 #include "../util/utf8.hpp"
+#include "detail/push_queue.hpp"
 
 namespace thinger::http{
 
-    // A sender waiting for its message to be written (send_*_async())
-    struct websocket_connection::send_waiter {
-        explicit send_waiter(const boost::asio::any_io_executor& executor) :
-            timer(executor, boost::asio::steady_timer::time_point::max()) {}
-
-        void finish(bool success){
-            done = true;
-            written = success;
-            timer.cancel();
-        }
-
-        awaitable<bool> wait(){
-            if(!done) co_await timer.async_wait(use_nothrow_awaitable);
-            co_return written;
-        }
-
-        boost::asio::steady_timer timer;
-        bool done = false;
-        bool written = false;
-    };
-
-    websocket_connection::websocket_connection(std::shared_ptr<asio::websocket> socket) :
+    websocket_connection::websocket_connection(std::shared_ptr<asio::websocket> socket,
+                                               const websocket_accept_options& options, server_scope scope) :
         ws_(std::move(socket)),
-        flow_(ws_->get_executor(), write_limits{.max_messages = MAX_OUTPUT_MESSAGES}),
+        queue_(std::make_unique<detail::push_queue<out_message>>(ws_->get_executor(),
+            write_limits{.max_messages = MAX_OUTPUT_MESSAGES},
+            detail::push_queue<out_message>::hooks{
+                .write_item = [this](out_message& message){ return write_message(message); },
+                .item_size = [](const out_message& message){ return message.data.size(); },
+                // every message is a unit: drop_oldest drops messages
+                .ends_unit = [](const out_message&){ return true; },
+                .on_failure = [this](detail::push_failure failure, boost::system::error_code ec){ queue_failed(failure, ec); },
+                .owner = [this]{ return std::shared_ptr<void>(shared_from_this()); },
+                .send_backlog = [this]{ return ws_->send_backlog(); }})),
+        buffer_(std::max<size_t>(options.max_message_size, 1)),
         on_close_(ws_->get_executor()),
-        resume_timer_(ws_->get_executor(), boost::asio::steady_timer::time_point::max())
+        scope_(std::move(scope)),
+        resumed_(ws_->get_executor()),
+        ping_interval_(options.ping_interval.value_or(asio::websocket::CONNECTION_TIMEOUT_SECONDS)),
+        idle_timeout_(options.idle_timeout.value_or(2 * asio::websocket::CONNECTION_TIMEOUT_SECONDS))
     {
         LOG_LEVEL(2, "websocket connection created");
     }
@@ -51,16 +47,16 @@ namespace thinger::http{
             return;
         }
         LOG_LEVEL(1, "closing websocket: the server shuts down");
-        co_spawn(ws_->get_executor(),
-            [this, self = shared_from_this()]() -> awaitable<void> {
-                co_await close_connection(asio::websocket::CLOSE_GOING_AWAY);
-            },
-            detached);
+        start_close(asio::websocket::CLOSE_GOING_AWAY);
     }
 
-    awaitable<void> websocket_connection::close_connection(uint16_t code){
-        co_await ws_->close_graceful(code);
-        wake_reader();
+    void websocket_connection::start_close(uint16_t code){
+        // The connection is told when the handshake ends (closed, or failed), as it may be paused
+        co_spawn(ws_->get_executor(), ws_->close_graceful(code),
+            [self = shared_from_this()](const std::exception_ptr&){
+                LOG_LEVEL(1, "websocket closed");
+                self->wake_reader();
+            });
     }
 
     void websocket_connection::on_message(sync_callback<void(std::string, bool binary)> callback){
@@ -75,25 +71,17 @@ namespace thinger::http{
     {
         co_spawn(ws_->get_executor(),
             [this, self = shared_from_this()]() -> awaitable<void> {
-                // RAII guard: clears the callbacks when the coroutine
-                // frame is destroyed (normal exit, exception, or io_context
-                // teardown). This breaks shared_ptr cycles that occur when the
-                // user captures shared_ptr<websocket_connection> in the callback.
-                struct cycle_guard {
-                    websocket_connection& connection;
-                    ~cycle_guard() {
-                        connection.on_frame_callback_ = nullptr;
-                        connection.on_shutdown_callback_ = nullptr;
-                        // never told if destroyed open (e.g. with the io_context)
-                        connection.on_close_.release();
-                        // the watermark callbacks too, and producers waiting are told
-                        connection.flow_.close();
-                        // closed: no longer counts for the server
-                        if (connection.tracking_) connection.tracking_->closed();
-                    }
-                };
-
-                cycle_guard guard{*this};
+                // However the loop ends (also with the io_context destroyed), the queue closes
+                // (its watermark callbacks released, producers waiting told) and the callbacks
+                // are released: they may hold this connection
+                auto guard = queue_->guard_cycles([this]{
+                    on_frame_callback_ = nullptr;
+                    on_shutdown_callback_ = nullptr;
+                    // never told if destroyed open (e.g. with the io_context)
+                    on_close_.release();
+                    // closed: no longer counts for the server
+                    scope_.closed();
+                });
                 co_await read_messages();
                 // Ended here, on the executor (not by the teardown of the io_context): closed,
                 // unless released. Told after the cleanup of the guard, as it is posted
@@ -121,7 +109,8 @@ namespace thinger::http{
 
     awaitable<void> websocket_connection::read_loop()
     {
-        size_t next_read_size = DEFAULT_BUFFER_SIZE;
+        // (never past the largest message: the buffer refuses it)
+        size_t next_read_size = std::min(DEFAULT_BUFFER_SIZE, buffer_.max_size());
 
         // (released from a callback, e.g. on_message(): the socket belongs to someone else)
         while (ws_->is_open() && !released_) {
@@ -160,7 +149,13 @@ namespace thinger::http{
                     co_return;
                 }
 
-                next_read_size = DEFAULT_BUFFER_SIZE;
+                // the message goes on in another frame, if not complete: it must fit
+                next_read_size = std::min(DEFAULT_BUFFER_SIZE, buffer_.max_size() - buffer_.size());
+                if(next_read_size == 0){
+                    LOG_ERROR("websocket buffer overflow. closing connection");
+                    ws_->close(asio::websocket::CLOSE_MESSAGE_TOO_BIG);
+                    co_return;
+                }
 
             }else{
                 // check if the buffer is not going to overflow
@@ -204,13 +199,14 @@ namespace thinger::http{
     {
         LOG_LEVEL(2, "websocket reading paused");
         while (paused_ && !released_ && ws_->is_open()) {
-            co_await resume_timer_.async_wait(use_nothrow_awaitable);
+            resumed_.reset();   // woken by the next wake_reader(), not by one before
+            co_await resumed_.wait();
         }
         co_return !released_ && ws_->is_open();
     }
 
     void websocket_connection::wake_reader(){
-        resume_timer_.cancel();
+        resumed_.set();
     }
 
     void websocket_connection::suspend_keepalive(){
@@ -244,54 +240,36 @@ namespace thinger::http{
         return paused_;
     }
 
-    void websocket_connection::process_out_queue()
+    awaitable<boost::system::error_code> websocket_connection::write_message(out_message& message)
     {
-        if(out_queue_.empty() || writing_) return;
-        writing_ = true;
-        co_spawn(ws_->get_executor(), write_loop(shared_from_this()), detached);
+        // (closed meanwhile, e.g. by the peer: what is queued is not written)
+        if(!ws_->is_open()) co_return boost::asio::error::not_connected;
+        LOG_LEVEL(2, "handling websocket write, remaining in queue: {}", queue_->queued_messages());
+        ws_->set_binary(message.binary);
+        // past a slice, with a write deadline, in slices: each one is progress, so a slow client
+        // reading a large message is told from one that stopped reading
+        auto [ec, bytes] = message.data.size() > asio::socket::WRITE_SLICE_SIZE && queue_->get_write_limits().write_timeout.count() > 0
+            ? co_await ws_->write_message(message.data, [this]{ queue_->write_progressed(); })
+            : co_await ws_->write_message(message.data);
+        co_return ec;
     }
 
-    awaitable<void> websocket_connection::write_loop([[maybe_unused]] std::shared_ptr<websocket_connection> self)
+    void websocket_connection::queue_failed(detail::push_failure failure, boost::system::error_code ec)
     {
-        while(!out_queue_.empty() && ws_->is_open()) {
-            LOG_LEVEL(2, "handling websocket write, remaining in queue: {}", out_queue_.size());
-            auto message = std::move(out_queue_.front());
-            out_queue_.pop_front();
-            ws_->set_binary(message.binary);
-
-            flow_.write_started(*this, [](websocket_connection& self){ self.close_congested("its write timed out"); });
-            auto [write_ec, write_bytes] = co_await ws_->write_message(message.data);
-            flow_.write_finished();
-
-            flow_.remove(message.data.size());
-            if(message.waiter) message.waiter->finish(!write_ec);
-
-            if (write_ec) {
-                // a websocket that cannot write is broken: closed, which ends reading too
-                LOG_LEVEL(1, "websocket write failed: {}", write_ec.message());
-                if(write_ec != boost::asio::error::operation_aborted) ws_->close();
-                break;
-            }
-
-            LOG_DEBUG("message sent, remaining in queue: {}", out_queue_.size());
-        }
-
-        if(!ws_->is_open() || !out_queue_.empty()){
-            discard_queue();
-            wake_reader();
-        }
-        writing_ = false;
-    }
-
-    void websocket_connection::discard_queue()
-    {
-        // closed first: nobody is told the queue drained
-        flow_.close();
-        auto discarded = std::move(out_queue_);
-        out_queue_.clear();
-        flow_.clear();
-        for(auto& message : discarded){
-            if(message.waiter) message.waiter->finish(false);
+        switch(failure){
+            case detail::push_failure::overflow:
+                close_congested("it is congested");
+                return;
+            case detail::push_failure::write_timeout:
+                close_congested("its write timed out");
+                return;
+            case detail::push_failure::write_error:
+                // a websocket that cannot write is broken: closed, which ends reading too (not
+                // the socket released: its write was cancelled)
+                LOG_LEVEL(1, "websocket write failed: {}", ec.message());
+                if(ec != boost::asio::error::operation_aborted) ws_->close();
+                wake_reader();
+                return;
         }
     }
 
@@ -323,16 +301,13 @@ namespace thinger::http{
         started_ = true;
 
         // Taken over from a server: told when it shuts down
-        tracking_ = taken_over_connection::of(*ws_);
-        if(tracking_){
-            tracking_->set_type(connection_type::websocket);
-            tracking_->on_shutdown([weak = weak_from_this()]{
-                if(auto self = weak.lock()) self->server_shutdown();
-            });
-        }
+        scope_.set_type(connection_type::websocket);
+        scope_.on_shutdown([weak = weak_from_this()]{
+            if(auto self = weak.lock()) self->server_shutdown();
+        });
 
         // handle timeout on websocket (suspended while paused)
-        ws_->start_timeout();
+        ws_->set_keepalive(ping_interval_, idle_timeout_);
         if(paused_) suspend_keepalive();
 
         // initiates async reading on socket
@@ -342,17 +317,12 @@ namespace thinger::http{
     void websocket_connection::stop(){
         execute([this, self = shared_from_this()]{
             LOG_LEVEL(1, "closing websocket");
-            co_spawn(ws_->get_executor(),
-                [this, self]() -> awaitable<void> {
-                    co_await close_connection(asio::websocket::CLOSE_NORMAL);
-                    LOG_LEVEL(1, "websocket closed");
-                },
-                detached);
+            start_close(asio::websocket::CLOSE_NORMAL);
         });
     }
 
     bool websocket_connection::queue_full() const{
-        return flow_.overflows(1);
+        return queue_->full();
     }
 
     void websocket_connection::send_binary(std::string data){
@@ -368,86 +338,50 @@ namespace thinger::http{
     }
 
     void websocket_connection::push_message(std::string data, bool binary){
-        switch(flow_.admit(data.size(), [this](size_t size){ return drop_oldest(size); })){
-            case write_flow::admission::queue:
-                LOG_LEVEL(2, "adding frame to websocket queue");
-                enqueue(out_message{std::move(data), binary, nullptr});
-                break;
-            case write_flow::admission::drop:
-                LOG_WARNING("websocket is congested. discarding packets!");
-                break;
-            case write_flow::admission::close:
-                close_congested("it is congested");
-                break;
+        // (once closed, nothing is sent: not a congestion)
+        if(queue_->push(out_message{std::move(data), binary}) == detail::push_queue<out_message>::admission::drop && !queue_->closed()){
+            LOG_WARNING("websocket is congested. discarding packets!");
         }
-    }
-
-    bool websocket_connection::drop_oldest(size_t size){
-        size_t bytes = 0;
-        size_t messages = 0;
-        auto it = out_queue_.begin();
-        while(it != out_queue_.end() && flow_.overflows(size, bytes, messages)){
-            // a sender waits for it: never dropped
-            if(it->waiter){
-                ++it;
-                continue;
-            }
-            LOG_LEVEL(2, "websocket is congested. discarding the oldest message");
-            bytes += it->data.size();
-            ++messages;
-            it = out_queue_.erase(it);
-        }
-        // accounted for once the queue is consistent
-        flow_.remove(bytes, messages);
-        return !flow_.overflows(size);
-    }
-
-    void websocket_connection::enqueue(out_message message){
-        flow_.add(message.data.size());
-        out_queue_.push_back(std::move(message));
-        process_out_queue();
     }
 
     awaitable<bool> websocket_connection::send_async(std::string data, bool binary){
-        auto waiter = std::make_shared<send_waiter>(ws_->get_executor());
-        enqueue(out_message{std::move(data), binary, waiter});
-        co_return co_await waiter->wait();
+        return queue_->push_and_wait(out_message{std::move(data), binary});
     }
 
     awaitable<bool> websocket_connection::send_text_async(std::string text){
-        return on_executor(ws_->get_executor(), shared_from_this(), send_async(std::move(text), false));
+        return send_async(std::move(text), false);
     }
 
     awaitable<bool> websocket_connection::send_binary_async(std::string data){
-        return on_executor(ws_->get_executor(), shared_from_this(), send_async(std::move(data), true));
+        return send_async(std::move(data), true);
     }
 
     awaitable<bool> websocket_connection::wait_writable(){
-        return flow_.wait_writable(shared_from_this());
+        return queue_->wait_writable();
     }
 
     void websocket_connection::set_write_limits(const write_limits& limits){
-        flow_.set_limits(shared_from_this(), limits);
+        queue_->set_write_limits(limits);
     }
 
     write_limits websocket_connection::get_write_limits() const{
-        return flow_.limits();
+        return queue_->get_write_limits();
     }
 
     size_t websocket_connection::queued_bytes() const{
-        return flow_.queued_bytes();
+        return queue_->queued_bytes();
     }
 
     size_t websocket_connection::queued_messages() const{
-        return flow_.queued_messages();
+        return queue_->queued_messages();
     }
 
     void websocket_connection::on_high_watermark(sync_callback<void()> callback){
-        flow_.on_high_watermark(shared_from_this(), std::move(callback));
+        queue_->on_high_watermark(std::move(callback));
     }
 
     void websocket_connection::on_low_watermark(sync_callback<void()> callback){
-        flow_.on_low_watermark(shared_from_this(), std::move(callback));
+        queue_->on_low_watermark(std::move(callback));
     }
 
 }

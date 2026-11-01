@@ -1,5 +1,6 @@
 #include "file_response.hpp"
 #include "../response.hpp"
+#include "../../common/http_request.hpp"
 #include "../response_compression.hpp"
 #include <fstream>
 #include <optional>

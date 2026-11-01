@@ -2,7 +2,8 @@ name: Quality
 
 # Complexity (lizard), duplication (jscpd) and static analysis (clang-tidy, see .clang-tidy).
 # Reported in the job summary and as an artifact. Findings never fail the build, except
-# functions a pull request adds or changes above the complexity limits (the ratchet).
+# functions a pull request adds or changes above the complexity limits (the ratchet), and
+# guardrails over their structure budget (structure-budget.json) in a pull request.
 
 on:
   push:
@@ -64,6 +65,17 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           python3 .github/scripts/complexity_ratchet.py --base "$BASE" $FAIL thinger
+
+      # The guardrails H1-H10 (greps): a value over its budget, or one well under a budget that
+      # was not lowered, fails pull requests and is a warning on pushes; the table goes to the
+      # job summary. The self-test of the script fails the job on any event
+      - name: Structure budget
+        if: ${{ !cancelled() }}
+        env:
+          WARN_ONLY: ${{ github.event_name != 'pull_request' && '--warn-only' || '' }}
+        run: |
+          python3 .github/scripts/structure_budget_test.py
+          python3 .github/scripts/structure_budget.py $WARN_ONLY
 
       - name: Summary
         if: always()

@@ -15,7 +15,11 @@ int main() {
         "https://api.github.com/users/octocat"
     };
 
-    http::async_client client;
+    // The workers the clients run on: the application starts them, and stops them at the end
+    asio::workers workers;
+    workers.start();
+
+    http::async_client client(workers);
     std::atomic<int> completed{0};
 
     std::cout << "Launching " << urls.size() << " concurrent requests...\n" << std::endl;
@@ -53,7 +57,7 @@ int main() {
     // ============================================
     std::cout << "\n--- Using Coroutines ---\n" << std::endl;
 
-    http::async_client client2;
+    http::async_client client2(workers);
     std::atomic<int> completed2{0};
 
     for (const auto& url : urls) {
@@ -79,7 +83,7 @@ int main() {
     // ============================================
     std::cout << "\n--- Parallel Coroutines (operator&&) ---\n" << std::endl;
 
-    http::async_client client_parallel;
+    http::async_client client_parallel(workers);
 
     client_parallel.run([&client_parallel]() -> awaitable<void> {
         // Launch 3 requests in parallel and wait for all of them
@@ -107,7 +111,7 @@ int main() {
     // ============================================
     std::cout << "\n--- Pending Requests ---\n" << std::endl;
 
-    http::async_client client3;
+    http::async_client client3(workers);
 
     // Launch requests
     client3.get("https://httpbin.org/delay/1", [](http::client_response&) {
@@ -130,5 +134,6 @@ int main() {
     client3.wait();
     std::cout << "All completed!" << std::endl;
 
+    workers.stop();
     return 0;
 }

@@ -209,10 +209,16 @@ int main(int argc, char* argv[]) {
         });
     });
     
-    // Shutdown endpoint
-    server.post("/api/shutdown", [&](http::response& res) {
+    // Shutdown endpoint: answers, then shuts the server down gracefully (start() returns once it
+    // ends). The drain waits for this request too, so its handler does not await it: it runs on
+    // the thread of the handler, which goes on serving the requests in flight meanwhile
+    server.post("/api/shutdown", [&](http::response& res) -> awaitable<void> {
         LOG_WARNING("Shutdown requested via API");
-        server.stop();
+        res.json({{"message", "Shutting down within 5 seconds"}});
+        auto by = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        co_spawn(co_await boost::asio::this_coro::executor, server.shutdown(by), [](std::exception_ptr, bool clean) {
+            LOG_INFO("Shutdown {}", clean ? "finished cleanly" : "closed the connections still open");
+        });
     });
     
     // Custom 404 handler

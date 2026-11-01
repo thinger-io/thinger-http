@@ -3,8 +3,11 @@
 #include <thinger/http/client/client.hpp>
 #include <thinger/http/client/async_client.hpp>
 #include <type_traits>
+#include "../../../fixtures/running_workers.hpp"
 
 using namespace thinger;
+using thinger::http::test::running_workers;
+using thinger::http::test::client_under_test;
 
 // Helper trait to get the client type name for test naming
 template<typename T>
@@ -27,15 +30,15 @@ TEMPLATE_TEST_CASE("HTTP Client construction and destruction", "[http][client][u
                    http::client, http::async_client) {
 
     SECTION("Default construction") {
-        TestType client;
+        client_under_test<TestType> client;
         // Both clients should construct cleanly
         REQUIRE(true);
     }
 
     SECTION("Multiple instances can coexist") {
-        TestType client1;
-        TestType client2;
-        TestType client3;
+        client_under_test<TestType> client1;
+        client_under_test<TestType> client2;
+        client_under_test<TestType> client3;
 
         // All clients should coexist
         REQUIRE(true);
@@ -43,7 +46,7 @@ TEMPLATE_TEST_CASE("HTTP Client construction and destruction", "[http][client][u
 
     SECTION("Destruction is clean") {
         {
-            TestType client;
+            client_under_test<TestType> client;
             // Client goes out of scope and should destruct cleanly
         }
         // If we get here without crashes, destruction worked
@@ -54,7 +57,7 @@ TEMPLATE_TEST_CASE("HTTP Client construction and destruction", "[http][client][u
 TEMPLATE_TEST_CASE("HTTP Client configuration", "[http][client][unit]",
                    http::client, http::async_client) {
 
-    TestType client;
+    client_under_test<TestType> client;
 
     SECTION("Timeout configuration with fluent API") {
         client.timeout(std::chrono::seconds(60));
@@ -117,7 +120,7 @@ TEMPLATE_TEST_CASE("HTTP Client configuration", "[http][client][unit]",
 TEMPLATE_TEST_CASE("HTTP Request building", "[http][client][unit]",
                    http::client, http::async_client) {
 
-    TestType client;
+    client_under_test<TestType> client;
 
     SECTION("Create GET request") {
         auto req = client.create_request(http::method::GET, "http://example.com");
@@ -187,20 +190,27 @@ TEMPLATE_TEST_CASE("HTTP Request building", "[http][client][unit]",
 // Tests specific to async_client
 TEST_CASE("Async Client specific features", "[http][client][async][unit]") {
 
-    SECTION("Service name") {
-        http::async_client client;
-        REQUIRE(client.get_service_name() == "http_async_client");
+    SECTION("Workers never start by themselves") {
+        asio::workers workers;
+        {
+            http::async_client client(workers);
+            REQUIRE(client.is_running());
+            REQUIRE_FALSE(workers.running());
+        }
+        REQUIRE_FALSE(workers.running());
     }
 
     SECTION("Running state and pending requests") {
-        http::async_client client;
+        running_workers workers;
+        http::async_client client(workers);
         REQUIRE(client.is_running() == true);
         REQUIRE(client.pending_requests() == 0);
         REQUIRE(client.has_pending_requests() == false);
     }
 
     SECTION("Stop changes running state") {
-        http::async_client client;
+        running_workers workers;
+        http::async_client client(workers);
         REQUIRE(client.is_running() == true);
 
         client.stop();
@@ -209,28 +219,17 @@ TEST_CASE("Async Client specific features", "[http][client][async][unit]") {
         // Should be safe to stop multiple times
         client.stop();
         REQUIRE(client.is_running() == false);
+        // The workers are the application's: they keep running
+        REQUIRE(workers.running());
     }
 
-    SECTION("Worker auto-management") {
-        // Save initial state
-        bool auto_manage = asio::get_workers().is_auto_managed();
-        size_t initial_clients = asio::get_workers().client_count();
-
+    SECTION("The workers keep running once the client is gone") {
+        running_workers workers;
         {
-            http::async_client client;
+            http::async_client client(workers);
             REQUIRE(client.is_running() == true);
-
-            // Client should be registered
-            REQUIRE(asio::get_workers().client_count() == initial_clients + 1);
-
-            // If auto-manage is enabled and workers weren't running, they should start
-            if (auto_manage && initial_clients == 0) {
-                REQUIRE(asio::get_workers().running() == true);
-            }
         }
-
-        // After client destruction, count should return to initial
-        REQUIRE(asio::get_workers().client_count() == initial_clients);
+        REQUIRE(workers.running());
     }
 }
 
@@ -238,29 +237,9 @@ TEST_CASE("Async Client specific features", "[http][client][async][unit]") {
 TEST_CASE("Standalone Client specific features", "[http][client][standalone][unit]") {
 
     SECTION("Independent from workers") {
-        // Save initial state
-        bool initial_running = asio::get_workers().running();
-
-        // workers should not be running initially
-        REQUIRE(initial_running == false);
-
-        // initial client count should be zero
-        size_t initial_clients = asio::get_workers().client_count();
-        REQUIRE(initial_clients == 0);
-
-        {
-            http::client client;
-
-            // Creating a standalone client shouldn't register with workers
-            REQUIRE(asio::get_workers().client_count() == initial_clients);
-
-            // Workers state shouldn't change
-            REQUIRE(asio::get_workers().running() == initial_running);
-        }
-
-        // After destruction, everything should remain the same
-        REQUIRE(asio::get_workers().client_count() == initial_clients);
-        REQUIRE(asio::get_workers().running() == initial_running);
+        // It runs its requests on an io_context of its own: no workers exist
+        http::client client;
+        REQUIRE(client.pool_size() == 0);
     }
 
     SECTION("Synchronous methods return directly") {

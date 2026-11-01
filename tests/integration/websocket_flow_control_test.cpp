@@ -2,6 +2,7 @@
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
+#include <thinger/http/server/websocket_connection.hpp>
 
 #include "server_test_helpers.hpp"
 #include "../fixtures/stream_test_helpers.hpp"
@@ -205,7 +206,7 @@ TEST_CASE("WebSocket awaitable send with a slow reader", "[websocket][flow][inte
     http::server server;
     auto state = std::make_shared<producer_state>();
     server.get("/push", [state](http::request&, http::response& res) {
-        res.upgrade_websocket([state](ws_ptr ws) -> awaitable<void> {
+        res.upgrade_websocket({}, [state](ws_ptr ws) -> awaitable<void> {
             co_await start_producer(awaited_producer(ws, state, count, size), ws, state);
         });
     });
@@ -245,7 +246,7 @@ TEST_CASE("WebSocket watermarks and queued bytes", "[websocket][flow][integratio
     std::vector<std::string> events;
     std::promise<ws_ptr> created;
     server.get("/flow", [&](http::request&, http::response& res) {
-        res.upgrade_websocket([&](ws_ptr ws) {
+        res.upgrade_websocket({}, [&](ws_ptr ws) {
             ws->set_write_limits({.max_messages = 0, .high_watermark = 1024 * 1024, .low_watermark = 256 * 1024});
             ws->on_high_watermark([&, ws] {
                 std::lock_guard lock(mutex);
@@ -305,7 +306,7 @@ TEST_CASE("WebSocket producer waiting for the queue to drain", "[websocket][flow
     http::server server;
     auto state = std::make_shared<producer_state>();
     server.get("/push", [state](http::request&, http::response& res) {
-        res.upgrade_websocket([state](ws_ptr ws) -> awaitable<void> {
+        res.upgrade_websocket({}, [state](ws_ptr ws) -> awaitable<void> {
             ws->set_write_limits({.max_messages = 0, .high_watermark = high, .low_watermark = high / 4});
             co_await start_producer(watermark_producer(ws, state, count, size), ws, state);
         });
@@ -329,7 +330,7 @@ TEST_CASE("WebSocket awaitable send from another thread, and once closed", "[web
     http::server server;
     std::promise<ws_ptr> created;
     server.get("/ws", [&](http::request&, http::response& res) {
-        res.upgrade_websocket([&](ws_ptr ws) { created.set_value(ws); });
+        res.upgrade_websocket({}, [&](ws_ptr ws) { created.set_value(ws); });
     });
     running_server running(server);
 
@@ -364,7 +365,7 @@ TEST_CASE("WebSocket pause_reading", "[websocket][flow][integration]") {
     std::vector<uint32_t> received;
     std::promise<ws_ptr> created;
     server.get("/pause", [&](http::request&, http::response& res) {
-        res.upgrade_websocket([&](ws_ptr ws) {
+        res.upgrade_websocket({}, [&](ws_ptr ws) {
             ws->on_message([&, ws](std::string message, bool) {
                 std::lock_guard lock(mutex);
                 received.push_back(index_of(message));
@@ -424,7 +425,7 @@ TEST_CASE("WebSocket overflow policies", "[websocket][flow][integration]") {
     std::promise<ws_ptr> created;
     std::function<void(const ws_ptr&)> setup;
     server.get("/ws", [&](http::request&, http::response& res) {
-        res.upgrade_websocket([&](ws_ptr ws) {
+        res.upgrade_websocket({}, [&](ws_ptr ws) {
             setup(ws);
             created.set_value(ws);
         });
@@ -524,7 +525,7 @@ TEST_CASE("WebSocket drop_oldest falls back to drop_newest", "[websocket][flow][
     http::server server;
     std::promise<size_t> queued;
     server.get("/ws", [&](http::request&, http::response& res) {
-        res.upgrade_websocket([&](ws_ptr ws) -> awaitable<void> {
+        res.upgrade_websocket({}, [&](ws_ptr ws) -> awaitable<void> {
             ws->set_write_limits({.max_messages = 3, .policy = http::overflow_policy::drop_oldest});
             auto executor = co_await boost::asio::this_coro::executor;
             // larger than the socket buffers: the first one is still being written below
@@ -552,7 +553,7 @@ TEST_CASE("WebSocket watermark callbacks that send", "[websocket][flow][integrat
     std::promise<std::weak_ptr<http::websocket_connection>> created;
     std::function<void(const ws_ptr&)> setup;
     server.get("/ws", [&](http::request&, http::response& res) {
-        res.upgrade_websocket([&](ws_ptr ws) {
+        res.upgrade_websocket({}, [&](ws_ptr ws) {
             ws->on_low_watermark([lows, weak = std::weak_ptr(ws)] {
                 ++*lows;
                 // re-enters the queue: never while it is being changed
@@ -612,7 +613,7 @@ TEST_CASE("WebSocket limits changed while congested", "[websocket][flow][integra
     std::promise<ws_ptr> created;
     auto lows = std::make_shared<std::atomic<int>>(0);
     server.get("/ws", [&](http::request&, http::response& res) {
-        res.upgrade_websocket([&](ws_ptr ws) {
+        res.upgrade_websocket({}, [&](ws_ptr ws) {
             ws->set_write_limits({.max_messages = 0, .high_watermark = 1 << 20, .low_watermark = 256 << 10});
             ws->on_low_watermark([lows] { ++*lows; });
             for (int i = 0; i < 400; ++i) ws->send_binary(std::string(64 * 1024, 'y'));
@@ -642,7 +643,7 @@ TEST_CASE("WebSocket write timeout", "[websocket][flow][integration]") {
     auto state = std::make_shared<producer_state>();
     auto writable = std::make_shared<std::promise<bool>>();
     server.get("/push", [state, writable](http::request&, http::response& res) {
-        res.upgrade_websocket([state, writable](ws_ptr ws) -> awaitable<void> {
+        res.upgrade_websocket({}, [state, writable](ws_ptr ws) -> awaitable<void> {
             ws->set_write_limits({.max_messages = 0, .high_watermark = 1 << 20, .write_timeout = 300ms});
             auto executor = co_await boost::asio::this_coro::executor;
             // a producer waiting for the queue to drain, and another one awaiting its sends
@@ -673,7 +674,7 @@ TEST_CASE("WebSocket write timeout", "[websocket][flow][integration]") {
 TEST_CASE("WebSocket close codes of messages not delivered", "[websocket][flow][integration]") {
     http::server server;
     server.get("/ws", [](http::request&, http::response& res) {
-        res.upgrade_websocket([](ws_ptr ws) { ws->on_message([](std::string, bool) {}); });
+        res.upgrade_websocket({}, [](ws_ptr ws) { ws->on_message([](std::string, bool) {}); });
     });
     running_server running(server);
     raw_ws_client client(running.port);

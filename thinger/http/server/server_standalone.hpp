@@ -1,7 +1,7 @@
 #ifndef THINGER_HTTP_SERVER_STANDALONE_HPP
 #define THINGER_HTTP_SERVER_STANDALONE_HPP
 
-#include "http_server_base.hpp"
+#include "server_base.hpp"
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/executor_work_guard.hpp>
 
@@ -10,9 +10,10 @@ namespace thinger::http {
 /**
  * Standalone HTTP server that uses its own io_context.
  * Perfect for simple applications that don't need the full worker infrastructure.
- * Single-threaded server that runs in the thread that calls wait().
+ * Single-threaded server that runs in the thread that calls wait(): every listener accepts and
+ * serves on it.
  */
-class server : public http_server_base {
+class server : public server_base {
 private:
     // Own io_context for handling async operations
     boost::asio::io_context io_context_;
@@ -22,15 +23,17 @@ private:
     std::unique_ptr<work_guard_type> work_guard_;
     
     std::atomic<bool> running_{false};
+    // A thread runs the io_context (see wait())
+    std::atomic<bool> serving_{false};
+
+    // Stop listening and the io_context, releasing wait()
+    void stop_running();
     
 protected:
-    // Create socket server with our io_context
-    std::unique_ptr<asio::socket_server> create_socket_server(
-        const std::string& host, const std::string& port) override;
-    
-    // Create Unix socket server with our io_context
-    std::unique_ptr<asio::unix_socket_server> create_unix_socket_server(
-        const std::string& unix_path) override;
+    // A listener accepting and serving on our io_context
+    std::unique_ptr<asio::listener> create_listener(asio::listener_options options) override;
+    // The first listener opened: the io_context may run (see wait())
+    void listening() override;
 
     boost::asio::io_context* shutdown_context() override;
     bool in_server_thread() override;
@@ -40,15 +43,12 @@ public:
     server();
     ~server() override;
     
-    // Override listen to setup server
-    bool listen(const std::string& host, uint16_t port) override;
-    bool listen_unix(const std::string& unix_path) override;
-    
-    // Wait for server to stop
+    // Run the io_context in the calling thread until the server stops: at once if it does not
+    // listen
     void wait() override;
     
     // Stop the server
-    bool stop() override;
+    void stop() override;
     
     // Get direct access to io_context for advanced use cases
     boost::asio::io_context& get_io_context() { 

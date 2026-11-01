@@ -58,8 +58,11 @@ public:
     // Whether the connection can be taken over (WebSocket, SSE, response::take_over)
     virtual bool can_take_over() const { return false; }
 
-    // Send the response, then hand the connection to `handler` (see response::take_over)
-    virtual void take_over(std::shared_ptr<http_response> /*response*/, takeover_handler /*handler*/) {}
+    // Send the response, then hand the connection to `handler` (see response::take_over).
+    // `framing` is close when what the handler writes is the body of the response, ending
+    // when the connection closes: the response says so
+    virtual void take_over(std::shared_ptr<http_response> /*response*/, takeover_handler /*handler*/,
+                           body_framing /*framing*/) {}
 
     // Connection the response is written to, null if none
     virtual std::shared_ptr<server_connection> connection() const { return nullptr; }
@@ -89,7 +92,8 @@ public:
     awaitable<bool> end_stream() override;
     void abort_stream() override;
     bool can_take_over() const override { return true; }
-    void take_over(std::shared_ptr<http_response> response, takeover_handler handler) override;
+    void take_over(std::shared_ptr<http_response> response, takeover_handler handler,
+                   body_framing framing) override;
     std::shared_ptr<server_connection> connection() const override { return connection_.lock(); }
     void observe(std::shared_ptr<response_observer> observer) override;
 
@@ -100,8 +104,9 @@ private:
     // Queue a frame and wait until it is written; false if it could not be
     awaitable<bool> write_and_wait(std::shared_ptr<http_frame> frame);
 
-    // Close the connection once this response is written
-    void close_after_response();
+    // Close the connection once this response is written, for `reason` (see
+    // http_stream::must_close()); before any frame written after this call
+    void must_close(detail::close_reason reason);
 
     std::weak_ptr<server_connection> connection_;
     std::weak_ptr<http_stream> stream_;

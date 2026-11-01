@@ -114,10 +114,11 @@ TEST_CASE("Client WebSockets on strands of an io_context run by several threads"
           "[websocket][executor][threading][integration]") {
     http::server server;
     server.get("/echo", [](http::request&, http::response& res) {
-        http::websocket_options options;
+        http::websocket_accept_options options;
         options.ping_interval = PING_INTERVAL;
         options.idle_timeout = IDLE_TIMEOUT;
-        res.upgrade_websocket_stream(options, [](std::shared_ptr<asio::websocket> ws, std::string) -> awaitable<void> {
+        res.upgrade_websocket_stream(options, [](http::upgraded_websocket upgraded) -> awaitable<void> {
+            auto ws = std::move(upgraded.stream);
             co_await echo(std::move(ws));
         });
     });
@@ -235,7 +236,8 @@ TEST_CASE("A websocket_connection on a strand of an io_context run by several th
 TEST_CASE("A WebSocket runs on the executor of its creator", "[websocket][executor][integration]") {
     http::server server;
     server.get("/echo", [](http::request&, http::response& res) {
-        res.upgrade_websocket_stream({}, [](std::shared_ptr<asio::websocket> ws, std::string) -> awaitable<void> {
+        res.upgrade_websocket_stream({}, [](http::upgraded_websocket upgraded) -> awaitable<void> {
+            auto ws = std::move(upgraded.stream);
             co_await echo(std::move(ws));
         });
     });
@@ -262,7 +264,8 @@ TEST_CASE("A WebSocket runs on the executor of its creator", "[websocket][execut
 TEST_CASE("The synchronous calls of a client WebSocket fail on its strand", "[websocket][executor][integration]") {
     http::server server;
     server.get("/echo", [](http::request&, http::response& res) {
-        res.upgrade_websocket_stream({}, [](std::shared_ptr<asio::websocket> ws, std::string) -> awaitable<void> {
+        res.upgrade_websocket_stream({}, [](http::upgraded_websocket upgraded) -> awaitable<void> {
+            auto ws = std::move(upgraded.stream);
             co_await echo(std::move(ws));
         });
     });

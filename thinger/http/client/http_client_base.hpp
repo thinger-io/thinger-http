@@ -53,6 +53,12 @@ protected:
     // Each derived class provides its own io_context
     virtual boost::asio::io_context& get_io_context() = 0;
 
+    // The executor a WebSocket opened by a coroutine running on `executor` runs on: that one
+    // (e.g. its strand), unless the derived class runs its coroutines on one of its own
+    virtual boost::asio::any_io_executor websocket_executor(const boost::asio::any_io_executor& executor) {
+        return executor;
+    }
+
     void apply_default_headers(const std::shared_ptr<http_request>& request);
 
     // A connection for a request: an idle one of the pool if `reuse` and there is one, or a

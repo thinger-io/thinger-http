@@ -3,6 +3,7 @@
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
+#include <thinger/http/server/websocket_connection.hpp>
 #include <thinger/util/logger.hpp>
 #include <spdlog/sinks/ringbuffer_sink.h>
 
@@ -65,7 +66,7 @@ namespace {
         });
         server.get("/data", [](http::request&, http::response& res) { res.send("ok"); });
         server.get("/echo", [](http::request&, http::response& res) {
-            res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) {
+            res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection> ws) {
                 ws->on_message([ws](std::string message, bool binary) {
                     if (binary) ws->send_binary(std::move(message));
                     else ws->send_text(std::move(message));
@@ -96,8 +97,9 @@ namespace {
 TEST_CASE("HTTP logs show no body, header value or credential by default", "[logging][integration]") {
     http::server server;
     routes(server);
-    running_server running(server);
+    // The logger set before the server thread logs, and restored after it ends
     log_capture logs;
+    running_server running(server);
 
     http::client client;
     auto res = login(client, running.port);
@@ -126,8 +128,9 @@ TEST_CASE("HTTP logs show no body, header value or credential by default", "[log
 TEST_CASE("WebSocket messages are not logged, only their size", "[logging][websocket][integration]") {
     http::server server;
     routes(server);
-    running_server running(server);
+    // The logger set before the server thread logs, and restored after it ends
     log_capture logs;
+    running_server running(server);
 
     http::client client;
     auto ws = client.websocket("ws://127.0.0.1:" + std::to_string(running.port) + "/echo");
@@ -150,10 +153,12 @@ TEST_CASE("Logged bodies are truncated and credential headers stay redacted", "[
     constexpr size_t max_length = 16;
     http::server server;
     routes(server);
-    server.log_bodies(true, max_length);
-    REQUIRE(server.get_body_logging().enabled);
-    running_server running(server);
+    http::connection_options options;
+    options.logging = {true, max_length};
+    server.set_connection_options(options);
+    // The logger set before the server thread logs, and restored after it ends
     log_capture logs;
+    running_server running(server);
 
     http::client client;
     client.log_bodies(true, max_length);
@@ -181,6 +186,40 @@ TEST_CASE("Logged bodies are truncated and credential headers stay redacted", "[
     REQUIRE(logs.contains("  Set-Cookie: [redacted]"));
 }
 
+TEST_CASE("Two servers of one process log each as configured", "[logging][connection_options][integration]") {
+    // One logs the header values and the bodies, the other keeps the default (off)
+    http::server logging_server;
+    http::connection_options options;
+    options.logging = {true, 1024};
+    logging_server.set_connection_options(options);
+    http::server quiet_server;
+    for (auto* server : {&logging_server, &quiet_server}) {
+        server->post("/reply", [](http::request& req, http::response& res) { res.send("reply-to-" + req.body()); });
+    }
+    running_server logging_running(logging_server);
+    running_server quiet_running(quiet_server);
+    log_capture logs;
+
+    http::client client;
+    auto post = [&](uint16_t port, const std::string& name) {
+        return client.request("http://127.0.0.1:" + std::to_string(port) + "/reply")
+            .header("X-Server", name + "-server")
+            .body(name + "-body", "text/plain")
+            .post();
+    };
+    REQUIRE(post(logging_running.port, "logging").body() == "reply-to-logging-body");
+    REQUIRE(post(quiet_running.port, "quiet").body() == "reply-to-quiet-body");
+
+    INFO("captured logs:\n" << logs.dump());
+    REQUIRE(logs.contains("  X-Server: logging-server"));
+    REQUIRE(logs.contains("  reply-to-logging-body"));
+    REQUIRE_FALSE(logs.contains("quiet-server"));
+    REQUIRE_FALSE(logs.contains("reply-to-quiet-body"));
+    // The quiet one logs the names and sizes alone
+    REQUIRE(logs.contains("  X-Server"));
+    REQUIRE(logs.contains("Body: " + std::to_string(std::string("reply-to-quiet-body").size()) + " bytes"));
+}
+
 TEST_CASE("Logged bodies cannot forge log lines", "[logging][unit]") {
     log_capture logs;
     http::http_request request;
@@ -206,8 +245,9 @@ TEST_CASE("Logged bodies cannot forge log lines", "[logging][unit]") {
 TEST_CASE("Credentials in the query string are redacted from the request lines", "[logging][integration]") {
     http::server server;
     routes(server);
-    running_server running(server);
+    // The logger set before the server thread logs, and restored after it ends
     log_capture logs;
+    running_server running(server);
 
     http::client client;
     auto res = client.get("http://127.0.0.1:" + std::to_string(running.port) + "/data?authorization=" + token + "&count=10");

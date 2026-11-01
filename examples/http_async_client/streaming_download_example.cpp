@@ -42,7 +42,11 @@ void draw_progress(size_t downloaded, size_t total) {
 int main() {
     std::cout << "Streaming Download Example (async_client)\n" << std::endl;
 
-    http::async_client client;
+    // The workers the clients run on: the application starts them, and stops them at the end
+    asio::workers workers;
+    workers.start();
+
+    http::async_client client(workers);
 
     // =========================================
     // Example 1: Download file with progress
@@ -135,5 +139,6 @@ int main() {
     client.wait();
     std::cout << "\nAll " << completed << " downloads completed!" << std::endl;
 
+    workers.stop();
     return 0;
 }

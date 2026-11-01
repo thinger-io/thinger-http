@@ -21,6 +21,10 @@ public:
 
 public:
 
+    frame_kind kind() const override {
+        return frame_kind::data;
+    }
+
     void to_buffer(std::vector<boost::asio::const_buffer> &buffer) const override{
         if(data_){
             data_->to_buffer(buffer);

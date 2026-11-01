@@ -27,7 +27,14 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
+        id: build
         run: cmake --build build -j$(( $(nproc) / 4 ))
 
+      # The transport matrix (target design §7.1): every [matrix] case on TCP, TLS and a Unix
+      # socket, failing on its own. The full ctest run below runs these cases too
+      - name: Transport matrix (TCP, TLS, Unix)
+        run: build/tests/all_integration_tests "[matrix]"
+
       - name: Run tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: ctest --test-dir build --output-on-failure --timeout 120

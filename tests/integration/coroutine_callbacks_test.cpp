@@ -14,6 +14,7 @@
 #include <future>
 
 #include "server_test_helpers.hpp"
+#include "../fixtures/running_workers.hpp"
 
 // Callbacks given as coroutines: run where the library can await them (middlewares, the
 // handlers of upgrades, event streams and takeovers, the async client callbacks), and
@@ -43,9 +44,7 @@ namespace {
     template<typename F>
     concept server_on_shutdown = requires(http::server& server, F f) { server.on_shutdown(f); };
     template<typename F>
-    concept shutdown_done = requires(http::server& server, F f) { server.begin_shutdown(1s, f); };
-    template<typename F>
-    concept socket_shutdown = requires(asio::socket& socket, F f) { http::on_server_shutdown(socket, f); };
+    concept scope_shutdown = requires(const http::server_scope& scope, F f) { scope.on_shutdown(f); };
     template<typename F>
     concept pipe_end = requires(asio::socket_pipe& pipe, F f) { pipe.set_on_end(f); };
     template<typename F>
@@ -79,15 +78,10 @@ TEST_CASE("Callbacks that are not awaited reject coroutines at compile time", "[
     static_assert(sse_on_shutdown<decltype(sync_with_no_args)>);
     static_assert(!server_on_shutdown<decltype(coroutine_with_no_args)>);
     static_assert(server_on_shutdown<decltype(sync_with_no_args)>);
-    static_assert(!socket_shutdown<decltype(coroutine_with_no_args)>);
-    static_assert(socket_shutdown<decltype(sync_with_no_args)>);
+    static_assert(!scope_shutdown<decltype(coroutine_with_no_args)>);
+    static_assert(scope_shutdown<decltype(sync_with_no_args)>);
     static_assert(!pipe_end<decltype(coroutine_with_no_args)>);
     static_assert(pipe_end<decltype(sync_with_no_args)>);
-
-    auto done = [](bool) -> awaitable<void> { co_return; };
-    auto done_sync = [](bool) {};
-    static_assert(!shutdown_done<decltype(done)>);
-    static_assert(shutdown_done<decltype(done_sync)>);
 
     auto formatter = [](const http::http_error&, http::http_response&) -> awaitable<void> { co_return; };
     auto formatter_sync = [](const http::http_error&, http::http_response&) {};
@@ -157,13 +151,14 @@ TEST_CASE("Coroutine middlewares with next() run", "[coroutine][middleware][inte
 TEST_CASE("Coroutine WebSocket handlers run before the WebSocket starts", "[coroutine][websocket][integration]") {
     http::server server;
     server.get("/ws", [](http::response& res) {
-        res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) -> awaitable<void> {
+        res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection> ws) -> awaitable<void> {
             co_await short_pause();
             ws->on_message([ws](std::string message, bool) { ws->send_text("echo: " + message); });
         });
     });
     server.get("/stream", [](http::response& res) {
-        res.upgrade_websocket_stream([](std::shared_ptr<asio::websocket> ws, std::string) -> awaitable<void> {
+        res.upgrade_websocket_stream({}, [](http::upgraded_websocket upgraded) -> awaitable<void> {
+            auto ws = std::move(upgraded.stream);
             uint8_t buffer[256];
             auto [ec, bytes] = co_await ws->read_some(buffer, sizeof(buffer));
             if (ec) co_return;
@@ -207,10 +202,10 @@ TEST_CASE("Coroutine SSE and takeover handlers run", "[coroutine][sse][takeover]
         res.status(http::http_response::status::switching_protocols);
         res.header("Upgrade", "echo");
         res.header("Connection", "Upgrade");
-        res.take_over([](std::shared_ptr<asio::socket> socket, std::string buffered) -> awaitable<void> {
+        res.take_over([](http::upgraded_connection conn) -> awaitable<void> {
             co_await short_pause();
-            co_await socket->write("taken over, buffered: " + buffered);
-            socket->close();
+            co_await conn.socket->write("taken over, buffered: " + conn.buffered);
+            conn.socket->close();
         });
     });
     running_server running(server);
@@ -232,12 +227,13 @@ TEST_CASE("Coroutine SSE and takeover handlers run", "[coroutine][sse][takeover]
 }
 
 TEST_CASE("Coroutine callbacks of the async client are awaited", "[coroutine][client][integration]") {
+    thinger::http::test::running_workers workers;
     http::server server;
     server.get("/hello", [](http::response& res) { res.send("hello"); });
     running_server running(server);
     auto url = "http://127.0.0.1:" + std::to_string(running.port) + "/hello";
 
-    http::async_client client;
+    http::async_client client(workers);
     std::promise<std::string> body;
     client.get(url, [&body](http::client_response& res) -> awaitable<void> {
         co_await short_pause();

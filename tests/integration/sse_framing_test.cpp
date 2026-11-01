@@ -1,15 +1,17 @@
 #include <catch2/catch_test_macros.hpp>
+#include <thinger/asio/io_context_of.hpp>
 #include <thinger/http/server/server_standalone.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/sse_connection.hpp>
 #include "server_test_helpers.hpp"
-#include <boost/asio.hpp>
+#include <boost/asio/use_future.hpp>
 #include <chrono>
 #include <functional>
 #include <future>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 // Framing of the SSE fields (values with line breaks) and the keep-alive comments, read back
@@ -27,18 +29,18 @@ namespace {
         std::string id;
     };
 
-    // A raw client of an SSE stream: the request, then the stream parsed as a browser does
+    // A raw client of an SSE stream over any transport: the request, then the stream parsed as
+    // a browser does
     struct sse_client {
-        boost::asio::io_context ioc;
-        boost::asio::ip::tcp::socket sock{ioc};
-        boost::asio::streambuf buf;
+        http::test::raw_connection connection;
+        std::string buffer;
         std::vector<std::string> comments;
 
-        explicit sse_client(uint16_t port, const std::string& path = "/events") {
-            sock.connect({boost::asio::ip::make_address("127.0.0.1"), port});
+        explicit sse_client(const http::test::transport_endpoint& to, const std::string& path = "/events")
+            : connection(to) {
             std::string request = "GET " + path + " HTTP/1.1\r\nHost: localhost\r\n"
                                   "Accept: text/event-stream\r\n\r\n";
-            boost::asio::write(sock, boost::asio::buffer(request));
+            REQUIRE(connection.write(request));
             auto head = read_until("\r\n\r\n", 5s);
             REQUIRE(head);
             REQUIRE(head->find("HTTP/1.1 200") != std::string::npos);
@@ -46,21 +48,11 @@ namespace {
 
         // Up to and including `delimiter`, or nothing if it does not arrive in time
         std::optional<std::string> read_until(const std::string& delimiter, std::chrono::milliseconds timeout) {
-            std::optional<std::string> result;
-            boost::asio::async_read_until(sock, buf, delimiter, [&](boost::system::error_code ec, size_t size) {
-                if (ec) return;
-                std::string data(boost::asio::buffers_begin(buf.data()), boost::asio::buffers_begin(buf.data()) + size);
-                buf.consume(size);
-                result = std::move(data);
-            });
-            ioc.restart();
-            ioc.run_for(timeout);
-            if (!result) {
-                sock.cancel();
-                ioc.restart();
-                ioc.run();
-            }
-            return result;
+            if (!connection.read_until(buffer, delimiter, timeout)) return std::nullopt;
+            auto end = buffer.find(delimiter) + delimiter.size();
+            std::string data = buffer.substr(0, end);
+            buffer.erase(0, end);
+            return data;
         }
 
         // One line, its terminator (CRLF, CR or LF) removed; the server ends lines with LF
@@ -118,14 +110,14 @@ namespace {
         std::promise<std::shared_ptr<http::sse_connection>> connected;
         std::optional<server_test::running_server> running;
 
-        explicit sse_server(accept_hook hook = {}) : on_accept(std::move(hook)) {
+        explicit sse_server(http::test::transport kind, accept_hook hook = {}) : on_accept(std::move(hook)) {
             server.get("/events", [this](http::request&, http::response& res) {
                 res.start_sse([this](std::shared_ptr<http::sse_connection> connection) {
                     if (on_accept) on_accept(connection);
                     connected.set_value(std::move(connection));
                 });
             });
-            running.emplace(server);
+            running.emplace(server, kind);
         }
 
         std::shared_ptr<http::sse_connection> accept() {
@@ -134,14 +126,15 @@ namespace {
             return future.get();
         }
 
-        uint16_t port() const { return running->port; }
+        const http::test::transport_endpoint& endpoint() const { return running->endpoint(); }
     };
 
 }
 
-TEST_CASE("SSE data with line breaks is sent as several data fields", "[server][sse][integration]") {
-    sse_server server;
-    sse_client client(server.port());
+TEST_CASE("SSE data with line breaks is sent as several data fields", "[server][sse][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    sse_server server(kind);
+    sse_client client(server.endpoint());
     auto sse = server.accept();
 
     SECTION("LF, CRLF and CR all end a line") {
@@ -194,9 +187,10 @@ TEST_CASE("SSE data with line breaks is sent as several data fields", "[server][
     sse->stop();
 }
 
-TEST_CASE("SSE event names and ids with line breaks are refused", "[server][sse][integration]") {
-    sse_server server;
-    sse_client client(server.port());
+TEST_CASE("SSE event names and ids with line breaks are refused", "[server][sse][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    sse_server server(kind);
+    sse_client client(server.endpoint());
     auto sse = server.accept();
 
     CHECK_FALSE(sse->send_event("a\nevent: admin"));
@@ -205,10 +199,19 @@ TEST_CASE("SSE event names and ids with line breaks are refused", "[server][sse]
     CHECK_FALSE(sse->send_id("1\ndata: injected"));
     CHECK_FALSE(sse->send_id("1\r"));
     CHECK_FALSE(sse->send_id(std::string("1\0" "2", 3)));
-    CHECK_FALSE(sse->handle_write("event", "x\ny"));
-    CHECK_FALSE(sse->handle_write("da\nta", "x"));
-    CHECK_FALSE(sse->handle_write("data: x", "y"));
-    CHECK_FALSE(sse->handle_write("", "y"));
+    CHECK_FALSE(sse->send_event("x\ny"));
+    CHECK_FALSE(sse->send_comment("a\ndata: injected"));
+    CHECK_FALSE(sse->send_comment("a\rb"));
+    // a whole event is refused with any of its fields, and nothing of it is sent
+    CHECK_FALSE(sse->send(http::sse_event{.event = "a\nevent: admin", .data = "x"}));
+    CHECK_FALSE(sse->send(http::sse_event{.id = "1\r", .data = "x"}));
+    CHECK_FALSE(sse->send(http::sse_event{.id = std::string("1\0" "2", 3), .data = "x"}));
+    CHECK_FALSE(sse->send(http::sse_event{.event = "ok", .retry = -1ms, .data = "x"}));
+    auto send_async = [&](http::sse_event event) {
+        return boost::asio::co_spawn(sse->get_executor(), sse->send_async(std::move(event)), boost::asio::use_future).get();
+    };
+    CHECK_FALSE(send_async(http::sse_event{.event = "a\r\nb", .data = "x"}));
+    CHECK_FALSE(send_async(http::sse_event{.id = "1\ndata: injected", .data = "x"}));
 
     // nothing of the refused fields was sent: the next event is the first one valid
     REQUIRE(sse->send_event("ok"));
@@ -221,9 +224,10 @@ TEST_CASE("SSE event names and ids with line breaks are refused", "[server][sse]
     sse->stop();
 }
 
-TEST_CASE("SSE sends keep-alive comments on a quiet stream", "[server][sse][integration]") {
-    sse_server server;
-    sse_client client(server.port());
+TEST_CASE("SSE sends keep-alive comments on a quiet stream", "[server][sse][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    sse_server server(kind);
+    sse_client client(server.endpoint());
     auto sse = server.accept();
 
     SECTION("at the interval set, and the stream stays open") {
@@ -275,16 +279,134 @@ TEST_CASE("SSE sends keep-alive comments on a quiet stream", "[server][sse][inte
     sse->stop();
 }
 
-TEST_CASE("SSE stream closes when the client leaves, without a keep-alive", "[server][sse][integration]") {
+TEST_CASE("SSE stream closes when the client leaves, without a keep-alive", "[server][sse][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     // (shared: the connection may outlive the test if it is not told)
     auto closed = std::make_shared<std::promise<void>>();
     auto future = closed->get_future();
-    sse_server server([closed](const std::shared_ptr<http::sse_connection>& sse) {
+    sse_server server(kind, [closed](const std::shared_ptr<http::sse_connection>& sse) {
         sse->set_keepalive(0ms);
         sse->on_close([closed] { closed->set_value(); });
     });
-    std::optional<sse_client> client(std::in_place, server.port());
+    std::optional<sse_client> client(std::in_place, server.endpoint());
     auto sse = server.accept();
     client.reset();
     CHECK(future.wait_for(5s) == std::future_status::ready);
+}
+
+TEST_CASE("SSE events sent whole are on the wire as their fields sent one by one", "[server][sse][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    sse_server server(kind);
+    sse_client client(server.endpoint());
+    auto sse = server.accept();
+
+    SECTION("every field, and data of several lines") {
+        REQUIRE(sse->send_event("update"));
+        REQUIRE(sse->send_id("42"));
+        sse->send_retry(3000);
+        sse->send_data("a\r\nb\nc");
+        auto fields = client.read_until("\n\n", 5s);
+        REQUIRE(sse->send(http::sse_event{.event = "update", .id = "42", .retry = 3000ms, .data = "a\r\nb\nc"}));
+        auto whole = client.read_until("\n\n", 5s);
+        REQUIRE(fields);
+        REQUIRE(whole);
+        CHECK(*fields == "event: update\nid: 42\nretry: 3000\ndata: a\ndata: b\ndata: c\n\n");
+        CHECK(*whole == *fields);
+    }
+
+    SECTION("data alone, also awaited") {
+        sse->send_data("x");
+        auto fields = client.read_until("\n\n", 5s);
+        REQUIRE(sse->send(http::sse_event{.data = "x"}));
+        auto whole = client.read_until("\n\n", 5s);
+        auto written = boost::asio::co_spawn(sse->get_executor(), sse->send_async(http::sse_event{.data = "x"}),
+                                             boost::asio::use_future);
+        auto awaited = client.read_until("\n\n", 5s);
+        REQUIRE(written.wait_for(5s) == std::future_status::ready);
+        CHECK(written.get());
+        REQUIRE(fields);
+        CHECK(*fields == "data: x\n\n");
+        CHECK(whole == fields);
+        CHECK(awaited == fields);
+    }
+
+    sse->stop();
+}
+
+TEST_CASE("SSE execute() runs on the executor of the connection", "[server][sse][executor][integration]") {
+    sse_server server(http::test::transport::tcp);
+    sse_client client(server.endpoint());
+    auto sse = server.accept();
+    REQUIRE_FALSE(asio::running_in_this_thread(sse->get_executor()));
+
+    SECTION("from another thread: there") {
+        std::promise<bool> ran;
+        sse->execute([&] { ran.set_value(asio::running_in_this_thread(sse->get_executor())); });
+        auto on_executor = ran.get_future();
+        REQUIRE(on_executor.wait_for(5s) == std::future_status::ready);
+        CHECK(on_executor.get());
+    }
+
+    SECTION("from its executor: at once") {
+        std::promise<bool> inline_run;
+        sse->execute([&] {
+            bool ran = false;
+            sse->execute([&] { ran = true; });
+            inline_run.set_value(ran);
+        });
+        auto at_once = inline_run.get_future();
+        REQUIRE(at_once.wait_for(5s) == std::future_status::ready);
+        CHECK(at_once.get());
+    }
+
+    sse->stop();
+}
+
+TEST_CASE("SSE keep-alive comments every 100 ms", "[server][sse][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    sse_server server(kind);
+    sse_client client(server.endpoint());
+    auto sse = server.accept();
+
+    SECTION("on a quiet stream, one per interval") {
+        auto set = std::chrono::steady_clock::now();
+        sse->set_keepalive(100ms);
+        for (int i = 0; i < 3; ++i) {
+            auto line = client.read_until("\n", 3s);
+            REQUIRE(line);
+            CHECK(*line == ": keep-alive\n");
+        }
+        // the third one once three intervals passed
+        CHECK(std::chrono::steady_clock::now() - set >= 280ms);
+    }
+
+    SECTION("none with continuous traffic") {
+        sse->set_keepalive(100ms);
+        for (int i = 0; i < 60; ++i) {
+            sse->send_data("tick");
+            std::this_thread::sleep_for(10ms);
+        }
+        for (int i = 0; i < 60; ++i) {
+            auto event = client.next_event(2s);
+            REQUIRE(event);
+            CHECK(event->data == "tick");
+        }
+        CHECK(client.comments.empty());
+    }
+
+    SECTION("0 disables them") {
+        sse->set_keepalive(100ms);
+        auto line = client.read_until("\n", 3s);
+        REQUIRE(line);
+        CHECK(*line == ": keep-alive\n");
+        sse->set_keepalive(0ms);
+        // sent after it is disabled: no comment after it
+        sse->send_data("marker");
+        auto event = client.next_event();
+        REQUIRE(event);
+        CHECK(event->data == "marker");
+        CHECK_FALSE(client.read_until("\n", 500ms));
+    }
+
+    sse->stop();
 }

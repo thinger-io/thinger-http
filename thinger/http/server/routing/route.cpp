@@ -51,6 +51,19 @@ route& route::timeout(std::chrono::milliseconds timeout, http_response::status s
     return *this;
 }
 
+route& route::request_timeout(std::chrono::milliseconds timeout) {
+    request_timeout_ = std::max(timeout, std::chrono::milliseconds{0});
+    return *this;
+}
+
+route& route::cancel_on(std::initializer_list<cancel_reason> reasons) {
+    cancel_on_ = 0;
+    for (auto reason : reasons) {
+        if (reason != cancel_reason::none) cancel_on_ |= static_cast<uint8_t>(1u << static_cast<unsigned>(reason));
+    }
+    return *this;
+}
+
 route& route::decode_limits(body_limits limits) {
     decode_limits_ = limits;
     return *this;

@@ -15,6 +15,8 @@
 #include <thread>
 #include <vector>
 #include "../fixtures/compression_bomb.hpp"
+#include "../fixtures/running_workers.hpp"
+#include "../fixtures/server_listen.hpp"
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -61,7 +63,7 @@ namespace {
                 body answer;
                 {
                     std::lock_guard lock(mutex);
-                    client_ports.insert(req.get_http_connection()->get_socket()->get_remote_port());
+                    client_ports.insert(req.connection().peer_port);
                     accept_encodings.push_back(req.header("Accept-Encoding"));
                     auto it = bodies.find(req["name"]);
                     if (it == bodies.end()) {
@@ -74,8 +76,8 @@ namespace {
                 if (!answer.encoding.empty()) res.header("Content-Encoding", answer.encoding);
                 res.send(answer.data, "application/octet-stream");
             });
-            REQUIRE(server.listen("127.0.0.1", 0));
-            port = server.local_port();
+            REQUIRE_FALSE(server.listen("127.0.0.1", 0));
+            port = http::test::listening_port(server);
             thread = std::thread([this] { server.wait(); });
         }
 
@@ -257,10 +259,10 @@ TEST_CASE("Client stops inflating decompression bombs at its maximum content siz
 
     SECTION("The asynchronous client too") {
         server.set("bomb", name_of(type), compression_bomb::zeros(type, 64));
-        asio::get_workers().start(2);
+        thinger::http::test::running_workers workers;
         boost::system::error_code error;
         {
-            http::async_client async;
+            http::async_client async(workers);
             async.timeout(5s);
             async.max_content_size(mib);
             std::promise<boost::system::error_code> done;
@@ -268,7 +270,7 @@ TEST_CASE("Client stops inflating decompression bombs at its maximum content siz
             error = done.get_future().get();
             async.wait();
         }
-        asio::get_workers().stop();
+        workers.stop();
         REQUIRE(error == http::client_error::body_too_large);
     }
 }

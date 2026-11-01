@@ -7,6 +7,7 @@
 #include <optional>
 #include <functional>
 #include <atomic>
+#include <chrono>
 
 #include "../../asio/sockets/websocket.hpp"
 #include "../../util/types.hpp"
@@ -26,6 +27,26 @@ namespace thinger::http {
  *       auto [msg, binary] = ws->receive();
  *       ws->close();
  *   }
+ *
+ * Keepalive: on by default, as on the server (asio::websocket::start_timeout()): it pings the
+ * peer once nothing was received from it for 60 s, and closes the connection once nothing was
+ * received for 120 s, so a read or a write never waits for ever on a dead peer (lost behind a
+ * NAT, a black hole). set_keepalive() changes both, (0, 0) turns it off. The idle time counts
+ * time without receiving any byte, pongs included: a peer sending a byte within each idle
+ * timeout is alive, even if no message completes. A connection closed for being idle (its
+ * close frame has code 1001, going away) ends what is pending and fails what comes after:
+ * receive() returns an empty message, send_text() and send_binary() return false, is_open() is
+ * false and get_close_code() is 1001 (CLOSE_GOING_AWAY).
+ *
+ * The keepalive runs on the io_context of the socket: where something runs it (the workers of
+ * an async_client, the io_context of an executor_client), it acts on time. With the
+ * synchronous API of http::client nothing runs between two calls: the keepalive acts at the
+ * next one, which ends as above if the connection was found idle (it never hangs). Bytes that arrived meanwhile (e.g. the pongs of a
+ * client that only sends) count as received; and if the idle timeout passed with no ping
+ * sent, it pings then instead of closing, and closes only if that ping is not answered within
+ * the idle timeout minus the ping interval. A client that never reads is closed at the idle
+ * timeout once its socket buffer is full of the frames it does not read (weeks of pongs at
+ * the defaults, sooner if the peer sends it data): run() or receive() read them.
  */
 class websocket_client {
 public:
@@ -55,9 +76,11 @@ public:
     // ============================================
     // Synchronous API
     //
-    // Each call waits running the io_context of the socket. Called on the strand the WebSocket
-    // was opened from (e.g. from a coroutine of executor_client on a strand), where it would
-    // wait forever, it throws std::logic_error: use the coroutine API there
+    // Each call waits running the io_context of the socket, until its own operation completes
+    // (not until the io_context runs out of work: the keepalive keeps it busy). Called on the
+    // strand the WebSocket was opened from (e.g. from a coroutine of executor_client on a
+    // strand), where it would wait forever, it throws std::logic_error: use the coroutine API
+    // there
     // ============================================
 
     /**
@@ -102,11 +125,35 @@ public:
     std::string get_protocol() const { return websocket_ ? websocket_->get_protocol() : std::string{}; }
 
     /**
+     * Status code of the closing handshake (asio::websocket::get_close_code()): the one of the
+     * peer's close frame, else the one this end closed with (1001 for the keepalive); 1006 if
+     * none was exchanged or once released.
+     */
+    uint16_t get_close_code() const {
+        return websocket_ ? websocket_->get_close_code() : asio::websocket::CLOSE_ABNORMAL;
+    }
+
+    /**
+     * Keepalive (see above): ping the peer once nothing was received from it for
+     * `ping_interval`, close the connection once nothing was received for `idle_timeout`; 0
+     * disables each one, (0, 0) the keepalive. Applies from now on, the idle time counted from
+     * now. Called anywhere: off the executor of the WebSocket it waits running its io_context,
+     * as the synchronous calls
+     */
+    void set_keepalive(std::chrono::milliseconds ping_interval, std::chrono::milliseconds idle_timeout);
+    // The keepalive in force: 60 s and 120 s unless changed; 0 once released
+    std::chrono::milliseconds get_ping_interval() const;
+    std::chrono::milliseconds get_idle_timeout() const;
+
+    /**
      * Release ownership of the underlying WebSocket.
      * It is a byte stream socket (asio::socket), usable by any protocol or with a
      * socket_pipe; it writes text messages unless set_binary(true) is called.
      * After calling this method, the websocket_client becomes invalid.
      * Use this to take full control of the raw WebSocket for advanced use cases.
+     * The keepalive in force (the default or the one set) stays on the WebSocket released:
+     * its new owner changes it with asio::websocket::set_keepalive(), or turns it off with
+     * set_keepalive(0, 0).
      * @return The underlying WebSocket, or nullptr if already released
      */
     std::shared_ptr<asio::websocket> release_socket();

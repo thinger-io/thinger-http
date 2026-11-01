@@ -7,7 +7,9 @@
 #include "../request.hpp"
 #include "../response.hpp"
 #include "../../client/response_factory.hpp"
+#include "../../../asio/async_event.hpp"
 #include "../../../asio/sockets/tcp_socket.hpp"
+#include "../../../asio/watchdog.hpp"
 #include <boost/asio/steady_timer.hpp>
 #include <chrono>
 #include <memory>
@@ -49,9 +51,12 @@ namespace thinger::http::proxy_detail {
 
     bool is_ip_address(const std::string& value);
 
-    // Tunnel between a client and a target after a protocol upgrade (proxy_tunnel.cpp)
+    // Tunnel between a client and a target after a protocol upgrade, ended once nothing was
+    // forwarded for idle_timeout (zero for never, see proxy_options::tunnel_idle_timeout)
+    // (proxy_tunnel.cpp)
     awaitable<void> run_tunnel(std::shared_ptr<asio::socket> client, std::shared_ptr<asio::socket> target,
-                               std::string to_client, std::string to_target);
+                               std::string to_client, std::string to_target,
+                               std::chrono::milliseconds idle_timeout);
 
     // A request forwarded to a target, and its response. Its parts are defined by concern:
     // the request (proxy_request.cpp), its body (proxy_body.cpp), the response
@@ -93,6 +98,7 @@ namespace thinger::http::proxy_detail {
         // Send the request, read the response head, then relay the response or tunnel
         awaitable<void> exchange();
         awaitable<bool> send_head();
+        awaitable<bool> read_head_while_streaming();
         awaitable<void> stream_body();
         void frame_part(std::vector<boost::asio::const_buffer>& buffers, std::string& size_line,
                         const uint8_t* data, size_t size) const;
@@ -109,18 +115,21 @@ namespace thinger::http::proxy_detail {
         awaitable<bool> relay_chunked();
         awaitable<bool> relay_until_close();
 
-        // End the exchange once the idle or total timeout passes, or once the client closed
-        // its connection (after sending the whole request)
-        awaitable<void> watchdog();
+        // End the exchange once the idle or total timeout passes (see deadline_), or once the
+        // scope of the request is cancelled (see request::client_gone())
+        bool has_deadline() const;
+        std::optional<clock::time_point> next_deadline() const;
+        void start_deadline();
+        awaitable<void> stop_at_deadline();
         awaitable<void> watch_client();
-        awaitable<void> wait_forever();
+        void stop_for_timeout();
         void finish_stopped();
 
         // I/O with the target and the client, tracking activity for the idle timeout
         awaitable<io_result> read_target(uint8_t* buffer, size_t size);
         awaitable<bool> write_target(const std::vector<boost::asio::const_buffer>& buffers);
         awaitable<bool> send_to_client(std::string data);
-        void touch() { last_activity_ = clock::now(); }
+        void touch();
 
         // Answer an error to the client, or abort the response if it already started
         void fail(http_response::status status, const std::string& message, const std::string& detail);
@@ -166,9 +175,22 @@ namespace thinger::http::proxy_detail {
         // The whole response is queued: the connection may close after it (not the client leaving)
         bool response_ended_ = false;
         stop_reason stopped_ = stop_reason::none;
-        std::optional<boost::asio::steady_timer> request_sent_signal_;
         clock::time_point start_;
         clock::time_point last_activity_;
+
+        // On the executor of the exchange, from run(). The events are declared before the
+        // watchdog, which sets one: it goes first.
+        //
+        // Set once read_head_while_streaming() ends, however it ends: stream_body() waits for it
+        // once the body is sent (the response ends the exchange, not the body)
+        std::optional<asio::async_event> head_read_;
+        // Set once the whole response is written (or failed to be): watch_client() waits for it
+        // when the client goes after the response was queued whole
+        std::optional<asio::async_event> response_written_;
+        // Set by deadline_ once the idle or total timeout passes
+        std::optional<asio::async_event> deadline_passed_;
+        // The earliest of the idle and total deadlines, moved by touch(); none without timeouts
+        std::optional<asio::watchdog> deadline_;
 
         proxy_result result_;
     };

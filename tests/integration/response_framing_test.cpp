@@ -37,7 +37,8 @@ namespace {
 
 }
 
-TEST_CASE("Hand-built responses are framed by their content", "[server][framing][integration]") {
+TEST_CASE("Hand-built responses are framed by their content", "[server][framing][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     server.get("/no-length", [](http::response& res) {
         auto response = hand_built(http::http_response::status::ok);
@@ -78,11 +79,11 @@ TEST_CASE("Hand-built responses are framed by their content", "[server][framing]
         response->get_content() = "hello";
         res.send_response(response);
     });
-    running_server running(server);
+    running_server running(server, kind);
 
     // Two requests on the same connection: both answered, the connection kept open
     auto twice = [&](const std::string& path, const std::string& method = "GET") {
-        auto result = raw_exchange(running.port, get(path, method) + get(path, method), 500ms);
+        auto result = raw_exchange(running, get(path, method) + get(path, method), 500ms);
         INFO(result.data);
         REQUIRE_FALSE(result.closed);
         return result.data;
@@ -134,10 +135,12 @@ TEST_CASE("Hand-built responses are framed by their content", "[server][framing]
     }
 }
 
-TEST_CASE("Responses of connections taken over say how the body ends", "[server][framing][takeover][integration]") {
+TEST_CASE("Responses of connections taken over say how the body ends", "[server][framing][takeover][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     server.get("/raw", [](http::response& res) {
-        res.take_over([](std::shared_ptr<asio::socket> socket, std::string) {
+        res.take_over([](http::upgraded_connection conn) {
+            auto socket = std::move(conn.socket);
             co_spawn(socket->get_io_context(), [socket]() -> awaitable<void> {
                 co_await socket->write(std::string_view("raw body"));
                 socket->close();
@@ -146,7 +149,8 @@ TEST_CASE("Responses of connections taken over say how the body ends", "[server]
     });
     server.get("/framed", [](http::response& res) {
         res.header("Content-Length", "8");
-        res.take_over([](std::shared_ptr<asio::socket> socket, std::string) {
+        res.take_over([](http::upgraded_connection conn) {
+            auto socket = std::move(conn.socket);
             co_spawn(socket->get_io_context(), [socket]() -> awaitable<void> {
                 co_await socket->write(std::string_view("raw body"));
             }, detached);
@@ -156,15 +160,15 @@ TEST_CASE("Responses of connections taken over say how the body ends", "[server]
         res.status(http::http_response::status::switching_protocols);
         res.header("Upgrade", "custom");
         res.header("Connection", "Upgrade");
-        res.take_over([](std::shared_ptr<asio::socket> socket, std::string) { socket->close(); });
+        res.take_over([](http::upgraded_connection conn) { conn.socket->close(); });
     });
     server.get("/events", [](http::response& res) {
         res.start_sse([](std::shared_ptr<http::sse_connection> sse) { sse->stop(); });
     });
-    running_server running(server);
+    running_server running(server, kind);
 
     SECTION("A body until the connection closes") {
-        auto result = raw_exchange(running.port, get("/raw"));
+        auto result = raw_exchange(running, get("/raw"));
         auto head = head_of(result.data);
         REQUIRE(head.starts_with("http/1.1 200"));
         REQUIRE(head.find("connection: close\r\n") != std::string::npos);
@@ -172,20 +176,20 @@ TEST_CASE("Responses of connections taken over say how the body ends", "[server]
         REQUIRE(result.data.ends_with("\r\n\r\nraw body"));
     }
     SECTION("A body framed by the handler") {
-        auto result = raw_exchange(running.port, get("/framed"), 500ms);
+        auto result = raw_exchange(running, get("/framed"), 500ms);
         auto head = head_of(result.data);
         REQUIRE(head.find("content-length: 8\r\n") != std::string::npos);
         REQUIRE(head.find("connection: close") == std::string::npos);
     }
     SECTION("A protocol switch") {
-        auto result = raw_exchange(running.port, get("/upgrade"));
+        auto result = raw_exchange(running, get("/upgrade"));
         auto head = head_of(result.data);
         REQUIRE(head.starts_with("http/1.1 101"));
         REQUIRE(head.find("connection: upgrade\r\n") != std::string::npos);
         REQUIRE(head.find("connection: close") == std::string::npos);
     }
     SECTION("An event stream") {
-        auto result = raw_exchange(running.port, get("/events"));
+        auto result = raw_exchange(running, get("/events"));
         auto head = head_of(result.data);
         REQUIRE(head.find("content-type: text/event-stream\r\n") != std::string::npos);
         REQUIRE(head.find("connection: close\r\n") != std::string::npos);

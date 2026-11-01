@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <thinger/http/server/server_standalone.hpp>
+#include "../fixtures/transport_matrix.hpp"
 #include <boost/asio.hpp>
 #include <boost/asio/use_future.hpp>
 #include <array>
@@ -11,21 +12,26 @@
 #include <string>
 #include <thread>
 
-// Helpers for server tests: a server running on its own thread, raw TCP exchanges that
-// never block longer than a timeout, and in-memory dispatch
+// Helpers for server tests: a server running on its own thread (on any transport of the matrix),
+// raw exchanges that never block longer than a timeout, and in-memory dispatch
 namespace server_test {
 
     using namespace std::chrono_literals;
 
-    // Runs `server` (routes registered beforehand) on an ephemeral port until destroyed
+    using thinger::http::test::exchange_result;
+    using thinger::http::test::transport;
+    using thinger::http::test::transport_endpoint;
+
+    // Runs `server` (routes registered beforehand) until destroyed, on an ephemeral port of
+    // 127.0.0.1 (TCP, TLS) or on a socket in a temporary directory (Unix)
     struct running_server {
         thinger::http::server& server;
+        thinger::http::test::transport_listener listener;
         uint16_t port = 0;
         std::thread thread;
 
-        explicit running_server(thinger::http::server& s) : server(s) {
-            REQUIRE(server.listen("127.0.0.1", 0));
-            port = server.local_port();
+        explicit running_server(thinger::http::server& s, transport kind = transport::tcp)
+            : server(s), listener(s, kind), port(listener.endpoint().port) {
             thread = std::thread([this]() { server.wait(); });
         }
 
@@ -33,11 +39,14 @@ namespace server_test {
             server.stop();
             if (thread.joinable()) thread.join();
         }
-    };
 
-    struct exchange_result {
-        std::string data;
-        bool closed = false;    // the server closed the connection
+        const transport_endpoint& endpoint() const { return listener.endpoint(); }
+        transport kind() const { return endpoint().kind; }
+        std::string url(const std::string& path = "/") const { return endpoint().url(path); }
+
+        // Point a client at this server (see transport_endpoint::configure())
+        template<typename Client>
+        Client& configure(Client& client) const { return endpoint().configure(client); }
     };
 
     // Read from `sock` until the peer closes it or the timeout expires
@@ -70,6 +79,19 @@ namespace server_test {
         boost::system::error_code ec;
         boost::asio::write(sock, boost::asio::buffer(request), ec);
         return read_until_closed(ioc, sock, timeout);
+    }
+
+    // The same over the transport of `to`
+    inline exchange_result raw_exchange(const transport_endpoint& to, const std::string& request,
+                                        std::chrono::milliseconds timeout = 3s) {
+        thinger::http::test::raw_connection connection(to);
+        connection.write(request);
+        return connection.read_until_closed(timeout);
+    }
+
+    inline exchange_result raw_exchange(const running_server& to, const std::string& request,
+                                        std::chrono::milliseconds timeout = 3s) {
+        return raw_exchange(to.endpoint(), request, timeout);
     }
 
     inline size_t count(const std::string& data, const std::string& needle) {

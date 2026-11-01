@@ -90,6 +90,7 @@ awaitable<boost::system::error_code> ssl_socket::handshake(const std::string& ho
             close();
             co_return boost::asio::error::access_denied;
         }
+        if (!ec) handshake_ = tls_handshake_record::take(ssl_stream_.native_handle());
         co_return ec;
     }
 }
@@ -213,20 +214,22 @@ awaitable<boost::system::error_code> ssl_socket::wait(boost::asio::socket_base::
     co_return co_await tcp_socket::wait(type);
 }
 
-awaitable<bool> ssl_socket::peer_closed() {
-    if (!read_ahead_.empty()) co_return false;
+awaitable<boost::system::error_code> ssl_socket::peer_closed() {
+    if (!read_ahead_.empty()) co_return boost::system::error_code{};
 
     // The raw socket holds TLS records: a close_notify alert (sent before the FIN, so the
     // socket is not empty) cannot be told apart from data without decrypting it, as TLS
     // 1.3 encrypts alerts too. Read through the TLS stream and keep any data for the next
-    // read: the end of the stream (close_notify, FIN) or an error means the peer is gone.
+    // read. The end of the stream is eof, with a close_notify or without one (a FIN alone,
+    // stream_truncated); any other error is the connection's (a reset)
     std::array<uint8_t, 4096> data;
     auto [ec, bytes] = co_await ssl_stream_.async_read_some(boost::asio::buffer(data), use_nothrow_awaitable);
     if (bytes > 0) {
         read_ahead_.append(reinterpret_cast<const char*>(data.data()), bytes);
-        co_return false;
+        co_return boost::system::error_code{};
     }
-    co_return true;
+    if (ec == boost::asio::ssl::error::stream_truncated) co_return boost::asio::error::eof;
+    co_return ec;
 }
 
 bool ssl_socket::readable_now() const {

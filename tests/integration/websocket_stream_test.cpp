@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <thinger/asio/socket_pipe.hpp>
 #include <thinger/asio/sockets/tcp_socket.hpp>
 #include <thinger/asio/sockets/websocket.hpp>
@@ -8,17 +9,20 @@
 #include <thinger/http/server/server_standalone.hpp>
 #include <thinger/http/server/pool_server.hpp>
 #include <thinger/http/server/connection_tracker.hpp>
+#include <thinger/http/server/websocket_connection.hpp>
 #include <thinger/http/client/client.hpp>
 #include <thinger/util/base64.hpp>
 #include <thinger/util/sha1.hpp>
 
 #include "server_test_helpers.hpp"
+#include "../fixtures/awaited_shutdown.hpp"
 #include "../fixtures/stream_test_helpers.hpp"
 
 #include <cstring>
 #include <future>
 #include <mutex>
 #include <vector>
+#include "../fixtures/running_workers.hpp"
 
 // The server-side WebSocket used as a byte stream socket: protocols running on it, subprotocol
 // negotiation, control frames, closing, and tunnels with socket_pipe
@@ -216,19 +220,21 @@ namespace {
 
 }
 
-TEST_CASE("WebSocket stream: a binary protocol reads fragmented messages as one stream", "[websocket][stream][integration]") {
+TEST_CASE("WebSocket stream: a binary protocol reads fragmented messages as one stream", "[websocket][stream][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     result_slot<boost::system::error_code> ended;
     server.get("/echo", [&](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string protocol) {
+        res.upgrade_websocket_stream({}, [&](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             co_spawn(ws->get_io_context(), [ws, &ended]() -> awaitable<void> {
                 ended.set(co_await length_prefixed_echo(ws));
             }, detached);
         });
     });
-    running_server running(server);
+    running_server running(server, kind);
 
-    raw_ws_client client(running.port);
+    raw_ws_client client(running.endpoint());
     auto response = client.handshake("/echo");
     REQUIRE(response.starts_with("HTTP/1.1 101"));
 
@@ -305,10 +311,12 @@ TEST_CASE("WebSocket stream: a binary protocol reads fragmented messages as one 
     REQUIRE(*end == boost::asio::error::eof);
 }
 
-TEST_CASE("WebSocket stream: read_until and exact reads over frames", "[websocket][stream][integration]") {
+TEST_CASE("WebSocket stream: read_until and exact reads over frames", "[websocket][stream][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     server.get("/lines", [](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream([](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({}, [](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             co_spawn(ws->get_io_context(), [ws]() -> awaitable<void> {
                 boost::asio::streambuf buffer;
                 for (;;) {
@@ -331,9 +339,9 @@ TEST_CASE("WebSocket stream: read_until and exact reads over frames", "[websocke
             }, detached);
         });
     });
-    running_server running(server);
+    running_server running(server, kind);
 
-    raw_ws_client client(running.port);
+    raw_ws_client client(running.endpoint());
     REQUIRE(client.handshake("/lines").starts_with("HTTP/1.1 101"));
     client.send_frame(OP_BINARY, "hel");
     client.send_frame(OP_BINARY, "lo\r\nwor");
@@ -343,11 +351,13 @@ TEST_CASE("WebSocket stream: read_until and exact reads over frames", "[websocke
     REQUIRE(client.read_data(23) == "HELLO\nWORLD\nABCDEFGHIJ\n");
 }
 
-TEST_CASE("WebSocket stream: subprotocol negotiation", "[websocket][stream][integration]") {
+TEST_CASE("WebSocket stream: subprotocol negotiation", "[websocket][stream][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     result_slot<std::string> negotiated;
-    auto handler = [&](std::shared_ptr<asio::websocket> ws, std::string protocol) {
-        negotiated.set(protocol + "|" + ws->get_protocol());
+    auto handler = [&](http::upgraded_websocket upgraded) {
+        auto ws = std::move(upgraded.stream);
+        negotiated.set(upgraded.protocol + "|" + ws->get_protocol());
         ws->close();
     };
     server.get("/mqtt", [&](http::request& req, http::response& res) {
@@ -357,15 +367,15 @@ TEST_CASE("WebSocket stream: subprotocol negotiation", "[websocket][stream][inte
         res.upgrade_websocket_stream({.protocols = {"iotmp"}, .protocol_required = false}, handler);
     });
     server.get("/any", [&](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream(handler);
+        res.upgrade_websocket_stream({}, handler);
     });
-    server.get("/legacy", [&](http::request& req, http::response& res) {
-        res.upgrade_websocket([](std::shared_ptr<http::websocket_connection>) {}, {"chat", "json"});
+    server.get("/messages", [&](http::request& req, http::response& res) {
+        res.upgrade_websocket({.protocols = {"chat", "json"}}, [](std::shared_ptr<http::websocket_connection>) {});
     });
-    running_server running(server);
+    running_server running(server, kind);
 
     auto handshake = [&](const std::string& path, const std::string& protocols) {
-        raw_ws_client client(running.port);
+        raw_ws_client client(running.endpoint());
         return client.handshake(path, protocols.empty() ? "" : "Sec-WebSocket-Protocol: " + protocols + "\r\n");
     };
 
@@ -384,7 +394,7 @@ TEST_CASE("WebSocket stream: subprotocol negotiation", "[websocket][stream][inte
     }
 
     SECTION("Several headers") {
-        raw_ws_client client(running.port);
+        raw_ws_client client(running.endpoint());
         auto response = client.handshake("/mqtt", "Sec-WebSocket-Protocol: foo\r\nSec-WebSocket-Protocol: mqtt\r\n");
         REQUIRE(response.starts_with("HTTP/1.1 101"));
         REQUIRE(header_value(response, "Sec-WebSocket-Protocol") == "mqtt");
@@ -420,43 +430,47 @@ TEST_CASE("WebSocket stream: subprotocol negotiation", "[websocket][stream][inte
     }
 
     SECTION("Not a WebSocket request") {
-        auto result = server_test::raw_exchange(running.port, "GET /mqtt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        auto result = server_test::raw_exchange(running, "GET /mqtt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         REQUIRE(result.data.starts_with("HTTP/1.1 426"));
     }
 
     SECTION("Message interface: a list offered") {
-        auto response = handshake("/legacy", "foo, json");
+        auto response = handshake("/messages", "foo, json");
         REQUIRE(response.starts_with("HTTP/1.1 101"));
         REQUIRE(header_value(response, "Sec-WebSocket-Protocol") == "json");
-        REQUIRE(handshake("/legacy", "foo").starts_with("HTTP/1.1 400"));
-        REQUIRE(handshake("/legacy", "").starts_with("HTTP/1.1 400"));
+        REQUIRE(handshake("/messages", "foo").starts_with("HTTP/1.1 400"));
+        REQUIRE(handshake("/messages", "").starts_with("HTTP/1.1 400"));
     }
 }
 
-TEST_CASE("WebSocket stream: frames sent along with the handshake are kept", "[websocket][stream][integration]") {
+TEST_CASE("WebSocket stream: frames sent along with the handshake are kept", "[websocket][stream][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     server.get("/echo", [](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream([](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({}, [](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             co_spawn(ws->get_io_context(), length_prefixed_echo(ws), detached);
         });
     });
-    running_server running(server);
+    running_server running(server, kind);
 
-    raw_ws_client client(running.port);
+    raw_ws_client client(running.endpoint());
     auto early = make_frame(OP_BINARY, be32(5) + "early") + make_frame(OP_BINARY, be32(3) + "fo", false);
     REQUIRE(client.handshake("/echo", "", early).starts_with("HTTP/1.1 101"));
     client.send_frame(OP_CONTINUATION, "o");
     REQUIRE(client.read_data(16) == be32(5) + "early" + be32(3) + "foo");
 }
 
-TEST_CASE("WebSocket stream: concurrent writes are sent whole and in order", "[websocket][stream][integration]") {
+TEST_CASE("WebSocket stream: concurrent writes are sent whole and in order", "[websocket][stream][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     constexpr int writers = 4;
     constexpr int messages = 20;
     constexpr size_t size = 50000;
 
     http::server server;
     server.get("/flood", [](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream([](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({}, [](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             for (int writer = 0; writer < writers; ++writer) {
                 co_spawn(ws->get_io_context(), [ws, writer]() -> awaitable<void> {
                     for (int i = 0; i < messages; ++i) {
@@ -468,9 +482,9 @@ TEST_CASE("WebSocket stream: concurrent writes are sent whole and in order", "[w
             }
         });
     });
-    running_server running(server);
+    running_server running(server, kind);
 
-    raw_ws_client client(running.port);
+    raw_ws_client client(running.endpoint());
     REQUIRE(client.handshake("/flood").starts_with("HTTP/1.1 101"));
     std::vector<int> next(writers, 0);
     for (int received = 0; received < writers * messages; ++received) {
@@ -487,10 +501,12 @@ TEST_CASE("WebSocket stream: concurrent writes are sent whole and in order", "[w
     }
 }
 
-TEST_CASE("WebSocket stream: text messages", "[websocket][stream][integration]") {
+TEST_CASE("WebSocket stream: text messages", "[websocket][stream][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     server.get("/text", [](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream({.binary = false}, [](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({.binary = false}, [](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             co_spawn(ws->get_io_context(), [ws]() -> awaitable<void> {
                 co_await ws->write(std::string_view("{\"hello\":1}"));
                 ws->set_binary(true);
@@ -500,9 +516,9 @@ TEST_CASE("WebSocket stream: text messages", "[websocket][stream][integration]")
             }, detached);
         });
     });
-    running_server running(server);
+    running_server running(server, kind);
 
-    raw_ws_client client(running.port);
+    raw_ws_client client(running.endpoint());
     REQUIRE(client.handshake("/text").starts_with("HTTP/1.1 101"));
     auto text = client.read_frame();
     REQUIRE(text);
@@ -517,24 +533,26 @@ TEST_CASE("WebSocket stream: text messages", "[websocket][stream][integration]")
     REQUIRE(end->payload == "end");
 }
 
-TEST_CASE("WebSocket stream: ping, keepalive and idle timeout", "[websocket][stream][integration]") {
+TEST_CASE("WebSocket stream: ping, keepalive and idle timeout", "[websocket][stream][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     result_slot<boost::system::error_code> ended;
-    auto echo = [&](std::shared_ptr<asio::websocket> ws, std::string) {
+    auto echo = [&](http::upgraded_websocket upgraded) {
+        auto ws = std::move(upgraded.stream);
         co_spawn(ws->get_io_context(), [ws, &ended]() -> awaitable<void> {
             ended.set(co_await length_prefixed_echo(ws));
         }, detached);
     };
     server.get("/echo", [&](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream(echo);
+        res.upgrade_websocket_stream({}, echo);
     });
     server.get("/keepalive", [&](http::request& req, http::response& res) {
         res.upgrade_websocket_stream({.ping_interval = 100ms, .idle_timeout = 600ms}, echo);
     });
-    running_server running(server);
+    running_server running(server, kind);
 
     SECTION("Pings are answered") {
-        raw_ws_client client(running.port);
+        raw_ws_client client(running.endpoint());
         REQUIRE(client.handshake("/echo").starts_with("HTTP/1.1 101"));
         client.send_frame(OP_PING, "are you there?");
         auto pong = client.read_frame();
@@ -548,7 +566,7 @@ TEST_CASE("WebSocket stream: ping, keepalive and idle timeout", "[websocket][str
     }
 
     SECTION("A client answering the pings stays connected") {
-        raw_ws_client client(running.port);
+        raw_ws_client client(running.endpoint());
         REQUIRE(client.handshake("/keepalive").starts_with("HTTP/1.1 101"));
         int pings = 0;
         auto until = std::chrono::steady_clock::now() + 1500ms;
@@ -566,7 +584,7 @@ TEST_CASE("WebSocket stream: ping, keepalive and idle timeout", "[websocket][str
     }
 
     SECTION("An idle client is closed") {
-        raw_ws_client client(running.port);
+        raw_ws_client client(running.endpoint());
         REQUIRE(client.handshake("/keepalive").starts_with("HTTP/1.1 101"));
         auto start = std::chrono::steady_clock::now();
         std::optional<ws_frame> close;
@@ -586,11 +604,96 @@ TEST_CASE("WebSocket stream: ping, keepalive and idle timeout", "[websocket][str
     }
 }
 
-TEST_CASE("WebSocket stream: closing", "[websocket][stream][integration]") {
+namespace {
+
+    // A websocket in `role` over one end of a TCP connection on `ioc`, the other end `peer`,
+    // with a keepalive of 100 ms / 600 ms; its user never reads. When it closes, measured from
+    // its keepalive set
+    struct unread_websocket {
+        unread_websocket(boost::asio::io_context& ioc, bool server)
+            : acceptor(ioc, {tcp::v4(), 0}), peer(ioc) {
+            peer.connect({boost::asio::ip::make_address("127.0.0.1"), acceptor.local_endpoint().port()});
+            auto end = std::make_shared<asio::tcp_socket>("ws", acceptor.accept());
+            ws = std::make_shared<asio::websocket>(end, true, server);
+            ws->on_close([this](const asio::websocket_close&) {
+                closed_after = std::chrono::steady_clock::now() - start;
+            });
+            start = std::chrono::steady_clock::now();
+            ws->set_keepalive(100ms, 600ms);
+        }
+
+        tcp::acceptor acceptor;
+        tcp::socket peer;
+        std::shared_ptr<asio::websocket> ws;
+        std::chrono::steady_clock::time_point start;
+        std::optional<std::chrono::steady_clock::duration> closed_after;
+    };
+
+    // A binary frame of one byte, masked as a client sends it (to a server) or not
+    std::string one_byte_frame(bool masked) {
+        if (!masked) return std::string("\x82\x01" "x", 3);
+        return std::string("\x82\x81" "\x00\x00\x00\x00" "x", 7);
+    }
+
+}
+
+// The keepalive of a client, whose user may not read all the time (a synchronous client
+// between its calls), counts the bytes arrived unread as received, and pings before it closes
+// on a check run late. A server always reads: neither applies to it, its timing is the same
+TEST_CASE("WebSocket stream: the keepalive of a server is not changed by what a client counts", "[websocket][stream][integration]") {
+    const bool server = GENERATE(true, false);
+    INFO((server ? "server" : "client") << " role");
+    boost::asio::io_context ioc;
+
+    SECTION("Bytes arriving unread") {
+        unread_websocket unread(ioc, server);
+        // a frame every 100 ms, never read by the user of the websocket
+        auto frame = one_byte_frame(server);
+        boost::asio::steady_timer ticker(ioc);
+        std::function<void()> tick = [&] {
+            boost::asio::write(unread.peer, boost::asio::buffer(frame));
+            ticker.expires_after(100ms);
+            ticker.async_wait([&](boost::system::error_code ec) { if (!ec && !unread.closed_after) tick(); });
+        };
+        tick();
+        ioc.run_for(1500ms);
+        if (server) {
+            // closed at its idle timeout, as if nothing arrived
+            REQUIRE(unread.closed_after);
+            CHECK(*unread.closed_after >= 600ms);
+            CHECK(*unread.closed_after < 900ms);
+        } else {
+            CHECK_FALSE(unread.closed_after);
+            CHECK(unread.ws->is_open());
+        }
+        ticker.cancel();
+        unread.ws->close();
+    }
+
+    SECTION("A check run late") {
+        unread_websocket unread(ioc, server);
+        // nothing runs the io_context for longer than the idle timeout; the peer is silent
+        std::this_thread::sleep_for(800ms);
+        ioc.run_for(1500ms);
+        REQUIRE(unread.closed_after);
+        if (server) {
+            // closed at once
+            CHECK(*unread.closed_after < 900ms);
+        } else {
+            // a ping first, unanswered for the rest of the idle timeout (500 ms)
+            CHECK(*unread.closed_after >= 1300ms);
+            CHECK(*unread.closed_after < 1600ms);
+        }
+    }
+}
+
+TEST_CASE("WebSocket stream: closing", "[websocket][stream][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     result_slot<bool> handler_done;
     server.get("/close", [&](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({}, [&](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             co_spawn(ws->get_io_context(), [ws, &handler_done]() -> awaitable<void> {
                 co_await ws->write(std::string_view("bye"));
                 ws->close();
@@ -601,7 +704,8 @@ TEST_CASE("WebSocket stream: closing", "[websocket][stream][integration]") {
         });
     });
     server.get("/graceful", [&](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({}, [&](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             co_spawn(ws->get_io_context(), [ws, &handler_done]() -> awaitable<void> {
                 co_await ws->write(std::string_view("bye"));
                 co_await ws->close_graceful();
@@ -610,19 +714,20 @@ TEST_CASE("WebSocket stream: closing", "[websocket][stream][integration]") {
         });
     });
     server.get("/echo", [&](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream([](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({}, [](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             co_spawn(ws->get_io_context(), length_prefixed_echo(ws), detached);
         });
     });
     server.get("/drop", [&](http::request& req, http::response& res) {
         // released without closing
-        res.upgrade_websocket_stream([](std::shared_ptr<asio::websocket>, std::string) {});
+        res.upgrade_websocket_stream({}, [](http::upgraded_websocket) {});
     });
-    running_server running(server);
+    running_server running(server, kind);
 
     for (std::string path : {"/close", "/graceful", "/drop"}) {
         DYNAMIC_SECTION("Closed by the server: " << path) {
-            raw_ws_client client(running.port);
+            raw_ws_client client(running.endpoint());
             REQUIRE(client.handshake(path).starts_with("HTTP/1.1 101"));
             if (path != "/drop") REQUIRE(client.read_data(3) == "bye");
             auto close = client.read_frame();
@@ -639,7 +744,7 @@ TEST_CASE("WebSocket stream: closing", "[websocket][stream][integration]") {
     }
 
     SECTION("A peer that does not answer the close frame is closed after the timeout") {
-        raw_ws_client client(running.port);
+        raw_ws_client client(running.endpoint());
         REQUIRE(client.handshake("/close").starts_with("HTTP/1.1 101"));
         REQUIRE(client.read_data(3) == "bye");
         REQUIRE(client.read_frame()->opcode == OP_CLOSE);
@@ -647,7 +752,7 @@ TEST_CASE("WebSocket stream: closing", "[websocket][stream][integration]") {
     }
 
     SECTION("Protocol errors close the connection with 1002") {
-        raw_ws_client client(running.port);
+        raw_ws_client client(running.endpoint());
         REQUIRE(client.handshake("/echo").starts_with("HTTP/1.1 101"));
         // unmasked frame from a client
         client.send_raw(make_frame(OP_BINARY, "unmasked", true, false));
@@ -660,7 +765,9 @@ TEST_CASE("WebSocket stream: closing", "[websocket][stream][integration]") {
     }
 }
 
-TEST_CASE("WebSocket stream: on_close", "[websocket][stream][on-close][integration]") {
+TEST_CASE("WebSocket stream: on_close", "[websocket][stream][on-close][integration][matrix]") {
+    thinger::http::test::running_workers workers;
+    MATRIX_TRANSPORT(kind);
     // What on_close() told: how many times, how, and whether from within the call to close()
     struct close_record {
         std::atomic<int> calls{0};
@@ -694,10 +801,11 @@ TEST_CASE("WebSocket stream: on_close", "[websocket][stream][on-close][integrati
 
     http::server server;
     server.get("/watch", [&](http::request&, http::response& res) {
-        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) { watch(ws); });
+        res.upgrade_websocket_stream({}, [&](http::upgraded_websocket upgraded) { watch(upgraded.stream); });
     });
     server.get("/close", [&](http::request&, http::response& res) {
-        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({}, [&](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             watch(ws);
             record->closing = true;
             ws->close();
@@ -705,22 +813,25 @@ TEST_CASE("WebSocket stream: on_close", "[websocket][stream][on-close][integrati
         });
     });
     server.get("/late", [&](http::request&, http::response& res) {
-        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({}, [&](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             ws->close(4001);
             watch(ws);
         });
     });
     server.get("/shutdown", [&](http::request&, http::response& res) {
-        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({}, [&](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             watch(ws);
-            http::on_server_shutdown(*ws, [weak = std::weak_ptr<asio::websocket>(ws)] {
+            upgraded.scope.on_shutdown([weak = std::weak_ptr<asio::websocket>(ws)] {
                 if (auto self = weak.lock()) self->close(asio::websocket::CLOSE_GOING_AWAY);
             });
         });
     });
     std::atomic<int> thrown{0};
     server.get("/throw", [&](http::request&, http::response& res) {
-        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({}, [&](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             ws->on_close([&thrown](const asio::websocket_close&) {
                 ++thrown;
                 throw std::runtime_error("close callback failure");
@@ -728,10 +839,10 @@ TEST_CASE("WebSocket stream: on_close", "[websocket][stream][on-close][integrati
             co_spawn(ws->get_io_context(), length_prefixed_echo(ws), detached);
         });
     });
-    running_server running(server);
+    running_server running(server, kind);
 
     SECTION("The close frame of the peer: its code and reason") {
-        raw_ws_client client(running.port);
+        raw_ws_client client(running.endpoint());
         REQUIRE(client.handshake("/watch").starts_with("HTTP/1.1 101"));
         client.send_frame(OP_CLOSE, close_payload(4000, "bye"));
         auto answer = client.read_frame();
@@ -746,7 +857,7 @@ TEST_CASE("WebSocket stream: on_close", "[websocket][stream][on-close][integrati
 
     for (bool reset : {true, false}) {
         DYNAMIC_SECTION("The connection lost without a close frame: " << (reset ? "reset" : "end of the stream")) {
-            raw_ws_client client(running.port);
+            raw_ws_client client(running.endpoint());
             REQUIRE(client.handshake("/watch").starts_with("HTTP/1.1 101"));
             if (reset) {
                 client.reset();
@@ -761,7 +872,7 @@ TEST_CASE("WebSocket stream: on_close", "[websocket][stream][on-close][integrati
     }
 
     SECTION("close(): told afterwards, never from within it") {
-        raw_ws_client client(running.port);
+        raw_ws_client client(running.endpoint());
         REQUIRE(client.handshake("/close").starts_with("HTTP/1.1 101"));
         auto frame = client.read_frame();
         REQUIRE(frame);
@@ -775,7 +886,7 @@ TEST_CASE("WebSocket stream: on_close", "[websocket][stream][on-close][integrati
     }
 
     SECTION("Set once closed: told at once") {
-        raw_ws_client client(running.port);
+        raw_ws_client client(running.endpoint());
         REQUIRE(client.handshake("/late").starts_with("HTTP/1.1 101"));
         auto close = told_once();
         REQUIRE(close);
@@ -783,20 +894,20 @@ TEST_CASE("WebSocket stream: on_close", "[websocket][stream][on-close][integrati
     }
 
     SECTION("What the callback throws is logged, and the server goes on") {
-        raw_ws_client client(running.port);
+        raw_ws_client client(running.endpoint());
         REQUIRE(client.handshake("/throw").starts_with("HTTP/1.1 101"));
         client.send_frame(OP_CLOSE, close_payload(1000));
         REQUIRE(client.closed_within(2s));
         for (int i = 0; i < 200 && thrown == 0; ++i) std::this_thread::sleep_for(10ms);
         REQUIRE(thrown == 1);
-        raw_ws_client next(running.port);
+        raw_ws_client next(running.endpoint());
         REQUIRE(next.handshake("/watch").starts_with("HTTP/1.1 101"));
     }
 
     SECTION("The server shutting down: closed when the handler is told") {
-        raw_ws_client client(running.port);
+        raw_ws_client client(running.endpoint());
         REQUIRE(client.handshake("/shutdown").starts_with("HTTP/1.1 101"));
-        server.begin_shutdown(5s);
+        http::test::awaited_shutdown shutdown(server, 5s);
         auto frame = client.read_frame();
         REQUIRE(frame);
         REQUIRE(frame->close_code() == asio::websocket::CLOSE_GOING_AWAY);
@@ -807,15 +918,15 @@ TEST_CASE("WebSocket stream: on_close", "[websocket][stream][on-close][integrati
         REQUIRE_FALSE(close->remote);
     }
 
-    SECTION("The server shutting down: closed at the end of the grace period") {
+    SECTION("The server shutting down: closed at its deadline") {
         // A pool server: its workers still run once it stopped
-        http::pool_server pool;
+        http::pool_server pool(workers);
         pool.get("/watch", [&](http::request&, http::response& res) {
-            res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) { watch(ws); });
+            res.upgrade_websocket_stream({}, [&](http::upgraded_websocket upgraded) { watch(upgraded.stream); });
         });
-        REQUIRE(pool.listen("127.0.0.1", 0));
+        http::test::transport_listener listener(pool, kind);
         auto waiting = std::async(std::launch::async, [&] { pool.wait(); });
-        raw_ws_client client(pool.local_port());
+        raw_ws_client client(listener.endpoint());
         REQUIRE(client.handshake("/watch").starts_with("HTTP/1.1 101"));
         // the websocket ignores the shutdown
         REQUIRE_FALSE(pool.shutdown(200ms));
@@ -856,18 +967,20 @@ TEST_CASE("WebSocket stream: on_close is not called once destroyed open", "[webs
     REQUIRE(*calls == 0);
 }
 
-TEST_CASE("WebSocket stream: tunnel to a TCP server", "[websocket][stream][socket-pipe][integration]") {
+TEST_CASE("WebSocket stream: tunnel to a TCP server", "[websocket][stream][socket-pipe][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     tcp_echo_server backend("quit");
     http::server server;
     result_slot<bool> pipe_ended;
     server.get("/tunnel", [&](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream({.protocols = {"binary"}}, [&](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({.protocols = {"binary"}}, [&](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             tunnel_to_tcp(ws, backend.port(), &pipe_ended);
         });
     });
-    running_server running(server);
+    running_server running(server, kind);
 
-    raw_ws_client client(running.port);
+    raw_ws_client client(running.endpoint());
     REQUIRE(client.handshake("/tunnel", "Sec-WebSocket-Protocol: binary\r\n").starts_with("HTTP/1.1 101"));
 
     SECTION("Large data both ways, closed by the WebSocket end") {
@@ -917,19 +1030,23 @@ TEST_CASE("WebSocket stream: tunnel to a TCP server", "[websocket][stream][socke
     }
 }
 
-TEST_CASE("WebSocket stream: the client WebSocket used as a socket", "[websocket][stream][socket-pipe][client][integration]") {
+TEST_CASE("WebSocket stream: the client WebSocket used as a socket", "[websocket][stream][socket-pipe][client][integration][matrix]") {
+    thinger::http::test::running_workers workers;
+    MATRIX_TRANSPORT(kind);
     tcp_echo_server backend;
     http::server server;
     server.get("/tunnel", [&](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream({.protocols = {"binary"}}, [&](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({.protocols = {"binary"}}, [&](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             tunnel_to_tcp(ws, backend.port());
         });
     });
-    running_server running(server);
-    auto url = "ws://127.0.0.1:" + std::to_string(running.port) + "/tunnel";
+    running_server running(server, kind);
+    auto url = running.url("/tunnel");
 
     SECTION("Large data written and read at the same time") {
-        http::async_client client;
+        http::async_client client(workers);
+        running.configure(client);
         result_slot<std::string> result;
         auto data = pattern(4 * 1024 * 1024, 3);
         client.run([&]() -> awaitable<void> {
@@ -969,7 +1086,8 @@ TEST_CASE("WebSocket stream: the client WebSocket used as a socket", "[websocket
 
     SECTION("In a pipe on the client side") {
         // client WebSocket <-> local TCP connection, as a proxy to a WebSocket target does
-        http::async_client client;
+        http::async_client client(workers);
+        running.configure(client);
         result_slot<uint16_t> local_port;
         client.run([&]() -> awaitable<void> {
             auto ws = co_await client.websocket(url, "binary");
@@ -1033,29 +1151,31 @@ namespace {
 
 }
 
-TEST_CASE("WebSocket stream: a synchronous client closes without running its io_context", "[websocket][stream][client][integration]") {
+TEST_CASE("WebSocket stream: a synchronous client closes without running its io_context", "[websocket][stream][client][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     result_slot<boost::system::error_code> ended;
     server.get("/echo", [&](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({}, [&](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             co_spawn(ws->get_io_context(), [ws, &ended]() -> awaitable<void> {
                 ended.set(co_await length_prefixed_echo(ws));
             }, detached);
         });
     });
     server.get("/ok", [](http::response& res) { res.send("ok"); });
-    running_server running(server);
-    auto base = "127.0.0.1:" + std::to_string(running.port);
+    running_server running(server, kind);
 
     http::client client;
-    auto ws = client.websocket("ws://" + base + "/echo");
+    running.configure(client);
+    auto ws = client.websocket(running.url("/echo"));
     REQUIRE(ws);
     // released without close(): closed now, leaving nothing for the next call of the client
     ws.reset();
     REQUIRE(ended.wait(2s));
 
     auto start = std::chrono::steady_clock::now();
-    auto response = client.get("http://" + base + "/ok");
+    auto response = client.get(running.url("/ok"));
     REQUIRE(response.ok());
     REQUIRE(std::chrono::steady_clock::now() - start < 1s);
 }
@@ -1100,14 +1220,16 @@ TEST_CASE("WebSocket stream: a websocket released on another thread starts no I/
     io_thread.join();
 }
 
-TEST_CASE("WebSocket stream: interrupted writes keep the framing", "[websocket][stream][integration]") {
+TEST_CASE("WebSocket stream: interrupted writes keep the framing", "[websocket][stream][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     result_slot<boost::system::error_code> first_write;
     result_slot<std::string> read_result;
     std::string big = pattern(STUCK_SIZE, 11);
 
     server.get("/cancel", [&](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({}, [&](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             co_spawn(ws->get_io_context(), [ws, &first_write, &big]() -> awaitable<void> {
                 co_spawn(ws->get_io_context(), [ws]() -> awaitable<void> {
                     co_await sleep_for(ws, 100ms);
@@ -1120,7 +1242,8 @@ TEST_CASE("WebSocket stream: interrupted writes keep the framing", "[websocket][
         });
     });
     server.get("/close", [&](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({}, [&](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             co_spawn(ws->get_io_context(), [ws, &first_write, &big]() -> awaitable<void> {
                 co_spawn(ws->get_io_context(), [ws]() -> awaitable<void> {
                     co_await sleep_for(ws, 100ms);
@@ -1132,7 +1255,8 @@ TEST_CASE("WebSocket stream: interrupted writes keep the framing", "[websocket][
         });
     });
     server.get("/pong", [&](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream([&](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({}, [&](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             co_spawn(ws->get_io_context(), [ws, &big]() -> awaitable<void> {
                 co_await ws->write(std::string_view(big));
             }, detached);
@@ -1144,17 +1268,22 @@ TEST_CASE("WebSocket stream: interrupted writes keep the framing", "[websocket][
         });
     });
     server.get("/pings", [&](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream({.ping_interval = 300ms}, [&](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({.ping_interval = 300ms}, [&](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             co_spawn(ws->get_io_context(), [ws, &big]() -> awaitable<void> {
                 co_await ws->write(std::string_view(big));
             }, detached);
             co_spawn(ws->get_io_context(), length_prefixed_echo(ws), detached);
         });
     });
-    running_server running(server);
+    running_server running(server, kind);
 
     SECTION("cancel() in the middle of a frame: the next write completes it first") {
-        raw_ws_client client(running.port);
+        // 10.3 (tls_socket): over TLS, cancelling a write in the middle of a TLS record loses
+        // the ciphertext not sent yet (ssl_socket inherits tcp_socket::cancel(), which cancels
+        // the write of the lower socket), so the stream is corrupted and no frame arrives
+        if (kind == http::test::transport::tls) SKIP("10.3: cancel() in the middle of a write corrupts a TLS stream");
+        raw_ws_client client(running.endpoint());
         REQUIRE(client.handshake("/cancel").starts_with("HTTP/1.1 101"));
         auto ec = first_write.wait();
         REQUIRE(ec);
@@ -1168,7 +1297,9 @@ TEST_CASE("WebSocket stream: interrupted writes keep the framing", "[websocket][
     }
 
     SECTION("close() in the middle of a frame: completed, then the close frame") {
-        raw_ws_client client(running.port);
+        // 10.3 (tls_socket): close() cancels the write as cancel() does (see above)
+        if (kind == http::test::transport::tls) SKIP("10.3: close() in the middle of a write corrupts a TLS stream");
+        raw_ws_client client(running.endpoint());
         REQUIRE(client.handshake("/close").starts_with("HTTP/1.1 101"));
         REQUIRE(first_write.wait());
         auto frames = read_frames(client, 2);
@@ -1181,7 +1312,7 @@ TEST_CASE("WebSocket stream: interrupted writes keep the framing", "[websocket][
     }
 
     SECTION("A ping does not hold the reads while a write is in progress") {
-        raw_ws_client client(running.port);
+        raw_ws_client client(running.endpoint());
         REQUIRE(client.handshake("/pong").starts_with("HTTP/1.1 101"));
         std::this_thread::sleep_for(100ms);
         client.send_frame(OP_PING, "p");
@@ -1196,7 +1327,7 @@ TEST_CASE("WebSocket stream: interrupted writes keep the framing", "[websocket][
     }
 
     SECTION("Keepalive pings do not pile up behind a write in progress") {
-        raw_ws_client client(running.port);
+        raw_ws_client client(running.endpoint());
         REQUIRE(client.handshake("/pings").starts_with("HTTP/1.1 101"));
         std::this_thread::sleep_for(4500ms);   // 15 ping intervals
         auto start = std::chrono::steady_clock::now();
@@ -1253,17 +1384,18 @@ TEST_CASE("WebSocket stream: cancel() ends a read whose socket read completed al
     REQUIRE(uint8_t(socket->written[1]) == 0x80);
 }
 
-TEST_CASE("WebSocket stream: handshake checks", "[websocket][stream][integration]") {
+TEST_CASE("WebSocket stream: handshake checks", "[websocket][stream][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     auto handler = [](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream([](std::shared_ptr<asio::websocket> ws, std::string) {});
+        res.upgrade_websocket_stream({}, [](http::upgraded_websocket) {});
     };
     server.get("/ws", handler);
     server.post("/ws", handler);
-    running_server running(server);
+    running_server running(server, kind);
 
     auto exchange = [&](const std::string& method, const std::string& headers) {
-        return server_test::raw_exchange(running.port, method + " /ws HTTP/1.1\r\nHost: localhost\r\n" + headers +
+        return server_test::raw_exchange(running, method + " /ws HTTP/1.1\r\nHost: localhost\r\n" + headers +
                                                        "Content-Length: 0\r\n\r\n", 300ms).data;
     };
     const std::string upgrade = "Upgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n";

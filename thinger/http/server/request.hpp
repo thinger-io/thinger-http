@@ -10,11 +10,11 @@
 #include <boost/algorithm/string.hpp>
 
 #include "http_stream.hpp"
-#include "server_connection.hpp"
 #include "body_reader.hpp"
 #include "body_decoders.hpp"
 #include "multipart.hpp"
 #include "request_context.hpp"
+#include "../common/http_request.hpp"
 #include "../common/http_response.hpp"
 #include "../../util/types.hpp"
 
@@ -23,22 +23,37 @@ namespace thinger::http{
     // Maximum request body size unless the application or the route set theirs
     inline constexpr size_t default_max_body_size = 8 * 1024 * 1024;
 
+    // Why the scope of a request was cancelled (see request::cancelled()):
+    // - client_gone: its client reset the connection, or a read or write on it failed, or it
+    //   ended before the request was complete (a client that only closes its sending side
+    //   after a complete request still gets its response: that is not client_gone);
+    // - timeout: the timeout of its route (or of its in-memory dispatch) expired;
+    // - shutdown: the server reached the deadline of its shutdown with the request in progress.
+    // The library interrupts a handler for a reason only if its route declared it (see
+    // route::cancel_on), and always for shutdown
+    enum class cancel_reason : uint8_t { none, client_gone, timeout, shutdown };
+
     // Forward declarations
     class route;
     class virtual_host;
     class trusted_proxies;
     struct body_settings;
+    class http_application;
+    namespace proxy_detail { class proxy_exchange; }
 
     /**
      * Class that represents a single HTTP request over the API. It means, that the HTTP request
-     * was matched to some of the registered endpoints in the API. It holds the original HTTP
-     * connection, the stream associated to the HTTP request, and the HTTP request itself.
+     * was matched to some of the registered endpoints in the API. It holds where its body is
+     * read from (its connection, or memory), the stream associated to the HTTP request, and the
+     * HTTP request itself.
      */
     class request{
     public:
-        request(const std::shared_ptr<server_connection>& http_connection,
-                    const std::shared_ptr<http_stream>& http_stream,
-                    std::shared_ptr<http_request> http_request);
+        /// A request whose body comes from `source` (none: no body beyond what it was given,
+        /// and no connection), answered on `stream` (none in memory)
+        request(std::unique_ptr<detail::request_source> source,
+                std::shared_ptr<http_stream> http_stream,
+                std::shared_ptr<http_request> http_request);
 
         virtual ~request();
 
@@ -67,6 +82,21 @@ namespace thinger::http{
 
         /// Address of the direct peer (the connection's remote IP), whatever it forwards
         std::string get_peer_ip() const;
+
+        /// The connection the request came from: its peer and local addresses, and whether it
+        /// is TLS (for requests dispatched in memory, the peer address of the dispatch). Empty
+        /// once the connection is gone
+        connection_info connection() const;
+
+        /// TLS session of the connection (e.g. the client certificate on an mTLS route): none
+        /// without TLS, in memory, or once the connection is gone
+        std::optional<asio::tls_session> tls() const;
+
+        /// Whether the request came on a TLS connection whose handshake (SNI) chose another
+        /// client certificate mode or certificate than its host name (Host) gets: it must not be
+        /// served there (421, see asio::tls_handshake_record::misdirected()). False at once without
+        /// TLS, in memory, or once the connection is gone
+        bool misdirected() const;
 
         /// Client scheme, "http" or "https": the one of the connection (TLS or not; for
         /// requests dispatched in memory, the one of the request, see http_request::is_ssl())
@@ -112,8 +142,6 @@ namespace thinger::http{
         /// Get request header by key
         std::string header(const std::string& key) const;
 
-        std::shared_ptr<server_connection> get_http_connection() const;
-        
         std::shared_ptr<http_stream> get_http_stream() const;
 
         void set_uri_parameter(const std::string& param, const std::string& value);
@@ -142,20 +170,40 @@ namespace thinger::http{
         
         const route* get_matched_route() const;
 
-
+        // Whether the client asked to keep the connection (its Connection header and HTTP
+        // version), not whether the server keeps it after the response
         bool keep_alive() const;
+
+        // --- Cancellation (see cancel_reason, route::cancel_on) ---
+
+        /// Why the scope of the request was cancelled: none until then (or for a request
+        /// without a stream). Its handler goes on unless its route declared the reason (or
+        /// the server shuts down): it looks here where it chooses
+        cancel_reason cancelled() const;
+
+        /// Completes once the scope of the request is cancelled, whatever the reason, and
+        /// returns it; none if this wait is cancelled itself (e.g. by `||`). For a request
+        /// without a stream it never completes. Await it on the executor of the handler
+        thinger::awaitable<cancel_reason> client_gone();
+
+        /// Slot cancelled (terminal) with the scope of the request while the handler runs,
+        /// for the awaits the handler chooses to abandon then: bind it with
+        /// boost::asio::bind_cancellation_slot, to one pending await at a time (asio's rule).
+        /// Not connected for a request without a stream
+        boost::asio::cancellation_slot cancellation_slot();
 
         // --- Body reading (see body_reader) ---
 
-        /// Store read-ahead data (called by server_connection before dispatch)
+        /// Store read-ahead data: the bytes read past the request head (called by the
+        /// connection before dispatch)
         void set_read_ahead(const uint8_t* data, size_t size);
 
-        /// Read exactly `size` bytes (read-ahead first, then socket). TCP backpressure.
+        /// Read exactly `size` bytes (read-ahead first, then the source). TCP backpressure.
         /// Returns less at the end of the body, or if it fails (see get_body_error()), e.g.
         /// for a body over the maximum body size (a Content-Length one before reading it).
         thinger::awaitable<size_t> read(uint8_t* buffer, size_t size);
 
-        /// Read up to `max_size` bytes (read-ahead first, then socket); 0 at the end of the
+        /// Read up to `max_size` bytes (read-ahead first, then the source); 0 at the end of the
         /// body, or if it fails (see get_body_error()), as read(). A read cancelled (e.g. by
         /// `read_some() || timer`) returns 0 too, without failing: the body is still pending.
         thinger::awaitable<size_t> read_some(uint8_t* buffer, size_t max_size);
@@ -192,9 +240,6 @@ namespace thinger::http{
         /// Whether the request uses chunked transfer encoding
         bool is_chunked() const;
 
-        /// Bytes remaining in read-ahead buffer
-        size_t read_ahead_available() const;
-
         /// Remove and return the unconsumed read-ahead bytes (data following this request)
         std::vector<uint8_t> take_read_ahead();
 
@@ -207,10 +252,6 @@ namespace thinger::http{
         void set_body_settings(const body_settings* settings) { body_settings_ = settings; }
         const body_settings& get_body_settings() const;
 
-        /// Underlying socket. Do not read or write it while the server owns the connection:
-        /// read the body with read()/read_some(), or own the socket with response::take_over().
-        std::shared_ptr<asio::socket> get_socket() const;
-
     private:
 
         /// After reading the body: once read to its end, none of it is left on the connection
@@ -218,18 +259,18 @@ namespace thinger::http{
         void note_body_read();
 
         /**
-         * HTTP connection is the wrapper for a raw socket, being able to parse request and to
-         * pipeline HTTP responses
-         */
-        std::weak_ptr<server_connection> http_connection_;
-
-        /**
          * A stream is a channel inside the HTTP connection. i.e, while receiving multiple requests
          * and responses are generated asynchronously, it is required to know which response
          * belong to a given query, and provide an ordered response (to support HTTP pipelining).
          * With HTTP2.0 it is possible to provide responses without pipelining.
          */
-        std::weak_ptr<http_stream> http_stream_;
+        std::shared_ptr<http_stream> http_stream_;
+
+        /**
+         * Where the body is read from, and what is known of the connection (see
+         * detail::request_source). After the stream it refers to, so destroyed before it
+         */
+        std::unique_ptr<detail::request_source> source_;
 
         /**
          * This is the request that originated the API Request, and required to know the body, the
@@ -265,11 +306,11 @@ namespace thinger::http{
         /// Body decoders, accepted types and limits of the application (null: defaults)
         const body_settings* body_settings_ = nullptr;
 
-        /// The client waits for 100 Continue before sending the body: sent by the first read
-        /// from the connection (see server_connection::send_continue)
-        bool expect_continue_ = false;
-
+        /// The sink of the response, the deadline of a route timeout and the proxy watching the
+        /// client reach the connection through the source
         friend class connection_sink;
+        friend class http_application;
+        friend class proxy_detail::proxy_exchange;
 
         /// Body parsed as JSON by the matched route, for callbacks taking it
         friend class route;

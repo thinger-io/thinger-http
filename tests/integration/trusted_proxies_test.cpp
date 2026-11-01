@@ -4,10 +4,12 @@
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/client/client.hpp>
 #include <thinger/util/types.hpp>
+#include <thinger/asio/ssl/certificate_manager.hpp>
 #include <nlohmann/json.hpp>
 #include <boost/asio.hpp>
 #include <boost/asio/use_future.hpp>
 #include <thread>
+#include "../fixtures/server_listen.hpp"
 
 using namespace thinger;
 
@@ -130,11 +132,11 @@ TEST_CASE("Client IP over a connection", "[server][proxies][integration]") {
 
     auto request_ips = [&server](bool trusted) {
         if (trusted) REQUIRE(server.set_trusted_proxies({"127.0.0.1"}));
-        REQUIRE(server.listen("127.0.0.1", 0));
+        REQUIRE_FALSE(server.listen("127.0.0.1", 0));
         std::thread thread([&server]() { server.wait(); });
 
         http::client client;
-        auto response = client.get("http://127.0.0.1:" + std::to_string(server.local_port()) + "/ip",
+        auto response = client.get("http://127.0.0.1:" + std::to_string(http::test::listening_port(server)) + "/ip",
                                    {{"X-Forwarded-For", "203.0.113.9"}});
         server.stop();
         thread.join();
@@ -202,13 +204,13 @@ TEST_CASE("Request scheme over a connection", "[server][proxies][integration]") 
 
     auto request_scheme = [&server](bool secure, bool trusted) {
         if (trusted) REQUIRE(server.set_trusted_proxies({"127.0.0.1"}));
-        server.enable_ssl(secure);
-        REQUIRE(server.listen("127.0.0.1", 0));
+        auto certificates = secure ? std::make_shared<asio::certificate_manager>() : nullptr;
+        REQUIRE_FALSE(server.listen(http::test::listen_options("127.0.0.1", 0, certificates)));
         std::thread thread([&server]() { server.wait(); });
 
         http::client client;
         client.verify_ssl(false);
-        auto url = std::string(secure ? "https" : "http") + "://127.0.0.1:" + std::to_string(server.local_port()) + "/ip";
+        auto url = std::string(secure ? "https" : "http") + "://127.0.0.1:" + std::to_string(http::test::listening_port(server)) + "/ip";
         auto response = client.get(url, {{"X-Forwarded-Proto", secure ? "http" : "https"}});
         server.stop();
         thread.join();

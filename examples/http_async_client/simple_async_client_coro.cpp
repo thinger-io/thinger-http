@@ -6,7 +6,11 @@ using namespace thinger;
 int main() {
     std::cout << "Simple Async Client Example (Coroutines)\n" << std::endl;
 
-    http::async_client client;
+    // The workers the clients run on: the application starts them, and stops them at the end
+    asio::workers workers;
+    workers.start();
+
+    http::async_client client(workers);
 
     // Sequential requests using co_await
     client.run([&client]() -> awaitable<void> {
@@ -44,5 +48,6 @@ int main() {
 
     std::cout << "\nAll requests completed!" << std::endl;
 
+    workers.stop();
     return 0;
 }

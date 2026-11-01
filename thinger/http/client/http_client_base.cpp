@@ -539,11 +539,15 @@ awaitable<client_response> http_client_base::options(const std::string& url, hea
 }
 
 awaitable<client_response> http_client_base::send(std::shared_ptr<http_request> request) {
+    // A request not made by create_request() (a request_builder's) reaches the socket of the
+    // client too, unless it names its own
+    if (request->get_unix_socket().empty() && !unix_socket_.empty()) request->set_unix_socket(unix_socket_);
     co_return co_await send_with_redirects(std::move(request));
 }
 
 awaitable<stream_result> http_client_base::send_streaming(std::shared_ptr<http_request> request,
                                                           stream_callback callback) {
+    if (request->get_unix_socket().empty() && !unix_socket_.empty()) request->set_unix_socket(unix_socket_);
     // Streamed bodies are handed as received, so they are not asked compressed. Before
     // apply_default_headers, which would ask for gzip and deflate
     if (!request->has_header("Accept-Encoding")) {
@@ -664,15 +668,23 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
     auto key = set_upgrade_headers(*request, *url, subprotocol);
     apply_default_headers(request);
 
-    // A connection of its own, never pooled: it becomes the WebSocket. Through a proxy, it
-    // is a tunnel (CONNECT) for ws:// too, as the request has Upgrade
-    boost::system::error_code ec;
-    auto plan = plan_connection(*request, ec);
-    if (ec) {
-        LOG_ERROR("WebSocket connect error: {}", ec.message());
-        co_return std::nullopt;
+    // A connection of its own, never pooled: it becomes the WebSocket. Over the Unix socket of
+    // the request or of the client, as the other requests; otherwise through a proxy it is a
+    // tunnel (CONNECT) for ws:// too, as the request has Upgrade
+    if (request->get_unix_socket().empty() && !unix_socket_.empty()) request->set_unix_socket(unix_socket_);
+    std::shared_ptr<client_connection> connection;
+    if (!request->get_unix_socket().empty()) {
+        auto sock = std::make_shared<thinger::asio::unix_socket>("http_client", get_io_context());
+        connection = std::make_shared<client_connection>(sock, request->get_unix_socket(), timeout_);
+    } else {
+        boost::system::error_code ec;
+        auto plan = plan_connection(*request, ec);
+        if (ec) {
+            LOG_ERROR("WebSocket connect error: {}", ec.message());
+            co_return std::nullopt;
+        }
+        connection = make_connection(plan);
     }
-    auto connection = make_connection(plan);
 
     auto response = co_await connection->send_request(request);
     if (!response || response->get_status_code() != 101) {
@@ -688,10 +700,12 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
     // Used, and running its keepalive and closing handshake, where the caller runs: on its
     // strand, never at the same time as the caller on an io_context run by several threads
     auto ws = std::make_shared<asio::websocket>(connection->release_socket(), false, false,
-                                                co_await boost::asio::this_coro::executor);
+                                                websocket_executor(co_await boost::asio::this_coro::executor));
     ws->set_protocol(response->get_header("Sec-WebSocket-Protocol"));
     // Frames the server sent right after its response, read along with it
     ws->set_read_ahead(connection->take_buffered());
+    // Every network wait has a deadline: the keepalive of the server, 60 s and 120 s
+    ws->start_timeout();
 
     LOG_INFO("WebSocket connected to {}", request->get_url());
     co_return websocket_client(std::move(ws));

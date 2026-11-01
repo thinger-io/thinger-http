@@ -2,20 +2,26 @@
 #define THINGER_WEBSOCKET_CONNECTION_HPP
 
 #include <chrono>
-#include <deque>
 #include <memory>
-#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/streambuf.hpp>
+#include "../../asio/async_event.hpp"
 #include "../../asio/io_context_of.hpp"
 #include "../../asio/sockets/websocket.hpp"
 #include "../../asio/sockets/socket.hpp"
 #include "../data/out_data.hpp"
 #include "../../util/types.hpp"
-#include "connection_tracker.hpp"
+#include "upgrade.hpp"
 #include "flow_control.hpp"
 #include "close_notifier.hpp"
 
 namespace thinger::http{
+
+// The queue of the connection (detail/push_queue.hpp), only declared here: not public
+namespace detail {
+    template<typename Item>
+    class push_queue;
+    enum class push_failure;
+}
 
 /// How a server WebSocket closed (see websocket_connection::on_close() and
 /// asio::websocket_close). The status code (RFC 6455, 7.4) is the one of the peer's close frame
@@ -48,21 +54,27 @@ class websocket_connection : public std::enable_shared_from_this<websocket_conne
 
 public:
 
-    /// Size of a read, and the largest message received (a larger one closes with 1009)
+    /// Size of a read, and the default largest message received (a larger one closes with
+    /// 1009, see websocket_accept_options::max_message_size)
     static constexpr size_t DEFAULT_BUFFER_SIZE = 1024;        // 1KB
     static constexpr size_t MAX_BUFFER_SIZE = 16*1024*1024;   // 16MB
 
     /// Default max_messages of the queue
     static constexpr int MAX_OUTPUT_MESSAGES = 100;
 
-    websocket_connection(std::shared_ptr<asio::websocket> socket);
+    /// On `socket`, with the largest message and the keepalive of `options` (its subprotocols
+    /// and binary are those of an upgrade, not used here), and taken over from a server through
+    /// `scope`, if any: told when the server shuts down (see on_shutdown()), counted as a
+    /// websocket until closed
+    websocket_connection(std::shared_ptr<asio::websocket> socket, const websocket_accept_options& options = {},
+                         server_scope scope = {});
 
     virtual ~websocket_connection();
 
     /// Each message received, whole, and whether it is binary
     void on_message(sync_callback<void(std::string, bool binary)> callback);
 
-    /// What to do when the server shuts down gracefully (see http_server_base::shutdown()),
+    /// What to do when the server shuts down gracefully (see server_base::shutdown()),
     /// e.g. send a last message and stop(). By default it closes with 1001 (Going Away);
     /// whatever is open at the end of the grace period is closed anyway
     void on_shutdown(sync_callback<void()> callback);
@@ -75,6 +87,9 @@ public:
     /// at once. Not called once released (release_socket()), nor if the io_context is stopped
     /// and destroyed with it open
     void on_close(sync_callback<void(const websocket_close&)> callback);
+
+    /// The executor of the websocket (its thread, or strand): the one of its socket
+    const boost::asio::any_io_executor& get_executor() const { return ws_->get_executor(); }
 
     /// Run `callback` on the websocket thread
     inline void execute(sync_callback<void()> callback){
@@ -162,40 +177,26 @@ private:
     void suspend_keepalive();
     void restore_keepalive();
 
-    /// Close (waiting for the handshake), and end the read loop if paused
-    awaitable<void> close_connection(uint16_t code);
+    /// Start the closing handshake with `code`, and end the read loop once closed if paused
+    void start_close(uint16_t code);
 
-    struct send_waiter;
-
+    /// A message to write
     struct out_message {
         std::string data;
         bool binary = false;
-        /// The sender waiting for it to be written (send_*_async()), if any
-        std::shared_ptr<send_waiter> waiter;
     };
+
+    /// Write a message, closing the connection if the queue fails (see push_queue)
+    awaitable<boost::system::error_code> write_message(out_message& message);
+    void queue_failed(detail::push_failure failure, boost::system::error_code ec);
 
     /// Queue a message sent without waiting, or apply the overflow policy
     void push_message(std::string data, bool binary);
 
-    /// Drop the oldest messages without a sender waiting until one of `size` bytes fits:
-    /// false if it does not fit even so
-    bool drop_oldest(size_t size);
-
     /// Close a websocket that does not keep up: 1013 (Try Again Later)
     void close_congested(const char* reason);
 
-    /// Queue a message, and start writing if needed
-    void enqueue(out_message message);
-
     awaitable<bool> send_async(std::string data, bool binary);
-
-    void process_out_queue();
-
-    /// Write the messages queued, one at a time (`self` keeps the connection alive)
-    awaitable<void> write_loop(std::shared_ptr<websocket_connection> self);
-
-    /// Writing ended for good: the messages queued are discarded (their senders told)
-    void discard_queue();
 
     /// The server shuts down (on the websocket thread)
     void server_shutdown();
@@ -204,11 +205,8 @@ private:
 
     std::shared_ptr<asio::websocket> ws_;
 
-    /// Messages not written yet (the one being written is out of it)
-    std::deque<out_message> out_queue_;
-
-    /// Bytes queued against the write limits
-    write_flow flow_;
+    /// Messages not written yet, against the write limits, and their writer
+    std::unique_ptr<detail::push_queue<out_message>> queue_;
 
     /// Incoming data
     boost::asio::streambuf buffer_{MAX_BUFFER_SIZE};
@@ -217,14 +215,12 @@ private:
     sync_callback<void()> on_shutdown_callback_;
     close_notifier<websocket_close> on_close_;
 
-    /// The server tracking this connection, if any (see connection_tracker.hpp)
-    std::shared_ptr<taken_over_connection> tracking_;
+    /// The server this connection was taken over from, if any
+    server_scope scope_;
 
-    bool writing_ = false;
-
-    /// Reading paused (see pause_reading()), and the timer the read loop waits on meanwhile
+    /// Reading paused (see pause_reading()), and the event the read loop waits on meanwhile
     bool paused_ = false;
-    boost::asio::steady_timer resume_timer_;
+    asio::async_event resumed_;
 
     /// Started (start()), and released (release_socket())
     bool started_ = false;
@@ -233,7 +229,9 @@ private:
     /// The connection was lost: a read failed while the websocket was open
     bool lost_ = false;
 
-    /// Keepalive settings while suspended
+    /// Keepalive started by start(), and its settings while suspended
+    std::chrono::milliseconds ping_interval_;
+    std::chrono::milliseconds idle_timeout_;
     std::chrono::milliseconds keepalive_ping_{0};
     std::chrono::milliseconds keepalive_idle_{0};
 };

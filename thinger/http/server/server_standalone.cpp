@@ -1,12 +1,14 @@
 #include "server_standalone.hpp"
 #include "../../util/logger.hpp"
-#include "../../asio/ssl/certificate_manager.hpp"
 #include <future>
 
 namespace thinger::http {
 
 server::server() {
     LOG_DEBUG("Created standalone HTTP server (single-threaded)");
+    // The end of a shutdown stops the io_context, without calling stop() (see
+    // set_shutdown_stop())
+    set_shutdown_stop([this] { stop_running(); });
 }
 
 server::~server() {
@@ -15,7 +17,7 @@ server::~server() {
 }
 
 boost::asio::io_context* server::shutdown_context() {
-    return running_ ? &io_context_ : nullptr;
+    return running_ && serving_ ? &io_context_ : nullptr;
 }
 
 bool server::in_server_thread() {
@@ -23,104 +25,20 @@ bool server::in_server_thread() {
 }
 
 
-std::unique_ptr<asio::socket_server> server::create_socket_server(
-    const std::string& host, const std::string& port) {
-    
-    // Both acceptor and connections use our io_context
-    auto context_provider = [this]() -> boost::asio::io_context& {
-        return io_context_;
-    };
-    
-    auto server = std::make_unique<asio::socket_server>(
-        host, port,
-        context_provider,    // acceptor context
-        context_provider     // connection context
-    );
-    
-    // Configure SSL if enabled
-    if (ssl_enabled_) {
-        server->enable_ssl(true);
-        
-        auto& cert_mgr = asio::certificate_manager::instance();
-        auto default_ctx = cert_mgr.get_default_certificate();
-        
-        if (!default_ctx) {
-            LOG_ERROR("No default SSL certificate configured");
-            return nullptr;
-        }
-
-        // It has the SNI callback of the manager already
-        server->set_ssl_context(default_ctx);
-    }
-
-    return server;
+std::unique_ptr<asio::listener> server::create_listener(asio::listener_options options) {
+    // Both accepting and the connections on our io_context
+    auto executor = [this]() -> boost::asio::any_io_executor { return io_context_.get_executor(); };
+    return std::make_unique<asio::listener>(std::move(options), executor, executor);
 }
 
-std::unique_ptr<asio::unix_socket_server> server::create_unix_socket_server(
-    const std::string& unix_path) {
-    
-    // Both acceptor and connections use our io_context
-    auto context_provider = [this]() -> boost::asio::io_context& {
-        return io_context_;
-    };
-    
-    auto server = std::make_unique<asio::unix_socket_server>(
-        unix_path,
-        context_provider,    // acceptor context
-        context_provider     // connection context
-    );
-    
-    return server;
-}
-
-bool server::listen(const std::string& host, uint16_t port) {
-    if (running_) {
-        LOG_WARNING("Server already running");
-        return false;
-    }
-    
+void server::listening() {
+    if (running_) return;
     // Restart io_context if it was previously stopped
     io_context_.restart();
-    
-    // Call base implementation to setup socket server
-    if (!http_server_base::listen(host, port)) {
-        return false;
-    }
-    
     // Create work guard to keep io_context running
     work_guard_ = std::make_unique<work_guard_type>(io_context_.get_executor());
-    
-    // Mark as running
-    running_ = true;
-    LOG_DEBUG("Standalone server listening on {}:{} (single-threaded)", host, port);
-    
     // Note: io_context_.run() will be called in wait() method
-    
-    return true;
-}
-
-bool server::listen_unix(const std::string& unix_path) {
-    if (running_) {
-        LOG_WARNING("Server already running");
-        return false;
-    }
-
-    // Restart io_context if it was previously stopped
-    io_context_.restart();
-
-    // Call base implementation to setup unix socket server
-    if (!http_server_base::listen_unix(unix_path)) {
-        return false;
-    }
-
-    // Create work guard to keep io_context running
-    work_guard_ = std::make_unique<work_guard_type>(io_context_.get_executor());
-
-    // Mark as running
     running_ = true;
-    LOG_DEBUG("Standalone server listening on unix:{} (single-threaded)", unix_path);
-
-    return true;
 }
 
 void server::wait() {
@@ -131,22 +49,28 @@ void server::wait() {
     // Run io_context in the current thread
     // This blocks until the server is stopped
     LOG_DEBUG("Running io_context in current thread");
+    serving_ = true;
     io_context_.run();
+    serving_ = false;
     LOG_DEBUG("io_context stopped");
 }
 
-bool server::stop() {
+void server::stop() {
     // (a shutdown in progress ends first)
     end_shutdown();
+    stop_running();
+}
+
+void server::stop_running() {
     if (!running_) {
-        return false;
+        return;
     }
     
     LOG_DEBUG("Stopping standalone HTTP server");
     running_ = false;
     
     // Stop accepting new connections first (this is always safe to call)
-    http_server_base::stop();
+    server_base::stop();
     
     // Reset work guard to allow io_context to stop when it's running
     work_guard_.reset();
@@ -156,7 +80,6 @@ bool server::stop() {
     io_context_.stop();
     
     LOG_DEBUG("Standalone HTTP server stopped");
-    return true;
 }
 
 } // namespace thinger::http

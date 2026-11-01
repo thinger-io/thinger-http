@@ -3,6 +3,7 @@
 
 #include <thinger/asio/sockets/socket.hpp>
 #include <thinger/util/types.hpp>
+#include "transport_matrix.hpp"
 
 #include <boost/asio.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -74,13 +75,14 @@ namespace stream_test {
         return payload.append(reason);
     }
 
-    // Raw WebSocket client over TCP: every read waits up to a timeout
+    // Raw WebSocket client over TCP (to a port of 127.0.0.1) or any transport of the matrix:
+    // every read waits up to a timeout
     class raw_ws_client {
     public:
-        explicit raw_ws_client(uint16_t port) : sock_(ioc_) {
-            sock_.connect({net::ip::make_address("127.0.0.1"), port});
-            sock_.set_option(tcp::no_delay(true));
-        }
+        explicit raw_ws_client(uint16_t port)
+            : raw_ws_client(thinger::http::test::transport_endpoint{thinger::http::test::transport::tcp, port, {}}) {}
+
+        explicit raw_ws_client(const thinger::http::test::transport_endpoint& to) : connection_(to, true) {}
 
         // Send the handshake request (and `extra` bytes in the same write) and read the
         // response headers
@@ -100,10 +102,7 @@ namespace stream_test {
             return response;
         }
 
-        void send_raw(const std::string& data) {
-            boost::system::error_code ec;
-            net::write(sock_, net::buffer(data), ec);
-        }
+        void send_raw(const std::string& data) { connection_.write(data); }
 
         void send_frame(uint8_t opcode, std::string_view payload, bool fin = true) {
             send_raw(make_frame(opcode, payload, fin));
@@ -143,27 +142,19 @@ namespace stream_test {
         bool closed_within(std::chrono::milliseconds timeout) {
             buffer_.clear();
             auto deadline = std::chrono::steady_clock::now() + timeout;
-            while (!eof_) {
-                if (!read_more(deadline) && !eof_) return false;
+            while (!eof()) {
+                if (!read_more(deadline) && !eof()) return false;
                 buffer_.clear();
             }
             return true;
         }
 
-        bool eof() const { return eof_; }
+        bool eof() const { return connection_.eof(); }
 
-        void close() {
-            boost::system::error_code ec;
-            sock_.shutdown(tcp::socket::shutdown_both, ec);
-            sock_.close(ec);
-        }
+        void close() { connection_.close(); }
 
         // Close the connection with a reset (RST), as a peer that is lost
-        void reset() {
-            boost::system::error_code ec;
-            sock_.set_option(net::socket_base::linger(true, 0), ec);
-            sock_.close(ec);
-        }
+        void reset() { connection_.reset(); }
 
     private:
         std::optional<ws_frame> parse() {
@@ -191,35 +182,14 @@ namespace stream_test {
             return frame;
         }
 
+        // Read what arrives before the deadline: false if nothing did
         bool read_more(std::chrono::steady_clock::time_point deadline) {
-            if (eof_) return false;
-            auto timeout = deadline - std::chrono::steady_clock::now();
-            if (timeout <= std::chrono::steady_clock::duration::zero()) return false;
-            bool done = false;
-            boost::system::error_code error;
-            size_t bytes = 0;
-            sock_.async_read_some(net::buffer(chunk_), [&](boost::system::error_code ec, size_t n) {
-                error = ec;
-                bytes = n;
-                done = true;
-            });
-            ioc_.restart();
-            ioc_.run_for(timeout);
-            if (!done) {
-                sock_.cancel();
-                ioc_.restart();
-                ioc_.run();
-            }
-            buffer_.append(chunk_.data(), bytes);
-            if (error && error != net::error::operation_aborted) eof_ = true;
-            return !error;
+            auto timeout = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+            return connection_.read_some(buffer_, timeout) > 0;
         }
 
-        net::io_context ioc_;
-        tcp::socket sock_;
-        std::array<char, 65536> chunk_{};
+        thinger::http::test::raw_connection connection_;
         std::string buffer_;
-        bool eof_ = false;
     };
 
     // Socket defined by the application: a virtual stream whose other end is somewhere else

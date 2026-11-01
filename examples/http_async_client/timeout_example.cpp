@@ -9,7 +9,11 @@ int main() {
     std::cout << "Async Client Timeout Example\n" << std::endl;
 
     // Create pool client with 5 second timeout
-    http::async_client client;
+    // The workers the clients run on: the application starts them, and stops them at the end
+    asio::workers workers;
+    workers.start();
+
+    http::async_client client(workers);
     client.timeout(std::chrono::seconds(5));
 
     std::cout << "Async client configured with 5s timeout\n" << std::endl;
@@ -61,7 +65,7 @@ int main() {
     // ============================================
     std::cout << "\n--- Wait with timeout ---\n" << std::endl;
 
-    http::async_client client2;
+    http::async_client client2(workers);
     client2.timeout(std::chrono::seconds(30));  // Long timeout
 
     // Launch slow request
@@ -80,5 +84,6 @@ int main() {
     client2.wait();
     std::cout << "Now completed!" << std::endl;
 
+    workers.stop();
     return 0;
 }

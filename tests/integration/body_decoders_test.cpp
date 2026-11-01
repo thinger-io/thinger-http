@@ -11,6 +11,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include "../fixtures/server_listen.hpp"
 
 using namespace thinger;
 using json = nlohmann::json;
@@ -139,8 +140,8 @@ TEST_CASE("The same object reaches the handler from every format", "[server][bod
 
     SECTION("Over the network") {
         // Listening before the thread starts: the port is known here, without sharing it
-        REQUIRE(server.listen("127.0.0.1", 0));
-        uint16_t port = server.local_port();
+        REQUIRE_FALSE(server.listen("127.0.0.1", 0));
+        uint16_t port = http::test::listening_port(server);
         std::thread server_thread([&]() { server.wait(); });
         std::string base_url = "http://127.0.0.1:" + std::to_string(port);
 

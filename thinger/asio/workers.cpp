@@ -1,27 +1,42 @@
 #include "workers.hpp"
-#include <boost/bind/bind.hpp>
-#include <boost/asio/post.hpp>
-#include <mutex>
 #include <algorithm>
+#include <stdexcept>
+#include <pthread.h>
+#include <boost/asio/error.hpp>
+#include <boost/asio/executor_work_guard.hpp>
+#include <boost/asio/post.hpp>
+#include <boost/asio/signal_set.hpp>
 #include "../util/logger.hpp"
 
 namespace thinger::asio{
 
-	// Lazy singleton implementation
-	workers& get_workers() {
-		static workers instance;
-		return instance;
-	}
+    namespace {
 
-	using std::thread;
-	using std::bind;
-	using std::shared_ptr;
-	using std::make_shared;
+    // The workers that started the caller thread, and its io_context: set by the thread itself,
+    // before any other work, so it is read without a lock
+    struct thread_mark {
+        const workers* owner = nullptr;
+        boost::asio::io_context* context = nullptr;
+    };
 
-    workers::workers() :
-        signals_(wait_context_){
+    thread_mark& this_thread_mark() {
+        static thread_local thread_mark mark;
+        return mark;
+    }
+
+    // The name of the caller thread, as the system shows it (truncated to its 15 characters)
+    void name_this_thread(const std::string& name) {
+        auto truncated = name.substr(0, 15);
+#if defined(__APPLE__)
+        pthread_setname_np(truncated.c_str());
+#elif defined(__linux__)
+        pthread_setname_np(pthread_self(), truncated.c_str());
+#endif
+    }
 
     }
+
+    workers::workers() = default;
 
     workers::~workers()
     {
@@ -29,304 +44,178 @@ namespace thinger::asio{
             LOG_WARNING("workers destructor called while still running - forcing stop");
             stop();
         }
-    }
-
-    // A graceful stop: the clients that did not finish yet (plus one while they are asked)
-    struct workers::graceful_stop_state {
-        size_t pending = 1;
-    };
-
-    void workers::wait(const std::set<unsigned>& signals) {
-        wait_for_signals(signals, std::nullopt);
-    }
-
-    void workers::wait_graceful(std::chrono::milliseconds grace, const std::set<unsigned>& signals) {
-        wait_for_signals(signals, grace);
-    }
-
-    void workers::wait_for_signals(const std::set<unsigned>& signals, std::optional<std::chrono::milliseconds> grace) {
-        LOG_DEBUG("registering stop signals...");
-        
-        // Keep the wait_context_ running
-        wait_work_ = std::make_unique<work_guard_type>(wait_context_.get_executor());
-        
-        for (auto signal: signals){
-            signals_.add(signal);
+        // A stop() called from one of its threads may still be joining the others
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            stopped_.wait(lock, [this] { return stopping_ == 0; });
         }
-
-        // wait for any signal to be received
-        signals_.async_wait([this, grace](const boost::system::error_code& ec, int signal_number){
-            if(ec) return;
-            if(!grace){
-                LOG_INFO("received signal {}: stopping", signal_number);
-                stop();
-                return;
-            }
-            LOG_INFO("received signal {}: stopping gracefully, within {} ms (a second signal stops at once)",
-                     signal_number, grace->count());
-            // A second signal does not wait for the graceful stop
-            signals_.async_wait([this](const boost::system::error_code& ec, int signal_number){
-                if(ec) return;
-                LOG_WARNING("received signal {} during the graceful stop: stopping now", signal_number);
-                stop();
-            });
-            begin_graceful_stop(*grace);
-        });
-
-        // Run until stop() is called (if the workers were stopped before, they started again)
-        if (running_) wait_context_.restart();
-        wait_context_.run();
-
-        // Clean up
-        wait_work_.reset();
-    }
-
-    void workers::begin_graceful_stop(std::chrono::milliseconds grace) {
-        auto state = std::make_shared<graceful_stop_state>();
-        graceful_stop_ = state;
-
-        // Each client tells when it finished, from any thread: counted on the wait context,
-        // which stops the workers after the last one (unless they were stopped meanwhile)
-        auto done = [this, weak = std::weak_ptr<graceful_stop_state>(state)]() {
-            boost::asio::post(wait_context_, [this, weak]() {
-                auto state = weak.lock();
-                if (!state || state != graceful_stop_ || --state->pending > 0) return;
-                LOG_DEBUG("every worker client stopped gracefully");
-                stop();
-            });
-        };
-
-        // Clients are asked one at a time, outside the lock: one may unregister others (e.g.
-        // destroy an async_client from the shutdown callback of a server)
-        std::set<worker_client*> asked;
-        while (true) {
-            worker_client* client = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(clients_mutex_);
-                for (auto* candidate : clients_) {
-                    if (!asked.contains(candidate)) {
-                        client = candidate;
-                        break;
-                    }
-                }
-            }
-            if (!client) break;
-            asked.insert(client);
-            ++state->pending;
-            try {
-                client->graceful_stop(grace, done);
-            } catch (const std::exception& e) {
-                LOG_ERROR("Error stopping client {} gracefully: {}", client->get_service_name(), e.what());
-                done();
-            }
+        // Those that called stop() themselves, then the io_contexts with what they left pending
+        for(auto const& thread : stopped_threads_){
+            thread->stop();
         }
-        done();
+        stopped_threads_.clear();
     }
 
-
-    bool workers::start(size_t worker_threads)
+    boost::system::error_code workers::start(size_t threads)
     {
         std::scoped_lock<std::mutex> lock(mutex_);
-        if(running_) return false;
-        running_ = true;
+        if(running_) return boost::asio::error::already_started;
+        if(threads == 0) return make_error_code(boost::system::errc::invalid_argument);
 
-        LOG_DEBUG("starting {} working threads in the shared pool", worker_threads);
-        worker_threads_.reserve(worker_threads);
-        for(auto thread_number=1; thread_number<=worker_threads; ++thread_number){
-            auto worker = std::make_unique<worker_thread>("worker thread " + std::to_string(thread_number));
-            auto id = worker->start();
-            workers_threads_map_.emplace(id, *worker);
+        LOG_DEBUG("starting {} working threads in the shared pool", threads);
+        auto table = std::make_unique<pool_table>();
+        worker_threads_.reserve(threads);
+        for(size_t thread_number=1; thread_number<=threads; ++thread_number){
+            auto worker = start_thread("worker thread " + std::to_string(thread_number));
+            table->contexts.push_back(&worker->get_io_context());
             worker_threads_.emplace_back(std::move(worker));
         }
 
-        return running_;
-    }
-
-    boost::asio::io_context& workers::get_isolated_io_context(std::string thread_name)
-    {
-        LOG_DEBUG("starting '{}' worker thread", thread_name);
-        auto worker = std::make_unique<worker_thread>(std::move(thread_name));
-        auto& io_context = worker->get_io_context();
-        auto thread_id = worker->start();
-        auto& worker_ref = *worker;
-        job_threads_.emplace_back(std::move(worker));
-        workers_threads_map_.emplace(thread_id, worker_ref);
-        return io_context;
-    }
-
-    void workers::do_stop()
-    {
-        LOG_DEBUG("executing full stop");
-        
-        // First, notify all clients to stop
-        {
-            std::lock_guard<std::mutex> lock(clients_mutex_);
-            if (!clients_.empty()) {
-                LOG_DEBUG("Stopping {} worker clients", clients_.size());
-                for (auto* client : clients_) {
-                    if (client && client->is_running()) {
-                        try {
-                            LOG_DEBUG("Stopping client: {}", client->get_service_name());
-                            client->stop();
-                        } catch (const std::exception& e) {
-                            LOG_ERROR("Error stopping client {}: {}", client->get_service_name(), e.what());
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Stop all job threads
-        LOG_DEBUG("stopping job threads");
-        for(auto const& worker_thread : job_threads_){
-            worker_thread->stop();
-        }
-
-        // Stop all worker threads
-        LOG_DEBUG("stopping worker threads");
-        for(auto const& worker_thread : worker_threads_){
-            worker_thread->stop();
-        }
-
-        // Clear auxiliary references
-        LOG_DEBUG("clearing structures");
-        worker_threads_.clear();
-        job_threads_.clear();
-        workers_threads_map_.clear();
         next_io_context_.store(0, std::memory_order_relaxed);
-
-        // Cancel signals (and leave them to their default action) and stop wait_context
-        LOG_DEBUG("stopping wait context");
-        graceful_stop_.reset();
-        signals_.cancel();
-        signals_.clear();
-        wait_work_.reset();
-        wait_context_.stop();
-        
-        LOG_DEBUG("all done!");
+        table_.store(table.get());
+        tables_.emplace_back(std::move(table));
+        running_ = true;
+        return {};
     }
 
-    bool workers::stop()
+    std::unique_ptr<worker_thread> workers::start_thread(std::string name)
     {
-        //LOG_INFO("workers::stop() called");
-        
-        // Check if already stopping
+        auto worker = std::make_unique<worker_thread>(name);
+        auto& context = worker->get_io_context();
+        // The first work of the thread: it marks itself as one of these workers
+        boost::asio::post(context, [this, &context, name = std::move(name)] {
+            this_thread_mark() = {this, &context};
+            name_this_thread(name);
+        });
+        worker->start();
+        return worker;
+    }
+
+    boost::asio::any_io_executor workers::isolated_executor(std::string name)
+    {
+        std::scoped_lock<std::mutex> lock(mutex_);
+        if(!running_) return {};
+        LOG_DEBUG("starting '{}' worker thread", name);
+        auto worker = start_thread(std::move(name));
+        auto executor = worker->get_io_context().get_executor();
+        isolated_threads_.emplace_back(std::move(worker));
+        return executor;
+    }
+
+    void workers::stop()
+    {
+        std::vector<std::unique_ptr<worker_thread>> threads;
         {
             std::scoped_lock<std::mutex> lock(mutex_);
             if(!running_) {
                 LOG_WARNING("workers already stopped");
-                return false;
+                return;
             }
             running_ = false;
+            ++stopping_;
+            table_.store(nullptr);
+            for(auto* wait : waits_) wait->stop();
+            threads = std::move(isolated_threads_);
+            isolated_threads_.clear();
+            std::move(worker_threads_.begin(), worker_threads_.end(), std::back_inserter(threads));
+            worker_threads_.clear();
         }
 
-        // Check if wait_context_ is running in the current thread
-        if (wait_context_.get_executor().running_in_this_thread()) {
-            // We're already in wait_context_, execute directly
-            //LOG_INFO("executing stop directly in wait_context thread");
-            do_stop();
-        } else if (wait_work_) {
-            // wait_context_ is running in another thread, post to it
-            //LOG_INFO("posting stop to wait_context thread");
-            boost::asio::post(wait_context_, [this]() {
-                do_stop();
-            });
-        } else {
-            // wait_context_ is not running, execute directly
-            //LOG_INFO("wait_context not running, executing stop directly");
-            do_stop();
+        // Out of the lock, as a handler finishing meanwhile may call back into the workers:
+        // every io_context stops at once, then each thread is joined, but the caller's own
+        LOG_DEBUG("stopping {} worker threads", threads.size());
+        for(auto const& thread : threads){
+            thread->get_io_context().stop();
+        }
+        // Then the pending handlers of each are destroyed; the io_contexts are kept (see stop()
+        // in workers.hpp)
+        auto* own_context = this_thread_mark().owner == this ? this_thread_mark().context : nullptr;
+        for(auto const& thread : threads){
+            if(&thread->get_io_context() == own_context) continue;
+            thread->stop();
+            thread->shutdown();
         }
 
-        return true;
+        std::scoped_lock<std::mutex> lock(mutex_);
+        std::move(threads.begin(), threads.end(), std::back_inserter(stopped_threads_));
+        --stopping_;
+        stopped_.notify_all();
+        LOG_DEBUG("all done!");
+    }
+
+    int workers::wait(std::set<int> signals)
+    {
+        boost::asio::io_context context{1};
+        // With no signal, it waits for stop()
+        auto work = boost::asio::make_work_guard(context);
+        boost::asio::signal_set signal_set(context);
+        for(auto signal : signals){
+            signal_set.add(signal);
+        }
+
+        int received = 0;
+        signal_set.async_wait([&](const boost::system::error_code& ec, int signal_number){
+            if(ec) return;
+            LOG_INFO("received signal {}", signal_number);
+            received = signal_number;
+            context.stop();
+        });
+
+        {
+            std::scoped_lock<std::mutex> lock(mutex_);
+            if(!running_) return 0;
+            waits_.push_back(&context);
+        }
+        context.run();
+        {
+            std::scoped_lock<std::mutex> lock(mutex_);
+            std::erase(waits_, &context);
+        }
+        return received;
+    }
+
+    boost::asio::io_context* workers::next_context()
+    {
+        auto* table = table_.load();
+        if(!table) return nullptr;
+        auto next = next_io_context_.fetch_add(1, std::memory_order_relaxed);
+        return table->contexts[next % table->contexts.size()];
+    }
+
+    boost::asio::any_io_executor workers::next_executor()
+    {
+        auto* context = next_context();
+        if(!context) return {};
+        return context->get_executor();
+    }
+
+    std::function<boost::asio::any_io_executor()> workers::provider()
+    {
+        return [this] { return next_executor(); };
     }
 
 	boost::asio::io_context& workers::get_next_io_context()
 	{
-        auto next = next_io_context_.fetch_add(1, std::memory_order_relaxed);
-        return worker_threads_[next % worker_threads_.size()]->get_io_context();
+        auto* context = next_context();
+        if(!context) throw std::logic_error("thinger::asio::workers: not running");
+        return *context;
 	}
 
 	boost::asio::io_context& workers::get_thread_io_context()
 	{
-        std::thread::id this_id = std::this_thread::get_id();
-        
-        // First check if this is a worker thread
-        {
-            std::scoped_lock<std::mutex> lock(mutex_);
-            auto it = workers_threads_map_.find(this_id);
-            if(it != workers_threads_map_.end()){
-                return it->second.get().get_io_context();
-            }
-        }
-        
-        // Not a worker thread - return a worker thread's io_context
-        // The actual thread affinity will be handled differently
-        LOG_DEBUG("Thread is not a worker thread, using first worker's io_context");
-        return worker_threads_.begin()->get()->get_io_context();
+        // One of its threads: its io_context lives as long as the workers
+        const auto& mark = this_thread_mark();
+        if(mark.owner == this) return *mark.context;
+
+        // Any other thread: the first thread of the pool
+        auto* table = table_.load();
+        if(!table) throw std::logic_error("thinger::asio::workers: not running");
+        return *table->contexts.front();
 	}
 
-    bool workers::in_worker_thread()
+    bool workers::in_worker_thread() const
     {
-        std::scoped_lock<std::mutex> lock(mutex_);
-        return workers_threads_map_.contains(std::this_thread::get_id());
-    }
-
-    // Client management implementation
-    void workers::register_client(worker_client* client) {
-        if (!client) return;
-        
-        bool should_start = false;
-        
-        {
-            std::lock_guard<std::mutex> lock(clients_mutex_);
-            auto result = clients_.insert(client);
-            
-            if (result.second) { // Successfully inserted
-                LOG_DEBUG("Worker client registered: {}", client->get_service_name());
-                
-                // Auto-start if this is the first client and auto-manage is enabled
-                if (auto_manage_ && clients_.size() == 1 && !running_) {
-                    LOG_DEBUG("First worker client registered, starting workers automatically");
-                    should_start = true;
-                }
-            }
-        }
-        
-        // Start outside the lock to avoid potential deadlock
-        if (should_start) {
-            start();
-        }
-    }
-    
-    void workers::unregister_client(worker_client* client) {
-        if (!client) return;
-
-        bool should_stop = false;
-        
-        {
-            std::lock_guard<std::mutex> lock(clients_mutex_);
-            size_t removed = clients_.erase(client);
-            
-            if (removed > 0) {
-                LOG_DEBUG("Worker client unregistered: {}", client->get_service_name());
-                
-                // Auto-stop if no clients remain and auto-manage is enabled
-                if (auto_manage_ && clients_.empty() && running_) {
-                    LOG_DEBUG("Last worker client unregistered, stopping workers automatically");
-                    should_stop = true;
-                }
-            }
-        }
-        
-        // Stop outside the lock to avoid potential deadlock
-        if (should_stop) {
-            stop();
-        }
-    }
-    
-    size_t workers::client_count() const {
-        std::lock_guard<std::mutex> lock(clients_mutex_);
-        return clients_.size();
+        return this_thread_mark().owner == this && running_;
     }
 
 }

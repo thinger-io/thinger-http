@@ -58,7 +58,7 @@ namespace {
         });
 
         backend.get("/ws", [](http::response& res) {
-            res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) {
+            res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection> ws) {
                 ws->on_message([weak = std::weak_ptr<http::websocket_connection>(ws)](const std::string& message, bool) {
                     if (auto ws = weak.lock()) ws->send_text("echo: " + message);
                 });
@@ -75,7 +75,7 @@ int main(int argc, char* argv[]) {
     std::thread backend_thread;
     if (argc <= 1) {
         add_backend_routes(backend);
-        if (!backend.listen("127.0.0.1", 8097)) return 1;
+        if (backend.listen("127.0.0.1", 8097)) return 1;
         backend_thread = std::thread([&backend] { backend.wait(); });
     }
 

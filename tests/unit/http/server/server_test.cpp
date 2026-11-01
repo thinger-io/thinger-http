@@ -2,29 +2,47 @@
 #include <catch2/catch_template_test_macros.hpp>
 #include <thinger/http/server/server_standalone.hpp>
 #include <thinger/http/server/pool_server.hpp>
-#include <thinger/http/server/http_server_base.hpp>
+#include <thinger/http/server/server_base.hpp>
 #include <thinger/asio/workers.hpp>
 #include <thread>
 #include <chrono>
 
 #include "thinger/http/server/response.hpp"
+#include "../../../fixtures/running_workers.hpp"
+#include "../../../fixtures/server_listen.hpp"
 
 using namespace thinger;
+using thinger::http::test::running_workers;
+
+namespace {
+
+    using thinger::http::test::with_workers;
+
+    // A server of the type under test: a pool_server runs on workers of its own
+    template<typename Server>
+    struct server_under_test : Server {};
+
+    template<>
+    struct server_under_test<http::pool_server> : with_workers, http::pool_server {
+        server_under_test() : http::pool_server(workers) {}
+    };
+
+}
 
 // Template test cases that work for both server types
 TEMPLATE_TEST_CASE("HTTP Server construction and destruction", "[http][server][unit]", 
                    http::server, http::pool_server) {
     
     SECTION("Default construction") {
-        TestType server;
+        server_under_test<TestType> server;
         // Servers start in stopped state until listen() is called
         REQUIRE(server.is_listening() == false);
     }
     
     SECTION("Multiple instances can coexist") {
-        TestType server1;
-        TestType server2;
-        TestType server3;
+        server_under_test<TestType> server1;
+        server_under_test<TestType> server2;
+        server_under_test<TestType> server3;
         
         // All servers created successfully
         REQUIRE(true);
@@ -32,7 +50,7 @@ TEMPLATE_TEST_CASE("HTTP Server construction and destruction", "[http][server][u
     
     SECTION("Destruction is clean") {
         {
-            TestType server;
+            server_under_test<TestType> server;
             // Server goes out of scope and should destruct cleanly
         }
         // If we get here without crashes, destruction worked
@@ -43,19 +61,13 @@ TEMPLATE_TEST_CASE("HTTP Server construction and destruction", "[http][server][u
 TEMPLATE_TEST_CASE("HTTP Server configuration", "[http][server][unit]", 
                    http::server, http::pool_server) {
     
-    TestType server;
+    server_under_test<TestType> server;
     
-    SECTION("SSL configuration") {
-        server.enable_ssl(true);
-        // SSL can be enabled (actual SSL setup requires certificates)
-        
-        server.enable_ssl(false);
-        // SSL disabled
-        REQUIRE(true);
-    }
-    
-    SECTION("Request timeout configuration") {
-        server.set_connection_timeout(std::chrono::seconds(120));
+    SECTION("Connection options") {
+        http::connection_options options;
+        options.idle_timeout = std::chrono::seconds(60);
+        options.linger_max_bytes = 0;
+        server.set_connection_options(options);
 
         REQUIRE(true);
     }
@@ -66,25 +78,28 @@ TEMPLATE_TEST_CASE("HTTP Server configuration", "[http][server][unit]",
         
         REQUIRE(true);
     }
-    
-    SECTION("Max listening attempts") {
-        server.set_max_listening_attempts(5);
-        server.set_max_listening_attempts(-1); // Infinite
-        
-        REQUIRE(true);
-    }
+}
+
+// The deadlines of a connection are on by default: Node's headersTimeout and requestTimeout,
+// nginx's send_timeout
+TEST_CASE("Connection deadlines default to 60 s, 300 s and 60 s", "[http][server][unit]") {
+    http::connection_options options;
+    CHECK(options.header_timeout == std::chrono::seconds(60));
+    CHECK(options.request_timeout == std::chrono::seconds(300));
+    CHECK(options.write_timeout == std::chrono::seconds(60));
+    CHECK(options.idle_timeout == std::chrono::seconds(120));
 }
 
 TEMPLATE_TEST_CASE("HTTP Server lifecycle management", "[http][server][unit]", 
                    http::server, http::pool_server) {
     
     SECTION("Listen and stop") {
-        TestType server;
+        server_under_test<TestType> server;
         REQUIRE(server.is_listening() == false);
 
         // Listen on OS-assigned port
-        REQUIRE(server.listen("127.0.0.1", 0));
-        auto port = server.local_port();
+        REQUIRE_FALSE(server.listen("127.0.0.1", 0));
+        auto port = http::test::listening_port(server);
         REQUIRE(port != 0);
         REQUIRE(server.is_listening() == true);
 
@@ -97,7 +112,7 @@ TEMPLATE_TEST_CASE("HTTP Server lifecycle management", "[http][server][unit]",
         REQUIRE(server.is_listening() == false);
 
         // Should be able to restart on same port
-        bool restart_result = server.listen("127.0.0.1", port);
+        bool restart_result = !server.listen("127.0.0.1", port);
         if (restart_result) {
             REQUIRE(server.is_listening() == true);
             server.stop();
@@ -108,11 +123,11 @@ TEMPLATE_TEST_CASE("HTTP Server lifecycle management", "[http][server][unit]",
     }
     
     SECTION("Multiple start/stop cycles") {
-        TestType server;
+        server_under_test<TestType> server;
 
         REQUIRE(server.is_listening() == false);
 
-        REQUIRE(server.listen("127.0.0.1", 0));
+        REQUIRE_FALSE(server.listen("127.0.0.1", 0));
         REQUIRE(server.is_listening() == true);
 
         server.stop();
@@ -123,7 +138,7 @@ TEMPLATE_TEST_CASE("HTTP Server lifecycle management", "[http][server][unit]",
 TEMPLATE_TEST_CASE("HTTP Server route management", "[http][server][unit]", 
                    http::server, http::pool_server) {
     
-    TestType server;
+    server_under_test<TestType> server;
     
     SECTION("Add basic routes") {
         // Add GET route
@@ -218,52 +233,36 @@ TEMPLATE_TEST_CASE("HTTP Server route management", "[http][server][unit]",
 
 // Tests specific to pool_server
 TEST_CASE("Pool Server specific features", "[http][server][pool][unit]") {
-    
-    SECTION("Service name") {
-        http::pool_server server;
-        REQUIRE(server.get_service_name() == "http_pool_server");
-    }
-    
-    SECTION("Worker registration") {
-        // Save initial state
-        size_t initial_clients = asio::get_workers().client_count();
-        
+
+    SECTION("Workers never start by themselves") {
+        asio::workers workers;
         {
-            http::pool_server server;
-            
-            // Pool server should register with workers
-            REQUIRE(asio::get_workers().client_count() == initial_clients + 1);
+            http::pool_server server(workers);
+            REQUIRE_FALSE(workers.running());
         }
-        
-        // After destruction, count should return to initial
-        REQUIRE(asio::get_workers().client_count() == initial_clients);
+        REQUIRE_FALSE(workers.running());
     }
-    
-    SECTION("Listen starts workers") {
-        bool initial_running = asio::get_workers().running();
-        size_t initial_clients = asio::get_workers().client_count();
 
+    SECTION("The workers keep running once the server stops") {
+        running_workers workers;
         {
-            http::pool_server server;
-
-            // Listen on OS-assigned port
-            REQUIRE(server.listen("127.0.0.1", 0));
-
-            // If auto-manage is enabled and this is the first client, workers should start
-            if (asio::get_workers().is_auto_managed() && initial_clients == 0) {
-                REQUIRE(asio::get_workers().running() == true);
-            }
-
+            http::pool_server server(workers);
+            REQUIRE_FALSE(server.listen("127.0.0.1", 0));
             server.stop();
         }
+        REQUIRE(workers.running());
+    }
 
-        // Give time for async operations
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-        // Workers should stop if this was the last client
-        if (asio::get_workers().is_auto_managed() && initial_clients == 0) {
-            REQUIRE(asio::get_workers().running() == false);
-        }
+    SECTION("Several servers on the same workers") {
+        running_workers workers;
+        http::pool_server first(workers);
+        http::pool_server second(workers);
+        REQUIRE_FALSE(first.listen("127.0.0.1", 0));
+        REQUIRE_FALSE(second.listen("127.0.0.1", 0));
+        REQUIRE(http::test::listening_port(first) != http::test::listening_port(second));
+        first.stop();
+        REQUIRE(second.is_listening());
+        second.stop();
     }
 }
 
@@ -285,29 +284,11 @@ TEST_CASE("Standalone Server specific features", "[http][server][standalone][uni
     }
     
     SECTION("Independent from workers") {
-        // Save initial state
-        bool initial_running = asio::get_workers().running();
-
-        // workers should not be running initially
-        REQUIRE(initial_running == false);
-
-        // initial client count should be zero
-        size_t initial_clients = asio::get_workers().client_count();
-        REQUIRE(initial_clients == 0);
-
-        {
-            http::server server;
-            REQUIRE(server.is_listening() == false);
-
-            // Creating a standalone server shouldn't register with workers
-            REQUIRE(asio::get_workers().client_count() == initial_clients);
-            
-            // Workers state shouldn't change
-            REQUIRE(asio::get_workers().running() == initial_running);
-        }
-
-        // After destruction, everything should remain the same
-        REQUIRE(asio::get_workers().client_count() == initial_clients);
-        REQUIRE(asio::get_workers().running() == initial_running);
+        // It listens and serves on its own io_context: no workers exist
+        http::server server;
+        REQUIRE_FALSE(server.listen("127.0.0.1", 0));
+        REQUIRE(server.is_listening());
+        server.stop();
+        REQUIRE_FALSE(server.is_listening());
     }
 }

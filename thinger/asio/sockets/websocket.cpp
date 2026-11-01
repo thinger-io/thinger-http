@@ -68,7 +68,10 @@ websocket::websocket(std::shared_ptr<socket> sock, bool binary, bool server, boo
     , in_(INPUT_BUFFER_SIZE)
     , close_timer_(std::make_shared<boost::asio::steady_timer>(executor_))
     , on_close_(executor_)
-    , keepalive_timer_(std::make_shared<boost::asio::steady_timer>(executor_))
+    // A member, called only while this lives: not kept alive while waiting
+    , keepalive_(executor_, [this] {
+        if (auto self = weak_from_this().lock()) self->check_keepalive();
+    })
     , last_received_(std::chrono::steady_clock::now()) {
     ++connections;
     LOG_DEBUG("websocket created");
@@ -380,7 +383,6 @@ awaitable<bool> websocket::acquire_write(bool control) {
     }
     // Wait for the turn: control frames go before the data waiting, after other control frames
     auto waiter = std::make_shared<write_waiter>(executor_);
-    waiter->timer.expires_at(std::chrono::steady_clock::time_point::max());
     if (control) {
         auto position = std::find_if(write_waiters_.begin(), write_waiters_.end(),
                                      [](const auto& other) { return !other->control; });
@@ -389,7 +391,7 @@ awaitable<bool> websocket::acquire_write(bool control) {
     } else {
         write_waiters_.push_back(waiter);
     }
-    co_await waiter->timer.async_wait(use_nothrow_awaitable);
+    co_await waiter->turn.wait();
     if (waiter->granted) co_return true;
     // closed, cancelled, or the wait itself cancelled
     auto it = std::find(write_waiters_.begin(), write_waiters_.end(), waiter);
@@ -418,7 +420,7 @@ void websocket::release_write() {
         auto next = std::move(write_waiters_.front());
         write_waiters_.pop_front();
         next->granted = true;
-        next->timer.cancel();
+        next->turn.set();
         return;
     }
     writing_ = false;
@@ -427,7 +429,7 @@ void websocket::release_write() {
 void websocket::wake_writers() {
     auto waiters = std::move(write_waiters_);
     write_waiters_.clear();
-    for (auto& waiter : waiters) waiter->timer.cancel();
+    for (auto& waiter : waiters) waiter->turn.set();
 }
 
 void websocket::queue_control() {
@@ -460,7 +462,8 @@ awaitable<void> websocket::flush_control() {
 }
 
 awaitable<boost::system::error_code> websocket::write_frame(uint8_t opcode,
-                                                            const std::vector<boost::asio::const_buffer>& payload) {
+                                                            const std::vector<boost::asio::const_buffer>& payload,
+                                                            const sync_callback<void()>* progress) {
     // The rest of an interrupted frame goes first
     if (!tail_.empty()) {
         auto [ec, bytes] = co_await socket_->write(tail_.data(), tail_.size());
@@ -491,32 +494,25 @@ awaitable<boost::system::error_code> websocket::write_frame(uint8_t opcode,
         output.emplace_back(masked.data(), masked.size());
     }
 
-    auto [ec, bytes] = co_await socket_->write(output);
+    bool sliced = progress && header_size + size > WRITE_SLICE_SIZE;
+    auto [ec, bytes] = sliced ? co_await socket_->write_slices(output, *progress) : co_await socket_->write(output);
     check_lost(ec);
     if (ec) {
         if (ec != boost::asio::error::operation_aborted) {
             write_error_ = ec;
         } else if (bytes > 0) {
             // Interrupted in the middle of the frame: its rest is sent before anything else
-            size_t total = header_size + size;
-            tail_.resize(total - bytes);
-            auto rest = boost::asio::buffer(tail_);
-            size_t skip = bytes;
-            for (const auto& buffer : output) {
-                if (skip >= buffer.size()) {
-                    skip -= buffer.size();
-                    continue;
-                }
-                rest += boost::asio::buffer_copy(rest, buffer + skip);
-                skip = 0;
-            }
+            // (write_slices() leaves it in `output`)
+            if (!sliced) consume(output, bytes);
+            tail_.resize(boost::asio::buffer_size(output));
+            boost::asio::buffer_copy(boost::asio::buffer(tail_), output);
         }
     }
     co_return ec;
 }
 
 awaitable<io_result> websocket::send_frame(uint8_t opcode, const std::vector<boost::asio::const_buffer>& payload,
-                                           bool control) {
+                                           bool control, const sync_callback<void()>* progress) {
     if (!co_await acquire_write(control)) {
         co_return io_result{closed_ ? boost::asio::error::bad_descriptor : boost::asio::error::operation_aborted, 0};
     }
@@ -535,7 +531,7 @@ awaitable<io_result> websocket::send_frame(uint8_t opcode, const std::vector<boo
         co_return io_result{error, 0};
     }
 
-    auto ec = co_await write_frame(opcode, payload);
+    auto ec = co_await write_frame(opcode, payload, progress);
     release_write();
     co_return io_result{ec, ec ? 0 : boost::asio::buffer_size(payload)};
 }
@@ -578,6 +574,11 @@ awaitable<io_result> websocket::write_message(std::string_view data) {
                                   {boost::asio::buffer(data.data(), data.size())}, false);
 }
 
+awaitable<io_result> websocket::write_message(std::string_view data, const sync_callback<void()>& progress) {
+    co_return co_await send_frame(binary_ ? OPCODE_BINARY : OPCODE_TEXT,
+                                  {boost::asio::buffer(data.data(), data.size())}, false, &progress);
+}
+
 // ---------------------------------------------------------------------------
 // Closing
 // ---------------------------------------------------------------------------
@@ -590,8 +591,7 @@ void websocket::close(uint16_t code, bool expect_reply) {
     if (closed_) return;
     code = sendable_close_code(code);
     closed_ = true;
-    ++keepalive_generation_;
-    keepalive_timer_->cancel();
+    keepalive_.cancel();
     close_timer_->cancel();
     wake_writers();
     pending_pong_.reset();
@@ -716,56 +716,92 @@ void websocket::cancel() {
 void websocket::set_keepalive(std::chrono::milliseconds ping_interval, std::chrono::milliseconds idle_timeout) {
     ping_interval_ = ping_interval;
     idle_timeout_ = idle_timeout;
-    auto generation = ++keepalive_generation_;
-    keepalive_timer_->cancel();
+    keepalive_.cancel();
     if (closed_ || (ping_interval.count() <= 0 && idle_timeout.count() <= 0)) return;
-
-    std::weak_ptr<websocket> weak = weak_from_this();
-    if (weak.expired()) {
+    if (weak_from_this().expired()) {
         LOG_ERROR("websocket keepalive requires the websocket to be owned by a std::shared_ptr");
         return;
     }
-    keepalive_timer_ = std::make_shared<boost::asio::steady_timer>(executor_);
-    last_ping_ = {};
+    last_ping_ = first_ping_ = {};
     last_received_ = std::chrono::steady_clock::now();
+    check_keepalive();
+}
 
-    co_spawn(executor_, [weak, timer = keepalive_timer_, generation]() -> awaitable<void> {
-        using clock = std::chrono::steady_clock;
-        for (;;) {
-            clock::time_point next = clock::time_point::max();
-            {
-                // Not kept alive while waiting
-                auto self = weak.lock();
-                if (!self || self->closed_ || self->keepalive_generation_ != generation) co_return;
-                auto now = clock::now();
-                auto received = self->last_received_;
-                if (self->idle_timeout_.count() > 0) {
-                    if (now - received >= self->idle_timeout_) {
-                        LOG_DEBUG("websocket idle for too long, closing");
-                        self->close(CLOSE_GOING_AWAY);
-                        co_return;
-                    }
-                    next = received + self->idle_timeout_;
-                }
-                if (self->ping_interval_.count() > 0) {
-                    auto since = std::max(received, self->last_ping_);
-                    if (now - since >= self->ping_interval_) {
-                        // Queued, not waited for: a ping stuck behind a write that does not
-                        // end does not hold the idle timeout. One ping at a time
-                        self->last_ping_ = now;
-                        if (!self->pending_ping_ && !self->ping_in_flight_) {
-                            self->pending_ping_ = true;
-                            self->queue_control();
-                        }
-                        since = now;
-                    }
-                    next = std::min(next, since + self->ping_interval_);
-                }
-            }
-            timer->expires_at(next);
-            co_await timer->async_wait(use_nothrow_awaitable);
+namespace {
+
+// When the idle timeout of a websocket closes it, counted from the last byte `received`, and
+// whether a ping goes out first (see websocket::check_keepalive())
+struct idle_deadline {
+    std::chrono::steady_clock::time_point close_at;
+    bool ping_now = false;
+};
+
+// In the client role, with pings before the idle timeout, it closes only once the first ping
+// sent since the last byte received (`first_ping`) went unanswered for the rest of the idle
+// timeout: a check run late (nothing ran the io_context, as a synchronous client between its
+// calls) pings first. On time, that ping went out at the ping interval: the same instant
+idle_deadline idle_deadline_of(std::chrono::steady_clock::time_point now,
+                               std::chrono::steady_clock::time_point received,
+                               std::chrono::steady_clock::time_point first_ping,
+                               std::chrono::milliseconds idle_timeout, std::chrono::milliseconds ping_interval,
+                               bool server_role) {
+    idle_deadline deadline{received + idle_timeout};
+    bool pings_first = !server_role && ping_interval.count() > 0 && ping_interval < idle_timeout;
+    if (pings_first && now >= deadline.close_at) {
+        if (first_ping < received) {
+            deadline.ping_now = true;
+            deadline.close_at = now + (idle_timeout - ping_interval);
+        } else {
+            deadline.close_at = std::max(deadline.close_at, first_ping + (idle_timeout - ping_interval));
         }
-    }, detached);
+    }
+    return deadline;
+}
+
+}
+
+void websocket::check_keepalive() {
+    using clock = std::chrono::steady_clock;
+    if (closed_) return;
+    auto now = clock::now();
+    // In the client role, bytes that arrived since the previous check and nothing read count
+    // as received (e.g. the pongs of a client that only sends). A server always reads: its
+    // timing does not change
+    if (!server_role_) {
+        auto arrived = socket_->is_open() ? available() : 0;
+        if (arrived > available_seen_) last_received_ = now;
+        available_seen_ = arrived;
+    }
+    auto received = last_received_;
+    // At most an interval from now: the deadlines below are never later
+    auto next = now + std::max(idle_timeout_, ping_interval_);
+    bool ping_now = false;
+    if (idle_timeout_.count() > 0) {
+        auto deadline = idle_deadline_of(now, received, first_ping_, idle_timeout_, ping_interval_, server_role_);
+        if (now >= deadline.close_at) {
+            LOG_DEBUG("websocket idle for too long, closing");
+            close(CLOSE_GOING_AWAY);
+            return;
+        }
+        ping_now = deadline.ping_now;
+        next = deadline.close_at;
+    }
+    if (ping_interval_.count() > 0) {
+        auto since = std::max(received, last_ping_);
+        if (ping_now || now - since >= ping_interval_) {
+            // Queued, not waited for: a ping stuck behind a write that does not end does not
+            // hold the idle timeout. One ping at a time
+            last_ping_ = now;
+            if (first_ping_ < received) first_ping_ = now;
+            if (!pending_ping_ && !ping_in_flight_) {
+                pending_ping_ = true;
+                queue_control();
+            }
+            since = now;
+        }
+        next = std::min(next, since + ping_interval_);
+    }
+    keepalive_.expires_at(next);
 }
 
 void websocket::start_timeout() {
@@ -820,6 +856,10 @@ size_t websocket::available() const {
     // received, framing included
     if (closed_) return 0;
     return buffered() + socket_->available();
+}
+
+size_t websocket::send_backlog() const {
+    return closed_ ? 0 : socket_->send_backlog();
 }
 
 std::string websocket::get_remote_ip() const {

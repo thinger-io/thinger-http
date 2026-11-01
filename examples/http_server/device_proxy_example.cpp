@@ -32,7 +32,7 @@ int main() {
     device.get("/login", [](http::response& res) {
         res.redirect("/");    // an absolute path of the device
     });
-    if (!device.listen("127.0.0.1", 8099)) return 1;
+    if (device.listen("127.0.0.1", 8099)) return 1;
     std::thread device_thread([&device] { device.wait(); });
 
     // Where each device is reached (e.g. through a tunnel or a Unix socket)

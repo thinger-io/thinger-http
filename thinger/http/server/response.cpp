@@ -10,6 +10,12 @@
 #include "../../util/logger.hpp"
 #include "../../util/base64.hpp"
 #include "../../util/sha1.hpp"
+#include "response_sink.hpp"
+#include "server_connection.hpp"
+#include "http_stream.hpp"
+#include "connection_tracker.hpp"
+#include "websocket_connection.hpp"
+#include "sse_connection.hpp"
 #include "../../asio/sockets/websocket.hpp"
 #include <algorithm>
 #include <atomic>
@@ -132,10 +138,6 @@ std::shared_ptr<http_response> response::take_draft(bool with_draft) {
     bool drafted = with_draft && state_->draft;
     auto message = drafted ? std::make_shared<http_response>(std::move(*state_->draft))
                            : std::make_shared<http_response>();
-    // A protocol switch keeps the Connection header set for it (Upgrade)
-    if (message->get_status() != http_response::status::switching_protocols) {
-        message->set_keep_alive(state_->request->keep_alive());
-    }
     if (!drafted && state_->cors_enabled) add_cors_headers(*message);
     return message;
 }
@@ -184,7 +186,7 @@ void response::frame_message(http_response& message) const {
     }
 }
 
-void response::frame_takeover(http_response& message) const {
+body_framing response::frame_takeover(http_response& message) const {
     // What follows the response belongs to the handler. Switching protocols (101, or 2xx to
     // CONNECT: a tunnel), nothing tells a body (RFC 9110, 9.3.6). Otherwise, unless the
     // handler framed it, what the handler writes is the body, ending when the connection
@@ -195,8 +197,9 @@ void response::frame_takeover(http_response& message) const {
         message.remove_headers(header::content_length);
         message.remove_headers(header::transfer_encoding);
     } else if (!message.has_content_length_header() && !message.has_transfer_encoding_header()) {
-        message.set_keep_alive(false);
+        return body_framing::close;
     }
+    return body_framing::none;
 }
 
 void response::prepare_body(http_response& message, bool compress) const {
@@ -294,7 +297,6 @@ void response::header(std::string key, std::string value) {
 
 void response::send_response(const std::shared_ptr<http_response>& response) {
     if (!ensure_not_responded()) return;
-    response->set_keep_alive(state_->request->keep_alive());
     if (state_->cors_enabled) add_cors_headers(*response);
     // A message built by hand may carry the framing of another one (e.g. copied from a
     // response whose body was decoded): its content is its body, sent whole (a response
@@ -474,17 +476,17 @@ namespace {
 
 }
 
-void response::upgrade_websocket(websocket_handler handler, const std::set<std::string>& supported_protocols) {
-    accept_websocket(supported_protocols, [handler = std::move(handler)](std::shared_ptr<websocket_connection> connection,
-                                                                        asio::websocket&) {
+void response::upgrade_websocket(const websocket_accept_options& options, websocket_handler handler) {
+    accept_websocket(options, [handler = std::move(handler)](std::shared_ptr<websocket_connection> connection,
+                                                            asio::websocket&) {
         handler(connection);
         connection->start();
     });
 }
 
-void response::upgrade_websocket(websocket_coroutine handler, const std::set<std::string>& supported_protocols) {
-    accept_websocket(supported_protocols, [handler = std::move(handler)](std::shared_ptr<websocket_connection> connection,
-                                                                        asio::websocket& websocket) mutable {
+void response::upgrade_websocket(const websocket_accept_options& options, websocket_coroutine handler) {
+    accept_websocket(options, [handler = std::move(handler)](std::shared_ptr<websocket_connection> connection,
+                                                            asio::websocket& websocket) mutable {
         spawn_handler(websocket.get_executor(), "WebSocket",
                       [handler = std::move(handler), connection]() mutable -> awaitable<void> {
             co_await handler(connection);
@@ -493,49 +495,48 @@ void response::upgrade_websocket(websocket_coroutine handler, const std::set<std
     });
 }
 
-void response::accept_websocket(const std::set<std::string>& supported_protocols,
+void response::accept_websocket(const websocket_accept_options& options,
                                 std::function<void(std::shared_ptr<websocket_connection>, asio::websocket&)> deliver) {
     if (!ensure_not_responded()) return;
     if (reject_takeover("WebSocket upgrade")) return;
 
     std::string protocol;
-    auto response = websocket_handshake({supported_protocols.begin(), supported_protocols.end()},
-                                        true, true, protocol);
+    auto response = websocket_handshake(options.protocols, options.protocol_required, true, protocol);
     if (!response) return;
 
-    take_over(std::move(response), [deliver = std::move(deliver), protocol](std::shared_ptr<asio::socket> socket, std::string buffered) {
+    hand_over(std::move(response), [deliver = std::move(deliver), options, protocol](upgraded_connection connection) {
         // A client must wait for the handshake response before sending frames (RFC 6455)
-        if (!buffered.empty()) {
+        if (!connection.buffered.empty()) {
             LOG_WARNING("WebSocket client sent data before the handshake completed, closing");
-            socket->close();
+            connection.socket->close();
             return;
         }
 
         // binary, server; on the io_context of the connection, where it is taken over (the
-        // default executor)
-        auto websocket = std::make_shared<asio::websocket>(socket, true, true);
+        // default executor). The connection holds the scope: told of a shutdown, counted as a
+        // websocket once started
+        auto websocket = std::make_shared<asio::websocket>(std::move(connection.socket), true, true);
         websocket->set_protocol(protocol);
-        wrap_connection(*socket, *websocket, connection_type::websocket);
-        auto ws_connection = std::make_shared<websocket_connection>(websocket);
+        connection.scope.set_type(connection_type::websocket);
+        auto ws_connection = std::make_shared<websocket_connection>(websocket, options, std::move(connection.scope));
 
         // The handler sets its callbacks, then the WebSocket starts
         deliver(ws_connection, *websocket);
     });
 }
 
-void response::upgrade_websocket_stream(const websocket_options& options, websocket_stream_coroutine handler) {
+void response::upgrade_websocket_stream(const websocket_accept_options& options, websocket_stream_coroutine handler) {
     upgrade_websocket_stream(options, websocket_stream_handler(
-        [handler = std::move(handler)](std::shared_ptr<asio::websocket> websocket, std::string protocol) mutable {
-            auto executor = websocket->get_executor();
+        [handler = std::move(handler)](upgraded_websocket websocket) mutable {
+            auto executor = websocket.stream->get_executor();
             spawn_handler(std::move(executor), "WebSocket",
-                          [handler = std::move(handler), websocket = std::move(websocket),
-                           protocol = std::move(protocol)]() mutable {
-                return handler(std::move(websocket), std::move(protocol));
+                          [handler = std::move(handler), websocket = std::move(websocket)]() mutable {
+                return handler(std::move(websocket));
             });
         }));
 }
 
-void response::upgrade_websocket_stream(const websocket_options& options, websocket_stream_handler handler) {
+void response::upgrade_websocket_stream(const websocket_accept_options& options, websocket_stream_handler handler) {
     if (!ensure_not_responded()) return;
     if (reject_takeover("WebSocket upgrade")) return;
 
@@ -543,56 +544,57 @@ void response::upgrade_websocket_stream(const websocket_options& options, websoc
     auto response = websocket_handshake(options.protocols, options.protocol_required, false, protocol);
     if (!response) return;
 
-    take_over(std::move(response), [handler = std::move(handler), options, protocol](std::shared_ptr<asio::socket> socket, std::string buffered) {
+    hand_over(std::move(response), [handler = std::move(handler), options, protocol](upgraded_connection connection) {
         // On the io_context of the connection, where it is taken over (the default executor)
-        auto websocket = std::make_shared<asio::websocket>(socket, options.binary, true);
-        // The handler may ask to be told of a shutdown on the websocket (on_server_shutdown())
-        wrap_connection(*socket, *websocket, connection_type::websocket);
+        auto websocket = std::make_shared<asio::websocket>(std::move(connection.socket), options.binary, true);
         websocket->set_protocol(protocol);
         // Frames the client sent right after its request, without waiting for the response
-        if (!buffered.empty()) websocket->set_read_ahead(std::move(buffered));
-        websocket->set_keepalive(options.ping_interval, options.idle_timeout);
-        handler(std::move(websocket), protocol);
+        if (!connection.buffered.empty()) websocket->set_read_ahead(std::move(connection.buffered));
+        // No keepalive unless asked for
+        websocket->set_keepalive(options.ping_interval.value_or(std::chrono::milliseconds{0}),
+                                 options.idle_timeout.value_or(std::chrono::milliseconds{0}));
+        connection.scope.set_type(connection_type::websocket);
+        handler(upgraded_websocket{std::move(websocket), protocol, std::move(connection.scope)});
     });
 }
 
 void response::take_over(takeover_handler handler) {
     if (!ensure_not_responded()) return;
     if (reject_takeover("Connection takeover")) return;
-    if (auto message = new_response()) take_over(std::move(message), std::move(handler));
+    if (auto message = new_response()) hand_over(std::move(message), std::move(handler));
 }
 
 void response::take_over(takeover_coroutine handler) {
-    take_over(takeover_handler([handler = std::move(handler)](std::shared_ptr<asio::socket> socket,
-                                                             std::string buffered) mutable {
-        auto& io_context = socket->get_io_context();
+    take_over(takeover_handler([handler = std::move(handler)](upgraded_connection connection) mutable {
+        auto& io_context = connection.socket->get_io_context();
         spawn_handler(io_context, "takeover",
-                      [handler = std::move(handler), socket = std::move(socket), buffered = std::move(buffered)]() mutable {
-            return handler(std::move(socket), std::move(buffered));
+                      [handler = std::move(handler), connection = std::move(connection)]() mutable {
+            return handler(std::move(connection));
         });
     }));
 }
 
-void response::take_over(std::shared_ptr<http_response> message, takeover_handler handler) {
-    frame_takeover(*message);
-    state_->sink->take_over(std::move(message), std::move(handler));
+void response::hand_over(std::shared_ptr<http_response> message, takeover_handler handler) {
+    auto framing = frame_takeover(*message);
+    state_->sink->take_over(std::move(message), std::move(handler), framing);
 }
 
-void response::start_sse(sse_handler handler) {
-    accept_sse([handler = std::move(handler)](std::shared_ptr<sse_connection> connection, asio::socket&) {
+void response::start_sse(sse_handler handler, const sse_options& options) {
+    accept_sse(options, [handler = std::move(handler)](std::shared_ptr<sse_connection> connection, asio::socket&) {
         handler(std::move(connection));
     });
 }
 
-void response::start_sse(sse_coroutine handler) {
-    accept_sse([handler = std::move(handler)](std::shared_ptr<sse_connection> connection, asio::socket& socket) mutable {
+void response::start_sse(sse_coroutine handler, const sse_options& options) {
+    accept_sse(options, [handler = std::move(handler)](std::shared_ptr<sse_connection> connection, asio::socket& socket) mutable {
         spawn_handler(socket.get_io_context(), "SSE", [handler = std::move(handler), connection = std::move(connection)]() mutable {
             return handler(std::move(connection));
         });
     });
 }
 
-void response::accept_sse(std::function<void(std::shared_ptr<sse_connection>, asio::socket&)> deliver) {
+void response::accept_sse(const sse_options& options,
+                          std::function<void(std::shared_ptr<sse_connection>, asio::socket&)> deliver) {
     if (!ensure_not_responded()) return;
     if (reject_takeover("Server-Sent Events")) return;
 
@@ -612,10 +614,14 @@ void response::accept_sse(std::function<void(std::shared_ptr<sse_connection>, as
 
     // Send the SSE headers and take over the connection (anything the client sends
     // afterwards is not part of the event stream)
-    take_over(std::move(response), [deliver = std::move(deliver)](std::shared_ptr<asio::socket> socket, std::string) {
-        auto sse_conn = std::make_shared<sse_connection>(socket);
+    hand_over(std::move(response), [deliver = std::move(deliver), keepalive = options.keepalive](upgraded_connection connection) {
+        // The connection holds the scope: told of a shutdown, counted as an event stream
+        auto& socket = *connection.socket;
+        auto sse_conn = std::make_shared<sse_connection>(std::move(connection.socket), boost::asio::any_io_executor{},
+                                                         std::move(connection.scope));
+        sse_conn->set_keepalive(keepalive);
         sse_conn->start();
-        deliver(std::move(sse_conn), *socket);
+        deliver(std::move(sse_conn), socket);
     });
 }
 

@@ -18,6 +18,11 @@ include(Catch)
 add_library(test_main STATIC test_main.cpp)
 target_link_libraries(test_main PUBLIC Catch2::Catch2 thinger::http spdlog::spdlog)
 
+# ctest runs one case at a time, and Catch2 exits with 4 when every case it ran skipped, even
+# when only one run of the case did (a SKIP with its reason, as one transport of the matrix):
+# that run is a skip, not a failure. Failed assertions still fail the test
+set(CATCH_RUN_ARGS EXTRA_ARGS --allow-running-no-tests)
+
 # Function to add a test easily
 function(add_thinger_test test_name test_file)
     add_executable(${test_name} ${test_file})
@@ -27,7 +32,7 @@ function(add_thinger_test test_name test_file)
             test_main
             nlohmann_json::nlohmann_json
     )
-    catch_discover_tests(${test_name})
+    catch_discover_tests(${test_name} ${CATCH_RUN_ARGS})
 endfunction()
 
 # ==================== UNIT TESTS ====================
@@ -90,12 +95,26 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/body_reader_test.cpp)
     add_thinger_test(test_body_reader unit/http/server/body_reader_test.cpp)
 endif()
 
+# Unit tests - The source of a request body: memory_source, and a request without a source
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/request_source_test.cpp)
+    add_thinger_test(test_request_source unit/http/server/request_source_test.cpp)
+endif()
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/body_decoders_test.cpp)
     add_thinger_test(test_body_decoders unit/http/server/body_decoders_test.cpp)
 endif()
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/request_context_test.cpp)
     add_thinger_test(test_request_context unit/http/server/request_context_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/http_stream_test.cpp)
+    add_thinger_test(test_http_stream unit/http/server/http_stream_test.cpp)
+endif()
+
+# response.hpp alone: without the connection headers, and its upgrade overloads
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/response_header_test.cpp)
+    add_thinger_test(test_response_header unit/http/server/response_header_test.cpp)
 endif()
 
 # Unit tests - HTTP Common
@@ -142,6 +161,18 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/asio/certificate_manager_test.cpp)
     add_thinger_test(test_certificate_manager unit/asio/certificate_manager_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/asio/async_event_test.cpp)
+    add_thinger_test(test_async_event unit/asio/async_event_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/asio/watchdog_test.cpp)
+    add_thinger_test(test_watchdog unit/asio/watchdog_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/unit/http/server/write_flow_test.cpp)
+    add_thinger_test(test_write_flow unit/http/server/write_flow_test.cpp)
+endif()
+
 # ==================== INTEGRATION TESTS ====================
 
 # Integration tests - Client
@@ -168,6 +199,11 @@ endif()
 # Integration tests - Async Client
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/async_client_wait_test.cpp)
     add_thinger_test(test_integration_async_client_wait integration/async_client_wait_test.cpp)
+endif()
+
+# Integration tests - An async client stopped or destroyed with requests in flight
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/async_client_lifetime_test.cpp)
+    add_thinger_test(test_integration_async_client_lifetime integration/async_client_lifetime_test.cpp)
 endif()
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/connection_pool_test.cpp)
@@ -208,6 +244,11 @@ endif()
 # Integration tests - Client certificates on TLS servers, and the deadline of the handshake
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/tls_client_verify_test.cpp)
     add_thinger_test(test_integration_tls_client_verify integration/tls_client_verify_test.cpp)
+endif()
+
+# Integration tests - Requests whose Host gets another TLS configuration than their SNI (421)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/tls_misdirected_test.cpp)
+    add_thinger_test(test_integration_tls_misdirected integration/tls_misdirected_test.cpp)
 endif()
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/client_keepalive_test.cpp)
@@ -252,6 +293,17 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_executor_test.cpp)
     add_thinger_test(test_integration_websocket_executor integration/websocket_executor_test.cpp)
 endif()
 
+# Integration tests - WebSocket accept options: defaults, each option, subprotocols
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_accept_options_test.cpp)
+    add_thinger_test(test_integration_websocket_accept_options integration/websocket_accept_options_test.cpp)
+endif()
+
+# Integration tests - Client WebSocket: the HTTP clients' websocket(), its synchronous API and
+# its keepalive
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_client_test.cpp)
+    add_thinger_test(test_integration_websocket_client integration/websocket_client_test.cpp)
+endif()
+
 # Integration tests - Sockets defined by the application
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/custom_socket_test.cpp)
     add_thinger_test(test_integration_custom_socket integration/custom_socket_test.cpp)
@@ -262,7 +314,6 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/compression_test.cpp)
     add_thinger_test(test_integration_compression integration/compression_test.cpp)
 endif()
 
-# Integration tests - Unix Socket Server
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/memory_dispatch_test.cpp)
     add_thinger_test(test_integration_memory_dispatch integration/memory_dispatch_test.cpp)
 endif()
@@ -271,8 +322,18 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/request_context_test.cpp)
     add_thinger_test(test_integration_request_context integration/request_context_test.cpp)
 endif()
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/unix_socket_server_test.cpp)
-    add_thinger_test(test_integration_unix_socket_server integration/unix_socket_server_test.cpp)
+# Integration tests - HTTP servers on Unix domain sockets
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/unix_server_test.cpp)
+    add_thinger_test(test_integration_unix_server integration/unix_server_test.cpp)
+endif()
+
+# Integration tests - One server on several listeners, and the connection options of each server
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/server_listeners_test.cpp)
+    add_thinger_test(test_integration_server_listeners integration/server_listeners_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/transport_fixture_test.cpp)
+    add_thinger_test(test_integration_transport_fixture integration/transport_fixture_test.cpp)
 endif()
 
 # Integration tests - Socket I/O
@@ -280,19 +341,50 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/socket_io_test.cpp)
     add_thinger_test(test_integration_socket_io integration/socket_io_test.cpp)
 endif()
 
+# Integration tests - peer_closed() of the TCP, TLS and Unix sockets: data, FIN and reset
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/peer_closed_test.cpp)
+    add_thinger_test(test_integration_peer_closed integration/peer_closed_test.cpp)
+endif()
+
+# Integration tests - Cancellation scope of a request: route::cancel_on, cancelled(),
+# client_gone(), cancellation_slot(), and what is a client gone (a reset, not a half-close)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/cancellation_test.cpp)
+    add_thinger_test(test_integration_cancellation integration/cancellation_test.cpp)
+endif()
+
 # Integration tests - Connect timeout of the TCP and Unix sockets
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/socket_connect_timeout_test.cpp)
     add_thinger_test(test_integration_socket_connect_timeout integration/socket_connect_timeout_test.cpp)
 endif()
 
-# Integration tests - Socket servers stopped while accepting
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/socket_server_stop_test.cpp)
-    add_thinger_test(test_integration_socket_server_stop integration/socket_server_stop_test.cpp)
+# Integration tests - Hostile peers (silent, trickle, no-read): every client operation that
+# waits on the peer ends within its deadline
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/hostile_peer_test.cpp)
+    add_thinger_test(test_integration_hostile_peer integration/hostile_peer_test.cpp)
 endif()
 
-# Integration tests - Socket servers failing to set a connection up
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/socket_server_setup_test.cpp)
-    add_thinger_test(test_integration_socket_server_setup integration/socket_server_setup_test.cpp)
+# Integration tests - Hostile clients (silent, trickling a head or a body, not reading): every
+# server wait on a client ends within its deadline
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/server_hostile_peer_test.cpp)
+    add_thinger_test(test_integration_server_hostile_peer integration/server_hostile_peer_test.cpp)
+endif()
+
+# Integration tests - Server deadlines: the request deadline of a route, a group or a virtual
+# host, what a handler timed out sees, and the requests it never applies to
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/server_deadlines_test.cpp)
+    add_thinger_test(test_integration_server_deadlines integration/server_deadlines_test.cpp)
+endif()
+
+# Integration tests - Listener: accepting TCP, TLS and Unix connections, stop() and the
+# deadline of TLS handshakes
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/listener_test.cpp)
+    add_thinger_test(test_integration_listener integration/listener_test.cpp)
+endif()
+
+# Integration tests - TLS of the listener: the bound of the handshakes per IO thread, the client
+# certificate mode of a host over the listener's, and the session cache
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/listener_tls_test.cpp)
+    add_thinger_test(test_integration_listener_tls integration/listener_tls_test.cpp)
 endif()
 
 # Integration tests - Routing
@@ -311,6 +403,16 @@ endif()
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/sse_framing_test.cpp)
     add_thinger_test(test_integration_sse_framing integration/sse_framing_test.cpp)
+endif()
+
+# Integration tests - SSE sends awaited from strands of an io_context run by several threads
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/sse_async_test.cpp)
+    add_thinger_test(test_integration_sse_async integration/sse_async_test.cpp)
+endif()
+
+# Integration tests - The same watermarks for WebSocket and SSE (one queue for both)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/push_flow_control_test.cpp)
+    add_thinger_test(test_integration_push_flow_control integration/push_flow_control_test.cpp)
 endif()
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/connection_close_test.cpp)
@@ -365,6 +467,12 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/expect_continue_test.cpp)
     add_thinger_test(test_integration_expect_continue integration/expect_continue_test.cpp)
 endif()
 
+# Integration tests - The network source of a request body: 100 Continue, deadline, lingering, a
+# request outliving its connection, the connection it reports
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/request_source_test.cpp)
+    add_thinger_test(test_integration_request_source integration/request_source_test.cpp)
+endif()
+
 # Integration tests - multipart/form-data bodies
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/multipart_test.cpp)
     add_thinger_test(test_integration_multipart integration/multipart_test.cpp)
@@ -378,6 +486,10 @@ endif()
 # Integration tests - Lingering close of connections with input unread
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/lingering_close_test.cpp)
     add_thinger_test(test_integration_lingering_close integration/lingering_close_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/close_reason_test.cpp)
+    add_thinger_test(test_integration_close_reason integration/close_reason_test.cpp)
 endif()
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/route_limits_test.cpp)
@@ -412,6 +524,31 @@ endif()
 # Integration tests - Graceful shutdown and statistics
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/shutdown_test.cpp)
     add_thinger_test(test_integration_shutdown integration/shutdown_test.cpp)
+endif()
+
+# Integration tests - shutdown(by): its deadline, several listeners, threads of the server
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/shutdown_deadline_test.cpp)
+    add_thinger_test(test_integration_shutdown_deadline integration/shutdown_deadline_test.cpp)
+endif()
+
+# Integration tests - The scope of the connections taken over: shutdown notice, statistics
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/server_scope_test.cpp)
+    add_thinger_test(test_integration_server_scope integration/server_scope_test.cpp)
+endif()
+
+# Integration tests - listen() racing stop_listening(), stop() and shutdown() on other threads
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/listen_races_test.cpp)
+    add_thinger_test(test_integration_listen_races integration/listen_races_test.cpp)
+endif()
+
+# Integration tests - A server stopped or destroyed with its connections open
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/server_lifetime_test.cpp)
+    add_thinger_test(test_integration_server_lifetime integration/server_lifetime_test.cpp)
+endif()
+
+# Integration tests - two workers in one process, each with a pool server and an async client
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/workers_instances_test.cpp)
+    add_thinger_test(test_integration_workers_instances integration/workers_instances_test.cpp)
 endif()
 
 # Integration tests - Framing of the responses sent
@@ -450,7 +587,7 @@ if(UNIT_TEST_FILES)
             test_main
             nlohmann_json::nlohmann_json
     )
-    catch_discover_tests(all_unit_tests)
+    catch_discover_tests(all_unit_tests ${CATCH_RUN_ARGS})
 endif()
 
 # Create a test runner for all integration tests
@@ -463,7 +600,7 @@ if(INTEGRATION_TEST_FILES)
             nlohmann_json::nlohmann_json
             spdlog::spdlog
     )
-    catch_discover_tests(all_integration_tests)
+    catch_discover_tests(all_integration_tests ${CATCH_RUN_ARGS})
 endif()
 
 # Create a test runner for ALL tests
@@ -477,5 +614,18 @@ if(ALL_TEST_FILES)
             nlohmann_json::nlohmann_json
             spdlog::spdlog
     )
-    catch_discover_tests(all_tests)
+    catch_discover_tests(all_tests ${CATCH_RUN_ARGS})
+endif()
+
+# ==================== STRUCTURE BUDGET ====================
+
+# The guardrails H1-H10 against structure-budget.json (greps only: nothing to build)
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME structure_budget
+        COMMAND ${Python3_EXECUTABLE} ${thinger_http_SOURCE_DIR}/.github/scripts/structure_budget.py
+        WORKING_DIRECTORY ${thinger_http_SOURCE_DIR})
+    # The script itself, on synthetic sources (H3: fire-and-forget spawns)
+    add_test(NAME structure_budget_self_test
+        COMMAND ${Python3_EXECUTABLE} ${thinger_http_SOURCE_DIR}/.github/scripts/structure_budget_test.py)
 endif()

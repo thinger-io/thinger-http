@@ -12,10 +12,10 @@
 using namespace thinger;
 using namespace std::chrono_literals;
 
-// HEAD requests over raw TCP, as Node.js/Express answer them: routed to the GET route of the
-// path unless a HEAD route matches it, with the status and headers of the GET answer
-// (Content-Length included) and no body, so the next response on the connection is read
-// where it starts
+// HEAD requests over raw bytes (on every transport), as Node.js/Express answer them: routed to
+// the GET route of the path unless a HEAD route matches it, with the status and headers of the
+// GET answer (Content-Length included) and no body, so the next response on the connection is
+// read where it starts
 
 namespace {
 
@@ -56,7 +56,7 @@ namespace {
     // Send the requests on one connection, the last one closing it, and split the bytes
     // received into their responses: each head, then a body of its Content-Length, except
     // for the answers to HEAD, which have none. Every byte must belong to a response.
-    std::vector<raw_response> exchange(uint16_t port, const std::vector<pipelined_request>& requests) {
+    std::vector<raw_response> exchange(const running_server& running, const std::vector<pipelined_request>& requests) {
         std::string data;
         for (size_t i = 0; i < requests.size(); ++i) {
             const auto& request = requests[i];
@@ -64,7 +64,7 @@ namespace {
             if (i + 1 == requests.size()) data += "Connection: close\r\n";
             data += "\r\n";
         }
-        auto result = raw_exchange(port, data);
+        auto result = raw_exchange(running, data);
         INFO(result.data);
         REQUIRE(result.closed);
 
@@ -105,8 +105,8 @@ namespace {
 
     // HEAD of `target`, then GET of it on the same connection: the HEAD answer is the GET one
     // without body, with the Content-Length of that body
-    void require_head_like_get(uint16_t port, const std::string& target, const std::string& headers = "") {
-        auto responses = exchange(port, {{"HEAD", target, headers}, {"GET", target, headers}});
+    void require_head_like_get(const running_server& running, const std::string& target, const std::string& headers = "") {
+        auto responses = exchange(running, {{"HEAD", target, headers}, {"GET", target, headers}});
         const auto& head = responses[0];
         const auto& get = responses[1];
         INFO(target);
@@ -119,7 +119,8 @@ namespace {
 
 }
 
-TEST_CASE("HEAD is answered by the GET route without body", "[server][head][integration]") {
+TEST_CASE("HEAD is answered by the GET route without body", "[server][head][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     server.get("/text", [](http::response& res) {
         res.header("X-Route", "text");
@@ -144,15 +145,15 @@ TEST_CASE("HEAD is answered by the GET route without body", "[server][head][inte
     });
 
     SECTION("send(), json(), error(), redirect(), with parameters and coroutines") {
-        running_server running(server);
+        running_server running(server, kind);
         for (const auto* target : {"/text", "/json", "/error", "/redirect", "/items/7", "/coroutine"}) {
-            require_head_like_get(running.port, target);
+            require_head_like_get(running, target);
         }
     }
 
     SECTION("The exact bytes on a keep-alive connection") {
-        running_server running(server);
-        auto result = raw_exchange(running.port,
+        running_server running(server, kind);
+        auto result = raw_exchange(running,
             "HEAD /text HTTP/1.1\r\nHost: localhost\r\n\r\n"
             "GET /text HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         REQUIRE(result.closed);
@@ -173,16 +174,16 @@ TEST_CASE("HEAD is answered by the GET route without body", "[server][head][inte
         server.set_error_formatter([](const http::http_error& error, http::http_response& response) {
             response.set_content(nlohmann::json{{"error", error.message}}.dump(), "application/json");
         });
-        running_server running(server);
-        require_head_like_get(running.port, "/error");
-        auto head = exchange(running.port, {{"HEAD", "/error"}})[0];
+        running_server running(server, kind);
+        require_head_like_get(running, "/error");
+        auto head = exchange(running, {{"HEAD", "/error"}})[0];
         REQUIRE(head.status == 403);
         REQUIRE(head.header("Content-Type") == "application/json");
     }
 
     SECTION("A HEAD request matching no route: 404, without body") {
-        running_server running(server);
-        auto responses = exchange(running.port, {{"HEAD", "/missing"}, {"GET", "/missing"}});
+        running_server running(server, kind);
+        auto responses = exchange(running, {{"HEAD", "/missing"}, {"GET", "/missing"}});
         REQUIRE(responses[0].status == 404);
         REQUIRE(responses[0].representation_headers() == responses[1].representation_headers());
     }
@@ -197,7 +198,8 @@ TEST_CASE("HEAD is answered by the GET route without body", "[server][head][inte
     }
 }
 
-TEST_CASE("HEAD: an explicit HEAD route wins over the GET one", "[server][head][integration]") {
+TEST_CASE("HEAD: an explicit HEAD route wins over the GET one", "[server][head][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     server.get("/both", [](http::response& res) { res.send("from get"); });
     server.head("/both", [](http::response& res) {
@@ -210,9 +212,9 @@ TEST_CASE("HEAD: an explicit HEAD route wins over the GET one", "[server][head][
     });
     // a HEAD wildcard of another prefix does not hide the GET routes
     server.head("/other/:path(.*)", [](http::response& res) { res.send(""); });
-    running_server running(server);
+    running_server running(server, kind);
 
-    auto responses = exchange(running.port, {{"HEAD", "/both"}, {"HEAD", "/only-get/5"}, {"GET", "/both"}});
+    auto responses = exchange(running, {{"HEAD", "/both"}, {"HEAD", "/only-get/5"}, {"GET", "/both"}});
     REQUIRE(responses[0].status == 200);
     REQUIRE(responses[0].header("X-Handler") == "head");
     REQUIRE(responses[0].header("Content-Length") == "9");
@@ -221,13 +223,14 @@ TEST_CASE("HEAD: an explicit HEAD route wins over the GET one", "[server][head][
     REQUIRE(responses[2].body == "from get");
 }
 
-TEST_CASE("HEAD: 405 lists HEAD wherever GET is allowed", "[server][head][integration]") {
+TEST_CASE("HEAD: 405 lists HEAD wherever GET is allowed", "[server][head][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     server.get("/items/:id", [](http::request& req, http::response& res) { res.send("item " + req["id"]); });
     server.post("/items", [](http::response& res) { res.send("created"); });
-    running_server running(server);
+    running_server running(server, kind);
 
-    auto responses = exchange(running.port, {{"DELETE", "/items/1"}, {"DELETE", "/items"}, {"PATCH", "/missing"},
+    auto responses = exchange(running, {{"DELETE", "/items/1"}, {"DELETE", "/items"}, {"PATCH", "/missing"},
                                              {"HEAD", "/items/1"}, {"HEAD", "/missing"}, {"POST", "/items/1", "Content-Length: 0\r\n"}});
     REQUIRE(responses[0].status == 405);
     REQUIRE(responses[0].header("Allow") == "GET, HEAD");
@@ -245,7 +248,8 @@ TEST_CASE("HEAD: 405 lists HEAD wherever GET is allowed", "[server][head][integr
     REQUIRE(responses[5].status == 404);
 }
 
-TEST_CASE("HEAD: serve_static does not take the HEAD requests of GET routes", "[server][head][static][integration]") {
+TEST_CASE("HEAD: serve_static does not take the HEAD requests of GET routes", "[server][head][static][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     auto root = fs::temp_directory_path() /
                 ("thinger_head_static_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     fs::create_directories(root);
@@ -258,15 +262,15 @@ TEST_CASE("HEAD: serve_static does not take the HEAD requests of GET routes", "[
             res.header("X-Api", "x");
             res.json({{"route", "/api/x"}, {"padding", std::string(10, 'p')}});
         });
-        running_server running(server);
+        running_server running(server, kind);
 
-        require_head_like_get(running.port, "/api/x");
-        auto head = exchange(running.port, {{"HEAD", "/api/x"}})[0];
+        require_head_like_get(running, "/api/x");
+        auto head = exchange(running, {{"HEAD", "/api/x"}})[0];
         REQUIRE(head.header("X-Api") == "x");
         REQUIRE(head.header("Content-Type") == "application/json");
 
         // the files are still answered to HEAD, by the GET route of serve_static
-        auto responses = exchange(running.port, {{"HEAD", "/index.html"}, {"HEAD", "/"}, {"HEAD", "/spa/path"}});
+        auto responses = exchange(running, {{"HEAD", "/index.html"}, {"HEAD", "/"}, {"HEAD", "/spa/path"}});
         for (const auto& response : responses) {
             REQUIRE(response.status == 200);
             REQUIRE(response.header("Content-Length") == "18");
@@ -279,14 +283,15 @@ TEST_CASE("HEAD: serve_static does not take the HEAD requests of GET routes", "[
     fs::remove_all(root, ec);
 }
 
-TEST_CASE("HEAD: not compressed, with the length of the identity body", "[server][head][compression][integration]") {
+TEST_CASE("HEAD: not compressed, with the length of the identity body", "[server][head][compression][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     const std::string text(4096, 'a');
     server.get("/big", [&text](http::response& res) { res.send(text); });
-    running_server running(server);
+    running_server running(server, kind);
 
     const std::string accept = "Accept-Encoding: gzip\r\n";
-    auto responses = exchange(running.port, {{"HEAD", "/big", accept}, {"GET", "/big", accept}, {"GET", "/big"}});
+    auto responses = exchange(running, {{"HEAD", "/big", accept}, {"GET", "/big", accept}, {"GET", "/big"}});
     const auto& head = responses[0];
     const auto& compressed = responses[1];
     const auto& identity = responses[2];
@@ -302,7 +307,8 @@ TEST_CASE("HEAD: not compressed, with the length of the identity body", "[server
     REQUIRE(head.representation_headers() == identity.representation_headers());
 }
 
-TEST_CASE("HEAD: chunked, streamed, SSE and WebSocket answers", "[server][head][integration]") {
+TEST_CASE("HEAD: chunked, streamed, SSE and WebSocket answers", "[server][head][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     server.get("/text", [](http::response& res) { res.send("Hello World!"); });
     server.get("/chunked", [](http::response& res) {
@@ -326,12 +332,12 @@ TEST_CASE("HEAD: chunked, streamed, SSE and WebSocket answers", "[server][head][
         });
     });
     server.get("/ws", [](http::response& res) {
-        res.upgrade_websocket([](std::shared_ptr<http::websocket_connection>) {});
+        res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection>) {});
     });
-    running_server running(server);
+    running_server running(server, kind);
 
     SECTION("Chunked: the headers, without Transfer-Encoding nor chunks") {
-        auto responses = exchange(running.port, {{"HEAD", "/chunked"}, {"GET", "/text"}});
+        auto responses = exchange(running, {{"HEAD", "/chunked"}, {"GET", "/text"}});
         REQUIRE(responses[0].status == 200);
         REQUIRE(responses[0].header("Content-Type") == "text/plain");
         REQUIRE_FALSE(responses[0].has_header("Transfer-Encoding"));
@@ -339,14 +345,14 @@ TEST_CASE("HEAD: chunked, streamed, SSE and WebSocket answers", "[server][head][
     }
 
     SECTION("Streamed: the length advertised, without the body") {
-        auto responses = exchange(running.port, {{"HEAD", "/stream"}, {"GET", "/text"}});
+        auto responses = exchange(running, {{"HEAD", "/stream"}, {"GET", "/text"}});
         REQUIRE(responses[0].status == 200);
         REQUIRE(responses[0].header("Content-Length") == "10");
         REQUIRE(responses[1].body == "Hello World!");
     }
 
     SECTION("SSE: the headers of the event stream, without events nor handler") {
-        auto responses = exchange(running.port, {{"HEAD", "/events"}, {"GET", "/text"}});
+        auto responses = exchange(running, {{"HEAD", "/events"}, {"GET", "/text"}});
         REQUIRE(responses[0].status == 200);
         REQUIRE(responses[0].header("Content-Type") == "text/event-stream");
         REQUIRE(responses[1].body == "Hello World!");
@@ -357,7 +363,7 @@ TEST_CASE("HEAD: chunked, streamed, SSE and WebSocket answers", "[server][head][
         const std::string upgrade = "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
                                     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
         // (the Connection: Upgrade of the request does not close it)
-        auto responses = exchange(running.port, {{"HEAD", "/ws", upgrade}, {"HEAD", "/ws"}, {"GET", "/text"}});
+        auto responses = exchange(running, {{"HEAD", "/ws", upgrade}, {"HEAD", "/ws"}, {"GET", "/text"}});
         REQUIRE(responses[0].status == 400);
         REQUIRE(responses[1].status == 426);
         REQUIRE(responses[2].body == "Hello World!");

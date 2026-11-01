@@ -3,27 +3,44 @@
 #include "proxy_exchange.hpp"
 #include "../connection_tracker.hpp"
 #include "../../../asio/socket_pipe.hpp"
+#include "../../../asio/sockets/websocket.hpp"
+#include "../../../asio/with_timeout.hpp"
 
 namespace thinger::http::proxy_detail {
 
+// A quiet WebSocket behind the proxy, with the server's default keepalive, pings before the
+// default tunnel deadline cuts it (see websocket_connection, upgrade.hpp's ping_interval)
+static_assert(proxy_options::DEFAULT_TUNNEL_IDLE_TIMEOUT > asio::websocket::CONNECTION_TIMEOUT_SECONDS,
+              "the default tunnel idle timeout must exceed the default WebSocket ping interval");
+
+namespace {
+
+// Write what a side sent right after the handshake, within the idle deadline, if any: a
+// peer that does not read it ends the tunnel as the pipe would
+awaitable<bool> write_early(asio::socket& to, const std::string& data, std::chrono::milliseconds idle_timeout) {
+    if (data.empty()) co_return true;
+    if (idle_timeout.count() <= 0) {
+        auto [ec, bytes] = co_await to.write(data);
+        co_return !ec;
+    }
+    auto result = co_await asio::with_timeout(to.write(data), idle_timeout);
+    co_return result && !std::get<0>(*result);
+}
+
+}
+
 awaitable<void> run_tunnel(std::shared_ptr<asio::socket> client, std::shared_ptr<asio::socket> target,
-                           std::string to_client, std::string to_target) {
+                           std::string to_client, std::string to_target,
+                           std::chrono::milliseconds idle_timeout) {
     // Bytes each side sent right after the handshake go first
-    bool ok = true;
-    if (!to_client.empty()) {
-        auto [ec, bytes] = co_await client->write(to_client);
-        ok = !ec;
-    }
-    if (ok && !to_target.empty()) {
-        auto [ec, bytes] = co_await target->write(to_target);
-        ok = !ec;
-    }
-    if (!ok) {
+    if (!co_await write_early(*client, to_client, idle_timeout) ||
+        !co_await write_early(*target, to_target, idle_timeout)) {
         client->close();
         target->close();
         co_return;
     }
     auto pipe = std::make_shared<asio::socket_pipe>(client, target);
+    pipe->set_idle_timeout(idle_timeout);
     co_await pipe->run();
 }
 
@@ -52,9 +69,12 @@ void proxy_exchange::upgrade() {
     // Once the 101 is written, the client connection and the target become a tunnel,
     // starting with what each one sent past its head
     auto target = std::exchange(target_socket_, nullptr);
-    res_.take_over([target, early = std::exchange(pending_, {})](std::shared_ptr<asio::socket> client, std::string buffered) {
-        set_connection_type(*client, connection_type::tunnel);
-        co_spawn(client->get_io_context(), run_tunnel(client, target, early, std::move(buffered)), detached);
+    res_.take_over([target, early = std::exchange(pending_, {}),
+                    idle_timeout = options_.tunnel_idle_timeout](upgraded_connection client) {
+        client.scope.set_type(connection_type::tunnel);
+        auto& io_context = client.socket->get_io_context();
+        co_spawn(io_context, run_tunnel(std::move(client.socket), target, early, std::move(client.buffered),
+                                        idle_timeout), detached);
     });
     result_.status = 101;
     result_.from_target = true;

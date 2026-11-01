@@ -362,6 +362,37 @@ std::shared_ptr<http_response> client_connection::complete_response(const http_r
     return response;
 }
 
+awaitable<std::shared_ptr<http_response>> client_connection::read_after_failed_write(
+    const http_request& request, boost::system::error_code write_ec, size_t bytes) {
+    error_ = write_ec;
+    request_unsent_ = bytes == 0;
+    // The server may have answered before taking the whole request, and closed the
+    // connection (e.g. 413 for a body over its limit): its answer may be there to read,
+    // as curl does. The connection is never reused then
+    if (bytes == 0 || (write_ec != boost::asio::error::broken_pipe &&
+                       write_ec != boost::asio::error::connection_reset)) {
+        co_return nullptr;
+    }
+    auto response = co_await read_response(request);
+    if (!response || response->get_status_code() == 101) {
+        error_ = write_ec;
+        co_return nullptr;
+    }
+    // A 408 on a reused connection is most likely the server closing it while idle,
+    // before this request arrived: not its answer, and it may be sent again (see
+    // http_client_base::can_retry()), as Go does
+    if (reused_ && response->get_status_code() == 408) {
+        error_ = write_ec;
+        response_started_ = false;
+        request_unsent_ = true;
+        co_return nullptr;
+    }
+    error_ = {};
+    reusable_ = false;
+    socket_->close();
+    co_return response;
+}
+
 awaitable<std::shared_ptr<http_response>> client_connection::exchange(std::shared_ptr<http_request> request) {
     std::shared_ptr<http_response> response;
     bool timed_out = false;
@@ -378,7 +409,7 @@ awaitable<std::shared_ptr<http_response>> client_connection::exchange(std::share
     boost::asio::steady_timer timer(socket_->get_io_context());
     timer.expires_after(timeout_);
 
-    auto do_request = [&]() -> awaitable<void> {
+    auto send_and_read = [&]() -> awaitable<void> {
         if (auto ec = co_await ensure_connected(*request)) {
             error_ = ec;
             co_return;
@@ -396,37 +427,22 @@ awaitable<std::shared_ptr<http_response>> client_connection::exchange(std::share
             written = co_await request->to_socket(socket_);
         }
         if (auto [write_ec, bytes] = written; write_ec) {
-            error_ = write_ec;
-            request_unsent_ = bytes == 0;
-            // The server may have answered before taking the whole request, and closed the
-            // connection (e.g. 413 for a body over its limit): its answer may be there to read,
-            // as curl does. The connection is never reused then
-            if (bytes == 0 || (write_ec != boost::asio::error::broken_pipe &&
-                               write_ec != boost::asio::error::connection_reset)) {
-                co_return;
-            }
-            response = co_await read_response(*request);
-            if (!response || response->get_status_code() == 101) {
-                response.reset();
-                error_ = write_ec;
-                co_return;
-            }
-            // A 408 on a reused connection is most likely the server closing it while idle,
-            // before this request arrived: not its answer, and it may be sent again (see
-            // http_client_base::can_retry()), as Go does
-            if (reused_ && response->get_status_code() == 408) {
-                response.reset();
-                error_ = write_ec;
-                response_started_ = false;
-                request_unsent_ = true;
-                co_return;
-            }
-            error_ = {};
-            reusable_ = false;
-            socket_->close();
+            response = co_await read_after_failed_write(*request, write_ec, bytes);
             co_return;
         }
         response = co_await read_response(*request);
+    };
+
+    // A cancellation that finds the request between two operations (one completed, its
+    // continuation queued or running) does not end an operation with operation_aborted: the
+    // next co_await throws it. The error is kept here, as || takes the end of do_timeout,
+    // cancelled at the same time, over an exception
+    auto do_request = [&]() -> awaitable<void> {
+        try {
+            co_await send_and_read();
+        } catch (const boost::system::system_error& error) {
+            error_ = error.code();
+        }
     };
 
     auto do_timeout = [&]() -> awaitable<void> {

@@ -1,4 +1,5 @@
 #include <thinger/http_server.hpp>
+#include <thinger/asio/ssl/certificate_manager.hpp>
 #include <thinger/util/logger.hpp>
 #include <iostream>
 
@@ -11,9 +12,10 @@ int main(int argc, char* argv[]) {
     // Initialize logging
     LOG_INFO("Starting Simple HTTPS Server Example");
     
-    // Create server instance and enable SSL
-    http::pool_server server;
-    server.enable_ssl(true);
+    // The workers the server runs on, and the server
+    asio::workers workers;
+    workers.start();
+    http::pool_server server(workers);
     
     // Define a simple root endpoint that returns HTML
     server.get("/", [](http::response& res) {
@@ -51,9 +53,13 @@ int main(int argc, char* argv[]) {
     // Start server with callback
     std::cout << "Starting HTTPS server..." << std::endl;
     
-    // Start server
-    if (!server.listen("0.0.0.0", port)) {
-        std::cerr << "Failed to start HTTPS server on port " << port << std::endl;
+    // Listen with TLS: the certificates of the listener (without one set, a self-signed
+    // certificate for development)
+    asio::listener_options options;
+    options.endpoint = asio::tcp_endpoint{"0.0.0.0", port};
+    options.tls = std::make_shared<asio::certificate_manager>();
+    if (auto ec = server.listen(std::move(options))) {
+        std::cerr << "Failed to start HTTPS server on port " << port << ": " << ec.message() << std::endl;
         return 1;
     }
     
@@ -64,8 +70,11 @@ int main(int argc, char* argv[]) {
     std::cout << "Note: Your browser will show a security warning because the certificate" << std::endl;
     std::cout << "      is self-signed. This is normal for development." << std::endl;
     
-    // Wait for the server
-    server.wait();
+    // Wait for Ctrl+C (or SIGTERM), then finish the requests in flight and stop
+    int signal = workers.wait();
+    std::cout << "Signal " << signal << " received: shutting down" << std::endl;
+    server.shutdown(std::chrono::seconds(5));
+    workers.stop();
     
     return 0;
 }

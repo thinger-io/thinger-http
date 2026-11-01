@@ -1,24 +1,26 @@
 #ifndef THINGER_ASIO_SSL_CERTIFICATE_MANAGER_HPP
 #define THINGER_ASIO_SSL_CERTIFICATE_MANAGER_HPP
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <unordered_map>
 #include <string>
 #include <set>
-#include <regex>
 #include <mutex>
 #include <optional>
 #include <string_view>
 #include <boost/asio/ssl/context.hpp>
+#include <boost/system/error_code.hpp>
 #include <openssl/ssl.h>
 #include "tls_session.hpp"
 
 namespace thinger::asio {
 
-// Forward declaration
-template<typename T>
-class regex_map;
+namespace detail {
+    // Values by host name, exact or wildcard (see certificate_manager.cpp)
+    template<typename T>
+    class host_table;
+}
 
 // Versions of the TLS protocol
 enum class tls_version : uint8_t { tls1_0, tls1_1, tls1_2, tls1_3 };
@@ -69,6 +71,36 @@ enum class certificate_error : uint8_t {
 certificate_error use_certificate(boost::asio::ssl::context& context, std::string_view certificate_chain,
                                   std::string_view private_key);
 
+class certificate_manager;
+
+// What the handshake of a server connection chose by the host name its client sent (SNI), kept
+// by the connection once the handshake completes (see ssl_socket), to check the host names of
+// its requests against it
+struct tls_handshake_record {
+    // The host name of the ClientHello, lowercase, without a trailing dot (not that of a
+    // session resumed); empty without SNI
+    std::string name;
+    bool has_name = false;
+    // The client certificate mode the handshake applied, and the one of its listener
+    client_verify mode = client_verify::none;
+    client_verify listener_mode = client_verify::none;
+    // The manager that chose; none if no manager did (gone, or not of this context)
+    std::weak_ptr<const certificate_manager> manager;
+
+    // Whether a request for `host` (its Host, port removed) is misdirected (RFC 9110 15.5.20)
+    // on this connection: `host` is not the handshake's name, and the manager would give it
+    // another client certificate mode than the one applied or, with SNI, another certificate
+    // entry (by its registered name: replacing a certificate changes none) than to that name.
+    // Without SNI only the mode is compared: a client that named no host negotiated the
+    // default certificate for any. The same name, or no manager, is never misdirected; another
+    // name is, once the manager that chose is gone (fails closed)
+    bool misdirected(std::string_view host) const;
+
+    // Internal (ssl_socket): the record of the server handshake just completed on `ssl`, moved
+    // out of it; empty (no manager) if no manager chose for it
+    static tls_handshake_record take(SSL* ssl);
+};
+
 // Certificates of the TLS servers: a default one, and one per host name selected by SNI (exact
 // or wildcard). The contexts it creates (from PEM, or the self-signed default) have its TLS
 // options (see set_tls_options()), the certificate of a host included, so SNI cannot lower them.
@@ -82,39 +114,41 @@ certificate_error use_certificate(boost::asio::ssl::context& context, std::strin
 // A host name may also ask for client certificates in a mode of its own (see
 // set_client_verify()), e.g. the host of the devices in a listener that asks for none. Every
 // context it creates or is given has the same session id context, so that sessions with client
-// certificates can be resumed.
-class certificate_manager {
+// certificates can be resumed, and the session cache of the listeners that use it (see
+// listener_options::session_cache), on which they must agree.
+//
+// An application creates as many managers as it needs (one per listener, or one shared), each
+// with its own certificates, options and modes. A manager is always held by a shared_ptr (built
+// with std::make_shared): the SNI callback of its contexts reaches it through a weak_ptr kept
+// with each context (and freed with it), never through a raw pointer, so a context may outlive
+// its manager. The handshakes of a context whose manager is gone stay on that context (their
+// listener's certificate and client certificate mode). One kept elsewhere than in a shared_ptr
+// leaves its contexts without SNI the same way. A context belongs to one manager: given ready
+// made to two, the SNI of its handshakes goes to the last one it was given to (not supported).
+//
+// The setters return an error_code: empty on success, `invalid_argument` (the reason logged)
+// when what they are given cannot be used, and then nothing changes.
+class certificate_manager : public std::enable_shared_from_this<certificate_manager> {
 private:
-    // Private constructor for singleton
-    certificate_manager();
-    
-    // Delete copy and move operations
-    certificate_manager(const certificate_manager&) = delete;
-    certificate_manager& operator=(const certificate_manager&) = delete;
-    certificate_manager(certificate_manager&&) = delete;
-    certificate_manager& operator=(certificate_manager&&) = delete;
-    
-    // Install the server name callback (see sni_callback()), the client hello callback (which
-    // keeps the host name asked for) and the session id context on a context, before any
-    // handshake uses it: listeners do not write them into contexts shared with running servers
-    static void prepare_context(boost::asio::ssl::context& context);
-
-    // The key a host name is stored with: itself, or a regex for a wildcard (*.domain)
-    static std::string host_key(const std::string& hostname);
+    // Install the server name callback (see sni_callback()) with this manager as its argument,
+    // the client hello callback (which keeps the host name asked for) and the session id
+    // context on a context, before any handshake uses it: listeners do not write them into
+    // contexts shared with running servers
+    void prepare_context(boost::asio::ssl::context& context);
 
     // Create base SSL context with common settings, and the TLS options
-    static std::shared_ptr<boost::asio::ssl::context> create_base_ssl_context(const tls_options& options);
+    std::shared_ptr<boost::asio::ssl::context> create_base_ssl_context(const tls_options& options);
     
     // Create SSL context from certificate and key strings
     std::shared_ptr<boost::asio::ssl::context> create_ssl_context(
         const std::string& cert_chain,
         const std::string& private_key);
     
-    // Certificate storage with regex support for wildcards
-    std::unique_ptr<regex_map<std::shared_ptr<boost::asio::ssl::context>>> ssl_contexts_;
+    // Certificates by host name: exact names and wildcards (*.domain), lowercase
+    std::unique_ptr<detail::host_table<std::shared_ptr<boost::asio::ssl::context>>> ssl_contexts_;
 
-    // Client certificate modes by host name (lowercase), as the certificates
-    std::unique_ptr<regex_map<client_verify>> client_verify_;
+    // Client certificate modes by host name, matched as the certificates
+    std::unique_ptr<detail::host_table<client_verify>> client_verify_;
     
     // Default certificate context
     std::shared_ptr<boost::asio::ssl::context> default_context_;
@@ -135,6 +169,10 @@ private:
     std::optional<legacy_change> legacy_;
     bool ciphers_chosen_ = false;
 
+    // Whether a self-signed default is generated when there is none (until
+    // remove_default_certificate())
+    bool self_signed_default_ = true;
+
     // Validate and set the options (with the lock held)
     bool update_tls_options(const tls_options& options);
     
@@ -144,53 +182,107 @@ private:
     // Generate self-signed certificate for development (with the lock held)
     void generate_self_signed_certificate();
 
+    // The session cache claimed by the listeners of this manager (see claim_session_cache()):
+    // none until the first claim, kept (with no holder) when the last one is released
+    struct session_cache_claim {
+        session_cache_options options;
+        std::size_t holders = 0;
+    };
+    std::optional<session_cache_claim> session_cache_;
+
+    // Write the claimed session cache, if any, on a context the manager holds from now on
+    // (with the lock held)
+    void apply_session_cache(boost::asio::ssl::context& context) const;
+
+    // A listener opening on this manager claims its session cache, which applies it to every
+    // context of the manager (those it holds and those it gets afterwards).
+    // `invalid_argument` (logged), and nothing changes, if it is enabled with a size of 0, or
+    // differs from the one held by other listeners. A setting with no holder left may be
+    // replaced. The listener releases it once, when it stops; the contexts keep it
+    friend class listener;
+    boost::system::error_code claim_session_cache(const session_cache_options& options);
+    void release_session_cache();
+
     // The context of a handshake: the certificate of the host name (SNI), or the default one
     // (none if there is no default yet)
     std::shared_ptr<boost::asio::ssl::context> select_context(const char* hostname) const;
 
     // Ask the client of a handshake for its certificate in the mode of its host name, if it
     // has one, or in the mode of the listener, with the CAs and limits of the listener (which
-    // switching the context dropped). Nothing if neither asks: the SSL keeps its settings
+    // switching the context dropped). Nothing if neither asks: the SSL keeps its settings.
+    // Recorded in the handshake of the SSL (see tls_handshake_record)
     void apply_client_verify(SSL* ssl, const char* hostname) const;
+
+    // See tls_handshake_record::misdirected(), once the names differ
+    friend struct tls_handshake_record;
+    bool misdirected(const tls_handshake_record& handshake, std::string_view host) const;
     
 public:
-    // Singleton instance
-    static certificate_manager& instance();
-    
-    // Certificate management
-    bool set_certificate(const std::string& hostname, 
-                        const std::string& certificate, 
-                        const std::string& private_key);
-    
-    bool set_certificate(const std::string& hostname,
-                        std::shared_ptr<boost::asio::ssl::context> ssl_context);
-    
+    // Always kept in a shared_ptr (std::make_shared<certificate_manager>()): see above
+    certificate_manager();
+    ~certificate_manager();
+
+    certificate_manager(const certificate_manager&) = delete;
+    certificate_manager& operator=(const certificate_manager&) = delete;
+    certificate_manager(certificate_manager&&) = delete;
+    certificate_manager& operator=(certificate_manager&&) = delete;
+
+    // Host names are matched exactly, or by a wildcard "*.domain" for one more label (not
+    // empty) in front of domain, an exact name first, case-insensitive (a trailing dot of the
+    // name looked up ignored): a lookup probes one exact name and one wildcard, however many
+    // there are. A name is a host name (labels of 1 to 63 letters, digits, hyphens or
+    // underscores, 253 characters at most) or "*." and one: the setters refuse any other
+    // (`invalid_argument`), patterns included.
+    //
+    // The certificate of a host name, from PEM (as use_certificate()) or as a context made
+    // elsewhere. `invalid_argument` if the name is not one or the certificate cannot be used (the
+    // host keeps the one it had). Replacing the one of the default host (see set_default_host())
+    // replaces the default certificate too
+    boost::system::error_code set_certificate(const std::string& hostname,
+                                              const std::string& certificate,
+                                              const std::string& private_key);
+
+    boost::system::error_code set_certificate(const std::string& hostname,
+                                              std::shared_ptr<boost::asio::ssl::context> ssl_context);
+
+    // The certificate of the handshakes with the host name `hostname` (wildcards resolved): a
+    // wildcard is also found by its own name ("*.domain")
     std::shared_ptr<boost::asio::ssl::context> get_certificate(const std::string& hostname) const;
     
     bool has_certificate(const std::string& hostname) const;
     
+    // Remove the certificate registered with this name (a wildcard by its "*.domain"): false,
+    // and nothing changes, if there is none
     bool remove_certificate(const std::string& hostname);
     
     // Default certificate management: the certificate of the handshakes without a host name
     // (SNI) or with one without a certificate. Replacing it applies to the next handshakes of
     // the servers already listening, as Node's setSecureContext() does; connections keep theirs.
-    // The PEM version keeps the current one and returns false if they are not valid
-    void set_default_certificate(std::shared_ptr<boost::asio::ssl::context> ssl_context);
-    bool set_default_certificate(const std::string& certificate, const std::string& private_key);
+    // Both versions return `invalid_argument` (logged) and keep the current one, and the
+    // self-signed setting, when given nothing usable: PEM that is not valid, or a null context
+    // (null does not drop the default: remove_default_certificate() does). Without one,
+    // get_default_certificate() generates a self-signed certificate (for development) on its
+    // first call, unless remove_default_certificate() was called since the last one set
+    boost::system::error_code set_default_certificate(std::shared_ptr<boost::asio::ssl::context> ssl_context);
+    boost::system::error_code set_default_certificate(const std::string& certificate, const std::string& private_key);
     std::shared_ptr<boost::asio::ssl::context> get_default_certificate() const;
+    // The way to drop the default certificate: get_default_certificate() returns none (no
+    // self-signed one is generated) until one is set again. Servers already listening keep the context they
+    // listen with; their handshakes switch to no other default
+    void remove_default_certificate();
     void set_default_host(const std::string& host);
     std::string get_default_host() const;
     
-    // Get all registered hostnames
+    // The names of the certificates, lowercase, as registered ("*.domain" for a wildcard)
     std::set<std::string> get_registered_hosts() const;
 
     // Client certificates of the handshakes whose host name (SNI) is `hostname`: exact or a
-    // wildcard ("*.domain"), as the certificates, but case-insensitive. Other hosts keep the
-    // mode of their listener (see tcp_socket_server::enable_ssl()), whose trusted CAs and limits
-    // apply (deferred validation on a listener that asks for none). Applies to the next
-    // handshakes of the servers already listening. False if `hostname` is not a host name.
-    // A session is never resumed without a certificate on a host that requires one
-    bool set_client_verify(const std::string& hostname, client_verify mode);
+    // wildcard ("*.domain"), matched as the certificates. Other hosts keep the mode of their
+    // listener (see listener_options::client_verify), whose trusted CAs and limits apply
+    // (deferred validation on a listener that asks for none). Applies to the next handshakes of
+    // the servers already listening. `invalid_argument` if `hostname` is not a host name. A
+    // session is never resumed without a certificate on a host that requires one
+    boost::system::error_code set_client_verify(const std::string& hostname, client_verify mode);
     // Back to the mode of the listener: false if `hostname` had no mode of its own
     bool remove_client_verify(const std::string& hostname);
     // The mode of the handshakes with the host name `hostname` (wildcards resolved), if it has
@@ -198,19 +290,19 @@ public:
     std::optional<client_verify> get_client_verify(const std::string& hostname) const;
     
     // TLS options of the contexts created from now on (those created before keep theirs): set
-    // them before the certificates, and before listening. False if OpenSSL refuses them, then
-    // the current ones are kept. The defaults are those of tls_options. They replace everything
-    // the two setters below changed
-    bool set_tls_options(const tls_options& options);
+    // them before the certificates, and before listening. `invalid_argument` if OpenSSL refuses
+    // them, then the current ones are kept. The defaults are those of tls_options. They replace
+    // everything the two setters below changed
+    boost::system::error_code set_tls_options(const tls_options& options);
     tls_options get_tls_options() const;
 
     // Deprecated, use set_tls_options(); they change the options as set_tls_options() would,
     // and are validated as well (in any order, they give the same options).
     //
     // The TLS 1.2 ciphers (empty: OpenSSL's defaults) and whether the server's order is
-    // preferred: tls_options::ciphers and tls_options::prefer_server_ciphers. False if OpenSSL
-    // refuses the ciphers (the current ones are kept)
-    bool set_server_ciphers(const std::string& ciphers, bool prefer_server_ciphers);
+    // preferred: tls_options::ciphers and tls_options::prefer_server_ciphers.
+    // `invalid_argument` if OpenSSL refuses the ciphers (the current ones are kept)
+    boost::system::error_code set_server_ciphers(const std::string& ciphers, bool prefer_server_ciphers);
     // Allow TLS 1.0 and 1.1 (true): the minimum version is TLS 1.0, the OpenSSL security level
     // 0 (OpenSSL 3 refuses them above), and the ciphers OpenSSL's defaults (TLS 1.0 and 1.1 have
     // no AEAD cipher) unless set_server_ciphers() chose them. False undoes only what true did,
@@ -221,122 +313,10 @@ public:
     // or is given: switches to the certificate of the host name, or to the default certificate
     // when it is not the one the listener was created with, and asks for the client
     // certificate in the mode of the host name (see set_client_verify()). OpenSSL calls it with
-    // or without SNI, from the context of the listener
+    // or without SNI, from the context of the listener, with the weak_ptr to the manager kept
+    // with that context as `arg`: if the manager is gone (or `arg` is null) the handshake stays
+    // on the context it started with
     static int sni_callback(SSL* ssl, int* al, void* arg);
-};
-
-// Simple regex map implementation for certificate hostname matching
-template<typename T>
-class regex_map {
-private:
-    struct regex_entry {
-        std::string key;
-        T value;
-        std::regex pattern;
-        
-        regex_entry(const std::string& k, const T& v, const std::regex& p) 
-            : key(k), value(v), pattern(p) {}
-    };
-    
-    std::vector<regex_entry> regex_items_;
-    std::unordered_map<std::string, T> non_regex_items_;
-    mutable std::mutex mutex_;
-    
-public:
-    void set(const std::string& key, const T& value, const std::string& original = "") {
-        std::lock_guard<std::mutex> lock(mutex_);
-        
-        // Store the original key
-        std::string store_key = original.empty() ? key : original;
-        
-        // Check if key contains regex patterns
-        bool has_regex_chars = key.find_first_of("^$.*+?{}[]|()\\") != std::string::npos;
-        
-        if (!has_regex_chars) {
-            // Store as non-regex item
-            non_regex_items_[store_key] = value;
-        } else {
-            // Remove any existing regex entry with the same original key
-            regex_items_.erase(
-                std::remove_if(regex_items_.begin(), regex_items_.end(),
-                    [&store_key](const regex_entry& e) { return e.key == store_key; }),
-                regex_items_.end()
-            );
-            
-            // Treat as regex pattern
-            try {
-                regex_items_.emplace_back(store_key, value, std::regex(key));
-            } catch (const std::regex_error& e) {
-                // If regex compilation fails, skip this entry
-                return;
-            }
-        }
-    }
-    
-    std::optional<T> get(const std::string& key) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        
-        // First try exact match in non-regex items
-        auto it = non_regex_items_.find(key);
-        if (it != non_regex_items_.end()) {
-            return it->second;
-        }
-        
-        // Check if the key itself is a stored regex pattern (like *.example.com)
-        for (const auto& item : regex_items_) {
-            if (item.key == key) {
-                return item.value;
-            }
-        }
-        
-        // Then try regex matches
-        for (const auto& item : regex_items_) {
-            if (std::regex_match(key, item.pattern)) {
-                return item.value;
-            }
-        }
-        
-        return std::nullopt;
-    }
-    
-    bool has(const std::string& key) const {
-        return get(key).has_value();
-    }
-    
-    void erase(const std::string& key) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        
-        // Try to erase from non-regex items first
-        auto it = non_regex_items_.find(key);
-        if (it != non_regex_items_.end()) {
-            non_regex_items_.erase(it);
-            return;
-        }
-        
-        // Then try regex items
-        regex_items_.erase(
-            std::remove_if(regex_items_.begin(), regex_items_.end(),
-                [&key](const regex_entry& e) { return e.key == key; }),
-            regex_items_.end()
-        );
-    }
-    
-    std::set<std::string> keys() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::set<std::string> result;
-        
-        // Add non-regex keys
-        for (const auto& pair : non_regex_items_) {
-            result.insert(pair.first);
-        }
-        
-        // Add regex keys
-        for (const auto& entry : regex_items_) {
-            result.insert(entry.key);
-        }
-        
-        return result;
-    }
 };
 
 } // namespace thinger::asio

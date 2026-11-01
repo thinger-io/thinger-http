@@ -3,7 +3,11 @@
 
 #include "http_client_base.hpp"
 #include "request_builder.hpp"
+#include "../../asio/io_context_of.hpp"
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/use_future.hpp>
+#include <chrono>
+#include <future>
 
 namespace thinger::http {
 
@@ -33,16 +37,15 @@ class client : public http_client_base {
 private:
     boost::asio::io_context io_context_;
 
-    // Internal helper to run an awaitable synchronously
+    // Internal helper to run an awaitable synchronously: until it completes (an open
+    // WebSocket keeps the io_context busy with its keepalive)
     template<typename T>
     T exec(awaitable<T> coro) {
-        T result;
-        co_spawn(io_context_, [&result, coro = std::move(coro)]() mutable -> awaitable<void> {
-            result = co_await std::move(coro);
-        }, detached);
-        io_context_.run();
-        io_context_.restart();
-        return result;
+        auto result = co_spawn(io_context_, std::move(coro), boost::asio::use_future);
+        asio::run_until(io_context_, [&] {
+            return result.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        });
+        return result.get();
     }
 
 protected:
@@ -51,8 +54,8 @@ protected:
     }
 
 public:
-    // The io_context runs only during a call (and the WebSocket calls run it until it has no
-    // work): idle connections are not closed by timers, but when found expired as a request
+    // The io_context runs only during a call, until its operation completes (as the WebSocket
+    // calls): idle connections are not closed by timers, but when found expired as a request
     // starts or ends. Between calls nothing runs: clear_connections() closes them
     client() { pool_.use_idle_timers(false); }
     // The idle connections are closed while their io_context exists

@@ -7,6 +7,7 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include "../fixtures/server_listen.hpp"
 
 using namespace thinger;
 
@@ -26,8 +27,8 @@ TEST_CASE("Basic HTTP Server Test", "[server]") {
         });
 
         // Start server on OS-assigned port
-        REQUIRE(server.listen("127.0.0.1", 0));
-        REQUIRE(server.local_port() != 0);
+        REQUIRE_FALSE(server.listen("127.0.0.1", 0));
+        REQUIRE(http::test::listening_port(server) != 0);
     }
     
     SECTION("Server can handle multiple endpoints") {
@@ -48,21 +49,21 @@ TEST_CASE("Basic HTTP Server Test", "[server]") {
         });
 
         // Start server on OS-assigned port
-        REQUIRE(server.listen("127.0.0.1", 0));
+        REQUIRE_FALSE(server.listen("127.0.0.1", 0));
     }
     
     SECTION("Server fails to start on invalid address") {
         // Create server instance
         http::server server;
         
-        // Set max attempts to 1 to fail fast in tests
-        server.set_max_listening_attempts(1);
-        
-        // Try to start on invalid IP address
-        bool started = server.listen("999.999.999.999", 8080);
-        
+        // Try to start on invalid IP address (one attempt, to fail fast in tests)
+        asio::listener_options options;
+        options.endpoint = asio::tcp_endpoint{"999.999.999.999", 8080};
+        options.max_listening_attempts = 1;
+
         // Should fail due to invalid IP
-        REQUIRE_FALSE(started);
+        REQUIRE(server.listen(std::move(options)));
+        REQUIRE_FALSE(server.is_listening());
     }
     
     SECTION("Server fails to start on port already in use") {
@@ -71,19 +72,20 @@ TEST_CASE("Basic HTTP Server Test", "[server]") {
             http::server server1;
 
             // Start first server on OS-assigned port
-            REQUIRE(server1.listen("127.0.0.1", 0));
-            auto port = server1.local_port();
+            REQUIRE_FALSE(server1.listen("127.0.0.1", 0));
+            auto port = http::test::listening_port(server1);
 
             // Create second server instance in nested scope
             {
                 http::server server2;
 
-                // Set max attempts to 1 to fail fast in tests
-                server2.set_max_listening_attempts(1);
-
-                // Try to start second server on same port - should fail
-                bool started2 = server2.listen("127.0.0.1", port);
-                REQUIRE_FALSE(started2);
+                // Try to start second server on same port (one attempt, to fail fast in
+                // tests) - should fail
+                asio::listener_options options;
+                options.endpoint = asio::tcp_endpoint{"127.0.0.1", port};
+                options.max_listening_attempts = 1;
+                REQUIRE(server2.listen(std::move(options)));
+                REQUIRE(server2.listening_on().empty());
 
                 // server2 should be destroyed cleanly here even though it failed to start
             }
@@ -94,15 +96,30 @@ TEST_CASE("Basic HTTP Server Test", "[server]") {
         // Both servers destroyed here
     }
     
-    SECTION("Server cannot start twice") {
+    SECTION("Server cannot listen twice on the same endpoint") {
         // Create server instance
         http::server server;
 
         // Start server first time
-        REQUIRE(server.listen("127.0.0.1", 0));
+        REQUIRE_FALSE(server.listen("127.0.0.1", 0));
+        auto port = http::test::listening_port(server);
 
-        // Try to start again - should fail
-        bool started2 = server.listen("127.0.0.1", 0);
-        REQUIRE_FALSE(started2);
+        // The same endpoint again fails, leaving the listener open as it is
+        REQUIRE(server.listen("127.0.0.1", port) == boost::asio::error::address_in_use);
+        REQUIRE(server.listening_on().size() == 1);
+
+        // Port 0 is always a new endpoint: a second listener
+        REQUIRE_FALSE(server.listen("127.0.0.1", 0));
+        REQUIRE(server.listening_on().size() == 2);
     }
+}
+TEST_CASE("listening_on() is empty while the server is not listening", "[server]") {
+    http::server server;
+    REQUIRE(server.listening_on().empty());
+    REQUIRE_FALSE(server.listen("127.0.0.1", 0));
+    auto port = http::test::listening_port(server);
+    REQUIRE(port != 0);
+    REQUIRE(server.listening_on() == std::vector<std::string>{"http://127.0.0.1:" + std::to_string(port)});
+    server.stop();
+    REQUIRE(server.listening_on().empty());
 }

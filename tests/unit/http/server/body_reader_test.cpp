@@ -77,12 +77,13 @@ namespace {
         size_t reads = 0;
 
         body_reader::source source() {
-            return [this](uint8_t* buffer, size_t size) -> thinger::awaitable<size_t> {
+            return [this](uint8_t* buffer, size_t size) -> thinger::awaitable<thinger::io_result> {
                 reads++;
                 size_t bytes = std::min({size, piece, data.size() - position});
                 std::memcpy(buffer, data.data() + position, bytes);
                 position += bytes;
-                co_return bytes;
+                if (bytes == 0) co_return thinger::io_result{boost::asio::error::eof, 0};
+                co_return thinger::io_result{boost::system::error_code{}, bytes};
             };
         }
 
@@ -460,16 +461,16 @@ TEST_CASE("Cancelled body reads leave the body pending", "[body_reader][cancella
     // bytes, as a socket read cancelled), then data arrives
     boost::asio::io_context ioc;
     std::string data;
-    auto source = [&](uint8_t* buffer, size_t size) -> thinger::awaitable<size_t> {
+    auto source = [&](uint8_t* buffer, size_t size) -> thinger::awaitable<thinger::io_result> {
         if (data.empty()) {
             boost::asio::steady_timer never(ioc, std::chrono::steady_clock::time_point::max());
-            co_await never.async_wait(thinger::use_nothrow_awaitable);
-            co_return 0;
+            auto [ec] = co_await never.async_wait(thinger::use_nothrow_awaitable);
+            co_return thinger::io_result{ec, 0};
         }
         size_t bytes = std::min(size, data.size());
         std::memcpy(buffer, data.data(), bytes);
         data.erase(0, bytes);
-        co_return bytes;
+        co_return thinger::io_result{boost::system::error_code{}, bytes};
     };
 
     // Reads with a timeout, as a handler or the reverse proxy do (the read loses the race)
@@ -538,7 +539,9 @@ TEST_CASE("Cancelled body reads leave the body pending", "[body_reader][cancella
     SECTION("A connection that ends is still an incomplete body") {
         body_reader reader;
         reader.set_framing(false, 5);
-        reader.set_source([](uint8_t*, size_t) -> thinger::awaitable<size_t> { co_return 0; });
+        reader.set_source([](uint8_t*, size_t) -> thinger::awaitable<thinger::io_result> {
+            co_return thinger::io_result{boost::asio::error::eof, 0};
+        });
 
         REQUIRE(run(reader.read_some(buffer, sizeof(buffer))) == 0);
         REQUIRE(reader.error() == body_error::incomplete);

@@ -1,85 +1,57 @@
 #include "pool_server.hpp"
+#include "../../asio/detail/listener_access.hpp"
+#include "../../asio/io_context_of.hpp"
 #include "../../util/logger.hpp"
-#include "../../asio/ssl/certificate_manager.hpp"
 
 namespace thinger::http {
 
-pool_server::pool_server() 
-    : worker_client("http_pool_server") {
+pool_server::pool_server(asio::workers& workers)
+    : workers_(workers) {
     LOG_DEBUG("Created HTTP pool server");
+    // The end of a shutdown releases wait(), without calling stop() (see set_shutdown_stop())
+    set_shutdown_stop([this] { release_wait(); });
 }
 
 pool_server::~pool_server() {
     LOG_DEBUG("Destroying HTTP pool server");
-    if (is_running()) {
-        stop();
-    }
+    stop();
 }
 
-std::unique_ptr<asio::socket_server> pool_server::create_socket_server(
-    const std::string& host, const std::string& port) {
-    
-    // Use legacy constructor that automatically uses workers
-    auto server = std::make_unique<asio::socket_server>(host, port);
-    
-    // Configure SSL if enabled
-    if (ssl_enabled_) {
-        server->enable_ssl(true);
-        
-        auto& cert_mgr = asio::certificate_manager::instance();
-        auto default_ctx = cert_mgr.get_default_certificate();
-        
-        if (!default_ctx) {
-            LOG_ERROR("No default SSL certificate configured");
-            return nullptr;
-        }
-
-        // It has the SNI callback of the manager already
-        server->set_ssl_context(default_ctx);
-    }
-
-    return server;
-}
-
-std::unique_ptr<asio::unix_socket_server> pool_server::create_unix_socket_server(
-    const std::string& unix_path) {
-    
-    // Use legacy constructor that automatically uses workers
-    auto server = std::make_unique<asio::unix_socket_server>(unix_path);
-    
-    return server;
+std::unique_ptr<asio::listener> pool_server::create_listener(asio::listener_options options) {
+    auto listener = std::make_unique<asio::listener>(
+        std::move(options),
+        [this]() -> boost::asio::any_io_executor { return workers_.get_thread_io_context().get_executor(); },
+        workers_.provider());
+    // Accepting does not wait behind the connections a worker serves
+    asio::detail::listener_access::use_acceptor_thread(*listener);
+    return listener;
 }
 
 boost::asio::io_context* pool_server::shutdown_context() {
-    auto& workers = asio::get_workers();
-    return workers.running() ? &workers.get_thread_io_context() : nullptr;
+    // One read of the workers, which may stop meanwhile on another thread: none once stopped
+    return asio::io_context_of(workers_.next_executor());
 }
 
 bool pool_server::in_server_thread() {
-    return asio::get_workers().in_worker_thread();
+    return workers_.in_worker_thread();
 }
 
-bool pool_server::stop() {
-    // Stop the socket server
-    bool result = http_server_base::stop();
-    
-    // Call base class implementation to handle notifications
-    worker_client::stop();
-    
-    return result;
+void pool_server::stop() {
+    server_base::stop();
+    release_wait();
 }
 
-void pool_server::graceful_stop(std::chrono::milliseconds grace, std::function<void()> done) {
-    if (!is_running()) {
-        done();
-        return;
+void pool_server::release_wait() {
+    {
+        std::lock_guard<std::mutex> lock(wait_mutex_);
+        stopped_ = true;
     }
-    begin_shutdown(grace, [done = std::move(done)](bool) { done(); });
+    wait_cv_.notify_all();
 }
 
 void pool_server::wait() {
-    // Use worker_client's wait implementation
-    worker_client::wait();
+    std::unique_lock<std::mutex> lock(wait_mutex_);
+    wait_cv_.wait(lock, [this] { return stopped_; });
 }
 
 } // namespace thinger::http

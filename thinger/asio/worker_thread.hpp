@@ -16,6 +16,8 @@ namespace thinger::asio{
 
         std::thread::id start();
         bool stop();
+        // Once stopped: destroy the pending handlers, keeping the io_context (see io_worker)
+        void shutdown();
         void run(std::function<void()> handler);
 
     protected:

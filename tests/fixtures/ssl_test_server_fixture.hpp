@@ -6,6 +6,7 @@
 #include <thinger/http/server/response.hpp>
 #include <thinger/asio/ssl/certificate_manager.hpp>
 #include <nlohmann/json.hpp>
+#include "server_listen.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <chrono>
@@ -16,13 +17,14 @@ namespace thinger::http::test {
 
 // HTTPS test server fixture with SSL support and self-signed certificate
 struct SSLTestServerFixture {
+    // The certificates of the server: a self-signed default
+    std::shared_ptr<asio::certificate_manager> certificates = std::make_shared<asio::certificate_manager>();
     http::server server;
     uint16_t port = 0;
     std::string base_url;
     std::thread server_thread;
 
     SSLTestServerFixture() {
-        server.enable_ssl(true);
         setup_default_endpoints();
         start_server();
     }
@@ -97,39 +99,23 @@ protected:
         });
 
         // /delay/:seconds endpoint
-        server.get("/delay/:seconds", [](http::request& req, http::response& res) {
+        server.get("/delay/:seconds", [](http::request& req, http::response& res) -> awaitable<void> {
             auto seconds_str = req["seconds"];
             int seconds = seconds_str.empty() ? 1 : std::stoi(seconds_str);
 
-            auto connection = req.get_http_connection();
-            if (!connection) {
+            // The handler runs on its connection's executor
+            boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, std::chrono::seconds(seconds));
+            auto [ec] = co_await timer.async_wait(use_nothrow_awaitable);
+            if (!ec) {
+                nlohmann::json response;
+                response["delay"] = seconds;
+                response["status"] = "ok";
+                res.json(response);
+            } else {
+                // Timer was cancelled or error occurred
                 res.status(http::http_response::status::internal_server_error);
-                res.send("No connection available");
-                return;
+                res.send("Timer error");
             }
-
-            auto socket = connection->get_socket();
-            if (!socket) {
-                res.status(http::http_response::status::internal_server_error);
-                res.send("No socket available");
-                return;
-            }
-
-            auto& io_context = socket->get_io_context();
-            auto timer = std::make_shared<boost::asio::steady_timer>(io_context);
-            timer->expires_after(std::chrono::seconds(seconds));
-
-            timer->async_wait([res = std::move(res), seconds, timer](const boost::system::error_code& ec) mutable {
-                if (!ec) {
-                    nlohmann::json response;
-                    response["delay"] = seconds;
-                    response["status"] = "ok";
-                    res.json(response);
-                } else {
-                    res.status(http::http_response::status::internal_server_error);
-                    res.send("Timer error");
-                }
-            });
         });
 
         // /redirect/:n endpoint
@@ -227,8 +213,8 @@ protected:
 
 private:
     void start_server() {
-        REQUIRE(server.listen("0.0.0.0", 0));
-        port = server.local_port();
+        REQUIRE_FALSE(server.listen(listen_options("0.0.0.0", 0, certificates)));
+        port = listening_port(server);
         base_url = "https://localhost:" + std::to_string(port);
 
         std::promise<void> ready;

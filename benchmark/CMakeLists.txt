@@ -44,3 +44,7 @@ target_link_libraries(benchmark_ws_echo PRIVATE thinger::http)
 # A server pushing to a slow WebSocket reader: bytes queued and memory by producer mode
 add_executable(benchmark_ws_slow_reader websocket/ws_slow_reader_benchmark.cpp)
 target_link_libraries(benchmark_ws_slow_reader PRIVATE thinger::http)
+
+# Server CPU per message of WebSocket connections that get a message now and then
+add_executable(benchmark_ws_sporadic websocket/ws_sporadic_benchmark.cpp)
+target_link_libraries(benchmark_ws_sporadic PRIVATE thinger::http)

@@ -3,6 +3,8 @@
 #pragma once
 
 #include "socket.hpp"
+#include "../async_event.hpp"
+#include "../watchdog.hpp"
 #include "../../util/close_notifier.hpp"
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -131,6 +133,9 @@ public:
     // One message of the type set with set_binary(), as write(), but an empty one is sent too
     // (a frame without payload), for message-oriented users
     awaitable<io_result> write_message(std::string_view data);
+    // The same, a frame larger than WRITE_SLICE_SIZE written in slices (still one frame),
+    // `progress` called after each one (see socket::write_slices()), e.g. to move a write deadline
+    awaitable<io_result> write_message(std::string_view data, const sync_callback<void()>& progress);
 
     // Wait
     awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type) override;
@@ -173,6 +178,8 @@ public:
     bool is_open() const override;
     bool is_secure() const override;
     size_t available() const override;
+    // The one of the socket it runs on
+    size_t send_backlog() const override;
     std::string get_remote_ip() const override;
     std::string get_local_port() const override;
     std::string get_remote_port() const override;
@@ -194,9 +201,15 @@ public:
     const boost::asio::any_io_executor& get_executor() const { return executor_; }
 
     // Keepalive: ping the peer once nothing was received from it for `ping_interval`, and
-    // close the connection once nothing was received for `idle_timeout` (pongs included).
-    // 0 disables each one; calling it again replaces the previous settings, and counts the
-    // idle time from then. Requires the websocket to be owned by a std::shared_ptr.
+    // close the connection (1001) once nothing was received for `idle_timeout` (pongs
+    // included). 0 disables each one; calling it again replaces the previous settings, and
+    // counts the idle time from then. Requires the websocket to be owned by a std::shared_ptr.
+    // In the client role, for a user that does not read all the time (e.g. a synchronous
+    // client between its calls): bytes that reached the socket while nothing read count as
+    // received, once its check sees them; and, with a ping interval under the idle timeout, a
+    // check that runs late (nothing ran the executor) pings first, and closes only once that
+    // ping went unanswered for idle_timeout - ping_interval. Run on time, the instants are the
+    // same; in the server role nothing of this applies
     void set_keepalive(std::chrono::milliseconds ping_interval, std::chrono::milliseconds idle_timeout);
     std::chrono::milliseconds get_ping_interval() const { return ping_interval_; }
     std::chrono::milliseconds get_idle_timeout() const { return idle_timeout_; }
@@ -253,15 +266,19 @@ private:
     void release_write();
     void wake_writers();
     awaitable<io_result> send_frame(uint8_t opcode, const std::vector<boost::asio::const_buffer>& payload,
-                                    bool control);
+                                    bool control, const sync_callback<void()>* progress = nullptr);
     // Write a frame, holding the turn: the rest of an interrupted frame first, and what this
-    // one leaves if interrupted
-    awaitable<boost::system::error_code> write_frame(uint8_t opcode, const std::vector<boost::asio::const_buffer>& payload);
+    // one leaves if interrupted. In slices with a `progress` (see write_message())
+    awaitable<boost::system::error_code> write_frame(uint8_t opcode, const std::vector<boost::asio::const_buffer>& payload,
+                                                     const sync_callback<void()>* progress = nullptr);
     awaitable<boost::system::error_code> send_close(uint16_t code);
     // Queue a pong (answering the last ping) or a ping, sent without waiting for it
     void queue_control();
     // Send the control frames queued, holding the turn
     awaitable<void> flush_control();
+    // Close the connection when idle for too long, or queue a ping when due, and arm the
+    // keepalive for the next check
+    void check_keepalive();
 
     void start_linger();
     // The rest of a frame and a close frame, the bytes still buffered and the payload
@@ -298,8 +315,9 @@ private:
 
     // Writes waiting for their turn
     struct write_waiter {
-        explicit write_waiter(const boost::asio::any_io_executor& executor) : timer(executor) {}
-        boost::asio::steady_timer timer;
+        explicit write_waiter(const boost::asio::any_io_executor& executor) : turn(executor) {}
+        // Set when the turn is granted, or the writers are woken (closed, cancelled)
+        async_event turn;
         bool control = false;
         bool granted = false;
     };
@@ -330,12 +348,15 @@ private:
     util::close_notifier<websocket_close> on_close_;
 
     // Keepalive
-    std::shared_ptr<boost::asio::steady_timer> keepalive_timer_;
-    uint64_t keepalive_generation_ = 0;
+    watchdog keepalive_;
     std::chrono::milliseconds ping_interval_{0};
     std::chrono::milliseconds idle_timeout_{0};
     std::chrono::steady_clock::time_point last_received_;
     std::chrono::steady_clock::time_point last_ping_;
+    // In the client role: the first ping sent since the last byte received, and the bytes
+    // available (unread) at the previous check
+    std::chrono::steady_clock::time_point first_ping_;
+    size_t available_seen_ = 0;
 };
 
 }

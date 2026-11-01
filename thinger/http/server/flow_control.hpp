@@ -6,7 +6,8 @@
 #include <cstddef>
 #include <memory>
 #include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/steady_timer.hpp>
+#include "../../asio/async_event.hpp"
+#include "../../asio/watchdog.hpp"
 #include "../../util/types.hpp"
 
 namespace thinger::http {
@@ -36,9 +37,12 @@ namespace thinger::http {
         /// written, one a sender waits for, nor the rest of an SSE event being written; when
         /// that is not enough, the new message is dropped, so the limits hold
         overflow_policy policy = overflow_policy::drop_newest;
-        /// A write to the socket not done in time closes the connection (a WebSocket with 1013),
-        /// as a client that stopped reading; awaited sends and wait_writable() then return false
-        std::chrono::milliseconds write_timeout{0};
+        /// A write that makes no progress for this long (no byte taken by the socket, nor by the
+        /// peer from it, watched for a quarter of it more: see set_send_backlog()) closes
+        /// the connection (a WebSocket with 1013), as a client that stopped reading; awaited sends and wait_writable() then return false. A stall, not the time to
+        /// write a message: a slow client that keeps reading is never cut. 60 s, nginx's
+        /// send_timeout; 0 disables it
+        std::chrono::milliseconds write_timeout{60000};
     };
 
     /**
@@ -101,32 +105,42 @@ namespace thinger::http {
         void on_low_watermark(std::shared_ptr<void> owner, sync_callback<void()> callback);
         awaitable<bool> wait_writable(std::shared_ptr<void> owner);
 
-        /// A write starts, and finishes: one not done within the write timeout calls
-        /// `on_timeout(connection)`, if the connection still lives
-        template<typename Connection, typename OnTimeout>
-        void write_started(Connection& connection, OnTimeout on_timeout) {
-            if(closed_ || limits_.write_timeout.count() <= 0) return;
-            watch_write([weak = connection.weak_from_this(), on_timeout = std::move(on_timeout)]{
-                if(auto self = weak.lock()) on_timeout(*self);
-            });
-        }
+        /// A write starts, makes progress (some bytes taken by the socket), and finishes: one
+        /// without progress for the write timeout calls `on_timeout`, by a writer that keeps
+        /// its connection alive until the write finishes. Progress moves the deadline lazily
+        /// (see asio::watchdog): no timer operation
+        void write_started(sync_callback<void()> on_timeout);
+        void write_progressed();
         void write_finished();
+
+        /// The bytes the socket holds that the peer has not taken (asio::socket::send_backlog()),
+        /// checked once a write made no progress for the write timeout: their fall is progress
+        /// too. A backlog that does not fall within 1/BACKLOG_WATCH of the timeout after it times
+        /// the write out; one that does is checked every 1/BACKLOG_CHECKS of it from then. The
+        /// system may wake a writer only once much of its buffer is free (a third of it, over TCP
+        /// on Linux), long after a slow reader took the first byte. A write that progresses
+        /// within its timeout is never checked: no timer operation per message
+        void set_send_backlog(sync_callback<size_t()> backlog);
+        static constexpr int BACKLOG_CHECKS = 16;
+        static constexpr int BACKLOG_WATCH = 4;
 
         /// Waits end, pending notifications are dropped and the callbacks released
         void close();
         bool closed() const { return closed_; }
 
     private:
-        /// Shared with the notifications posted and the write timer, which may outlive this
+        /// Shared with the notifications posted, which may outlive this
         struct shared_state {
             bool closed = false;
-            uint64_t write_generation = 0;
             sync_callback<void()> on_high;
             sync_callback<void()> on_low;
         };
 
         void dispatch(std::shared_ptr<void> owner, sync_callback<void()> operation);
-        void watch_write(sync_callback<void()> on_timeout);
+        /// The write deadline from the last progress, with the limits set now
+        void arm_write_timer();
+        /// The timer expired: a backlog check, or the write timed out
+        void write_expired();
         void update_watermarks();
         void notify(bool high);
 
@@ -138,9 +152,16 @@ namespace thinger::http {
         bool congested_ = false;
         bool closed_ = false;
         bool write_watched_ = false;
-        /// Never expires: cancelled to wake the producers waiting
-        boost::asio::steady_timer drained_;
-        boost::asio::steady_timer write_timer_;
+        /// Set once the queue drains (or closes), waking the producers waiting; reset while congested
+        asio::async_event drained_;
+        /// The write timeout, and what it calls: released once the write finishes
+        asio::watchdog write_timer_;
+        std::chrono::steady_clock::time_point write_progress_{};
+        sync_callback<void()> on_write_timeout_;
+        sync_callback<size_t()> send_backlog_;
+        /// The backlog at the last check since the last progress, if checked
+        size_t backlog_seen_ = 0;
+        bool backlog_checked_ = false;
     };
 
 }

@@ -2,6 +2,7 @@
 #include <thinger/http/server/server_standalone.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
+#include <thinger/http/server/websocket_connection.hpp>
 #include <thinger/http/client/client.hpp>
 #include <thinger/util/types.hpp>
 #include <nlohmann/json.hpp>
@@ -9,6 +10,7 @@
 #include <boost/asio/use_future.hpp>
 #include <chrono>
 #include <thread>
+#include "../fixtures/server_listen.hpp"
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -50,7 +52,7 @@ namespace {
             co_return;
         });
         server.get("/ws", [](http::request& req, http::response& res) {
-            res.upgrade_websocket([](std::shared_ptr<http::websocket_connection>) {});
+            res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection>) {});
         });
         server.get("/slow", [](http::response& res) -> awaitable<void> {
             boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 5s);
@@ -194,11 +196,11 @@ TEST_CASE("Custom error format", "[server][errors][integration]") {
     }
 
     SECTION("Errors over a connection") {
-        REQUIRE(server.listen("127.0.0.1", 0));
+        REQUIRE_FALSE(server.listen("127.0.0.1", 0));
         std::thread thread([&server]() { server.wait(); });
 
         http::client client;
-        auto base = "http://127.0.0.1:" + std::to_string(server.local_port());
+        auto base = "http://127.0.0.1:" + std::to_string(http::test::listening_port(server));
 
         auto missing = client.get(base + "/missing");
         REQUIRE(missing.status() == 404);

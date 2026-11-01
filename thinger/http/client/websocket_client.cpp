@@ -2,6 +2,8 @@
 #include "../../asio/io_context_of.hpp"
 #include "../../util/logger.hpp"
 
+#include <boost/asio/use_future.hpp>
+
 #include <future>
 #include <stdexcept>
 
@@ -18,6 +20,25 @@ namespace {
         throw std::logic_error(std::string("websocket_client::") + call +
                                "() called on the strand of its WebSocket, where it would wait forever: "
                                "use the coroutine API (send_text_async(), receive_async()...)");
+    }
+
+    // A synchronous call: `operation` on the executor of the WebSocket, running its io_context
+    // until the operation completes (not until the io_context runs out of work: the keepalive
+    // keeps it busy)
+    template<typename T>
+    T run_blocking(asio::websocket& websocket, const char* call, awaitable<T> operation) {
+        ensure_not_on_strand(websocket, call);
+        auto future = boost::asio::co_spawn(websocket.get_executor(), std::move(operation), boost::asio::use_future);
+        asio::run_until(websocket.get_io_context(), [&] {
+            return future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        });
+        return future.get();
+    }
+
+    awaitable<void> apply_keepalive(std::shared_ptr<asio::websocket> websocket,
+                                    std::chrono::milliseconds ping_interval, std::chrono::milliseconds idle_timeout) {
+        websocket->set_keepalive(ping_interval, idle_timeout);
+        co_return;
     }
 
 }
@@ -66,32 +87,7 @@ std::shared_ptr<asio::websocket> websocket_client::release_socket() {
 
 bool websocket_client::send_text(std::string_view message) {
     if (!is_open()) return false;
-    ensure_not_on_strand(*websocket_, "send_text");
-
-    std::promise<bool> promise;
-    auto future = promise.get_future();
-
-    auto& io_context = websocket_->get_io_context();
-
-    boost::asio::co_spawn(
-        websocket_->get_executor(),
-        [this, msg = std::string(message), &promise]() -> awaitable<void> {
-            bool result = co_await send_text_async(std::move(msg));
-            promise.set_value(result);
-        },
-        boost::asio::detached
-    );
-
-    if (io_context.get_executor().running_in_this_thread()) {
-        while (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
-            io_context.poll_one();
-        }
-    } else {
-        io_context.run();
-        io_context.restart();
-    }
-
-    return future.get();
+    return run_blocking(*websocket_, "send_text", send_text_async(std::string(message)));
 }
 
 bool websocket_client::send_binary(const void* data, size_t size) {
@@ -100,93 +96,34 @@ bool websocket_client::send_binary(const void* data, size_t size) {
 
 bool websocket_client::send_binary(std::string_view data) {
     if (!is_open()) return false;
-    ensure_not_on_strand(*websocket_, "send_binary");
-
-    std::promise<bool> promise;
-    auto future = promise.get_future();
-
-    auto& io_context = websocket_->get_io_context();
-    std::vector<uint8_t> data_vec(data.begin(), data.end());
-
-    boost::asio::co_spawn(
-        websocket_->get_executor(),
-        [this, data_vec = std::move(data_vec), &promise]() mutable -> awaitable<void> {
-            bool result = co_await send_binary_async(std::move(data_vec));
-            promise.set_value(result);
-        },
-        boost::asio::detached
-    );
-
-    if (io_context.get_executor().running_in_this_thread()) {
-        while (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
-            io_context.poll_one();
-        }
-    } else {
-        io_context.run();
-        io_context.restart();
-    }
-
-    return future.get();
+    return run_blocking(*websocket_, "send_binary", send_binary_async(std::vector<uint8_t>(data.begin(), data.end())));
 }
 
 std::pair<std::string, bool> websocket_client::receive() {
     if (!is_open()) return {"", false};
-    ensure_not_on_strand(*websocket_, "receive");
-
-    std::promise<std::pair<std::string, bool>> promise;
-    auto future = promise.get_future();
-
-    auto& io_context = websocket_->get_io_context();
-
-    boost::asio::co_spawn(
-        websocket_->get_executor(),
-        [this, &promise]() -> awaitable<void> {
-            auto result = co_await receive_async();
-            promise.set_value(std::move(result));
-        },
-        boost::asio::detached
-    );
-
-    if (io_context.get_executor().running_in_this_thread()) {
-        while (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
-            io_context.poll_one();
-        }
-    } else {
-        io_context.run();
-        io_context.restart();
-    }
-
-    return future.get();
+    return run_blocking(*websocket_, "receive", receive_async());
 }
 
 void websocket_client::close() {
     if (!websocket_) return;
-    ensure_not_on_strand(*websocket_, "close");
+    run_blocking(*websocket_, "close", close_async());
+}
 
-    std::promise<void> promise;
-    auto future = promise.get_future();
-
-    auto& io_context = websocket_->get_io_context();
-
-    boost::asio::co_spawn(
-        websocket_->get_executor(),
-        [this, &promise]() -> awaitable<void> {
-            co_await close_async();
-            promise.set_value();
-        },
-        boost::asio::detached
-    );
-
-    if (io_context.get_executor().running_in_this_thread()) {
-        while (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
-            io_context.poll_one();
-        }
-    } else {
-        io_context.run();
-        io_context.restart();
+void websocket_client::set_keepalive(std::chrono::milliseconds ping_interval, std::chrono::milliseconds idle_timeout) {
+    if (!websocket_) return;
+    if (asio::running_in_this_thread(websocket_->get_executor())) {
+        websocket_->set_keepalive(ping_interval, idle_timeout);
+        return;
     }
+    run_blocking(*websocket_, "set_keepalive", apply_keepalive(websocket_, ping_interval, idle_timeout));
+}
 
-    future.get();
+std::chrono::milliseconds websocket_client::get_ping_interval() const {
+    return websocket_ ? websocket_->get_ping_interval() : std::chrono::milliseconds{0};
+}
+
+std::chrono::milliseconds websocket_client::get_idle_timeout() const {
+    return websocket_ ? websocket_->get_idle_timeout() : std::chrono::milliseconds{0};
 }
 
 // ============================================

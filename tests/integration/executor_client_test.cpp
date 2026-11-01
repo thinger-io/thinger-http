@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <thinger/http/client/client.hpp>
+#include <thinger/http/client/async_client.hpp>
 #include <thinger/http/client/executor_client.hpp>
 #include <thinger/asio/io_context_of.hpp>
 #include <thinger/http/server/request.hpp>
@@ -13,8 +14,11 @@
 
 #include "server_test_helpers.hpp"
 #include "../fixtures/ssl_test_server_fixture.hpp"
+#include "../fixtures/running_workers.hpp"
+#include "../fixtures/hostile_peer.hpp"
 
 #include <atomic>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -28,7 +32,6 @@
 using namespace thinger;
 using namespace std::chrono_literals;
 using server_test::running_server;
-using tcp = boost::asio::ip::tcp;
 
 namespace {
 
@@ -112,44 +115,6 @@ namespace {
             a_url.set(url_a);
             b_url.set(url_b);
         }
-    };
-
-    // A server that accepts one connection and never answers: tells when the client closes it
-    struct silent_server {
-        boost::asio::io_context context;
-        tcp::acceptor acceptor{context, {boost::asio::ip::make_address("127.0.0.1"), 0}};
-        std::atomic<bool> accepted{false};
-        std::atomic<bool> closed{false};
-        std::thread thread;
-
-        silent_server() {
-            thread = std::thread([this] {
-                tcp::socket peer(context);
-                std::array<char, 4096> buffer{};
-                std::function<void()> read = [&] {
-                    peer.async_read_some(boost::asio::buffer(buffer), [&](boost::system::error_code ec, size_t) {
-                        if (ec) {
-                            closed = true;
-                            return;
-                        }
-                        read();
-                    });
-                };
-                acceptor.async_accept(peer, [&](boost::system::error_code ec) {
-                    if (ec) return;
-                    accepted = true;
-                    read();
-                });
-                context.run_for(10s);
-            });
-        }
-
-        ~silent_server() {
-            boost::asio::post(context, [this] { context.stop(); });
-            thread.join();
-        }
-
-        std::string url() const { return "http://127.0.0.1:" + std::to_string(acceptor.local_endpoint().port()); }
     };
 
 }
@@ -250,6 +215,21 @@ TEST_CASE("The executor client runs its requests on the caller's thread", "[clie
         CHECK(status == 200);
     }
 
+    SECTION("In a coroutine of async_client::run(), on its worker") {
+        http::test::running_workers workers(2);
+        http::async_client pooled(workers);
+        std::promise<bool> ok;
+        pooled.run([&]() -> awaitable<void> {
+            auto worker = std::this_thread::get_id();
+            auto client = co_await http::executor_client::for_current_coroutine();
+            auto response = co_await client->get(origins.url_a + "/get");
+            ok.set_value(response.ok() && std::this_thread::get_id() == worker);
+        });
+        auto result = ok.get_future();
+        REQUIRE(result.wait_for(10s) == std::future_status::ready);
+        CHECK(result.get());
+    }
+
     SECTION("A coroutine of an executor without io_context cannot have one") {
         boost::asio::thread_pool pool(1);
         auto client = co_spawn(pool, http::executor_client::for_current_coroutine(), boost::asio::use_future);
@@ -279,30 +259,34 @@ TEST_CASE("Server coroutines call other servers with the executor client", "[cli
 }
 
 TEST_CASE("Cancelling the coroutine cancels the executor client's request", "[client][executor_client]") {
+    using http::test::hostile_behaviour;
+    using http::test::hostile_peer;
+    using http::test::transport;
     boost::asio::io_context context;
 
     SECTION("Raced against a timer") {
-        silent_server upstream;
+        // accepts and never answers: tells when the client closes the connection
+        hostile_peer upstream(transport::tcp, hostile_behaviour::silent);
         auto start = clock::now();
         auto winner = run(context, [&]() -> awaitable<size_t> {
             http::executor_client client(context);
-            auto result = co_await (client.get(upstream.url() + "/never") || sleep_for(200ms));
+            auto result = co_await (client.get(upstream.url("/never")) || sleep_for(200ms));
             co_return result.index();
         }());
         CHECK(winner == 1);
         CHECK(clock::now() - start < 5s);
-        CHECK(upstream.accepted);
-        CHECK(eventually([&] { return upstream.closed.load(); }));
+        CHECK(upstream.accepted() == 1);
+        CHECK(eventually([&] { return upstream.closed() == 1; }));
     }
 
     SECTION("With a cancellation signal") {
-        silent_server upstream;
+        hostile_peer upstream(transport::tcp, hostile_behaviour::silent);
         boost::asio::cancellation_signal cancel;
         std::atomic<bool> finished{false};
         co_spawn(context, [&]() -> awaitable<void> {
             http::executor_client client(context);
             try {
-                auto response = co_await client.get(upstream.url() + "/never");
+                auto response = co_await client.get(upstream.url("/never"));
                 CHECK(response.has_error());
             } catch (const boost::system::system_error& e) {
                 CHECK(e.code() == boost::asio::error::operation_aborted);
@@ -314,7 +298,34 @@ TEST_CASE("Cancelling the coroutine cancels the executor client's request", "[cl
         context.run_for(20s);
         REQUIRE(context.stopped());
         CHECK(finished);
-        CHECK(eventually([&] { return upstream.closed.load(); }));
+        CHECK(eventually([&] { return upstream.closed() == 1; }));
+    }
+
+    SECTION("Between two operations of the request") {
+        // The signal is emitted while the request runs (in its stream callback), not while it
+        // waits: no operation ends with operation_aborted, the next co_await throws it. As
+        // async_client::stop() under load, when the completion of a connect or a read is queued
+        using http::test::hostile_start;
+        hostile_peer upstream(transport::tcp, hostile_behaviour::silent, hostile_start::after_response_headers);
+        boost::asio::cancellation_signal cancel;
+        auto start = clock::now();
+        std::optional<http::stream_result> result;
+        co_spawn(context, [&]() -> awaitable<void> {
+            http::executor_client client(context);
+            auto request = std::make_shared<http::http_request>();
+            request->set_url(upstream.url("/partial"));
+            request->set_method(http::method::GET);
+            result = co_await client.send_streaming(request, [&](const http::stream_info&) {
+                cancel.emit(boost::asio::cancellation_type::terminal);
+                return true;
+            });
+        }, boost::asio::bind_cancellation_slot(cancel.slot(), detached));
+        context.run_for(20s);
+        REQUIRE(context.stopped());
+        REQUIRE(result);
+        CHECK(result->error == make_error_code(boost::asio::error::operation_aborted).message());
+        CHECK(clock::now() - start < 5s);
+        CHECK(eventually([&] { return upstream.closed() == 1; }));
     }
 }
 

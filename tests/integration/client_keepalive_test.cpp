@@ -10,12 +10,18 @@
 #include <chrono>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 #include "../fixtures/test_ca.hpp"
+#include "../fixtures/transport_matrix.hpp"
+#include "../fixtures/running_workers.hpp"
+#include "../fixtures/server_listen.hpp"
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -28,10 +34,15 @@ using namespace std::chrono_literals;
 namespace {
 
     using boost::asio::ip::tcp;
+    using http::test::transport;
+    using http::test::transport_endpoint;
+    using unix_protocol = boost::asio::local::stream_protocol;
+    using tls_stream = boost::asio::ssl::stream<tcp::socket>;
 
     // A server written by hand that answers requests on persistent connections as told, and
     // counts the connections accepted, the requests on each, and the connections the client
-    // closed
+    // closed. It listens on any transport of the matrix: 127.0.0.1 over TCP and TLS (with a
+    // certificate of the matrix CA for localhost), a socket in a temporary directory over Unix
     struct keepalive_server {
         // What to do with a request
         enum class then {
@@ -53,7 +64,11 @@ namespace {
         };
 
         boost::asio::io_context ioc;
-        tcp::acceptor acceptor{ioc, {boost::asio::ip::make_address("127.0.0.1"), 0}};
+        transport_endpoint endpoint;
+        std::optional<tcp::acceptor> acceptor;
+        std::optional<unix_protocol::acceptor> unix_acceptor;
+        std::unique_ptr<http::test::temporary_directory> directory;
+        std::unique_ptr<boost::asio::ssl::context> tls_context;
         std::atomic<int> accepts{0};
         std::atomic<int> closed_by_client{0};
         std::atomic<int> overlapped{0};     // requests received while one was being answered
@@ -78,8 +93,24 @@ namespace {
             idle_reset_ = reset;
         }
 
-        keepalive_server() {
-            co_spawn(ioc, accept_loop(), boost::asio::detached);
+        explicit keepalive_server(transport kind = transport::tcp) {
+            endpoint.kind = kind;
+            if (kind == transport::unix) {
+                directory = std::make_unique<http::test::temporary_directory>();
+                endpoint.unix_path = (directory->path() / "s.sock").string();
+                unix_acceptor.emplace(ioc, unix_protocol::endpoint(endpoint.unix_path));
+                co_spawn(ioc, accept_loop(*unix_acceptor), boost::asio::detached);
+            } else {
+                if (kind == transport::tls) {
+                    tls_context = std::make_unique<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
+                    auto [certificate, key] = http::test::matrix_ca().issue("localhost");
+                    tls_context->use_certificate_chain(boost::asio::buffer(certificate));
+                    tls_context->use_private_key(boost::asio::buffer(key), boost::asio::ssl::context::pem);
+                }
+                acceptor.emplace(ioc, tcp::endpoint{boost::asio::ip::make_address("127.0.0.1"), 0});
+                endpoint.port = acceptor->local_endpoint().port();
+                co_spawn(ioc, accept_loop(*acceptor), boost::asio::detached);
+            }
             thread = std::thread([this] { ioc.run(); });
         }
 
@@ -93,11 +124,23 @@ namespace {
                     "\r\n" + body};
         }
 
-        uint16_t port() const { return acceptor.local_endpoint().port(); }
+        uint16_t port() const { return endpoint.port; }
 
-        std::string url(const std::string& path = "/", const std::string& host = "127.0.0.1") const {
+        std::string url(const std::string& path = "/") const { return endpoint.url(path); }
+
+        // On another host name (TCP)
+        std::string url(const std::string& path, const std::string& host) const {
             return "http://" + host + ":" + std::to_string(port()) + path;
         }
+
+        // The origin the pool of a client keeps its connections to this server under
+        std::string origin() const {
+            return endpoint.kind == transport::unix ? "unix:" + endpoint.unix_path : endpoint.base_url();
+        }
+
+        // Point a client at this server (see transport_endpoint::configure())
+        template<typename Client>
+        Client& configure(Client& client) const { return endpoint.configure(client); }
 
         std::vector<received> received_requests() {
             std::lock_guard lock(mutex);
@@ -114,21 +157,41 @@ namespace {
             return true;
         }
 
-        awaitable<void> accept_loop() {
+        template<typename Acceptor>
+        awaitable<void> accept_loop(Acceptor& listening) {
             while (true) {
-                auto [ec, socket] = co_await acceptor.async_accept(use_nothrow_awaitable);
+                auto [ec, socket] = co_await listening.async_accept(use_nothrow_awaitable);
                 if (ec) co_return;
-                co_spawn(ioc, session(std::move(socket), ++accepts), boost::asio::detached);
+                int connection = ++accepts;
+                if constexpr (std::is_same_v<Acceptor, tcp::acceptor>) {
+                    if (tls_context) {
+                        co_spawn(ioc, [this, connection, stream = tls_stream(std::move(socket), *tls_context)]() mutable -> awaitable<void> {
+                            auto [error] = co_await stream.async_handshake(boost::asio::ssl::stream_base::server,
+                                                                           use_nothrow_awaitable);
+                            if (!error) co_await session(std::move(stream), connection);
+                        }, boost::asio::detached);
+                        continue;
+                    }
+                }
+                co_spawn(ioc, session(std::move(socket), connection), boost::asio::detached);
             }
         }
 
-        static void reset(tcp::socket& socket) {
+        // Close the connection (with a reset if `reset`), over TLS without a close_notify
+        template<typename Stream>
+        static void close(Stream& socket, bool reset = false) {
             boost::system::error_code ignored;
-            socket.set_option(boost::asio::socket_base::linger(true, 0), ignored);
-            socket.close(ignored);
+            auto& lowest = socket.lowest_layer();
+            if (reset) {
+                lowest.set_option(boost::asio::socket_base::linger(true, 0), ignored);
+            } else {
+                lowest.shutdown(boost::asio::socket_base::shutdown_both, ignored);
+            }
+            lowest.close(ignored);
         }
 
-        awaitable<void> session(tcp::socket socket, int connection) {
+        template<typename Stream>
+        awaitable<void> session(Stream socket, int connection) {
             std::string data;
             char buffer[4096];
             for (int index = 1;; ++index) {
@@ -150,13 +213,7 @@ namespace {
                         auto result = co_await (socket.async_read_some(boost::asio::buffer(buffer), use_nothrow_awaitable) ||
                                                 timer.async_wait(use_nothrow_awaitable));
                         if (result.index() == 1) {
-                            if (idle_reset) {
-                                reset(socket);
-                            } else {
-                                boost::system::error_code ignored;
-                                socket.shutdown(tcp::socket::shutdown_both, ignored);
-                                socket.close(ignored);
-                            }
+                            close(socket, idle_reset);
                             co_return;
                         }
                         std::tie(ec, bytes) = std::get<0>(result);
@@ -201,42 +258,38 @@ namespace {
                 }
                 // A client sending another request before this answer shares the connection
                 boost::system::error_code ignored;
-                if (!data.empty() || socket.available(ignored) > 0) overlapped++;
+                if (!data.empty() || socket.lowest_layer().available(ignored) > 0) overlapped++;
 
                 if (answer.after == then::drop) {
-                    socket.close(ignored);
+                    socket.lowest_layer().close(ignored);
                     co_return;
                 }
                 auto [ec, bytes] = co_await boost::asio::async_write(socket, boost::asio::buffer(answer.response),
                                                                      use_nothrow_awaitable);
                 if (ec) co_return;
-                if (answer.after == then::close) {
-                    socket.shutdown(tcp::socket::shutdown_both, ignored);
-                    socket.close(ignored);
-                    co_return;
-                }
-                if (answer.after == then::reset) {
-                    reset(socket);
+                if (answer.after == then::close || answer.after == then::reset) {
+                    close(socket, answer.after == then::reset);
                     co_return;
                 }
             }
         }
     };
 
-    // An HTTP(S) server telling the port each request came from: one per connection
+    // An HTTP(S) server telling the port each request came from: one per connection. With TLS,
+    // the certificates of its own manager
     struct port_server {
+        std::shared_ptr<asio::certificate_manager> certificates = std::make_shared<asio::certificate_manager>();
         http::server server;
         uint16_t port = 0;
         std::thread thread;
         bool tls;
 
         explicit port_server(bool use_tls) : tls(use_tls) {
-            if (tls) server.enable_ssl(true);
             server.get("/port", [](http::request& req, http::response& res) {
-                res.send(req.get_http_connection()->get_socket()->get_remote_port());
+                res.send(req.connection().peer_port);
             });
-            REQUIRE(server.listen("127.0.0.1", 0));
-            port = server.local_port();
+            REQUIRE_FALSE(server.listen(http::test::listen_options("127.0.0.1", 0, tls ? certificates : nullptr)));
+            port = http::test::listening_port(server);
             thread = std::thread([this] { server.wait(); });
         }
 
@@ -251,9 +304,8 @@ namespace {
     };
 
     // Workers for the asynchronous clients, while it exists
-    struct running_workers {
-        running_workers() { asio::get_workers().start(4); }
-        ~running_workers() { asio::get_workers().stop(); }
+    struct running_workers : http::test::running_workers {
+        running_workers() : http::test::running_workers(4) {}
     };
 
     int connections_of(const std::vector<keepalive_server::received>& requests) {
@@ -264,12 +316,13 @@ namespace {
 
 }
 
-TEST_CASE("HTTP client reuses a connection for sequential requests", "[http][client][pool][integration]") {
-    keepalive_server server;
+TEST_CASE("HTTP client reuses a connection for sequential requests", "[http][client][pool][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    keepalive_server server(kind);
 
     SECTION("Synchronous client") {
         http::client client;
-        client.timeout(5s);
+        server.configure(client).timeout(5s);
         for (int i = 0; i < 10; ++i) {
             auto res = client.get(server.url("/" + std::to_string(i)));
             REQUIRE(res.ok());
@@ -283,13 +336,13 @@ TEST_CASE("HTTP client reuses a connection for sequential requests", "[http][cli
         REQUIRE(stats.created == 1);
         REQUIRE(stats.reused == 9);
         REQUIRE(stats.hosts.size() == 1);
-        REQUIRE(stats.hosts.begin()->first == "http://127.0.0.1:" + std::to_string(server.port()));
+        REQUIRE(stats.hosts.begin()->first == server.origin());
     }
 
     SECTION("Asynchronous client, every method, with and without a body") {
         running_workers workers;
-        http::async_client client;
-        client.timeout(5s);
+        http::async_client client(workers);
+        server.configure(client).timeout(5s);
         bool all_ok = true;
         client.run([&]() -> awaitable<void> {
             for (int i = 0; i < 3; ++i) {
@@ -311,7 +364,7 @@ TEST_CASE("HTTP client reuses a connection for sequential requests", "[http][cli
 
     SECTION("Streaming responses, read whole") {
         http::client client;
-        client.timeout(5s);
+        server.configure(client).timeout(5s);
         for (int i = 0; i < 3; ++i) {
             std::string streamed;
             auto result = client.request(server.url()).get([&](const http::stream_info& info) {
@@ -327,7 +380,7 @@ TEST_CASE("HTTP client reuses a connection for sequential requests", "[http][cli
     SECTION("Not after a streaming response aborted by its callback") {
         server.respond([](const keepalive_server::received&) { return keepalive_server::ok(std::string(100000, 'x')); });
         http::client client;
-        client.timeout(5s);
+        server.configure(client).timeout(5s);
         auto result = client.request(server.url()).get([&](const http::stream_info&) { return false; });
         REQUIRE_FALSE(result.ok());
         REQUIRE(client.get(server.url()).ok());
@@ -343,7 +396,7 @@ TEST_CASE("HTTP client reuses a connection for sequential requests", "[http][cli
             return keepalive_server::ok("target");
         });
         http::client client;
-        client.timeout(5s);
+        server.configure(client).timeout(5s);
         for (int i = 0; i < 3; ++i) {
             auto res = client.get(server.url("/redirect"));
             REQUIRE(res.ok());
@@ -356,8 +409,8 @@ TEST_CASE("HTTP client reuses a connection for sequential requests", "[http][cli
 
 TEST_CASE("HTTP client reuses a TLS connection", "[http][client][pool][ssl][integration]") {
     http::test::test_ca ca;
-    http::test::server_certificate certificate("localhost", ca.issue("localhost"));
     port_server server(true);
+    http::test::server_certificate certificate(server.certificates, "localhost", ca.issue("localhost"));
 
     http::client client;
     client.timeout(5s).add_ca_pem(ca.pem());
@@ -381,14 +434,15 @@ TEST_CASE("HTTP client reuses a TLS connection", "[http][client][pool][ssl][inte
     }
 }
 
-TEST_CASE("HTTP client replaces connections the server closed while idle", "[http][client][pool][integration]") {
-    keepalive_server server;
+TEST_CASE("HTTP client replaces connections the server closed while idle", "[http][client][pool][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    keepalive_server server(kind);
     bool reset = GENERATE(false, true);
     server.close_idle(100ms, reset);
     INFO((reset ? "reset" : "closed"));
 
     http::client client;
-    client.timeout(5s);
+    server.configure(client).timeout(5s);
     REQUIRE(client.get(server.url("/first")).ok());
 
     // Closed by the server meanwhile: found so before reusing it, and the request goes on a
@@ -407,17 +461,18 @@ TEST_CASE("HTTP client replaces connections the server closed while idle", "[htt
     REQUIRE(server.accepts == 3);
 }
 
-TEST_CASE("HTTP client sends a request again only if it is safe", "[http][client][pool][integration]") {
+TEST_CASE("HTTP client sends a request again only if it is safe", "[http][client][pool][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     // The server reads the second request on the connection and closes it without answering
     // (as when it closes an idle connection just as the request arrives): no byte of the
     // response was received
-    keepalive_server server;
+    keepalive_server server(kind);
     server.respond([](const keepalive_server::received& request) {
         if (request.connection == 1 && request.index == 2) return keepalive_server::reply{{}, keepalive_server::then::drop};
         return keepalive_server::ok("hello");
     });
     http::client client;
-    client.timeout(5s);
+    server.configure(client).timeout(5s);
     REQUIRE(client.get(server.url("/first")).ok());
 
     SECTION("Idempotent: sent again on a new connection") {
@@ -469,14 +524,15 @@ TEST_CASE("HTTP client sends a request again only if it is safe", "[http][client
     }
 }
 
-TEST_CASE("HTTP client does not send a request again on a new connection, nor after a timeout", "[http][client][pool][integration]") {
-    keepalive_server server;
+TEST_CASE("HTTP client does not send a request again on a new connection, nor after a timeout", "[http][client][pool][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    keepalive_server server(kind);
     server.respond([](const keepalive_server::received& request) {
         if (request.index == 1) return keepalive_server::reply{{}, keepalive_server::then::drop};
         return keepalive_server::ok("hello");
     });
     http::client client;
-    client.timeout(5s);
+    server.configure(client).timeout(5s);
     // Failed on a connection opened for it: the server got it and gave up, nothing to retry
     REQUIRE_FALSE(client.get(server.url()).ok());
     REQUIRE(server.received_requests().size() == 1);
@@ -493,7 +549,8 @@ TEST_CASE("HTTP client does not send a request again on a new connection, nor af
     }
 }
 
-TEST_CASE("HTTP client does not reuse connections that cannot carry another request", "[http][client][pool][integration]") {
+TEST_CASE("HTTP client does not reuse connections that cannot carry another request", "[http][client][pool][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     struct reuse_case {
         std::string name;
         std::string response;
@@ -510,7 +567,7 @@ TEST_CASE("HTTP client does not reuse connections that cannot carry another requ
     INFO(test.name);
 
     // The connection is left open by the server: the client decides
-    keepalive_server server;
+    keepalive_server server(kind);
     server.respond([&](const keepalive_server::received& request) {
         if (request.connection == 1 && request.index == 1) {
             // (truncated: the server closes it, as the body never completes otherwise)
@@ -520,7 +577,7 @@ TEST_CASE("HTTP client does not reuse connections that cannot carry another requ
         return keepalive_server::ok("ok");
     });
     http::client client;
-    client.timeout(5s);
+    server.configure(client).timeout(5s);
     client.get(server.url());
     REQUIRE(client.get(server.url()).ok());
     REQUIRE(server.accepts == (test.reused ? 1 : 2));
@@ -531,23 +588,25 @@ TEST_CASE("HTTP client does not reuse connections that cannot carry another requ
     }
 }
 
-TEST_CASE("HTTP client does not reuse a connection when the request asks to close it", "[http][client][pool][integration]") {
-    keepalive_server server;
+TEST_CASE("HTTP client does not reuse a connection when the request asks to close it", "[http][client][pool][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    keepalive_server server(kind);
     http::client client;
-    client.timeout(5s);
+    server.configure(client).timeout(5s);
     REQUIRE(client.get(server.url(), {{"Connection", "close"}}).ok());
     REQUIRE(client.get(server.url()).ok());
     REQUIRE(server.accepts == 2);
 }
 
-TEST_CASE("HTTP client honours the idle timeout the server announces", "[http][client][pool][integration]") {
+TEST_CASE("HTTP client honours the idle timeout the server announces", "[http][client][pool][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     // timeout=2: kept for 1 s (the margin is 1 s)
-    keepalive_server server;
+    keepalive_server server(kind);
     server.respond([](const keepalive_server::received&) {
         return keepalive_server::ok("ok", "Keep-Alive: timeout=2\r\n");
     });
     http::client client;
-    client.timeout(5s);
+    server.configure(client).timeout(5s);
     REQUIRE(client.get(server.url()).ok());
     REQUIRE(client.get(server.url()).ok());
     REQUIRE(server.accepts == 1);
@@ -556,13 +615,14 @@ TEST_CASE("HTTP client honours the idle timeout the server announces", "[http][c
     REQUIRE(server.accepts == 2);
 }
 
-TEST_CASE("HTTP client closes connections idle for too long", "[http][client][pool][integration]") {
-    keepalive_server server;
+TEST_CASE("HTTP client closes connections idle for too long", "[http][client][pool][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    keepalive_server server(kind);
 
     SECTION("Asynchronous client: closed by its timer") {
         running_workers workers;
-        http::async_client client;
-        client.timeout(5s).idle_timeout(200ms);
+        http::async_client client(workers);
+        server.configure(client).timeout(5s).idle_timeout(200ms);
         bool ok = false;
         auto start = std::chrono::steady_clock::now();
         client.get(server.url(), [&](http::client_response& res) { ok = res.ok(); });
@@ -576,7 +636,7 @@ TEST_CASE("HTTP client closes connections idle for too long", "[http][client][po
 
     SECTION("Synchronous client: not reused once expired") {
         http::client client;
-        client.timeout(5s).idle_timeout(200ms);
+        server.configure(client).timeout(5s).idle_timeout(200ms);
         REQUIRE(client.get(server.url()).ok());
         std::this_thread::sleep_for(300ms);
         REQUIRE(client.get(server.url()).ok());
@@ -587,14 +647,17 @@ TEST_CASE("HTTP client closes connections idle for too long", "[http][client][po
     SECTION("Synchronous client: closed as a later request ends, once expired") {
         // Expired while a request to another server is answered: closed as it ends, without
         // waiting for a next call
-        keepalive_server slow;
+        keepalive_server slow(kind);
         slow.respond([](const keepalive_server::received&) {
             return keepalive_server::reply{keepalive_server::ok("slow").response, keepalive_server::then::keep, 400ms};
         });
         http::client client;
-        client.timeout(5s).idle_timeout(200ms);
+        server.configure(client).timeout(5s).idle_timeout(200ms);
         REQUIRE(client.get(server.url()).ok());
-        REQUIRE(client.get(slow.url()).ok());
+        // (one client reaches one Unix socket: the other one is the request's)
+        auto to_slow = client.request(slow.url());
+        if (kind == transport::unix) to_slow.unix_socket(slow.endpoint.unix_path);
+        REQUIRE(to_slow.get().ok());
         REQUIRE(keepalive_server::eventually([&] { return server.closed_by_client == 1; }, 1s));
         auto stats = client.pool_stats();
         REQUIRE(stats.idle == 1);
@@ -603,12 +666,13 @@ TEST_CASE("HTTP client closes connections idle for too long", "[http][client][po
     }
 }
 
-TEST_CASE("HTTP client closes its idle connections on demand", "[http][client][pool][integration]") {
+TEST_CASE("HTTP client closes its idle connections on demand", "[http][client][pool][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     // Between the calls of a synchronous client nothing runs: a long-lived one that makes
     // sporadic calls closes the connections it keeps
-    keepalive_server server;
+    keepalive_server server(kind);
     http::client client;
-    client.timeout(5s);
+    server.configure(client).timeout(5s);
     REQUIRE(client.get(server.url()).ok());
     REQUIRE(client.pool_size() == 1);
     client.clear_connections();
@@ -619,14 +683,15 @@ TEST_CASE("HTTP client closes its idle connections on demand", "[http][client][p
     REQUIRE(server.accepts == 2);
 }
 
-TEST_CASE("HTTP client never shares a busy connection, and bounds the idle ones", "[http][client][pool][integration]") {
+TEST_CASE("HTTP client never shares a busy connection, and bounds the idle ones", "[http][client][pool][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     running_workers workers;
-    keepalive_server server;
+    keepalive_server server(kind);
     server.respond([](const keepalive_server::received&) {
         return keepalive_server::reply{keepalive_server::ok("slow").response, keepalive_server::then::keep, 100ms};
     });
-    http::async_client client;
-    client.timeout(5s).max_idle_connections_per_host(4);
+    http::async_client client(workers);
+    server.configure(client).timeout(5s).max_idle_connections_per_host(4);
 
     const int concurrent = 16;
     std::atomic<int> ok{0};
@@ -634,7 +699,7 @@ TEST_CASE("HTTP client never shares a busy connection, and bounds the idle ones"
     for (int round = 0; round < 3; ++round) {
         for (int i = 0; i < concurrent; ++i) {
             // From the threads of the workers: requests, and their connections, on all of them
-            boost::asio::post(asio::get_workers().get_next_io_context(), [&] {
+            boost::asio::post(workers.next_executor(), [&] {
                 client.get(server.url(), [&](http::client_response& res) {
                     if (res.ok()) ok++;
                     done++;
@@ -654,23 +719,25 @@ TEST_CASE("HTTP client never shares a busy connection, and bounds the idle ones"
     REQUIRE(client.pool_stats().reused >= 8);
 }
 
-TEST_CASE("HTTP client with the pool disabled opens a connection per request", "[http][client][pool][integration]") {
-    keepalive_server server;
+TEST_CASE("HTTP client with the pool disabled opens a connection per request", "[http][client][pool][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    keepalive_server server(kind);
     http::client client;
-    client.timeout(5s).max_idle_connections_per_host(0);
+    server.configure(client).timeout(5s).max_idle_connections_per_host(0);
     for (int i = 0; i < 5; ++i) REQUIRE(client.get(server.url()).ok());
     REQUIRE(server.accepts == 5);
     REQUIRE(client.pool_size() == 0);
     REQUIRE(keepalive_server::eventually([&] { return server.closed_by_client == 5; }));
 }
 
-TEST_CASE("HTTP client closes its idle connections when destroyed", "[http][client][pool][integration]") {
-    keepalive_server server;
+TEST_CASE("HTTP client closes its idle connections when destroyed", "[http][client][pool][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    keepalive_server server(kind);
 
     SECTION("Synchronous client") {
         {
             http::client client;
-            client.timeout(5s);
+            server.configure(client).timeout(5s);
             REQUIRE(client.get(server.url()).ok());
             REQUIRE(client.pool_size() == 1);
         }
@@ -680,8 +747,8 @@ TEST_CASE("HTTP client closes its idle connections when destroyed", "[http][clie
     SECTION("Asynchronous client") {
         running_workers workers;
         {
-            http::async_client client;
-            client.timeout(5s);
+            http::async_client client(workers);
+            server.configure(client).timeout(5s);
             bool ok = false;
             client.get(server.url(), [&](http::client_response& res) { ok = res.ok(); });
             client.wait();
@@ -692,21 +759,26 @@ TEST_CASE("HTTP client closes its idle connections when destroyed", "[http][clie
     }
 
     SECTION("Asynchronous client, workers stopped first") {
-        http::async_client client;
+        // The idle connections stay on the stopped workers (alive until destroyed), and close
+        // with the client
+        running_workers workers;
         {
-            running_workers workers;
-            client.timeout(5s);
+            http::async_client client(workers);
+            server.configure(client).timeout(5s);
             bool ok = false;
             client.get(server.url(), [&](http::client_response& res) { ok = res.ok(); });
             client.wait();
             REQUIRE(ok);
+            workers.stop();
+            REQUIRE(client.pool_size() == 1);
         }
-        REQUIRE(client.pool_size() == 0);
         REQUIRE(keepalive_server::eventually([&] { return server.closed_by_client == 1; }));
     }
 }
 
 TEST_CASE("HTTP client keeps direct and proxied connections apart", "[http][client][pool][proxy][integration]") {
+    // (Not in the matrix: the client reaches a forwarding proxy over TCP, and the requests it
+    // sends through it name hosts that only TCP has.)
     // The server answers requests in absolute form too: it serves as the forwarding proxy.
     // Loopback addresses never use the proxy: the proxied requests name origin.test
     keepalive_server origin;

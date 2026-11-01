@@ -9,9 +9,10 @@ using namespace thinger;
 int main(int argc, char** argv) {
     int threads = argc > 1 ? std::atoi(argv[1]) : 8;
     int port = argc > 2 ? std::atoi(argv[2]) : 9080;
-    asio::get_workers().start(threads);
+    asio::workers workers;
+    workers.start(threads);
 
-    http::pool_server server;
+    http::pool_server server(workers);
 
     server.get("/hello", [](http::request&, http::response& res) {
         res.send("Hello World!");

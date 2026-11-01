@@ -12,6 +12,7 @@ using namespace std::chrono_literals;
 
 // Test asynchronous API for async_client (http::client is synchronous, so not tested here)
 TEST_CASE("HTTP Async Client asynchronous API", "[http][client][async]") {
+    thinger::http::test::running_workers workers;
 
     // Create test server fixture
     thinger::http::test::TestServerFixture fixture;
@@ -20,7 +21,7 @@ TEST_CASE("HTTP Async Client asynchronous API", "[http][client][async]") {
     auto& port = fixture.port;
 
     SECTION("Asynchronous GET with callback") {
-        http::async_client client;
+        http::async_client client(workers);
         std::promise<bool> promise;
         auto future = promise.get_future();
 
@@ -37,7 +38,7 @@ TEST_CASE("HTTP Async Client asynchronous API", "[http][client][async]") {
     }
 
     SECTION("Asynchronous POST with callback") {
-        http::async_client client;
+        http::async_client client(workers);
         std::promise<bool> promise;
         auto future = promise.get_future();
 
@@ -56,7 +57,7 @@ TEST_CASE("HTTP Async Client asynchronous API", "[http][client][async]") {
     }
 
     SECTION("Multiple async requests in parallel") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<int> completed{0};
         const int num_requests = 10;
 
@@ -86,7 +87,7 @@ TEST_CASE("HTTP Async Client asynchronous API", "[http][client][async]") {
     }
 
     SECTION("Error handling in async callbacks") {
-        http::async_client client;
+        http::async_client client(workers);
         std::promise<int> promise;
         auto future = promise.get_future();
 
@@ -100,7 +101,7 @@ TEST_CASE("HTTP Async Client asynchronous API", "[http][client][async]") {
     }
 
     SECTION("Async timeout handling") {
-        http::async_client client;
+        http::async_client client(workers);
         client.timeout(1s);
 
         std::promise<bool> promise;
@@ -118,7 +119,7 @@ TEST_CASE("HTTP Async Client asynchronous API", "[http][client][async]") {
     }
 
     SECTION("Concurrent GET and POST") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<int> get_done{0};
         std::atomic<int> post_done{0};
 
@@ -144,7 +145,7 @@ TEST_CASE("HTTP Async Client asynchronous API", "[http][client][async]") {
     }
 
     SECTION("wait_for with timeout") {
-        http::async_client client;
+        http::async_client client(workers);
 
         // Start a slow request
         client.get(base_url + "/delay/3", [](http::client_response& res) {
@@ -161,7 +162,7 @@ TEST_CASE("HTTP Async Client asynchronous API", "[http][client][async]") {
     }
 
     SECTION("Using run() with coroutines") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<int> completed{0};
 
         // Using run() for coroutine-based async

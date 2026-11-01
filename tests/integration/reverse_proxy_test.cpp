@@ -5,6 +5,7 @@
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/reverse_proxy.hpp>
 #include <thinger/http/server/websocket_connection.hpp>
+#include <thinger/http/server/sse_connection.hpp>
 #include <thinger/http/client/client.hpp>
 #include <thinger/asio/ssl/certificate_manager.hpp>
 #include <thinger/util/types.hpp>
@@ -16,6 +17,7 @@
 #include <openssl/x509v3.h>
 #include <unistd.h>
 #include "../../examples/http_server/device_proxy_policy.hpp"
+#include "../fixtures/transport_matrix.hpp"
 #include <atomic>
 #include <cctype>
 #include <filesystem>
@@ -30,26 +32,33 @@ using namespace std::chrono_literals;
 
 namespace {
 
-    // An HTTP server running on its own thread
+    using http::test::transport;
+
+    // An HTTP server running on its own thread, listening on a transport of the matrix (TCP
+    // by default)
     struct test_server {
         http::server server;
+        std::unique_ptr<http::test::transport_listener> listener;
         std::thread thread;
         uint16_t port = 0;
 
-        void start() {
-            REQUIRE(server.listen("127.0.0.1", 0));
-            port = server.local_port();
+        void start(transport kind = transport::tcp) {
+            listener = std::make_unique<http::test::transport_listener>(server, kind);
+            port = listener->endpoint().port;
             thread = std::thread([this] { server.wait(); });
         }
 
-        void start_unix(const std::string& path) {
-            REQUIRE(server.listen_unix(path));
+        // Listen with `options`, out of the matrix (endpoint() cannot be used)
+        void start(asio::listener_options options) {
+            bool tcp = std::holds_alternative<asio::tcp_endpoint>(options.endpoint);
+            REQUIRE_FALSE(server.listen(std::move(options)));
+            if (tcp) port = http::test::listening_port(server);
             thread = std::thread([this] { server.wait(); });
         }
 
-        std::string url(const std::string& path = "") const {
-            return "http://127.0.0.1:" + std::to_string(port) + path;
-        }
+        const http::test::transport_endpoint& endpoint() const { return listener->endpoint(); }
+
+        std::string url(const std::string& path = "") const { return endpoint().url(path); }
 
         ~test_server() {
             server.stop();
@@ -112,44 +121,28 @@ namespace {
         nlohmann::json json() const { return nlohmann::json::parse(body); }
     };
 
-    // A client connection sending and reading raw bytes
+    // A client connection sending and reading raw bytes, over TCP to a port or over any
+    // transport of the matrix
     struct raw_connection {
-        boost::asio::io_context ioc;
-        boost::asio::ip::tcp::socket socket{ioc};
+        http::test::raw_connection connection;
         std::string pending;
         bool closed = false;
 
-        explicit raw_connection(uint16_t port) {
-            socket.connect({boost::asio::ip::make_address("127.0.0.1"), port});
-        }
+        explicit raw_connection(uint16_t port) : raw_connection(http::test::transport_endpoint{.port = port}) {}
 
-        void send(std::string_view data) {
-            boost::asio::write(socket, boost::asio::buffer(data.data(), data.size()));
-        }
+        explicit raw_connection(const http::test::transport_endpoint& endpoint) : connection(endpoint) {}
+
+        void send(std::string_view data) { REQUIRE(connection.write(data)); }
+
+        // Leave with a reset (a client closing only its sending side still awaits the response)
+        void reset() { connection.reset(); }
 
         // Read once more into `pending`; false on timeout or once the connection is closed
         bool read_more(std::chrono::milliseconds timeout) {
             if (closed) return false;
-            char data[16384];
-            boost::system::error_code result;
-            size_t bytes = 0;
-            bool done = false;
-            socket.async_read_some(boost::asio::buffer(data), [&](boost::system::error_code ec, size_t n) {
-                result = ec;
-                bytes = n;
-                done = true;
-            });
-            ioc.restart();
-            ioc.run_for(timeout);
-            if (!done) {
-                socket.cancel();
-                ioc.restart();
-                ioc.run();
-                return false;
-            }
-            pending.append(data, bytes);
-            if (result) closed = true;
-            return !result;
+            size_t bytes = connection.read_some(pending, timeout);
+            closed = connection.eof();
+            return bytes > 0 && !closed;
         }
 
         bool read_until(const std::string& needle, std::chrono::milliseconds timeout = 5s) {
@@ -369,6 +362,19 @@ namespace {
         return *target;
     }
 
+    // The proxy target of a server listening on `endpoint`: over TLS the proxy verifies its
+    // certificate (issued for localhost by the matrix CA)
+    http::proxy_target target_on(const http::test::transport_endpoint& endpoint) {
+        if (endpoint.kind == transport::unix) return http::proxy_target::unix_socket(endpoint.unix_path);
+        auto target = target_of(endpoint.port);
+        if (endpoint.kind == transport::tls) {
+            target.type = http::proxy_target::transport::tls;
+            target.tls.server_name = endpoint.host();
+            target.tls.ca_pem = http::test::matrix_ca().pem();
+        }
+        return target;
+    }
+
     std::string get(const std::string& path, const std::string& extra_headers = "") {
         return "GET " + path + " HTTP/1.1\r\nHost: front.example\r\n" + extra_headers + "\r\n";
     }
@@ -429,6 +435,13 @@ namespace {
 
 }
 
+// Run the rest of the TEST_CASE once per pair of transports (client to proxy, proxy to
+// target), naming both in the failure messages
+#define MATRIX_PROXY_TRANSPORTS(client, target)                                       \
+    MATRIX_TRANSPORT(client);                                                         \
+    const auto target = GENERATE(transport::tcp, transport::tls, transport::unix);    \
+    INFO("proxy target: " << http::test::to_string(target))
+
 TEST_CASE("Reverse proxy target URLs", "[proxy][unit]") {
     auto target = http::proxy_target::from_url("https://backend.example:8443/api/");
     REQUIRE(target);
@@ -454,19 +467,20 @@ TEST_CASE("Reverse proxy target URLs", "[proxy][unit]") {
     }
 }
 
-TEST_CASE("Reverse proxy forwards requests and responses", "[proxy][integration]") {
+TEST_CASE("Reverse proxy forwards requests and responses", "[proxy][integration][matrix]") {
+    MATRIX_PROXY_TRANSPORTS(client_kind, target_kind);
     test_server target;
     add_inspect_handler(target.server);
     target.server.get("/teapot", [](http::response& res) {
         res.json({{"tea", true}}, static_cast<http::http_response::status>(418));
     });
-    target.start();
+    target.start(target_kind);
 
     http::reverse_proxy reverse_proxy;
     std::mutex mutex;
     http::proxy_result last;
     std::atomic<int> results{0};
-    auto destination = target_of(target.port);
+    auto destination = target_on(target.endpoint());
     test_server proxy;
     proxy.server.set_not_found_handler([&](http::request& req, http::response& res) -> awaitable<void> {
         auto result = co_await reverse_proxy.forward(req, res, destination);
@@ -474,9 +488,10 @@ TEST_CASE("Reverse proxy forwards requests and responses", "[proxy][integration]
         last = result;
         results++;
     });
-    proxy.start();
+    proxy.start(client_kind);
 
     http::client client;
+    proxy.endpoint().configure(client);
 
     SECTION("GET with query") {
         auto res = client.get(proxy.url("/items/7?sort=desc&q=a%20b"));
@@ -484,7 +499,8 @@ TEST_CASE("Reverse proxy forwards requests and responses", "[proxy][integration]
         auto json = res.json();
         REQUIRE(json["method"] == "GET");
         REQUIRE(json["uri"] == "/items/7?sort=desc&q=a%20b");
-        REQUIRE(json["headers"]["host"] == "127.0.0.1:" + std::to_string(target.port));
+        REQUIRE(json["headers"]["host"] == destination.authority());
+        REQUIRE(json["headers"]["x-forwarded-proto"] == (client_kind == transport::tls ? "https" : "http"));
 
         // (the handler gets the result once the response is sent)
         REQUIRE(wait_for([&] { return results == 1; }));
@@ -517,7 +533,7 @@ TEST_CASE("Reverse proxy forwards requests and responses", "[proxy][integration]
     }
 
     SECTION("Several requests on a keep-alive connection") {
-        raw_connection connection(proxy.port);
+        raw_connection connection(proxy.endpoint());
         for (int i = 0; i < 3; ++i) {
             connection.send(get("/n/" + std::to_string(i)));
             auto res = connection.read_response();
@@ -527,7 +543,8 @@ TEST_CASE("Reverse proxy forwards requests and responses", "[proxy][integration]
     }
 }
 
-TEST_CASE("Reverse proxy streams request bodies as they arrive", "[proxy][integration]") {
+TEST_CASE("Reverse proxy streams request bodies as they arrive", "[proxy][integration][matrix]") {
+    MATRIX_PROXY_TRANSPORTS(client_kind, target_kind);
     test_server target;
     std::atomic<size_t> received{0};
     target.server.post("/upload", [&received](http::request& req, http::response& res) -> awaitable<void> {
@@ -539,15 +556,15 @@ TEST_CASE("Reverse proxy streams request bodies as they arrive", "[proxy][integr
         }
         res.json({{"received", total}, {"failed", req.get_body_error() != http::body_error::none}});
     });
-    target.start();
+    target.start(target_kind);
 
     http::reverse_proxy reverse_proxy;
     test_server proxy;
-    forward_all(proxy.server, reverse_proxy, target_of(target.port));
-    proxy.start();
+    forward_all(proxy.server, reverse_proxy, target_on(target.endpoint()));
+    proxy.start(client_kind);
 
     const size_t part = 512 * 1024;
-    raw_connection connection(proxy.port);
+    raw_connection connection(proxy.endpoint());
 
     SECTION("Content-Length") {
         connection.send("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: " + std::to_string(2 * part) + "\r\n\r\n");
@@ -575,7 +592,8 @@ TEST_CASE("Reverse proxy streams request bodies as they arrive", "[proxy][integr
     REQUIRE(res.json()["failed"] == false);
 }
 
-TEST_CASE("Reverse proxy streams responses as they arrive", "[proxy][integration]") {
+TEST_CASE("Reverse proxy streams responses as they arrive", "[proxy][integration][matrix]") {
+    MATRIX_PROXY_TRANSPORTS(client_kind, target_kind);
     test_server target;
     std::atomic<bool> client_got_first{false};
     std::atomic<bool> first_seen_in_time{false};
@@ -616,15 +634,15 @@ TEST_CASE("Reverse proxy streams responses as they arrive", "[proxy][integration
             }, detached);
         });
     });
-    target.start();
+    target.start(target_kind);
 
     http::reverse_proxy reverse_proxy;
     test_server proxy;
-    forward_all(proxy.server, reverse_proxy, target_of(target.port));
-    proxy.start();
+    forward_all(proxy.server, reverse_proxy, target_on(target.endpoint()));
+    proxy.start(client_kind);
 
     SECTION("Chunked response") {
-        raw_connection connection(proxy.port);
+        raw_connection connection(proxy.endpoint());
         connection.send(get("/chunks"));
         REQUIRE(connection.read_until("first-part;"));
         client_got_first = true;
@@ -636,7 +654,12 @@ TEST_CASE("Reverse proxy streams responses as they arrive", "[proxy][integration
     }
 
     SECTION("Server-sent events, ended by the target closing the connection") {
-        raw_connection connection(proxy.port);
+        // The server closes a TLS connection without a close_notify: the proxy reads the end of
+        // the body as stream_truncated, an interrupted body, and the client never gets its end
+        if (target_kind == transport::tls) {
+            SKIP("10.3: the server ends TLS connections without close_notify (stream_truncated at the proxy)");
+        }
+        raw_connection connection(proxy.endpoint());
         connection.send(get("/events"));
         REQUIRE(connection.read_until("data: first\n\n"));
         client_got_first = true;
@@ -648,7 +671,7 @@ TEST_CASE("Reverse proxy streams responses as they arrive", "[proxy][integration
     }
 
     SECTION("Large response with Content-Length") {
-        raw_connection connection(proxy.port);
+        raw_connection connection(proxy.endpoint());
         connection.send(get("/large"));
         auto res = connection.read_response(false, 20s);
         REQUIRE(res.complete);
@@ -658,7 +681,7 @@ TEST_CASE("Reverse proxy streams responses as they arrive", "[proxy][integration
 
     SECTION("HTTP/1.0 client: body delimited by closing the connection") {
         client_got_first = true;
-        raw_connection connection(proxy.port);
+        raw_connection connection(proxy.endpoint());
         connection.send("GET /chunks HTTP/1.0\r\nHost: x\r\n\r\n");
         auto res = connection.read_response();
         REQUIRE(res.complete);
@@ -671,7 +694,7 @@ TEST_CASE("Reverse proxy streams responses as they arrive", "[proxy][integration
 TEST_CASE("Reverse proxy tunnels WebSocket connections", "[proxy][websocket][integration]") {
     test_server target;
     target.server.get("/ws", [](http::response& res) {
-        res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) {
+        res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection> ws) {
             // sent right after the handshake: it may reach the proxy with the 101
             ws->send_text("welcome");
             ws->on_message([weak = std::weak_ptr<http::websocket_connection>(ws)](const std::string& message, bool) {
@@ -683,8 +706,8 @@ TEST_CASE("Reverse proxy tunnels WebSocket connections", "[proxy][websocket][int
         res.status(http::http_response::status::switching_protocols);
         res.header("Upgrade", "echo");
         res.header("Connection", "Upgrade");
-        res.take_over([](std::shared_ptr<asio::socket> socket, std::string buffered) {
-            co_spawn(socket->get_io_context(), echo_session(socket, std::move(buffered)), detached);
+        res.take_over([](http::upgraded_connection conn) {
+            co_spawn(conn.socket->get_io_context(), echo_session(conn.socket, std::move(conn.buffered)), detached);
         });
     });
     target.start();
@@ -757,7 +780,7 @@ TEST_CASE("Reverse proxy forwards to Unix socket targets", "[proxy][unix][integr
 
     test_server target;
     add_inspect_handler(target.server);
-    target.start_unix(path);
+    target.start(http::test::unix_listen_options(path));
 
     http::reverse_proxy reverse_proxy;
     test_server proxy;
@@ -777,12 +800,14 @@ TEST_CASE("Reverse proxy forwards to Unix socket targets", "[proxy][unix][integr
 
 TEST_CASE("Reverse proxy verifies TLS targets", "[proxy][tls][integration]") {
     auto [certificate, key] = make_certificate("backend.test");
-    REQUIRE(asio::certificate_manager::instance().set_certificate("backend.test", certificate, key));
+    auto certificates = std::make_shared<asio::certificate_manager>();
+    // As the default: the proxy sends the address of the target as Host, which an entry of its
+    // own for backend.test (its SNI) would answer with 421
+    REQUIRE_FALSE(certificates->set_default_certificate(certificate, key));
 
     test_server target;
-    target.server.enable_ssl(true);
     add_inspect_handler(target.server);
-    target.start();
+    target.start(http::test::listen_options("127.0.0.1", 0, certificates));
 
     http::reverse_proxy reverse_proxy;
     http::proxy_target destination;
@@ -822,8 +847,6 @@ TEST_CASE("Reverse proxy verifies TLS targets", "[proxy][tls][integration]") {
         proxy.start();
         REQUIRE(raw_request(proxy.port, get("/secure")).status == 200);
     }
-
-    asio::certificate_manager::instance().remove_certificate("backend.test");
 }
 
 TEST_CASE("Reverse proxy removes hop-by-hop headers and adds forwarding headers", "[proxy][headers][integration]") {
@@ -1333,8 +1356,92 @@ TEST_CASE("Reverse proxy closes the target when the client leaves a silent excha
         raw_connection connection(proxy.port);
         connection.send(get("/events"));
         REQUIRE(wait_for([&] { return request_received.load(); }));
+        connection.reset();
     }
     REQUIRE(wait_for([&] { return target_closed.load(); }));
+}
+
+TEST_CASE("Reverse proxy stops the exchange within 50 ms of a reset of its client", "[proxy][cancellation][integration]") {
+    using clock = std::chrono::steady_clock;
+    // A target that reads the request and stays silent (or, for an event stream, sends its head
+    // and stays silent), telling when its connection closes
+    bool event_stream = GENERATE(false, true);
+    INFO((event_stream ? "a silent event stream" : "a target that does not answer"));
+    boost::asio::io_context ioc;
+    boost::asio::ip::tcp::acceptor acceptor(ioc, {boost::asio::ip::make_address("127.0.0.1"), 0});
+    std::atomic<bool> request_received{false};
+    std::atomic<bool> target_closed{false};
+    std::atomic<clock::rep> closed_at{0};
+    joiner silent_target;
+    silent_target.thread = std::thread([&] {
+        boost::asio::ip::tcp::socket socket(ioc);
+        acceptor.accept(socket);
+        char buffer[4096];
+        boost::system::error_code ec;
+        socket.read_some(boost::asio::buffer(buffer), ec);
+        if (event_stream) {
+            boost::asio::write(socket, boost::asio::buffer(std::string(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n")), ec);
+        }
+        request_received = true;
+        // the next read ends when the proxy closes the connection
+        socket.read_some(boost::asio::buffer(buffer), ec);
+        closed_at = clock::now().time_since_epoch().count();
+        target_closed = ec.failed();
+    });
+
+    // without timeouts, as for event streams that may stay silent
+    http::reverse_proxy reverse_proxy({.idle_timeout = 0ms});
+    auto target = target_of(acceptor.local_endpoint().port());
+    shared_value<std::string> error;
+    std::atomic<bool> finished{false};
+    test_server proxy;
+    proxy.server.set_not_found_handler([&](http::request& req, http::response& res) -> awaitable<void> {
+        auto result = co_await reverse_proxy.forward(req, res, target);
+        error.set(result.error);
+        finished = true;
+    });
+    proxy.start();
+
+    raw_connection connection(proxy.port);
+    connection.send(get("/events"));
+    REQUIRE(wait_for([&] { return request_received.load(); }));
+    if (event_stream) REQUIRE(connection.read_until("text/event-stream"));
+    auto reset_at = clock::now();
+    connection.reset();
+
+    REQUIRE(wait_for([&] { return target_closed.load(); }));
+    auto stopped_after = std::chrono::duration_cast<std::chrono::milliseconds>(
+        clock::time_point(clock::duration(closed_at.load())) - reset_at);
+    INFO("target closed " << stopped_after.count() << " ms after the reset");
+    CHECK(stopped_after <= 50ms);
+    // Stopped as a client that left (stop_reason::client_left)
+    REQUIRE(wait_for([&] { return finished.load(); }));
+    CHECK(error.get() == "the client closed the connection");
+}
+
+TEST_CASE("Reverse proxy answers a client that closed its sending side after its request",
+          "[proxy][cancellation][half_close][integration]") {
+    test_server target;
+    target.server.get("/slow", [](http::response& res) -> awaitable<void> {
+        boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 200ms);
+        co_await timer.async_wait(use_nothrow_awaitable);
+        res.send("late answer");
+    });
+    target.start();
+
+    http::reverse_proxy reverse_proxy;
+    test_server proxy;
+    forward_all(proxy.server, reverse_proxy, target_of(target.port));
+    proxy.start();
+
+    raw_connection connection(proxy.port);
+    connection.send(get("/slow"));
+    // A FIN: no leaving, the exchange goes on
+    connection.connection.shutdown_send();
+    auto response = connection.read_response();
+    CHECK(response.status == 200);
+    CHECK(response.body == "late answer");
 }
 
 TEST_CASE("Reverse proxy relays responses sent before the end of the request body", "[proxy][integration]") {

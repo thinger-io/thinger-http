@@ -6,6 +6,10 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #endif
+#if defined(__linux__)
+#include <linux/sockios.h>
+#include <sys/ioctl.h>
+#endif
 
 namespace thinger::asio {
 
@@ -70,9 +74,8 @@ namespace thinger::asio {
 #endif
     }
 
-    awaitable<bool> socket::peer_closed() {
-        // readable with nothing to read: end of stream, or an error
-        co_return available() == 0;
+    awaitable<boost::system::error_code> socket::peer_closed() {
+        co_return boost::asio::error::operation_not_supported;
     }
 
     awaitable<boost::system::error_code> socket::connect(const std::string&, const std::string&, std::chrono::seconds) {
@@ -95,6 +98,24 @@ namespace thinger::asio {
         return false;
     }
 
+    size_t socket::send_backlog() const {
+        return 0;
+    }
+
+    size_t socket::output_queue(native_handle_type descriptor) {
+        int bytes = 0;
+#if defined(__linux__)
+        // TCP: not acknowledged, sent or not; Unix: not read
+        if (::ioctl(descriptor, SIOCOUTQ, &bytes) != 0) return 0;
+#elif defined(SO_NWRITE)
+        socklen_t size = sizeof(bytes);
+        if (::getsockopt(descriptor, SOL_SOCKET, SO_NWRITE, &bytes, &size) != 0) return 0;
+#else
+        (void) descriptor;
+#endif
+        return bytes > 0 ? size_t(bytes) : 0;
+    }
+
     bool socket::poll_readable(native_handle_type descriptor) {
 #if !defined(BOOST_ASIO_WINDOWS)
         pollfd fd{};
@@ -109,6 +130,25 @@ namespace thinger::asio {
 #else
         (void) descriptor;
         return false;
+#endif
+    }
+
+    boost::system::error_code socket::peek_closed(native_handle_type descriptor) {
+#if defined(MSG_DONTWAIT) && !defined(BOOST_ASIO_WINDOWS)
+        char byte;
+        ssize_t bytes;
+        do {
+            bytes = ::recv(descriptor, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+        } while (bytes < 0 && errno == EINTR);
+        if (bytes > 0) return {};
+        if (bytes == 0) return boost::asio::error::eof;
+        boost::system::error_code ec(errno, boost::asio::error::get_system_category());
+        // Nothing to read yet: no conclusion, as with data
+        if (ec == boost::asio::error::would_block || ec == boost::asio::error::try_again) return {};
+        return ec;
+#else
+        (void) descriptor;
+        return boost::asio::error::operation_not_supported;
 #endif
     }
 
@@ -197,6 +237,36 @@ namespace thinger::asio {
             if (ec) co_return io_result{ec, total};
         }
         co_return io_result{boost::system::error_code{}, total};
+    }
+
+    awaitable<io_result> socket::write_slices(std::vector<boost::asio::const_buffer>& buffers,
+                                              const sync_callback<void()>& progress) {
+        std::vector<boost::asio::const_buffer> slice;
+        size_t total = 0;
+        consume(buffers, 0);
+        while (!buffers.empty()) {
+            slice.clear();
+            for (size_t size = 0, i = 0; i < buffers.size() && size < WRITE_SLICE_SIZE; ++i) {
+                slice.push_back(boost::asio::buffer(buffers[i], WRITE_SLICE_SIZE - size));
+                size += slice.back().size();
+            }
+            auto [ec, bytes] = co_await write(slice);
+            total += bytes;
+            consume(buffers, bytes);
+            if (ec) co_return io_result{ec, total};
+            progress();
+        }
+        co_return io_result{boost::system::error_code{}, total};
+    }
+
+    void socket::consume(std::vector<boost::asio::const_buffer>& buffers, size_t size) {
+        auto remaining = buffers.begin();
+        while (remaining != buffers.end() && size >= remaining->size()) {
+            size -= remaining->size();
+            ++remaining;
+        }
+        if (remaining != buffers.end()) *remaining += size;
+        buffers.erase(buffers.begin(), remaining);
     }
 
 }

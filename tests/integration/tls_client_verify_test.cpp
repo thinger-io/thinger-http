@@ -1,49 +1,52 @@
 #include <catch2/catch_test_macros.hpp>
-#include <thinger/asio/tcp_socket_server.hpp>
+#include <thinger/asio/listener.hpp>
+#include <thinger/asio/sockets/ssl_socket.hpp>
 #include <thinger/asio/ssl/certificate_manager.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/write.hpp>
 #include <openssl/x509.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <poll.h>
 #include <sys/resource.h>
-#include <sys/socket.h>
-#include <unistd.h>
 #include <atomic>
 #include <filesystem>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
 #include <vector>
+#include "../fixtures/listener_helpers.hpp"
 #include "../fixtures/test_ca.hpp"
 
 using namespace thinger;
 using namespace std::chrono_literals;
 using http::test::client_verify_host;
+using http::test::connect_tls;
 using http::test::key_type;
+using http::test::stalled_client;
 using http::test::test_ca;
+using http::test::tls_client;
+using http::test::tls_client_options;
 
-// Client certificates on TLS servers (tcp_socket_server::enable_ssl() with client_verify_options):
+// Client certificates on TLS listeners (listener_options::client_verify):
 // the three modes, deferred and trusted validation, limits, tls() and the accessors of ssl_socket,
 // modes per host name (SNI), session resumption, and the deadline of the handshake
 
 namespace {
 
     // A TLS server on localhost, on an io_context of its own, listening with the default
-    // certificate of the certificate_manager. It answers "ok" to each connection once its
-    // handshake is done, then echoes what it receives, and keeps what the connection told of TLS
+    // certificate of a certificate_manager (one of its own if none is given). It answers "ok" to
+    // each connection once its handshake is done, then echoes what it receives, and keeps what
+    // the connection told of TLS
     struct tls_server {
+        std::shared_ptr<asio::certificate_manager> certificates;
         boost::asio::io_context io_context;
         boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{io_context.get_executor()};
-        asio::tcp_socket_server server{"127.0.0.1", "0", provider(), provider()};
+        std::unique_ptr<asio::listener> server;
         std::thread thread;
-        bool enabled = false;
+        // What open() returned
+        boost::system::error_code opened;
 
         std::mutex mutex;
         std::vector<std::optional<asio::tls_session>> sessions;
@@ -56,21 +59,25 @@ namespace {
         std::atomic<int> handled{0};
 
         explicit tls_server(const asio::client_verify_options& verify = {},
-                            std::chrono::milliseconds handshake_timeout = asio::tcp_socket_server::DEFAULT_HANDSHAKE_TIMEOUT,
-                            bool tls = true) {
-            if (tls) {
-                enabled = server.enable_ssl(true, verify);
-                server.set_ssl_context(asio::certificate_manager::instance().get_default_certificate());
-            }
-            server.set_handshake_timeout(handshake_timeout);
-            server.set_max_listening_attempts(1);
-            server.set_handler([this](std::shared_ptr<asio::socket> sock) { serve(std::move(sock)); });
-            REQUIRE(server.start());
+                            std::chrono::milliseconds handshake_timeout = 60s,
+                            bool tls = true)
+            : tls_server(std::make_shared<asio::certificate_manager>(), verify, handshake_timeout, tls) {}
+
+        explicit tls_server(const std::shared_ptr<asio::certificate_manager>& manager,
+                            const asio::client_verify_options& verify = {},
+                            std::chrono::milliseconds handshake_timeout = 60s,
+                            bool tls = true)
+            : certificates(manager) {
+            auto options = tls ? http::test::secure_options(handshake_timeout, manager) : http::test::tcp_options();
+            options.client_verify = verify;
+            server = std::make_unique<asio::listener>(std::move(options), provider(), provider());
+            opened = server->open();
+            if (!opened) server->start([this](std::shared_ptr<asio::socket> sock) { serve(std::move(sock)); });
             thread = std::thread([this] { io_context.run(); });
         }
 
         ~tls_server() {
-            server.stop();
+            server->stop();
             work.reset();
             io_context.stop();
             thread.join();
@@ -79,7 +86,7 @@ namespace {
         tls_server(const tls_server&) = delete;
         tls_server& operator=(const tls_server&) = delete;
 
-        uint16_t port() const { return server.local_port(); }
+        uint16_t port() const { return server->local_port(); }
 
         std::optional<asio::tls_session> last_session() {
             std::scoped_lock lock(mutex);
@@ -87,8 +94,8 @@ namespace {
         }
 
     private:
-        asio::io_context_provider provider() {
-            return [this]() -> boost::asio::io_context& { return io_context; };
+        asio::executor_provider provider() {
+            return [this] { return boost::asio::any_io_executor(io_context.get_executor()); };
         }
 
         void serve(std::shared_ptr<asio::socket> sock) {
@@ -125,94 +132,6 @@ namespace {
         }
     };
 
-    using session_ptr = std::shared_ptr<SSL_SESSION>;
-
-    struct tls_client_options {
-        std::string certificate;            // PEM: the certificate first, then its chain
-        std::string key;
-        std::string server_name;            // SNI (none if empty)
-        int version = 0;                    // TLS1_2_VERSION or TLS1_3_VERSION (0: any)
-        session_ptr session;                // an earlier session to resume (a ticket)
-        std::function<void(SSL_CTX*)> tamper;
-    };
-
-    // A TLS client (OpenSSL through Boost.Asio, synchronous)
-    struct tls_client {
-        boost::asio::io_context io_context;
-        boost::asio::ssl::context context{boost::asio::ssl::context::tls_client};
-        std::unique_ptr<boost::asio::ssl::stream<boost::asio::ip::tcp::socket>> stream;
-
-        // As a client closing cleanly (close_notify, written to the stream's buffer only): OpenSSL
-        // makes the session of a connection freed without it not resumable
-        ~tls_client() {
-            if (stream && SSL_is_init_finished(stream->native_handle())) SSL_shutdown(stream->native_handle());
-        }
-
-        // Connect and do the handshake; then the server answers "ok" if it accepted the client
-        // (TLS 1.3 refuses a client certificate after the client finished its handshake)
-        bool connect(uint16_t port, const tls_client_options& options) {
-            auto* handle = context.native_handle();
-            if (options.version) {
-                SSL_CTX_set_min_proto_version(handle, options.version);
-                SSL_CTX_set_max_proto_version(handle, options.version);
-            }
-            if (!options.certificate.empty()) {
-                context.use_certificate_chain(boost::asio::buffer(options.certificate));
-                context.use_private_key(boost::asio::buffer(options.key), boost::asio::ssl::context::pem);
-            }
-            if (options.tamper) options.tamper(handle);
-            stream = std::make_unique<boost::asio::ssl::stream<boost::asio::ip::tcp::socket>>(io_context, context);
-            boost::system::error_code ec;
-            stream->next_layer().connect({boost::asio::ip::make_address("127.0.0.1"), port}, ec);
-            if (ec) return false;
-            if (!options.server_name.empty()) SSL_set_tlsext_host_name(stream->native_handle(), options.server_name.c_str());
-            if (options.session) {
-                // a copy: a connection that fails makes its session not resumable
-                SSL_SESSION* copy = SSL_SESSION_dup(options.session.get());
-                SSL_set_session(stream->native_handle(), copy);
-                SSL_SESSION_free(copy);
-            }
-            stream->handshake(boost::asio::ssl::stream_base::client, ec);
-            return !ec && read(2) == "ok";
-        }
-
-        std::string read(size_t size) {
-            std::string data(size, '\0');
-            boost::system::error_code ec;
-            auto bytes = boost::asio::read(*stream, boost::asio::buffer(data), ec);
-            data.resize(bytes);
-            return data;
-        }
-
-        bool write(const std::string& data) {
-            boost::system::error_code ec;
-            boost::asio::write(*stream, boost::asio::buffer(data), ec);
-            return !ec;
-        }
-
-        bool resumed() const { return SSL_session_reused(stream->native_handle()) == 1; }
-        session_ptr session() const { return {SSL_get1_session(stream->native_handle()), SSL_SESSION_free}; }
-    };
-
-    // What a client got from the server: whether it was accepted, whether it resumed a session,
-    // and its session (to resume it)
-    struct tls_attempt {
-        bool accepted = false;
-        bool resumed = false;
-        session_ptr session;
-    };
-
-    tls_attempt connect_tls(uint16_t port, const tls_client_options& options = {}) {
-        tls_client client;
-        tls_attempt attempt;
-        attempt.accepted = client.connect(port, options);
-        if (attempt.accepted) {
-            attempt.resumed = client.resumed();
-            attempt.session = client.session();
-        }
-        return attempt;
-    }
-
     tls_client_options with_certificate(const std::pair<std::string, std::string>& certificate, int version = 0,
                                         const std::string& chain = "") {
         tls_client_options options;
@@ -228,37 +147,6 @@ namespace {
         options.trusted_cas = std::move(trusted_cas);
         return options;
     }
-
-    // A TCP connection to a server that sends `bytes` and then nothing (POSIX, so many can be
-    // opened at once)
-    struct stalled_client {
-        int fd = -1;
-
-        explicit stalled_client(uint16_t port, const std::string& bytes = "") {
-            fd = ::socket(AF_INET, SOCK_STREAM, 0);
-            sockaddr_in address{};
-            address.sin_family = AF_INET;
-            address.sin_port = htons(port);
-            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) return;
-            if (!bytes.empty()) (void)!::send(fd, bytes.data(), bytes.size(), 0);
-        }
-
-        ~stalled_client() {
-            if (fd >= 0) ::close(fd);
-        }
-
-        stalled_client(const stalled_client&) = delete;
-        stalled_client& operator=(const stalled_client&) = delete;
-
-        // Whether the server closed the connection, waiting up to `timeout`
-        bool closed_within(std::chrono::milliseconds timeout) const {
-            pollfd descriptor{fd, POLLIN, 0};
-            if (::poll(&descriptor, 1, static_cast<int>(timeout.count())) <= 0) return false;
-            char byte;
-            return ::recv(fd, &byte, 1, MSG_DONTWAIT) <= 0;
-        }
-    };
 
     // The start of a TLS ClientHello: a handshake record header and a few bytes of it
     const std::string partial_client_hello{"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03", 11};
@@ -307,22 +195,6 @@ TEST_CASE("Client certificates: modes of a listener", "[tls][mtls][integration]"
             REQUIRE(server.last_session()->peer_chain_der[0] == leaf);
         }
     }
-
-    SECTION("The deprecated overload: true asks for an optional certificate, validated later") {
-        boost::asio::io_context io_context;
-        asio::tcp_socket_server server("127.0.0.1", "0", [&]() -> boost::asio::io_context& { return io_context; },
-                                       [&]() -> boost::asio::io_context& { return io_context; });
-#if defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-#endif
-        server.enable_ssl(true, true);
-        server.enable_ssl(true, false);
-#if defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
-        REQUIRE(server.get_service_name().starts_with("ssl_server@"));
-    }
 }
 
 TEST_CASE("Client certificates: deferred and trusted validation", "[tls][mtls][integration]") {
@@ -363,7 +235,7 @@ TEST_CASE("Client certificates: deferred and trusted validation", "[tls][mtls][i
     SECTION("Trusted CAs: a certificate of another CA is refused, also when optional") {
         for (auto mode : {asio::client_verify::optional, asio::client_verify::required}) {
             tls_server server(verify(mode, ca_a.pem()));
-            REQUIRE(server.enabled);
+            REQUIRE_FALSE(server.opened);
             REQUIRE_FALSE(connect_tls(server.port(), with_certificate(from_b, 0, intermediate->pem())).accepted);
             REQUIRE(server.handled == 0);
         }
@@ -377,15 +249,12 @@ TEST_CASE("Client certificates: deferred and trusted validation", "[tls][mtls][i
         REQUIRE(server.last_session()->verify_result == X509_V_OK);
     }
 
-    SECTION("Trusted CAs that cannot be read: the listener serves no connection") {
+    SECTION("Trusted CAs that cannot be read: the listener does not open") {
         for (std::string pem : {std::string("not a certificate"), ca_a.pem().substr(0, 100)}) {
             tls_server server(verify(asio::client_verify::optional, pem));
-            REQUIRE_FALSE(server.enabled);
-            // the connection is never served: no answer to its ClientHello
-            stalled_client client(server.port(), partial_client_hello);
-            pollfd descriptor{client.fd, POLLIN, 0};
-            REQUIRE(::poll(&descriptor, 1, 500) == 0);
-            REQUIRE(server.handled == 0);
+            REQUIRE(server.opened == boost::system::errc::invalid_argument);
+            // nothing bound
+            REQUIRE(server.port() == 0);
         }
     }
 }
@@ -457,7 +326,7 @@ TEST_CASE("Client certificates: tls() and the accessors of a connection", "[tls]
     auto intermediate = ca.issue_intermediate("Intermediate");
 
     SECTION("A plain TCP connection has no TLS details") {
-        tls_server server({}, asio::tcp_socket_server::DEFAULT_HANDSHAKE_TIMEOUT, false);
+        tls_server server({}, 60s, false);
         boost::asio::io_context io_context;
         boost::asio::ip::tcp::socket sock(io_context);
         sock.connect({boost::asio::ip::make_address("127.0.0.1"), server.port()});
@@ -517,11 +386,11 @@ TEST_CASE("Client certificates: tls() and the accessors of a connection", "[tls]
 TEST_CASE("Client certificates: modes per host name", "[tls][mtls][sni][integration]") {
     test_ca ca;
     auto certificate = ca.issue_client("device");
-    auto& manager = asio::certificate_manager::instance();
+    auto manager = std::make_shared<asio::certificate_manager>();
 
     SECTION("A host that requires a certificate on a listener that asks for none") {
-        tls_server server;
-        client_verify_host devices_host("devices.example.com", asio::client_verify::required);
+        tls_server server(manager);
+        client_verify_host devices_host(manager, "devices.example.com", asio::client_verify::required);
         REQUIRE(devices_host.set);
         tls_client_options devices;
         devices.server_name = "devices.example.com";
@@ -540,11 +409,11 @@ TEST_CASE("Client certificates: modes per host name", "[tls][mtls][sni][integrat
     }
 
     SECTION("Wildcards, invalid names, and removal") {
-        tls_server server;
-        client_verify_host wildcard("*.devices.example.com", asio::client_verify::optional);
+        tls_server server(manager);
+        client_verify_host wildcard(manager, "*.devices.example.com", asio::client_verify::optional);
         REQUIRE(wildcard.set);
-        REQUIRE(manager.get_client_verify("a.devices.example.com") == asio::client_verify::optional);
-        REQUIRE_FALSE(manager.get_client_verify("devices.example.com"));
+        REQUIRE(manager->get_client_verify("a.devices.example.com") == asio::client_verify::optional);
+        REQUIRE_FALSE(manager->get_client_verify("devices.example.com"));
         auto with = with_certificate(certificate);
         with.server_name = "a.devices.example.com";
         REQUIRE(connect_tls(server.port(), with).accepted);
@@ -554,23 +423,23 @@ TEST_CASE("Client certificates: modes per host name", "[tls][mtls][sni][integrat
         REQUIRE(connect_tls(server.port(), without).accepted);
 
         for (std::string name : {"", "bad host", "*", "*.", "a*.example.com", "a..example.com", "example.com."}) {
-            REQUIRE_FALSE(manager.set_client_verify(name, asio::client_verify::required));
+            REQUIRE(manager->set_client_verify(name, asio::client_verify::required) == boost::system::errc::invalid_argument);
         }
 
-        client_verify_host removed("removed.example.com", asio::client_verify::required);
+        client_verify_host removed(manager, "removed.example.com", asio::client_verify::required);
         REQUIRE(removed.set);
-        REQUIRE(manager.remove_client_verify("removed.example.com"));
-        REQUIRE_FALSE(manager.remove_client_verify("removed.example.com"));
-        REQUIRE_FALSE(manager.remove_client_verify("never.example.com"));
+        REQUIRE(manager->remove_client_verify("removed.example.com"));
+        REQUIRE_FALSE(manager->remove_client_verify("removed.example.com"));
+        REQUIRE_FALSE(manager->remove_client_verify("never.example.com"));
         without.server_name = "removed.example.com";
         REQUIRE(connect_tls(server.port(), without).accepted);
     }
 
     SECTION("A host with a certificate of its own keeps the trusted CAs of the listener") {
         test_ca other("Other CA");
-        http::test::server_certificate own("own.example.com", ca.issue("own.example.com"));
-        tls_server server(verify(asio::client_verify::optional, ca.pem()));
-        client_verify_host own_host("own.example.com", asio::client_verify::required);
+        http::test::server_certificate own(manager, "own.example.com", ca.issue("own.example.com"));
+        tls_server server(manager, verify(asio::client_verify::optional, ca.pem()));
+        client_verify_host own_host(manager, "own.example.com", asio::client_verify::required);
         REQUIRE(own_host.set);
         auto trusted = with_certificate(certificate);
         trusted.server_name = "own.example.com";
@@ -585,20 +454,55 @@ TEST_CASE("Client certificates: modes per host name", "[tls][mtls][sni][integrat
     }
 }
 
+namespace {
+
+    // Certificate requests a client of with_requests_counted() got from its servers
+    std::atomic<int> certificate_requests{0};
+
+    // A client asking for `name` that has no certificate, and counts the requests of one
+    tls_client_options with_requests_counted(const std::string& name) {
+        tls_client_options options;
+        options.server_name = name;
+        options.tamper = [](SSL_CTX* context) {
+            SSL_CTX_set_client_cert_cb(context, [](SSL*, X509**, EVP_PKEY**) {
+                ++certificate_requests;
+                return 0;
+            });
+        };
+        return options;
+    }
+
+}
+
+TEST_CASE("Client certificates: modes per host name of two managers", "[tls][mtls][sni][integration]") {
+    auto with_mode = std::make_shared<asio::certificate_manager>();
+    auto without_mode = std::make_shared<asio::certificate_manager>();
+    tls_server first(with_mode);
+    tls_server second(without_mode);
+    client_verify_host devices(with_mode, "devices.test", asio::client_verify::required);
+    REQUIRE(devices.set);
+    REQUIRE_FALSE(without_mode->get_client_verify("devices.test"));
+
+    // only the server of the manager with the mode asks for a certificate
+    certificate_requests = 0;
+    REQUIRE_FALSE(connect_tls(first.port(), with_requests_counted("devices.test")).accepted);
+    REQUIRE(certificate_requests == 1);
+    certificate_requests = 0;
+    REQUIRE(connect_tls(second.port(), with_requests_counted("devices.test")).accepted);
+    REQUIRE(certificate_requests == 0);
+}
+
 TEST_CASE("Client certificates: session id contexts", "[tls][mtls][resumption][integration]") {
     test_ca ca;
-    auto& manager = asio::certificate_manager::instance();
+    auto manager = std::make_shared<asio::certificate_manager>();
     // a context given ready-made, for a host
     auto given = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
     auto host_certificate = ca.issue("given.example.com");
     REQUIRE(asio::use_certificate(*given, host_certificate.first, host_certificate.second) == asio::certificate_error::none);
-    REQUIRE(manager.set_certificate("given.example.com", given));
-    struct removed {
-        ~removed() { asio::certificate_manager::instance().remove_certificate("given.example.com"); }
-    } remove_given;
+    REQUIRE_FALSE(manager->set_certificate("given.example.com", given));
 
     SECTION("Every context of the manager, created or given, has the same one") {
-        tls_server server;
+        tls_server server(manager);
         REQUIRE(connect_tls(server.port()).accepted);
         tls_client_options options;
         options.server_name = "given.example.com";
@@ -609,8 +513,8 @@ TEST_CASE("Client certificates: session id contexts", "[tls][mtls][resumption][i
     }
 
     SECTION("A listener asking for certificates has one of its own, also once switched by SNI") {
-        tls_server optional(verify(asio::client_verify::optional));
-        tls_server trusted(verify(asio::client_verify::optional, ca.pem()));
+        tls_server optional(manager, verify(asio::client_verify::optional));
+        tls_server trusted(manager, verify(asio::client_verify::optional, ca.pem()));
         tls_client_options options;
         options.server_name = "given.example.com";
         REQUIRE(connect_tls(optional.port(), options).accepted);
@@ -626,7 +530,8 @@ TEST_CASE("Client certificates: session resumption", "[tls][mtls][resumption][in
     test_ca ca;
     auto certificate = ca.issue_client("device");
     auto leaf = test_ca::der_of(certificate.first);
-    http::test::server_certificate own("resume.example.com", ca.issue("resume.example.com"));
+    auto manager = std::make_shared<asio::certificate_manager>();
+    http::test::server_certificate own(manager, "resume.example.com", ca.issue("resume.example.com"));
 
     // Resumed with tickets (the server's cache drops the sessions closed without close_notify)
     struct variant {
@@ -636,7 +541,7 @@ TEST_CASE("Client certificates: session resumption", "[tls][mtls][resumption][in
     for (auto [name, version] : {variant{"TLS 1.2", TLS1_2_VERSION}, variant{"TLS 1.3", TLS1_3_VERSION}}) {
         for (std::string host : {"", "resume.example.com"}) {
             DYNAMIC_SECTION("Resumed with a client certificate: " << name << ", host '" << host << "'") {
-                tls_server server(verify(asio::client_verify::optional));
+                tls_server server(manager, verify(asio::client_verify::optional));
                 auto options = with_certificate(certificate, version);
                 options.server_name = host;
                 auto first = connect_tls(server.port(), options);
@@ -654,8 +559,8 @@ TEST_CASE("Client certificates: session resumption", "[tls][mtls][resumption][in
         }
 
         DYNAMIC_SECTION("A session without a certificate is not resumed where one is required: " << name) {
-            tls_server server;
-            client_verify_host devices("devices.example.com", asio::client_verify::required);
+            tls_server server(manager);
+            client_verify_host devices(manager, "devices.example.com", asio::client_verify::required);
             REQUIRE(devices.set);
             tls_client_options options;
             options.version = version;
@@ -673,8 +578,8 @@ TEST_CASE("Client certificates: session resumption", "[tls][mtls][resumption][in
         DYNAMIC_SECTION("A session of a listener with deferred validation is not resumed on one with trusted CAs: " << name) {
             test_ca other("Other CA");
             auto untrusted = with_certificate(other.issue_client("device"), version);
-            tls_server deferred(verify(asio::client_verify::optional));
-            tls_server trusted(verify(asio::client_verify::optional, ca.pem()));
+            tls_server deferred(manager, verify(asio::client_verify::optional));
+            tls_server trusted(manager, verify(asio::client_verify::optional, ca.pem()));
             auto first = connect_tls(deferred.port(), untrusted);
             REQUIRE(first.accepted);
             untrusted.session = first.session;
@@ -686,12 +591,7 @@ TEST_CASE("Client certificates: session resumption", "[tls][mtls][resumption][in
 
 TEST_CASE("TLS handshake deadline", "[tls][handshake-timeout][integration]") {
     SECTION("60 s by default") {
-        boost::asio::io_context io_context;
-        asio::tcp_socket_server server("127.0.0.1", "0", [&]() -> boost::asio::io_context& { return io_context; },
-                                       [&]() -> boost::asio::io_context& { return io_context; });
-        REQUIRE(server.get_handshake_timeout() == 60s);
-        server.set_handshake_timeout(0ms);
-        REQUIRE(server.get_handshake_timeout() == 0ms);
+        REQUIRE(asio::listener_options{}.handshake_timeout == 60s);
     }
 
     for (std::string sent : {std::string(), partial_client_hello}) {
@@ -730,7 +630,7 @@ TEST_CASE("TLS handshake deadline", "[tls][handshake-timeout][integration]") {
             for (int i = 0; i < 10; ++i) clients.push_back(std::make_unique<stalled_client>(server.port(), partial_client_hello));
             // accepted by the server before it stops
             std::this_thread::sleep_for(200ms);
-            server.server.stop();
+            server.server->stop();
             for (const auto& client : clients) REQUIRE(client->closed_within(2s));
             REQUIRE(server.handled == 0);
         }

@@ -1,0 +1,19 @@
+# Public headers of thinger-http, one per line, relative to thinger/ (guardrail H1).
+#
+# status: draft
+# While this manifest is a draft, every header under thinger/ counts as public and none fails
+# for being outside it; structure_budget.py only checks that the entries below exist. Task 10.4
+# removes the dead headers and 11.4 freezes the manifest (about 70 headers, §3.1 of the target
+# design): from then on, removing the status line above makes it the list of public headers, and
+# adding one is a budget edit reviewed by the code owners.
+#
+# Public whatever their audience (decision D10): the core uses them. body_decoders.hpp is still
+# under http/server/; §3.1 places it in http/common/, and the entry follows it when it moves.
+asio/async_event.hpp
+asio/listener.hpp
+asio/watchdog.hpp
+http/common/syntax.hpp
+http/server/body_decoders.hpp
+http/server/upgrade.hpp
+http/util/url.hpp
+http/util/utf8.hpp

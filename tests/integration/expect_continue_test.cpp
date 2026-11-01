@@ -23,44 +23,22 @@ namespace {
 
     const std::string continue_line = "HTTP/1.1 100 Continue\r\n\r\n";
 
-    // A client connection reading with timeouts
-    struct raw_connection {
-        boost::asio::io_context ioc;
-        boost::asio::ip::tcp::socket socket{ioc};
+    // A client connection (on any transport) keeping what it read in `pending`
+    struct continue_client {
+        http::test::raw_connection connection;
         std::string pending;
         bool closed = false;
 
-        explicit raw_connection(uint16_t port) {
-            socket.connect({boost::asio::ip::make_address("127.0.0.1"), port});
-        }
+        explicit continue_client(const running_server& running) : connection(running.endpoint()) {}
 
-        void send(std::string_view data) {
-            boost::asio::write(socket, boost::asio::buffer(data.data(), data.size()));
-        }
+        void send(std::string_view data) { REQUIRE(connection.write(data)); }
 
         // Read once more into `pending`; false on timeout or once the connection is closed
         bool read_more(std::chrono::milliseconds timeout) {
             if (closed) return false;
-            char data[16384];
-            boost::system::error_code result;
-            size_t bytes = 0;
-            bool done = false;
-            socket.async_read_some(boost::asio::buffer(data), [&](boost::system::error_code ec, size_t n) {
-                result = ec;
-                bytes = n;
-                done = true;
-            });
-            ioc.restart();
-            ioc.run_for(timeout);
-            if (!done) {
-                socket.cancel();
-                ioc.restart();
-                ioc.run();
-                return false;
-            }
-            pending.append(data, bytes);
-            if (result) closed = true;
-            return !result;
+            size_t bytes = connection.read_some(pending, timeout);
+            closed = connection.eof();
+            return bytes > 0 && !closed;
         }
 
         bool read_until(const std::string& needle, std::chrono::milliseconds timeout = 5s) {
@@ -105,7 +83,6 @@ namespace {
     struct continue_server {
         http::server server;
         std::unique_ptr<running_server> running;
-        uint16_t port = 0;
         std::atomic<int> handled{0};
 
         explicit continue_server(size_t max_body_size = http::default_max_body_size) {
@@ -162,21 +139,20 @@ namespace {
             });
         }
 
-        void start() {
-            running = std::make_unique<running_server>(server);
-            port = running->port;
+        void start(transport kind) {
+            running = std::make_unique<running_server>(server, kind);
         }
     };
 
     // The server asks for the body: 100 Continue arrives while the client still holds it back
-    void require_continue(raw_connection& connection) {
+    void require_continue(continue_client& connection) {
         REQUIRE(connection.read_until(continue_line, 3s));
         REQUIRE(connection.pending.starts_with(continue_line));
         connection.take_until(continue_line);
     }
 
     // Nothing arrives within `wait`
-    void require_silence(raw_connection& connection, std::chrono::milliseconds wait = 300ms) {
+    void require_silence(continue_client& connection, std::chrono::milliseconds wait = 300ms) {
         connection.read_more(wait);
         REQUIRE(connection.pending.empty());
         REQUIRE_FALSE(connection.closed);
@@ -184,7 +160,7 @@ namespace {
 
     // The response ends the connection: final status `status`, no 100 Continue before it, and
     // Connection: close
-    void require_answered_without_continue(raw_connection& connection, const std::string& status) {
+    void require_answered_without_continue(continue_client& connection, const std::string& status) {
         REQUIRE(connection.read_until_closed(3s));
         INFO("response: " << connection.pending);
         REQUIRE(connection.pending.starts_with("HTTP/1.1 " + status));
@@ -195,10 +171,11 @@ namespace {
 
 }
 
-TEST_CASE("100 Continue is sent once the body is read", "[server][expect][integration]") {
+TEST_CASE("100 Continue is sent once the body is read", "[server][expect][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     continue_server fixture;
-    fixture.start();
-    raw_connection connection(fixture.port);
+    fixture.start(kind);
+    continue_client connection(*fixture.running);
 
     SECTION("Read by the server before the handler") {
         connection.send(expect_head("/echo", 5));
@@ -260,10 +237,11 @@ TEST_CASE("100 Continue is sent once the body is read", "[server][expect][integr
     REQUIRE(connection.pending.find("100 Continue") == std::string::npos);
 }
 
-TEST_CASE("A response sent without reading the body sends no 100 Continue and closes", "[server][expect][integration]") {
+TEST_CASE("A response sent without reading the body sends no 100 Continue and closes", "[server][expect][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     continue_server fixture;
-    fixture.start();
-    raw_connection connection(fixture.port);
+    fixture.start(kind);
+    continue_client connection(*fixture.running);
 
     SECTION("Handler answering 401") {
         connection.send(expect_head("/denied", 1000));
@@ -295,19 +273,21 @@ TEST_CASE("A response sent without reading the body sends no 100 Continue and cl
 
 }
 
-TEST_CASE("A Content-Length over the server limit is answered 413 without 100 Continue", "[server][expect][integration]") {
+TEST_CASE("A Content-Length over the server limit is answered 413 without 100 Continue", "[server][expect][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     continue_server fixture(100);
-    fixture.start();
-    raw_connection connection(fixture.port);
+    fixture.start(kind);
+    continue_client connection(*fixture.running);
     connection.send(expect_head("/echo", 1000));
     require_answered_without_continue(connection, "413");
     REQUIRE(fixture.handled == 0);
 }
 
-TEST_CASE("Other expectations are answered with 417", "[server][expect][integration]") {
+TEST_CASE("Other expectations are answered with 417", "[server][expect][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     continue_server fixture;
-    fixture.start();
-    raw_connection connection(fixture.port);
+    fixture.start(kind);
+    continue_client connection(*fixture.running);
 
     SECTION("With a body: the connection is closed") {
         connection.send(expect_head("/echo", 5, "foo"));
@@ -332,10 +312,11 @@ TEST_CASE("Other expectations are answered with 417", "[server][expect][integrat
     }
 }
 
-TEST_CASE("Expect is ignored in HTTP/1.0 requests", "[server][expect][integration]") {
+TEST_CASE("Expect is ignored in HTTP/1.0 requests", "[server][expect][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     continue_server fixture;
-    fixture.start();
-    raw_connection connection(fixture.port);
+    fixture.start(kind);
+    continue_client connection(*fixture.running);
 
     SECTION("100-continue") {
         connection.send(post_head("/echo", "Expect: 100-continue\r\nContent-Length: 5\r\n", "1.0"));
@@ -355,10 +336,11 @@ TEST_CASE("Expect is ignored in HTTP/1.0 requests", "[server][expect][integratio
     REQUIRE(connection.pending.find("100 Continue") == std::string::npos);
 }
 
-TEST_CASE("100 Continue is written in order with pipelined responses", "[server][expect][pipelining][integration]") {
+TEST_CASE("100 Continue is written in order with pipelined responses", "[server][expect][pipelining][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     continue_server fixture;
-    fixture.start();
-    raw_connection connection(fixture.port);
+    fixture.start(kind);
+    continue_client connection(*fixture.running);
 
     SECTION("After the response of a previous request") {
         connection.send("GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n" + expect_head("/echo", 5));
@@ -416,7 +398,9 @@ TEST_CASE("Expect in requests dispatched in memory", "[server][expect][memory][i
     }
 }
 
-TEST_CASE("Reverse proxy asks for the body once it streams it to the target", "[server][expect][proxy][integration]") {
+TEST_CASE("Reverse proxy asks for the body once it streams it to the target", "[server][expect][proxy][integration][matrix]") {
+    // The client on each transport, the target on TCP (reverse_proxy_test crosses both)
+    MATRIX_TRANSPORT(kind);
     // Target: echoes the body, and whether it got Expect
     http::server target;
     target.post("/upload", [](http::request& req, http::response& res) {
@@ -437,8 +421,8 @@ TEST_CASE("Reverse proxy asks for the body once it streams it to the target", "[
     proxy.post("/down", [&](http::request& req, http::response& res) -> awaitable<void> {
         co_await reverse_proxy.forward(req, res, *unreachable);
     });
-    running_server running_proxy(proxy);
-    raw_connection connection(running_proxy.port);
+    running_server running_proxy(proxy, kind);
+    continue_client connection(running_proxy);
 
     SECTION("A single 100 Continue, from the proxy; Expect is not forwarded") {
         connection.send(expect_head("/upload", 5));

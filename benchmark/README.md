@@ -12,7 +12,9 @@ Each framework runs an identical "Hello World!" endpoint:
 
 **thinger-http** (port 9080)
 ```cpp
-http::pool_server srv;
+asio::workers workers;
+workers.start();
+http::pool_server srv(workers);
 srv.get("/", [](http::request& req, http::response& res) {
     res.send("Hello World!");
 });

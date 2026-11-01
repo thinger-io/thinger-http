@@ -703,7 +703,9 @@ TEST_CASE("A timeout with the body read keeps the connection; with the body unre
 
 TEST_CASE("A route timeout longer than the connection timeout", "[server][timeout][connection][integration]") {
     http::server server;
-    server.set_connection_timeout(1s);
+    http::connection_options options;
+    options.idle_timeout = 1s;
+    server.set_connection_options(options);
     server.get("/device", [](http::response& res) -> thinger::awaitable<void> {
         co_await sleep_for(2000ms);
         res.send("answer");
@@ -726,7 +728,7 @@ TEST_CASE("In-memory dispatch honors the route timeout", "[server][timeout][disp
     server.get("/slower", [&](http::response& res) -> thinger::awaitable<void> {
         co_await sleep_for(5000ms);
         res.send("late");
-    }).timeout(4s);
+    }).timeout(4s).cancel_on({http::cancel_reason::timeout});
 
     auto start = clock::now();
     auto response = run_dispatch(server, make_request(http::method::GET, "/slow"));
@@ -735,7 +737,8 @@ TEST_CASE("In-memory dispatch honors the route timeout", "[server][timeout][disp
     // run_dispatch runs its io_context until the handler ends too
     CHECK(finished == 1);
 
-    // The dispatch timeout, if shorter, cancels the handler
+    // The dispatch timeout, if shorter, answers first, and interrupts a handler whose route
+    // declares the timeout
     start = clock::now();
     response = run_dispatch(server, make_request(http::method::GET, "/slower"), {.timeout = 200ms});
     CHECK(response->get_status_code() == 504);

@@ -2,6 +2,7 @@
 #define THINGER_ASIO_SSL_SOCKET_HPP
 
 #include "tcp_socket.hpp"
+#include "../ssl/certificate_manager.hpp"
 #include "../ssl/client_verify.hpp"
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
@@ -33,7 +34,7 @@ public:
 
     // wait
     awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type) override;
-    awaitable<bool> peer_closed() override;
+    awaitable<boost::system::error_code> peer_closed() override;
 
     // write operations
     awaitable<io_result> write(const uint8_t buffer[], size_t size) override;
@@ -50,6 +51,8 @@ public:
     bool readable_now() const override;
     // Once the handshake is done (none before, or once closed)
     std::optional<tls_session> tls() const override;
+    // Checked against the record of the server handshake (none on the client side)
+    bool misdirected(std::string_view host) const override { return handshake_.misdirected(host); }
 
     // The certificate of the peer (its leaf), without copying it: null if it sent none (or
     // before the handshake). Owned by the connection: not to be used once the socket is closed
@@ -64,8 +67,9 @@ public:
     // certificate of the server before the handshake
     SSL* native_handle() { return ssl_stream_.native_handle(); }
 
-    // Ask the client for its certificate with `policy` (see client_verify_policy), kept as long
-    // as the socket; before the server handshake
+    // Internal: only listener calls it, until tls_socket (0.10); applications set
+    // listener_options::client_verify. Ask the client for its certificate with `policy` (see
+    // client_verify_policy), kept as long as the socket; before the server handshake
     void set_client_verify(std::shared_ptr<const client_verify_policy> policy);
 
 private:
@@ -80,6 +84,8 @@ private:
     std::shared_ptr<boost::asio::ssl::context> ssl_context_;
     // Client certificates asked for (server side), referred to by the SSL
     std::shared_ptr<const client_verify_policy> client_verify_;
+    // What the server handshake chose by the host name of its client, kept once it completes
+    tls_handshake_record handshake_;
 };
 
 }

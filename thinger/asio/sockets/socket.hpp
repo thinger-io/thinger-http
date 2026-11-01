@@ -17,12 +17,6 @@
 
 namespace thinger::asio {
 
-// Something kept as long as a socket (see socket::set_attachment())
-class socket_attachment {
-public:
-    virtual ~socket_attachment() = default;
-};
-
 // Byte stream socket: TCP, TLS, Unix, a WebSocket (see websocket.hpp), or a socket defined by
 // the application (e.g. a virtual stream multiplexed inside another connection), all used the
 // same way by the protocols and tunnels running on them (see socket_pipe.hpp).
@@ -62,7 +56,14 @@ public:
 
     // socket control
     // Connect to host:port (with the TLS handshake if required); operation_not_supported
-    // by default
+    // by default. `timeout` bounds the whole call, taken as a deadline when it starts: the
+    // name resolution, the connect and, over TLS, the client handshake share it, each phase
+    // getting the time left. Once it passes, the socket is closed and the call returns
+    // boost::asio::error::timed_out (operation_aborted if the caller cancelled it). Other
+    // errors are returned as they are (a handshake error with the socket closed). The bound of
+    // the resolution is best-effort: asio cannot interrupt getaddrinfo, so a resolver that
+    // hangs ends the call only once it returns (with timed_out if the deadline passed); a host
+    // given as an address is not resolved
     virtual awaitable<boost::system::error_code> connect(
         const std::string &host,
         const std::string &port,
@@ -94,14 +95,25 @@ public:
     // waiting (then nothing is written). Not to be mixed with a pending write.
     virtual size_t write_now(const std::vector<boost::asio::const_buffer> &buffers, boost::system::error_code &ec);
 
+    // As write(buffers), in slices of WRITE_SLICE_SIZE (a socket buffer), `progress` called after
+    // each one: a write deadline it moves tells a slow peer that keeps reading from one that
+    // stopped, as nginx's send_timeout does. `buffers` is left with what was not written
+    static constexpr size_t WRITE_SLICE_SIZE = 64 * 1024;
+    awaitable<io_result> write_slices(std::vector<boost::asio::const_buffer> &buffers,
+                                      const sync_callback<void()> &progress);
+    // Drop the first `size` bytes of `buffers` (and the empty buffers they leave first)
+    static void consume(std::vector<boost::asio::const_buffer> &buffers, size_t size);
+
     // wait (operation_not_supported by default: then an HTTP server on the socket does not
     // watch for a client leaving while a response is pending)
     virtual awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type);
 
-    // Once the socket is readable (see wait()): whether the peer closed the connection
-    // (closed it, half-closed it or reset it) instead of sending data. Data is not consumed:
-    // it stays available to the next read. It may wait for the rest of a TLS record.
-    virtual awaitable<bool> peer_closed();
+    // Once the socket is readable (see wait()): why, without consuming anything. No error if
+    // the peer sent data (it stays available to the next read), eof if it closed its sending
+    // side (a FIN; over TLS a close_notify, or a FIN without one), the error of the connection
+    // otherwise (a reset). operation_not_supported by default, as wait(). It may wait for the
+    // rest of a TLS record
+    virtual awaitable<boost::system::error_code> peer_closed();
 
     // some getters to check the state
     virtual bool is_open() const = 0;
@@ -109,6 +121,10 @@ public:
     virtual bool is_secure() const;
     // Bytes that can be read without waiting (0 by default)
     virtual size_t available() const;
+    // Bytes written that the peer has not taken yet, as the system counts them (over TCP not
+    // acknowledged, over a Unix socket not read); 0 by default (unknown). It only falls as the
+    // peer takes them, so a stalled write tells a slow reader from one that stopped reading
+    virtual size_t send_backlog() const;
     // Without waiting: whether a read would complete now, with data, the end of the stream or
     // an error (e.g. on an idle connection, which should have nothing to read, the peer
     // closing it). False by default (unknown)
@@ -121,14 +137,13 @@ public:
     // default), or before the handshake or once closed. A socket running on another one (a
     // websocket) answers for it, so the caller never casts
     virtual std::optional<tls_session> tls() const;
+    // Whether a request for the host name `host` (its Host, port removed) is misdirected on
+    // this connection: its TLS handshake chose another client certificate mode or certificate
+    // than `host` gets (see tls_handshake_record::misdirected()). False without TLS (the default)
+    virtual bool misdirected(std::string_view /*host*/) const { return false; }
 
     // other methods
     boost::asio::io_context &get_io_context() const;
-
-    // Keep `attachment` as long as the socket: e.g. the server tracking a connection taken
-    // over from it (see http::on_server_shutdown()). One at a time
-    void set_attachment(std::shared_ptr<socket_attachment> attachment) { attachment_ = std::move(attachment); }
-    const std::shared_ptr<socket_attachment>& get_attachment() const { return attachment_; }
 
 protected:
     using native_handle_type = boost::asio::ip::tcp::socket::native_handle_type;
@@ -141,11 +156,17 @@ protected:
     // readable_now() of a plain stream socket: polled with no timeout (true if the poll fails)
     static bool poll_readable(native_handle_type descriptor);
 
+    // send_backlog() of a plain stream socket: SIOCOUTQ on Linux, SO_NWRITE on macOS (0 if
+    // neither tells, or on an error)
+    static size_t output_queue(native_handle_type descriptor);
+
+    // peer_closed() of a plain stream socket: a non-blocking peek of one byte, which leaves it
+    // in the socket. No error with data (or nothing to read yet), eof at the end of the stream,
+    // else the error of the socket
+    static boost::system::error_code peek_closed(native_handle_type descriptor);
+
     boost::asio::io_context &io_context_;
     static std::atomic<unsigned long> connections;
-
-private:
-    std::shared_ptr<socket_attachment> attachment_;
 };
 
 }

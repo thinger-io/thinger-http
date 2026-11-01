@@ -396,3 +396,55 @@ TEST_CASE("Socket pipe transfer stats are correct", "[socket-pipe]") {
     io.stop();
     io_thread.join();
 }
+
+TEST_CASE("Socket pipe ends at its idle deadline when both peers are silent", "[socket-pipe]") {
+    using steady = std::chrono::steady_clock;
+    net::io_context io;
+    tcp::acceptor acc = make_acceptor(io);
+    tcp::endpoint endpoint(net::ip::make_address("127.0.0.1"), get_port(acc));
+
+    // Two connected pairs: the pipe joins one end of each, the other ends stay silent
+    tcp::socket source_peer(io);
+    source_peer.connect(endpoint);
+    auto source = std::make_shared<tcp_socket>("idle-source", acc.accept());
+    tcp::socket target_peer(io);
+    target_peer.connect(endpoint);
+    auto target = std::make_shared<tcp_socket>("idle-target", acc.accept());
+
+    std::atomic<int> on_end_calls{0};
+    std::atomic<bool> done{false};
+    steady::duration elapsed{};
+
+    co_spawn(io, [&]() -> awaitable<void> {
+        auto pipe = std::make_shared<socket_pipe>(source, target);
+        pipe->set_on_end([&on_end_calls] { ++on_end_calls; });
+        pipe->set_idle_timeout(500ms);
+        auto started = steady::now();
+        co_await pipe->run();
+        elapsed = steady::now() - started;
+        pipe.reset();  // the on-end callback runs here, with the last reference
+        done = true;
+    }, detached);
+
+    std::thread io_thread([&io] { io.run(); });
+
+    // Bounded: a pipe that never ends fails here instead of hanging
+    REQUIRE(wait_for(done, 3s));
+    CHECK(elapsed >= 400ms);
+    CHECK(elapsed <= 1500ms);
+    CHECK(on_end_calls == 1);
+    CHECK_FALSE(source->is_open());
+    CHECK_FALSE(target->is_open());
+
+    // Both silent peers see their connection end
+    char buf[16];
+    boost::system::error_code source_ec, target_ec;
+    source_peer.read_some(net::buffer(buf), source_ec);
+    target_peer.read_some(net::buffer(buf), target_ec);
+    CHECK(source_ec);
+    CHECK(target_ec);
+
+    io.stop();
+    io_thread.join();
+    CHECK(on_end_calls == 1);
+}

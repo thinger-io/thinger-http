@@ -6,8 +6,11 @@
 
 #include "server_test_helpers.hpp"
 
+#include <algorithm>
 #include <future>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <vector>
 
 // Flow control of the server sse_connection: queued bytes and watermarks, a producer waiting
@@ -393,4 +396,215 @@ TEST_CASE("SSE write timeout", "[sse][flow][integration]") {
     REQUIRE(state->failed.load());
     client.read_events(SIZE_MAX, 5s);
     REQUIRE(client.closed());
+}
+
+// The write deadline is on by default (60 s), also once limits that do not name it are set, as
+// the flow-control examples of the README do
+TEST_CASE("SSE write deadline by default", "[sse][flow][integration]") {
+    http::server server;
+    std::promise<std::pair<std::chrono::milliseconds, std::chrono::milliseconds>> timeouts;
+    server.get("/events", [&](http::request&, http::response& res) {
+        res.start_sse([&](sse_ptr sse) {
+            auto by_default = sse->get_write_limits().write_timeout;
+            sse->set_write_limits({.max_messages = 0, .high_watermark = 1 << 20});
+            timeouts.set_value({by_default, sse->get_write_limits().write_timeout});
+        });
+    });
+    running_server running(server);
+    sse_client client(running.port);
+    auto [by_default, after_limits] = timeouts.get_future().get();
+    CHECK(by_default == 60s);
+    CHECK(after_limits == 60s);
+}
+
+// A producer awaiting each event, whose client stops reading: its pending send_async() completes
+// with false at the write deadline (the buffers of the connection fill first, a second at most),
+// and the producer ends, so nothing holds the connection
+TEST_CASE("SSE send_async ends at the write deadline", "[sse][flow][integration]") {
+    struct awaited {
+        std::atomic<size_t> written{0};
+        std::atomic<bool> done{false};
+        std::promise<std::weak_ptr<http::sse_connection>> created;
+    };
+    auto state = std::make_shared<awaited>();
+    http::server server;
+    server.get("/events", [state](http::request&, http::response& res) {
+        res.start_sse([state](sse_ptr sse) {
+            sse->set_write_limits({.write_timeout = 1s});
+            state->created.set_value(sse);
+            co_spawn(sse->get_executor(), [state, sse]() -> awaitable<void> {
+                for (size_t i = 0; co_await sse->send_async({.data = payload(i, 16 * 1024)}); ++i) ++state->written;
+                state->done = true;
+            }, detached);
+        });
+    });
+    running_server running(server);
+    auto start = std::chrono::steady_clock::now();
+    sse_client client(running.port);
+    auto weak = state->created.get_future().get();
+
+    REQUIRE(eventually([&] { return state->done.load(); }, 5s));
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    INFO("ended after " << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() << " ms, "
+                        << state->written << " events written");
+    CHECK(elapsed >= 1s - 100ms);
+    CHECK(elapsed <= 3s);
+    CHECK(state->written > 0);
+    REQUIRE(eventually([&] { return weak.expired(); }));
+}
+
+// 0 disables the write deadline, as in 0.8: a client that stops reading keeps its connection,
+// and once the queue is full the newest events are dropped
+TEST_CASE("SSE without a write deadline", "[sse][flow][integration]") {
+    http::server server;
+    std::promise<sse_ptr> created;
+    std::atomic<int> closes{0};
+    server.get("/events", [&](http::request&, http::response& res) {
+        res.start_sse([&](sse_ptr sse) {
+            sse->set_write_limits({.write_timeout = 0ms});
+            sse->on_close([&] { ++closes; });
+            co_spawn(sse->get_executor(), [sse]() -> awaitable<void> {
+                boost::asio::steady_timer timer(sse->get_executor());
+                for (size_t i = 0;; ++i) {
+                    sse->send_data(payload(i, 16 * 1024));
+                    if (!co_await sse->wait_writable()) co_return;
+                    timer.expires_after(10ms);
+                    co_await timer.async_wait(use_nothrow_awaitable);
+                }
+            }, detached);
+            created.set_value(sse);
+        });
+    });
+    running_server running(server);
+    auto start = std::chrono::steady_clock::now();
+    sse_client client(running.port);
+    auto sse = created.get_future().get();
+
+    // full once the buffers of the connection are (a few MiB, as the system sizes them): what
+    // is sent from then on is dropped
+    REQUIRE(eventually([&] { return sse->queued_messages() == http::write_limits{}.max_messages; }));
+    std::this_thread::sleep_until(std::max(start + 3s, std::chrono::steady_clock::now() + 1s));
+    CHECK(closes == 0);
+    CHECK(sse->queued_messages() == http::write_limits{}.max_messages);
+    client.read_events(1, 1s);
+    CHECK_FALSE(client.closed());
+}
+
+namespace {
+
+    // An event of three lines of data, with its type and ID
+    http::sse_event multiline_event(size_t index) {
+        auto i = std::to_string(index);
+        return {.event = "e" + i, .id = i, .data = i + "\nline 2\nline 3"};
+    }
+
+    std::string multiline_wire(size_t index) {
+        auto i = std::to_string(index);
+        return "event: e" + i + "\nid: " + i + "\ndata: " + i + "\ndata: line 2\ndata: line 3\n\n";
+    }
+
+    // The events of `stream`, as indexes: each one whole as `wire_of` writes it, or nothing if
+    // any is not (an orphan field, an event cut, a field of another one)
+    template<typename Wire>
+    std::optional<std::vector<size_t>> whole_events(const std::string& stream, Wire wire_of, size_t sent) {
+        std::vector<size_t> received;
+        size_t pos = 0;
+        while (pos < stream.size()) {
+            auto end = stream.find("\n\n", pos);
+            if (end == std::string::npos) return std::nullopt;
+            auto event = stream.substr(pos, end + 2 - pos);
+            size_t index = 0;
+            while (index < sent && wire_of(index) != event) ++index;
+            if (index == sent) return std::nullopt;
+            received.push_back(index);
+            pos = end + 2;
+        }
+        return received;
+    }
+
+    std::vector<size_t> indexes(std::initializer_list<size_t> first, size_t from, size_t to) {
+        std::vector<size_t> values(first);
+        for (auto i = from; i < to; ++i) values.push_back(i);
+        return values;
+    }
+
+}
+
+TEST_CASE("SSE drop_oldest keeps whole events", "[sse][flow][integration]") {
+    http::server server;
+    std::function<void(const sse_ptr&)> setup;
+    std::promise<size_t> queued;
+    server.get("/events", [&](http::request&, http::response& res) {
+        res.start_sse([&](sse_ptr sse) {
+            setup(sse);
+            queued.set_value(sse->queued_messages());
+        });
+    });
+    running_server running(server);
+    // the client reads once everything was sent: the queue is full meanwhile. The first event
+    // may be being written as the others are queued (see "drop_oldest drops whole events"):
+    // then it is completed, and the oldest whole events after it are dropped
+    auto receive = [&](auto wire_of, size_t sent) {
+        sse_client client(running.port);
+        auto received = whole_events(client.read_events(sent), wire_of, sent);
+        REQUIRE(received);
+        return *received;
+    };
+
+    SECTION("events sent whole, with several lines of data: each one counts one") {
+        setup = [](const sse_ptr& sse) {
+            sse->set_write_limits({.max_messages = 10, .policy = http::overflow_policy::drop_oldest});
+            for (size_t i = 0; i < 30; ++i) sse->send(multiline_event(i));
+        };
+        auto received = receive(multiline_wire, 30);
+        REQUIRE((received == indexes({}, 20, 30) || received == indexes({0}, 21, 30)));
+        REQUIRE(queued.get_future().get() == 10);
+    }
+
+    SECTION("events sent field by field, with a comment: each field counts one") {
+        auto wire_of = [](size_t index) { return ": c" + std::to_string(index) + "\n" + multiline_wire(index); };
+        setup = [](const sse_ptr& sse) {
+            // four fields each: three events
+            sse->set_write_limits({.max_messages = 12, .policy = http::overflow_policy::drop_oldest});
+            for (size_t i = 0; i < 30; ++i) {
+                auto event = multiline_event(i);
+                sse->send_comment("c" + std::to_string(i));
+                sse->send_event(*event.event);
+                sse->send_id(*event.id);
+                sse->send_data(event.data);
+            }
+        };
+        auto received = receive(wire_of, 30);
+        // the one being written, from its first field
+        REQUIRE((received == indexes({}, 27, 30) || received == indexes({0}, 28, 30)));
+        REQUIRE(queued.get_future().get() == 12);
+    }
+
+    SECTION("events awaited with send_async are never dropped") {
+        struct awaited {
+            std::atomic<int> told{0};
+            std::atomic<int> written{0};
+        };
+        auto results = std::make_shared<awaited>();
+        setup = [results](const sse_ptr& sse) {
+            sse->set_write_limits({.max_messages = 4, .policy = http::overflow_policy::drop_oldest});
+            for (size_t i = 0; i < 30; ++i) {
+                if (i % 5 != 0) {
+                    sse->send(multiline_event(i));
+                    continue;
+                }
+                co_spawn(sse->get_executor(), sse->send_async(multiline_event(i)), [results](std::exception_ptr, bool written) {
+                    if (written) ++results->written;
+                    ++results->told;
+                });
+            }
+        };
+        auto received = receive(multiline_wire, 30);
+        REQUIRE(eventually([&] { return results->told == 6; }));
+        CHECK(results->written == 6);
+        // every awaited one, once; the others dropped as whole events
+        for (size_t i = 0; i < 30; i += 5) CHECK(std::count(received.begin(), received.end(), i) == 1);
+        CHECK(received.size() < 30);
+        CHECK(std::set<size_t>(received.begin(), received.end()).size() == received.size());
+    }
 }

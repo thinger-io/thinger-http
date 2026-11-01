@@ -72,12 +72,13 @@ TEST_CASE("HTTP Client Timeout (sync)", "[http][client][timeout][sync]") {
 
 // Test timeout with async async_client
 TEST_CASE("HTTP Async Client Timeout (async)", "[http][client][timeout][async]") {
+    thinger::http::test::running_workers workers;
 
     thinger::http::test::TestServerFixture fixture;
     auto& base_url = fixture.base_url;
 
     SECTION("Connection timeout triggers when no data is received") {
-        http::async_client client;
+        http::async_client client(workers);
         client.timeout(2s);
 
         std::promise<bool> promise;
@@ -99,7 +100,7 @@ TEST_CASE("HTTP Async Client Timeout (async)", "[http][client][timeout][async]")
     }
 
     SECTION("Fast requests complete successfully with timeout") {
-        http::async_client client;
+        http::async_client client(workers);
         client.timeout(5s);
 
         std::promise<bool> promise;
@@ -115,8 +116,8 @@ TEST_CASE("HTTP Async Client Timeout (async)", "[http][client][timeout][async]")
     }
 
     SECTION("Multiple async_clients have independent timeouts") {
-        http::async_client client1;
-        http::async_client client2;
+        http::async_client client1(workers);
+        http::async_client client2(workers);
 
         client1.timeout(2s);
         client2.timeout(10s);

@@ -18,6 +18,10 @@ namespace thinger::asio{
         io_.stop();
     }
 
+    void io_worker::shutdown(){
+        io_.shutdown();
+    }
+
     boost::asio::io_context& io_worker::get_io_context(){
         return io_;
     }

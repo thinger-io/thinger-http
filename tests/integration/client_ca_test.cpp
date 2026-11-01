@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <vector>
 #include "../fixtures/test_ca.hpp"
+#include "../fixtures/server_listen.hpp"
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -27,18 +28,18 @@ using namespace std::chrono_literals;
 
 namespace {
 
-    // A TLS server on localhost, with the routes `routes` adds
+    // A TLS server on localhost, with the routes `routes` adds, and certificates of its own
     struct tls_server {
+        std::shared_ptr<asio::certificate_manager> certificates = std::make_shared<asio::certificate_manager>();
         http::server server;
         uint16_t port = 0;
         std::thread thread;
 
         explicit tls_server(const std::function<void(http::server&)>& routes = {}) {
-            server.enable_ssl(true);
             server.get("/hello", [](http::request&, http::response& res) { res.send("hello"); });
             if (routes) routes(server);
-            REQUIRE(server.listen("127.0.0.1", 0));
-            port = server.local_port();
+            REQUIRE_FALSE(server.listen(http::test::listen_options("127.0.0.1", 0, certificates)));
+            port = http::test::listening_port(server);
             thread = std::thread([this] { server.wait(); });
         }
 
@@ -88,8 +89,8 @@ namespace {
 
 TEST_CASE("HTTP client trusts the CAs added", "[http][client][tls][ca][integration]") {
     http::test::test_ca ca;
-    http::test::server_certificate certificate("localhost", ca.issue("localhost"));
     tls_server server;
+    http::test::server_certificate certificate(server.certificates, "localhost", ca.issue("localhost"));
     http::client client;
     client.timeout(5s);
 
@@ -128,7 +129,7 @@ TEST_CASE("HTTP client trusts the CAs added", "[http][client][tls][ca][integrati
     }
 
     SECTION("The certificate is still verified for the host") {
-        http::test::server_certificate other_name("localhost", ca.issue("other.example"));
+        http::test::server_certificate other_name(server.certificates, "localhost", ca.issue("other.example"));
         client.add_ca_pem(ca.pem());
         auto res = client.get(server.url());
         REQUIRE_FALSE(res);
@@ -176,7 +177,7 @@ TEST_CASE("HTTP client trusts the system CAs along with those added", "[http][cl
 
         // A server with a certificate of the "system" CA
         {
-            http::test::server_certificate certificate("localhost", system_ca.issue("localhost"));
+            http::test::server_certificate certificate(server.certificates, "localhost", system_ca.issue("localhost"));
             REQUIRE(client.get(server.url()).ok());
             client.add_ca_pem(private_ca.pem());
             REQUIRE(client.get(server.url()).ok());
@@ -184,18 +185,18 @@ TEST_CASE("HTTP client trusts the system CAs along with those added", "[http][cl
 
         // And one of the private CA, added
         {
-            http::test::server_certificate certificate("localhost", private_ca.issue("localhost"));
+            http::test::server_certificate certificate(server.certificates, "localhost", private_ca.issue("localhost"));
             REQUIRE(client.get(server.url()).ok());
         }
 
         // Without the system CAs, only the added ones
         client.use_system_ca(false);
         {
-            http::test::server_certificate certificate("localhost", system_ca.issue("localhost"));
+            http::test::server_certificate certificate(server.certificates, "localhost", system_ca.issue("localhost"));
             REQUIRE_FALSE(client.get(server.url()));
         }
         {
-            http::test::server_certificate certificate("localhost", private_ca.issue("localhost"));
+            http::test::server_certificate certificate(server.certificates, "localhost", private_ca.issue("localhost"));
             REQUIRE(client.get(server.url()).ok());
         }
     }
@@ -243,11 +244,12 @@ TEST_CASE("HTTP and WebSocket clients present a client certificate", "[http][cli
     peer_record peer;
     tls_server server([&peer](http::server& routes) {
         routes.get("/peer", [&peer](http::request& req, http::response& res) {
-            peer.set(req.get_socket()->tls());
+            peer.set(req.tls());
             res.send("peer");
         });
         routes.get("/ws", [&peer](http::request&, http::response& res) {
-            res.upgrade_websocket_stream([&peer](std::shared_ptr<asio::websocket> ws, std::string) {
+            res.upgrade_websocket_stream({}, [&peer](http::upgraded_websocket upgraded) {
+                auto ws = std::move(upgraded.stream);
                 peer.set(ws->tls());
                 co_spawn(ws->get_io_context(), [ws]() -> awaitable<void> {
                     uint8_t buffer[256];
@@ -261,7 +263,7 @@ TEST_CASE("HTTP and WebSocket clients present a client certificate", "[http][cli
         });
     });
     // The host name the client sends (SNI) requires a certificate; others do not
-    http::test::client_verify_host required("localhost", asio::client_verify::required);
+    http::test::client_verify_host required(server.certificates, "localhost", asio::client_verify::required);
     REQUIRE(required.set);
     auto url = [&server](const std::string& scheme, const std::string& path) {
         return scheme + "://localhost:" + std::to_string(server.port) + path;

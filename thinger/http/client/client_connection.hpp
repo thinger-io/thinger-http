@@ -136,6 +136,11 @@ private:
     awaitable<io_result> write_to_proxy(const http_request& request);
     awaitable<std::shared_ptr<http_response>> exchange(std::shared_ptr<http_request> request);
     awaitable<std::shared_ptr<http_response>> read_response(const http_request& request);
+    // After a write that failed with `write_ec` once `bytes` were sent: the answer the server
+    // may have sent before closing, if any (the connection is not reused then)
+    awaitable<std::shared_ptr<http_response>> read_after_failed_write(const http_request& request,
+                                                                      boost::system::error_code write_ec,
+                                                                      size_t bytes);
     // The response parsed whole, with the bytes read past it; null, and why in error_, if it
     // cannot be used
     std::shared_ptr<http_response> complete_response(const http_request& request, const uint8_t* begin,

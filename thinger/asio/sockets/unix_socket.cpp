@@ -133,6 +133,10 @@ awaitable<boost::system::error_code> unix_socket::wait(boost::asio::socket_base:
     co_return ec;
 }
 
+awaitable<boost::system::error_code> unix_socket::peer_closed() {
+    co_return peek_closed(socket_.native_handle());
+}
+
 bool unix_socket::is_open() const {
     return socket_.is_open();
 }
@@ -144,6 +148,12 @@ bool unix_socket::is_secure() const {
 bool unix_socket::readable_now() const {
     return socket_.is_open() &&
            poll_readable(const_cast<boost::asio::local::stream_protocol::socket&>(socket_).native_handle());
+}
+
+size_t unix_socket::send_backlog() const {
+    return socket_.is_open()
+        ? output_queue(const_cast<boost::asio::local::stream_protocol::socket&>(socket_).native_handle())
+        : 0;
 }
 
 size_t unix_socket::available() const {

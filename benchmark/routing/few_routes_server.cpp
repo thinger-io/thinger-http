@@ -12,9 +12,10 @@ using namespace thinger;
 int main(int argc, char* argv[]) {
     uint16_t port = argc > 1 ? static_cast<uint16_t>(std::atoi(argv[1])) : 9090;
     size_t threads = argc > 2 ? std::strtoul(argv[2], nullptr, 10) : std::thread::hardware_concurrency();
-    asio::get_workers().start(threads);
+    asio::workers workers;
+    workers.start(threads);
 
-    http::pool_server srv;
+    http::pool_server srv(workers);
     srv.get("/hello", [](http::response& res) {
         res.send("Hello World!");
     });

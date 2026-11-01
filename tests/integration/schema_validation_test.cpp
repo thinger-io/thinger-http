@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "server_test_helpers.hpp"
+#include "../fixtures/server_listen.hpp"
 
 using namespace thinger;
 
@@ -116,7 +117,7 @@ private:
     void start_server() {
         server_thread = std::thread([this]() {
             server.start("127.0.0.1", 0, [this]() {
-                auto listening = server.local_port();
+                auto listening = http::test::listening_port(server);
                 base_url = "http://127.0.0.1:" + std::to_string(listening);
                 port.store(listening, std::memory_order_release);
             });

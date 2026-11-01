@@ -14,25 +14,25 @@ TEMPLATE_TEST_CASE("HTTP Client redirect configuration", "[http][client][redirec
                    http::client, http::async_client) {
 
     SECTION("Client has default redirect settings") {
-        TestType client;
+        http::test::client_under_test<TestType> client;
         REQUIRE(client.get_follow_redirects() == true);
         REQUIRE(client.get_max_redirects() == 5); // Default max redirects
     }
 
     SECTION("Can configure max redirects") {
-        TestType client;
+        http::test::client_under_test<TestType> client;
         client.max_redirects(10);
         REQUIRE(client.get_max_redirects() == 10);
     }
 
     SECTION("Can disable redirect following") {
-        TestType client;
+        http::test::client_under_test<TestType> client;
         client.follow_redirects(false);
         REQUIRE(client.get_follow_redirects() == false);
     }
 
     SECTION("Fluent API for redirect configuration") {
-        TestType client;
+        http::test::client_under_test<TestType> client;
         client.max_redirects(3).follow_redirects(true);
         REQUIRE(client.get_max_redirects() == 3);
         REQUIRE(client.get_follow_redirects() == true);
@@ -82,6 +82,7 @@ TEST_CASE("HTTP Sync Client redirect handling", "[http][client][redirect][sync]"
 
 // Test redirect handling with async_client (async callbacks)
 TEST_CASE("HTTP Async Client redirect handling", "[http][client][redirect][async]") {
+    thinger::http::test::running_workers workers;
 
     // Create test server fixture
     thinger::http::test::TestServerFixture fixture;
@@ -89,7 +90,7 @@ TEST_CASE("HTTP Async Client redirect handling", "[http][client][redirect][async
     auto& base_url = fixture.base_url;
 
     SECTION("Client follows redirects by default") {
-        http::async_client client;
+        http::async_client client(workers);
         std::promise<bool> promise;
         auto future = promise.get_future();
 
@@ -102,7 +103,7 @@ TEST_CASE("HTTP Async Client redirect handling", "[http][client][redirect][async
     }
 
     SECTION("Client respects max redirect limit") {
-        http::async_client client;
+        http::async_client client(workers);
         client.max_redirects(2);
 
         std::promise<bool> promise;
@@ -118,7 +119,7 @@ TEST_CASE("HTTP Async Client redirect handling", "[http][client][redirect][async
     }
 
     SECTION("Client can disable redirect following") {
-        http::async_client client;
+        http::async_client client(workers);
         client.follow_redirects(false);
 
         std::promise<bool> promise;
@@ -133,8 +134,8 @@ TEST_CASE("HTTP Async Client redirect handling", "[http][client][redirect][async
     }
 
     SECTION("Multiple async_clients handle redirects independently") {
-        http::async_client client1;
-        http::async_client client2;
+        http::async_client client1(workers);
+        http::async_client client2(workers);
 
         client1.max_redirects(1);
         client2.max_redirects(5);

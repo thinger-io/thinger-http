@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 #include "../fixtures/test_ca.hpp"
+#include "../fixtures/server_listen.hpp"
 
 using namespace thinger;
 
@@ -70,31 +71,19 @@ namespace {
         return result;
     }
 
-    // The certificates and TLS options of the manager, restored at the end of the test
-    struct saved_manager {
-        std::shared_ptr<boost::asio::ssl::context> default_certificate = asio::certificate_manager::instance().get_default_certificate();
-        asio::tls_options options = asio::certificate_manager::instance().get_tls_options();
-        ~saved_manager() {
-            auto& manager = asio::certificate_manager::instance();
-            manager.set_tls_options(options);
-            manager.set_default_certificate(default_certificate);
-        }
-    };
-
-    // An HTTPS server on localhost, with a default certificate created from `default_certificate`
-    // with the current TLS options
+    // An HTTPS server on localhost with the certificates of `manager`, with a default certificate
+    // created from `default_certificate` with the current TLS options
     struct https_server {
         http::server server;
         uint16_t port = 0;
         std::thread thread;
 
-        explicit https_server(const std::pair<std::string, std::string>& default_certificate) {
-            REQUIRE(asio::certificate_manager::instance().set_default_certificate(default_certificate.first,
-                                                                                  default_certificate.second));
-            server.enable_ssl(true);
+        https_server(const std::shared_ptr<asio::certificate_manager>& manager,
+                     const std::pair<std::string, std::string>& default_certificate) {
+            REQUIRE_FALSE(manager->set_default_certificate(default_certificate.first, default_certificate.second));
             server.get("/hello", [](http::response& res) { res.send("hello"); });
-            REQUIRE(server.listen("127.0.0.1", 0));
-            port = server.local_port();
+            REQUIRE_FALSE(server.listen(http::test::listen_options("127.0.0.1", 0, manager)));
+            port = http::test::listening_port(server);
             thread = std::thread([this] { server.wait(); });
         }
 
@@ -108,9 +97,8 @@ namespace {
 
 TEST_CASE("HTTPS server accepts TLS 1.2 and 1.3 by default", "[ssl][tls][options][integration]") {
     http::test::test_ca ca;
-    saved_manager saved;
-    REQUIRE(asio::certificate_manager::instance().set_tls_options({}));
-    https_server https(ca.issue("default.test"));
+    auto manager = std::make_shared<asio::certificate_manager>();
+    https_server https(manager, ca.issue("default.test"));
 
     SECTION("TLS 1.0 and 1.1 are refused") {
         REQUIRE_FALSE(handshake(https.port, {.min_version = TLS1_VERSION, .max_version = TLS1_VERSION}).connected);
@@ -149,14 +137,13 @@ TEST_CASE("HTTPS server accepts TLS 1.2 and 1.3 by default", "[ssl][tls][options
 
 TEST_CASE("HTTPS server with TLS options set", "[ssl][tls][options][integration]") {
     http::test::test_ca ca;
-    saved_manager saved;
-    auto& manager = asio::certificate_manager::instance();
+    auto manager = std::make_shared<asio::certificate_manager>();
 
     SECTION("The server's cipher preference") {
         asio::tls_options options;
         options.prefer_server_ciphers = true;
-        REQUIRE(manager.set_tls_options(options));
-        https_server https(ca.issue("default.test"));
+        REQUIRE_FALSE(manager->set_tls_options(options));
+        https_server https(manager, ca.issue("default.test"));
         auto result = handshake(https.port, {.min_version = TLS1_2_VERSION, .max_version = TLS1_2_VERSION,
                                              .ciphers = "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256"});
         REQUIRE(result.cipher == "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256");
@@ -165,15 +152,15 @@ TEST_CASE("HTTPS server with TLS options set", "[ssl][tls][options][integration]
     SECTION("TLS 1.3 only") {
         asio::tls_options options;
         options.min_version = asio::tls_version::tls1_3;
-        REQUIRE(manager.set_tls_options(options));
-        https_server https(ca.issue("default.test"));
+        REQUIRE_FALSE(manager->set_tls_options(options));
+        https_server https(manager, ca.issue("default.test"));
         REQUIRE_FALSE(handshake(https.port, {.min_version = TLS1_2_VERSION, .max_version = TLS1_2_VERSION}).connected);
         REQUIRE(handshake(https.port, {}).version == "TLSv1.3");
     }
 
     SECTION("Legacy protocols") {
-        manager.enable_legacy_protocols(true);
-        https_server https(ca.issue("default.test"));
+        manager->enable_legacy_protocols(true);
+        https_server https(manager, ca.issue("default.test"));
         auto tls11 = handshake(https.port, {.min_version = TLS1_1_VERSION, .max_version = TLS1_1_VERSION});
         REQUIRE(tls11.connected);
         REQUIRE(tls11.version == "TLSv1.1");
@@ -183,14 +170,12 @@ TEST_CASE("HTTPS server with TLS options set", "[ssl][tls][options][integration]
 TEST_CASE("HTTPS server applies the TLS options to the certificates selected by SNI",
           "[ssl][tls][options][integration]") {
     http::test::test_ca ca;
-    saved_manager saved;
-    auto& manager = asio::certificate_manager::instance();
-    REQUIRE(manager.set_tls_options({}));
+    auto manager = std::make_shared<asio::certificate_manager>();
     auto host = ca.issue("sni.test");
-    REQUIRE(manager.set_certificate("sni.test", host.first, host.second));
-    https_server https(ca.issue("default.test"));
+    REQUIRE_FALSE(manager->set_certificate("sni.test", host.first, host.second));
+    https_server https(manager, ca.issue("default.test"));
 
-    auto context = manager.get_certificate("sni.test");
+    auto context = manager->get_certificate("sni.test");
     REQUIRE(SSL_CTX_get_min_proto_version(context->native_handle()) == TLS1_2_VERSION);
 
     REQUIRE_FALSE(handshake(https.port, {.max_version = TLS1_1_VERSION, .host = "sni.test"}).connected);
@@ -199,15 +184,13 @@ TEST_CASE("HTTPS server applies the TLS options to the certificates selected by 
     auto result = handshake(https.port, {.min_version = TLS1_2_VERSION, .max_version = TLS1_2_VERSION, .host = "sni.test"});
     REQUIRE(result.connected);
     REQUIRE(result.subject == "sni.test");
-    REQUIRE(manager.remove_certificate("sni.test"));
+    REQUIRE(manager->remove_certificate("sni.test"));
 }
 
 TEST_CASE("HTTPS server keeps its TLS options for a weaker certificate given ready-made",
           "[ssl][tls][options][integration]") {
     http::test::test_ca ca;
-    saved_manager saved;
-    auto& manager = asio::certificate_manager::instance();
-    REQUIRE(manager.set_tls_options({}));
+    auto manager = std::make_shared<asio::certificate_manager>();
 
     // A context made elsewhere, allowing TLS 1.0 and every cipher: SNI switches to its
     // certificate, but the versions and ciphers stay those of the context of the listener
@@ -218,8 +201,8 @@ TEST_CASE("HTTPS server keeps its TLS options for a weaker certificate given rea
     SSL_CTX_set_min_proto_version(weak->native_handle(), TLS1_VERSION);
     SSL_CTX_set_security_level(weak->native_handle(), 0);
     SSL_CTX_set_cipher_list(weak->native_handle(), "ALL:@SECLEVEL=0");
-    REQUIRE(manager.set_certificate("weak.test", weak));
-    https_server https(ca.issue("default.test"));
+    REQUIRE_FALSE(manager->set_certificate("weak.test", weak));
+    https_server https(manager, ca.issue("default.test"));
 
     REQUIRE_FALSE(handshake(https.port, {.max_version = TLS1_1_VERSION, .host = "weak.test"}).connected);
     REQUIRE_FALSE(handshake(https.port, {.min_version = TLS1_2_VERSION, .max_version = TLS1_2_VERSION,
@@ -228,5 +211,5 @@ TEST_CASE("HTTPS server keeps its TLS options for a weaker certificate given rea
     REQUIRE(result.connected);
     REQUIRE(result.subject == "weak.test");
     REQUIRE((result.cipher.find("GCM") != std::string::npos || result.cipher.find("CHACHA20") != std::string::npos));
-    REQUIRE(manager.remove_certificate("weak.test"));
+    REQUIRE(manager->remove_certificate("weak.test"));
 }

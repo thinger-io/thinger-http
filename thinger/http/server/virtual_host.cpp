@@ -3,7 +3,7 @@
 #include "response.hpp"
 #include "file_server/static_files.hpp"
 #include "../../util/ascii.hpp"
-#include <boost/algorithm/string.hpp>
+#include <algorithm>
 
 namespace thinger::http {
 
@@ -57,18 +57,23 @@ namespace {
 
 }
 
-virtual_host::virtual_host() : name_("*") {}
+virtual_host::virtual_host() {
+    settings_->name = "*";
+}
 
-virtual_host::virtual_host(const std::string& name) : name_(name) {
-    ::thinger::util::ascii::to_lower(name_);
-    if (is_host_pattern(name_)) {
-        pattern_ = std::regex(host_pattern_to_regex(name_, parameters_), std::regex::icase);
+virtual_host::virtual_host(const std::string& name) {
+    auto& host = *settings_;
+    host.name = name;
+    ::thinger::util::ascii::to_lower(host.name);
+    if (is_host_pattern(host.name)) {
+        host.pattern = std::regex(host_pattern_to_regex(host.name, host.parameters), std::regex::icase);
     }
 }
 
-virtual_host::virtual_host(const std::string& name, const std::regex& pattern)
-    : name_(name), pattern_(pattern) {
-    parameters_.resize(pattern.mark_count());
+virtual_host::virtual_host(const std::string& name, const std::regex& pattern) {
+    settings_->name = name;
+    settings_->pattern = pattern;
+    settings_->parameters.resize(pattern.mark_count());
 }
 
 bool virtual_host::is_host_pattern(const std::string& name) {
@@ -80,26 +85,30 @@ bool virtual_host::is_host_pattern(const std::string& name) {
 }
 
 std::string virtual_host::normalize_host(std::string_view host) {
-    std::string result;
-    if (host.starts_with('[')) {
-        // IPv6 literal, with an optional port after the closing bracket
-        auto close = host.find(']');
-        result = host.substr(0, close == std::string_view::npos ? host.size() : close + 1);
-    } else {
-        result = host.substr(0, host.find(':'));
-    }
-    boost::algorithm::trim(result);
+    std::string result(host_name(host));
     ::thinger::util::ascii::to_lower(result);
-    if (result.ends_with('.')) result.pop_back();
     return result;
 }
 
+std::string_view virtual_host::host_name(std::string_view host) {
+    // IPv6 literal, with an optional port after the closing bracket
+    bool literal = host.starts_with('[');
+    auto end = literal ? host.find(']') : host.find(':');
+    if (literal && end != std::string_view::npos) ++end;
+    host = host.substr(0, end);
+    constexpr std::string_view spaces = " \t\r\n\v\f";
+    host.remove_prefix(std::min(host.find_first_not_of(spaces), host.size()));
+    host = host.substr(0, host.find_last_not_of(spaces) + 1);
+    if (host.ends_with('.')) host.remove_suffix(1);
+    return host;
+}
+
 bool virtual_host::matches(const std::string& host, std::smatch& matches) const {
-    return pattern_ && std::regex_match(host, matches, *pattern_);
+    return settings_->pattern && std::regex_match(host, matches, *settings_->pattern);
 }
 
 void virtual_host::schema_component(const std::string& name, nlohmann::json schema) {
-    router_.add_schema_component(name, std::move(schema));
+    settings_->router.add_schema_component(name, std::move(schema));
 }
 
 // Static file serving

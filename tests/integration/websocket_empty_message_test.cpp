@@ -13,6 +13,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include "../fixtures/running_workers.hpp"
 
 // Empty WebSocket messages (a data frame without payload, valid per RFC 6455) are sent and
 // received as messages both ways, and do not end the stream of the client
@@ -36,7 +37,7 @@ namespace {
         empty_message_server() {
             // Echoes every message, and records it
             server.get("/echo", [this](http::request&, http::response& res) {
-                res.upgrade_websocket([this](std::shared_ptr<http::websocket_connection> ws) {
+                res.upgrade_websocket({}, [this](std::shared_ptr<http::websocket_connection> ws) {
                     ws->on_message([this, ws](std::string message, bool binary) {
                         {
                             std::lock_guard lock(mutex);
@@ -49,7 +50,7 @@ namespace {
             });
             // Sends empty messages of both types, then a last one, and closes when told
             server.get("/empties", [](http::request&, http::response& res) {
-                res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) {
+                res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection> ws) {
                     ws->on_message([ws](std::string message, bool) {
                         if (message == "close") ws->stop();
                     });
@@ -104,6 +105,7 @@ TEST_CASE("WebSocket empty messages from the client reach the server", "[websock
 }
 
 TEST_CASE("WebSocket empty messages from the server reach the client", "[websocket][client][integration]") {
+    thinger::http::test::running_workers workers;
     empty_message_server server;
 
     SECTION("synchronous receive") {
@@ -125,7 +127,7 @@ TEST_CASE("WebSocket empty messages from the server reach the client", "[websock
     }
 
     SECTION("event-driven: on_message gets them, on_close is not fired by them") {
-        http::async_client client;
+        http::async_client client(workers);
         std::mutex mutex;
         std::vector<received_message> messages;
         std::atomic<bool> closed{false};

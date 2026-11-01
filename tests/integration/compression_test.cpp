@@ -10,6 +10,7 @@
 #include <future>
 
 #include "server_test_helpers.hpp"
+#include "../fixtures/server_listen.hpp"
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -58,8 +59,8 @@ struct CompressionTestFixture {
 
 private:
     void start_server() {
-        REQUIRE(server.listen("0.0.0.0", 0));
-        port = server.local_port();
+        REQUIRE_FALSE(server.listen("0.0.0.0", 0));
+        port = http::test::listening_port(server);
         base_url = "http://localhost:" + std::to_string(port);
 
         std::promise<void> ready;

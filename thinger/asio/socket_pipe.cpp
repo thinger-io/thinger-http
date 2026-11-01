@@ -2,6 +2,7 @@
 #include "../util/logger.hpp"
 
 #include <boost/asio/dispatch.hpp>
+#include <boost/asio/this_coro.hpp>
 #include <vector>
 
 namespace thinger::asio {
@@ -28,10 +29,24 @@ socket_pipe::~socket_pipe() {
 
 awaitable<void> socket_pipe::run() {
     auto self = shared_from_this();
-    co_await (
-        forward(source_, target_, bytes_s2t_) ||
-        forward(target_, source_, bytes_t2s_)
-    );
+    if (idle_timeout_.count() > 0) {
+        // One timer for the whole run, which each forwarded write moves later without touching
+        // it (see watchdog). A local of run(): it never calls back once run() has ended
+        watchdog idle(co_await boost::asio::this_coro::executor, [this] {
+            LOG_DEBUG("socket pipe idle for {} ms: closing it", idle_timeout_.count());
+            cancel();
+        });
+        idle.expires_at(watchdog::clock::now() + idle_timeout_);
+        co_await (
+            forward(source_, target_, bytes_s2t_, &idle) ||
+            forward(target_, source_, bytes_t2s_, &idle)
+        );
+    } else {
+        co_await (
+            forward(source_, target_, bytes_s2t_, nullptr) ||
+            forward(target_, source_, bytes_t2s_, nullptr)
+        );
+    }
     cancel();
     // Closed before returning, also when cancel() was called from another thread and has not
     // closed them yet (a direction may see the flag and end first)
@@ -56,6 +71,10 @@ void socket_pipe::set_on_end(sync_callback<void()> listener) {
     on_end_ = std::move(listener);
 }
 
+void socket_pipe::set_idle_timeout(std::chrono::milliseconds timeout) {
+    idle_timeout_ = timeout;
+}
+
 size_t socket_pipe::bytes_source_to_target() const {
     return bytes_s2t_.load();
 }
@@ -75,7 +94,8 @@ std::shared_ptr<socket> socket_pipe::get_target() const {
 awaitable<void> socket_pipe::forward(
     std::shared_ptr<socket> from,
     std::shared_ptr<socket> to,
-    std::atomic<size_t>& bytes_transferred)
+    std::atomic<size_t>& bytes_transferred,
+    watchdog* idle)
 {
     std::vector<uint8_t> buffer(BUFFER_SIZE);
     while (!cancelled_) {
@@ -84,6 +104,7 @@ awaitable<void> socket_pipe::forward(
         auto [write_ec, written] = co_await to->write(buffer.data(), n);
         if (write_ec) break;
         bytes_transferred.fetch_add(n, std::memory_order_relaxed);
+        if (idle) idle->expires_at(watchdog::clock::now() + idle_timeout_);
     }
     // Close both sockets to interrupt the other direction
     cancel();

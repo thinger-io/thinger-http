@@ -3,8 +3,11 @@
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
+#include <thinger/http/server/sse_connection.hpp>
+#include <thinger/http/server/websocket_connection.hpp>
 
 #include "server_test_helpers.hpp"
+#include "../fixtures/awaited_shutdown.hpp"
 #include "../fixtures/stream_test_helpers.hpp"
 
 #include <atomic>
@@ -14,6 +17,7 @@
 #include <set>
 #include <stdexcept>
 #include <thread>
+#include "../fixtures/running_workers.hpp"
 
 // on_close() of the server WebSocket (websocket_connection) and SSE (sse_connection)
 // connections: called once, on the thread of the connection, whatever closed it
@@ -74,7 +78,7 @@ namespace {
     void websocket_route(http::http_application& app, const std::shared_ptr<close_record>& record,
                          std::function<void(const ws_ptr&)> setup = {}) {
         app.get("/ws", [record, setup](http::response& res) {
-            res.upgrade_websocket([record, setup](ws_ptr ws) {
+            res.upgrade_websocket({}, [record, setup](ws_ptr ws) {
                 record->opened();
                 ws->on_message([](std::string, bool) {});
                 ws->on_close([record](const http::websocket_close& close) { record->closed(close); });
@@ -92,45 +96,24 @@ namespace {
         client.send_frame(OP_CLOSE, close_payload(expected));
     }
 
-    // Raw SSE client: sends the request and reads the response headers
+    // Raw SSE client (on any transport): sends the request and reads the response
     struct sse_client {
-        net::io_context ioc;
-        tcp::socket sock{ioc};
+        http::test::raw_connection connection;
 
-        explicit sse_client(uint16_t port, const std::string& path = "/events") {
-            sock.connect({net::ip::make_address("127.0.0.1"), port});
-            net::write(sock, net::buffer("GET " + path + " HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+        explicit sse_client(const running_server& running, const std::string& path = "/events")
+            : connection(running.endpoint()) {
+            REQUIRE(connection.write("GET " + path + " HTTP/1.1\r\nHost: localhost\r\n\r\n"));
         }
 
         // What arrives until `needle`, the server closes the connection, or the timeout expires
         server_test::exchange_result read_until(const std::string& needle, std::chrono::milliseconds timeout = 3s) {
             server_test::exchange_result result;
-            std::array<char, 4096> buffer{};
-            auto deadline = std::chrono::steady_clock::now() + timeout;
-            while (result.data.find(needle) == std::string::npos && !result.closed) {
-                bool done = false;
-                sock.async_read_some(net::buffer(buffer), [&](boost::system::error_code ec, size_t bytes) {
-                    result.data.append(buffer.data(), bytes);
-                    if (ec) result.closed = true;
-                    done = true;
-                });
-                ioc.restart();
-                ioc.run_until(deadline);
-                if (!done) {
-                    sock.cancel();
-                    ioc.restart();
-                    ioc.run();
-                    break;
-                }
-            }
+            connection.read_until(result.data, needle, timeout);
+            result.closed = connection.eof();
             return result;
         }
 
-        void close() {
-            boost::system::error_code ec;
-            sock.shutdown(tcp::socket::shutdown_both, ec);
-            sock.close(ec);
-        }
+        void close() { connection.close(); }
     };
 
     // An SSE route recording on_close(), after `setup`
@@ -148,13 +131,14 @@ namespace {
 
 }
 
-TEST_CASE("WebSocket on_close tells how it closed", "[websocket][close][integration]") {
+TEST_CASE("WebSocket on_close tells how it closed", "[websocket][close][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     auto record = std::make_shared<close_record>();
     std::function<void(const ws_ptr&)> setup;
     websocket_route(server, record, [&](const ws_ptr& ws) { if (setup) setup(ws); });
-    running_server running(server);
-    raw_ws_client client(running.port);
+    running_server running(server, kind);
+    raw_ws_client client(running.endpoint());
 
     SECTION("The peer closes, with a code and a reason") {
         REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
@@ -215,14 +199,15 @@ TEST_CASE("WebSocket on_close tells how it closed", "[websocket][close][integrat
     }
 }
 
-TEST_CASE("WebSocket on_close after on_message throws", "[websocket][close][integration]") {
+TEST_CASE("WebSocket on_close after on_message throws", "[websocket][close][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     auto record = std::make_shared<close_record>();
     websocket_route(server, record, [](const ws_ptr& ws) {
         ws->on_message([](std::string, bool) { throw std::runtime_error("bad message"); });
     });
-    running_server running(server);
-    raw_ws_client client(running.port);
+    running_server running(server, kind);
+    raw_ws_client client(running.endpoint());
     REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
 
     client.send_frame(OP_TEXT, "hello");
@@ -233,13 +218,14 @@ TEST_CASE("WebSocket on_close after on_message throws", "[websocket][close][inte
     REQUIRE_FALSE(status.remote);
 }
 
-TEST_CASE("WebSocket on_close is called once", "[websocket][close][integration]") {
+TEST_CASE("WebSocket on_close is called once", "[websocket][close][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     auto record = std::make_shared<close_record>();
     std::promise<std::weak_ptr<http::websocket_connection>> created;
     websocket_route(server, record, [&](const ws_ptr& ws) { created.set_value(ws); });
-    running_server running(server);
-    raw_ws_client client(running.port);
+    running_server running(server, kind);
+    raw_ws_client client(running.endpoint());
     REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
     auto weak = created.get_future().get();
 
@@ -255,31 +241,33 @@ TEST_CASE("WebSocket on_close is called once", "[websocket][close][integration]"
     REQUIRE(eventually([&] { return weak.expired(); }));
 }
 
-TEST_CASE("WebSocket on_close on a server shutdown", "[websocket][close][shutdown][integration]") {
+TEST_CASE("WebSocket on_close on a server shutdown", "[websocket][close][shutdown][integration][matrix]") {
+    thinger::http::test::running_workers workers;
+    MATRIX_TRANSPORT(kind);
     auto record = std::make_shared<close_record>();
 
     SECTION("Closed by default with 1001") {
         http::server server;
         websocket_route(server, record);
-        running_server running(server);
-        raw_ws_client client(running.port);
+        running_server running(server, kind);
+        raw_ws_client client(running.endpoint());
         REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
         REQUIRE(eventually([&] { return server.stats().websocket_connections == 1; }));
 
-        server.begin_shutdown(5s);
+        http::test::awaited_shutdown shutdown(server, 5s);
         answer_close(client, 1001);
         auto status = record->wait();
         REQUIRE(status.code == 1001);
         REQUIRE_FALSE(status.remote);
     }
 
-    SECTION("Closed by the server at the end of the grace period") {
+    SECTION("Closed by the server at the shutdown deadline") {
         // A pool server: its workers still run once it stopped
-        http::pool_server server;
+        http::pool_server server(workers);
         websocket_route(server, record, [](const ws_ptr& ws) { ws->on_shutdown([] {}); });
-        REQUIRE(server.listen("127.0.0.1", 0));
+        http::test::transport_listener listener(server, kind);
         auto waiting = std::async(std::launch::async, [&] { server.wait(); });
-        raw_ws_client client(server.local_port());
+        raw_ws_client client(listener.endpoint());
         REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
         REQUIRE(eventually([&] { return server.stats().websocket_connections == 1; }));
 
@@ -291,7 +279,8 @@ TEST_CASE("WebSocket on_close on a server shutdown", "[websocket][close][shutdow
     }
 }
 
-TEST_CASE("WebSocket on_close is not called once released", "[websocket][close][integration]") {
+TEST_CASE("WebSocket on_close is not called once released", "[websocket][close][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     auto record = std::make_shared<close_record>();
     std::promise<std::shared_ptr<asio::socket>> released;
@@ -300,8 +289,8 @@ TEST_CASE("WebSocket on_close is not called once released", "[websocket][close][
             if (auto self = weak.lock()) released.set_value(self->release_socket());
         });
     });
-    running_server running(server);
-    raw_ws_client client(running.port);
+    running_server running(server, kind);
+    raw_ws_client client(running.endpoint());
     REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
 
     client.send_frame(OP_TEXT, "release");
@@ -317,15 +306,16 @@ TEST_CASE("WebSocket on_close is not called once released", "[websocket][close][
     boost::asio::post(io_context, [socket = std::move(socket)] {});
 }
 
-TEST_CASE("SSE on_close tells the client left", "[sse][close][integration]") {
+TEST_CASE("SSE on_close tells the client left", "[sse][close][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     auto record = std::make_shared<close_record>();
     std::function<void(const sse_ptr&)> setup;
     sse_route(server, record, [&](const sse_ptr& sse) { if (setup) setup(sse); });
-    running_server running(server);
+    running_server running(server, kind);
 
     SECTION("The client leaves, while nothing is sent") {
-        sse_client client(running.port);
+        sse_client client(running);
         REQUIRE(client.read_until("data: hello").data.find("data: hello") != std::string::npos);
         client.close();
         // at once, not when the next event fails or the idle timer expires
@@ -335,7 +325,7 @@ TEST_CASE("SSE on_close tells the client left", "[sse][close][integration]") {
 
     SECTION("stop()") {
         setup = [](const sse_ptr& sse) { sse->stop(); };
-        sse_client client(running.port);
+        sse_client client(running);
         REQUIRE(client.read_until("never").closed);
         record->wait();
     }
@@ -345,7 +335,7 @@ TEST_CASE("SSE on_close tells the client left", "[sse][close][integration]") {
             sse->set_write_limits({.max_messages = 2, .policy = http::overflow_policy::close});
             for (int i = 0; i < 10; ++i) sse->send_data(std::string(100, 'x'));
         };
-        sse_client client(running.port);
+        sse_client client(running);
         REQUIRE(client.read_until("never").closed);
         record->wait();
     }
@@ -353,7 +343,7 @@ TEST_CASE("SSE on_close tells the client left", "[sse][close][integration]") {
     SECTION("Called once") {
         std::promise<std::weak_ptr<http::sse_connection>> created;
         setup = [&](const sse_ptr& sse) { created.set_value(sse); };
-        sse_client client(running.port);
+        sse_client client(running);
         auto weak = created.get_future().get();
         if (auto sse = weak.lock()) {
             sse->stop();
@@ -365,21 +355,23 @@ TEST_CASE("SSE on_close tells the client left", "[sse][close][integration]") {
     }
 }
 
-TEST_CASE("SSE on_close on a server shutdown", "[sse][close][shutdown][integration]") {
+TEST_CASE("SSE on_close on a server shutdown", "[sse][close][shutdown][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     auto record = std::make_shared<close_record>();
     sse_route(server, record);
-    running_server running(server);
-    sse_client client(running.port);
+    running_server running(server, kind);
+    sse_client client(running);
     REQUIRE(client.read_until("data: hello").data.find("data: hello") != std::string::npos);
     REQUIRE(eventually([&] { return server.stats().sse_connections == 1; }));
 
-    server.begin_shutdown(5s);
+    http::test::awaited_shutdown shutdown(server, 5s);
     record->wait();
     REQUIRE(client.read_until("never").closed);
 }
 
-TEST_CASE("SSE on_close set once closed is posted at once", "[sse][close][integration]") {
+TEST_CASE("SSE on_close set once closed is posted at once", "[sse][close][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     std::atomic<bool> left{false};
     std::promise<std::pair<bool, bool>> called;   // within the call setting it, and afterwards
@@ -401,8 +393,8 @@ TEST_CASE("SSE on_close set once closed is posted at once", "[sse][close][integr
             called.set_value({inline_call, *told});
         });
     });
-    running_server running(server);
-    sse_client client(running.port);
+    running_server running(server, kind);
+    sse_client client(running);
     REQUIRE(eventually([&] { return server.stats().sse_connections == 1; }));
     client.close();
     left = true;
@@ -413,7 +405,8 @@ TEST_CASE("SSE on_close set once closed is posted at once", "[sse][close][integr
     REQUIRE(told);
 }
 
-TEST_CASE("SSE on_close is never called from within the call closing it", "[sse][close][integration]") {
+TEST_CASE("SSE on_close is never called from within the call closing it", "[sse][close][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     // A broadcaster sending to its subscribers under a lock, which on_close takes to remove
     // the one closing: the overflow policy closes it within send_data()
     http::server server;
@@ -442,21 +435,22 @@ TEST_CASE("SSE on_close is never called from within the call closing it", "[sse]
         }
         res.send("sent");
     });
-    running_server running(server);
-    sse_client client(running.port);
+    running_server running(server, kind);
+    sse_client client(running);
     REQUIRE(eventually([&] { std::scoped_lock lock(mutex); return subscribers.size() == 1; }));
-    auto result = server_test::raw_exchange(running.port, "GET /broadcast HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    auto result = server_test::raw_exchange(running, "GET /broadcast HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     REQUIRE(result.data.ends_with("sent"));
     REQUIRE(eventually([&] { return removed.load() == 1; }));
     std::scoped_lock lock(mutex);
     REQUIRE(subscribers.empty());
 }
 
-TEST_CASE("Close callbacks that throw are logged", "[websocket][sse][close][integration]") {
+TEST_CASE("Close callbacks that throw are logged", "[websocket][sse][close][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     std::atomic<int> calls{0};
     server.get("/ws", [&](http::response& res) {
-        res.upgrade_websocket([&](ws_ptr ws) {
+        res.upgrade_websocket({}, [&](ws_ptr ws) {
             ws->on_message([](std::string, bool) {});
             ws->on_close([&](const http::websocket_close&) {
                 ++calls;
@@ -473,34 +467,35 @@ TEST_CASE("Close callbacks that throw are logged", "[websocket][sse][close][inte
         });
     });
     server.get("/hello", [](http::response& res) { res.send("hello"); });
-    running_server running(server);
+    running_server running(server, kind);
     {
-        raw_ws_client ws_client(running.port);
+        raw_ws_client ws_client(running.endpoint());
         REQUIRE(ws_client.handshake("/ws").starts_with("HTTP/1.1 101"));
-        sse_client events(running.port);
+        sse_client events(running);
         REQUIRE(eventually([&] { return server.stats().sse_connections == 1; }));
         ws_client.close();
         events.close();
     }
     REQUIRE(eventually([&] { return calls.load() == 2; }));
     // the server goes on
-    auto result = server_test::raw_exchange(running.port, "GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    auto result = server_test::raw_exchange(running, "GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     REQUIRE(result.data.ends_with("hello"));
 }
 
-TEST_CASE("WebSocket on_close set once closed is posted at once", "[websocket][close][integration]") {
+TEST_CASE("WebSocket on_close set once closed is posted at once", "[websocket][close][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     auto record = std::make_shared<close_record>();
     std::promise<std::weak_ptr<http::websocket_connection>> created;
     server.get("/ws", [&](http::response& res) {
-        res.upgrade_websocket([&](ws_ptr ws) {
+        res.upgrade_websocket({}, [&](ws_ptr ws) {
             record->opened();
             ws->on_message([](std::string, bool) {});
             created.set_value(ws);
         });
     });
-    running_server running(server);
-    raw_ws_client client(running.port);
+    running_server running(server, kind);
+    raw_ws_client client(running.endpoint());
     REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
     auto weak = created.get_future().get();
     auto ws = weak.lock();
@@ -519,7 +514,8 @@ TEST_CASE("WebSocket on_close set once closed is posted at once", "[websocket][c
     ws.reset();
 }
 
-TEST_CASE("WebSocket released by on_message before it throws is not closed", "[websocket][close][integration]") {
+TEST_CASE("WebSocket released by on_message before it throws is not closed", "[websocket][close][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     auto record = std::make_shared<close_record>();
     std::promise<std::shared_ptr<asio::socket>> released;
@@ -529,8 +525,8 @@ TEST_CASE("WebSocket released by on_message before it throws is not closed", "[w
             throw std::runtime_error("after the release");
         });
     });
-    running_server running(server);
-    raw_ws_client client(running.port);
+    running_server running(server, kind);
+    raw_ws_client client(running.endpoint());
     REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
 
     client.send_frame(OP_TEXT, "release");

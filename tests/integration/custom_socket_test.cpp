@@ -165,7 +165,8 @@ TEST_CASE("Custom socket: tunnel with a WebSocket", "[socket][custom][websocket]
     http::server server;
     std::atomic<bool> pipe_ended{false};
     server.get("/virtual", [&](http::request& req, http::response& res) {
-        res.upgrade_websocket_stream({.protocols = {"binary"}}, [&](std::shared_ptr<asio::websocket> ws, std::string) {
+        res.upgrade_websocket_stream({.protocols = {"binary"}}, [&](http::upgraded_websocket upgraded) {
+            auto ws = std::move(upgraded.stream);
             // the virtual stream lives on the io_context of the WebSocket
             auto stream = remote.open(ws->get_io_context());
             auto pipe = std::make_shared<asio::socket_pipe>(ws, stream);
@@ -234,7 +235,7 @@ TEST_CASE("Custom socket: HTTP served over it answers late responses", "[socket]
     });
     auto connection = std::make_shared<http::server_connection>(socket);
     connection->set_handler([&app](std::shared_ptr<http::request> req) {
-        auto sink = std::make_shared<http::connection_sink>(req->get_http_connection(), req->get_http_stream());
+        auto sink = std::make_shared<http::connection_sink>(*req);
         return app.handle(std::move(req), std::move(sink));
     });
     boost::asio::post(ioc, [connection] { connection->start(); });

@@ -107,8 +107,12 @@ if (ws) {
 
 #### Callback API (via http::async_client)
 
+The `async_client` runs on workers the application starts, and stops once the client is done:
+
 ```cpp
-http::async_client client;
+asio::workers workers;
+workers.start();
+http::async_client client(workers);
 
 client.websocket("wss://echo.websocket.org", [](std::shared_ptr<http::websocket_client> ws) {
     if (ws) {
@@ -120,12 +124,13 @@ client.websocket("wss://echo.websocket.org", [](std::shared_ptr<http::websocket_
 });
 
 client.wait();  // Wait for completion
+workers.stop();
 ```
 
 #### Coroutine API (via http::async_client)
 
 ```cpp
-http::async_client client;
+http::async_client client(workers);  // on started workers, as above
 
 client.run([&client, &url]() -> awaitable<void> {
     // co_await the websocket upgrade

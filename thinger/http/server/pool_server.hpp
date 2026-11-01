@@ -1,46 +1,44 @@
 #ifndef THINGER_HTTP_POOL_SERVER_HPP
 #define THINGER_HTTP_POOL_SERVER_HPP
 
-#include "http_server_base.hpp"
-#include "../../asio/worker_client.hpp"
+#include <condition_variable>
+#include <mutex>
+#include "server_base.hpp"
 #include "../../asio/workers.hpp"
 
 namespace thinger::http {
 
 /**
- * HTTP server integrated with the worker thread pool.
- * Designed for high-performance server applications where
- * the server runs alongside other asynchronous services.
- * Uses the global worker thread pool for optimal resource sharing.
+ * HTTP server served on a pool of workers: it accepts on a thread of its own and serves each
+ * connection on the next thread of the pool. The application owns the workers, starts them,
+ * and keeps them alive longer than the server; several servers (and clients) may share them.
  */
-class pool_server : public http_server_base, public asio::worker_client {
+class pool_server : public server_base {
 protected:
-    // Create socket server that uses worker pool
-    std::unique_ptr<asio::socket_server> create_socket_server(
-        const std::string& host, const std::string& port) override;
-    
-    // Create Unix socket server that uses worker pool
-    std::unique_ptr<asio::unix_socket_server> create_unix_socket_server(
-        const std::string& unix_path) override;
+    // A listener accepting on a thread of its own and serving on the workers
+    std::unique_ptr<asio::listener> create_listener(asio::listener_options options) override;
 
     boost::asio::io_context* shutdown_context() override;
     bool in_server_thread() override;
     
 public:
-    pool_server();
+    explicit pool_server(asio::workers& workers);
     ~pool_server() override;
 
-    // Expose http_server_base::start overloads (hidden by worker_client::start)
-    using http_server_base::start;
-    
-    // Implementation of worker_client interface
-    bool start() override { return true; } // Already started in listen()
-    bool stop() override;
+    // Stop as server_base::stop() does (its connections are closed on the workers), and
+    // release wait()
+    void stop() override;
+    // Wait until the server stops (stop(), or the end of a shutdown)
     void wait() override;
 
-    // Graceful stop of the workers on a signal (see workers::wait_graceful()): a shutdown of
-    // the server (see shutdown())
-    void graceful_stop(std::chrono::milliseconds grace, std::function<void()> done) override;
+private:
+    // wait() returns
+    void release_wait();
+
+    asio::workers& workers_;
+    std::mutex wait_mutex_;
+    std::condition_variable wait_cv_;
+    bool stopped_ = false;
 };
 
 } // namespace thinger::http

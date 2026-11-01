@@ -4,7 +4,9 @@
 using namespace thinger;
 
 int main() {
-    http::pool_server srv;
+    asio::workers workers;
+    workers.start();
+    http::pool_server srv(workers);
 
     srv.get("/", [](http::request& req, http::response& res) {
         res.send("Hello World!");

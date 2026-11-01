@@ -214,7 +214,7 @@ int main(int argc, char* argv[]) {
     
     // Start the server
     std::string port = argc > 1 ? argv[1] : "8090";
-    if (!server.listen("0.0.0.0", static_cast<uint16_t>(std::stoi(port)))) {
+    if (server.listen("0.0.0.0", static_cast<uint16_t>(std::stoi(port)))) {
         LOG_ERROR("Failed to start HTTP server on port %s", port.c_str());
         return 1;
     }

@@ -36,11 +36,13 @@ To reproduce, see [`benchmark/compare`](benchmark/compare/): `benchmark/compare/
 - **WebSocket** - Server and client support with text/binary messages, or as a byte stream socket for other protocols and tunnels
 - **Server-Sent Events (SSE)** - Real-time server push
 - **SSL/TLS** - HTTPS and WSS support via OpenSSL, with per-domain certificates (SNI) and Mozilla's "intermediate" settings by default (TLS 1.2 and 1.3)
+- **Several Listeners** - One server, and one set of routes, on HTTP, HTTPS and Unix sockets at once
 - **Virtual Hosts** - Routes per host name, exact or by pattern, on the same listener
 - **Reverse Proxy** - Forward requests to HTTP, HTTPS or Unix socket targets, streaming bodies and tunneling WebSockets
 - **File Uploads** - Streaming multipart/form-data parser, with temporary files and limits
 - **C++20 Coroutines** - Async-first API with sync wrappers
-- **Graceful Shutdown** - Stop listening, finish the requests in flight and tell long-lived connections, within a grace period; connection statistics at no cost per request
+- **Graceful Shutdown** - Stop listening, finish the requests in flight and tell long-lived connections, until one deadline; connection statistics at no cost per request
+- **Request Cancellation** - Each request knows why it is no longer awaited (client gone, timeout, shutdown); routes opt in to have their handlers interrupted
 - **Lightweight** - Minimal dependencies, suitable for embedded systems
 
 ## Quick Start
@@ -115,7 +117,7 @@ include(FetchContent)
 FetchContent_Declare(
     thinger-http
     GIT_REPOSITORY https://github.com/thinger-io/thinger-http.git
-    GIT_TAG v0.8.1
+    GIT_TAG v0.9.0
 )
 FetchContent_MakeAvailable(thinger-http)
 
@@ -130,6 +132,8 @@ Releases are tagged `vMAJOR.MINOR.PATCH` and follow [Semantic Versioning](https:
 - a minor version (0.x.0) may add features and change the API or the behaviour. Every change that can break or alter existing code is listed in [CHANGELOG.md](CHANGELOG.md), under **Changed**, with how to adapt.
 
 From 1.0.0 on, only a major version changes the API in an incompatible way.
+
+[MIGRATING.md](MIGRATING.md) walks through each minor version's breaking changes in migration order, with code before and after: see [from 0.8 to 0.9](MIGRATING.md#from-08-to-09).
 
 ### Build from Source
 
@@ -289,7 +293,7 @@ server.post("/upload", [](http::request& req, http::response& res) -> thinger::a
 
 Reads never go past the end of the body, nor past the maximum body size of the route (`set_max_body_size()` unless the route sets its own): a larger body fails reading (`too_large`), a `Content-Length` one at the first read, without reading it. Whatever the handler leaves unread is discarded after it returns, so it is never parsed as the next request on a keep-alive connection; if it exceeds `set_max_body_size()` (or the route limit, if smaller), the connection is closed instead.
 
-- Do not read the body straight from `req.get_socket()`: use `read()`/`read_some()`, or take over the connection (below).
+- A request gives no access to its socket: read the body with `read()`/`read_some()`, or take over the connection (below). `req.connection()` tells its peer and local addresses and whether it is TLS, and `req.tls()` its TLS session.
 - `co_await req.read_body()` loads the remaining body into `req.body()`, up to the maximum body size (it fails without reading a larger `Content-Length` body). Do not mix it with `read()`/`read_some()` on the same request: the stored body would miss the part already read (and fail to decompress if the request is compressed).
 - `read()`/`read_some()` return 0 at the end of the body, and also if reading it fails: `req.get_body_error()` tells why (`too_large`, `malformed` framing, `incomplete` if the connection ended first, or `bad_encoding`). A request whose body fails is answered with `400` (`413` if too large) unless the handler responded, and its connection is closed.
 
@@ -353,20 +357,30 @@ Handlers taking the body decoded (`nlohmann::json&`) can also accept `multipart/
 
 ### Taking Over the Connection
 
-`res.take_over()` hands the connection to your code, for custom protocol upgrades or tunnels (WebSockets and SSE are built on it). The response set so far is sent first (200 by default; unless it is a `101`, a `2xx` to `CONNECT`, or carries a `Content-Length` or `Transfer-Encoding` set with `header()`, it says `Connection: close`, as what the handler writes is its body until the connection closes); then the server stops reading from the connection and calls the handler with the socket and any bytes the client had already sent past the request. From then on the handler owns the socket. It can also be called later from a copy of the response: until the response starts, the server handles nothing else the client sends on that connection (it stays readable from the socket, for the handler), but it notices a client that closes or half-closes the connection meanwhile, over TLS too, and closes it. A `take_over()` arriving after that does not call its handler: it is released, and a warning logged.
+`res.take_over()` hands the connection to your code, for custom protocol upgrades or tunnels (WebSockets and SSE are built on it). The response set so far is sent first (200 by default; unless it is a `101`, a `2xx` to `CONNECT`, or carries a `Content-Length` or `Transfer-Encoding` set with `header()`, it says `Connection: close`, as what the handler writes is its body until the connection closes); then the server stops reading from the connection and calls the handler with an `http::upgraded_connection`: the `socket`, the bytes the client had already sent past the request (`buffered`), and the `scope` of the connection. From then on the handler owns the socket. It can also be called later from a copy of the response: until the response starts, the server handles nothing else the client sends on that connection (it stays readable from the socket, for the handler), but it notices a client that resets the connection meanwhile, over TLS too, and closes it (a client that only closes its sending side has not left, see [Cancellation](#cancellation)). A `take_over()` arriving after that does not call its handler: it is released, and a warning logged.
 
 ```cpp
 server.get("/tunnel", [](http::request& req, http::response& res) {
     res.status(http::http_response::status::switching_protocols);
     res.header("Upgrade", "my-protocol");
     res.header("Connection", "Upgrade");
-    res.take_over([](std::shared_ptr<thinger::asio::socket> socket, std::string buffered) {
-        // `buffered` holds bytes already received after the request; process them first
+    res.take_over([](http::upgraded_connection conn) {
+        // conn.buffered holds bytes already received after the request; process them first
+        conn.scope.on_shutdown([socket = conn.socket] { socket->close(); });
+        // ... run the protocol on conn.socket; once done: conn.scope.closed()
     });
 });
 ```
 
-The handlers of `take_over()`, `upgrade_websocket()`, `upgrade_websocket_stream()` and `start_sse()` can be coroutines: they run on the io_context of the connection, detached (what they throw is logged); `upgrade_websocket()` starts reading messages once its coroutine completes. So can the middlewares with `next()` and the callbacks of the async client. Callbacks that are called and not awaited (`on_message()`, `on_shutdown()`, `begin_shutdown()`'s `on_done`, the error formatter, the reverse proxy `on_request`/`on_response` hooks, the OpenAPI hooks...) take only synchronous functions: a coroutine lambda there does not compile, instead of being dropped without running; `co_spawn()` the work from them instead.
+The scope (`http::server_scope`, in `thinger/http/server/upgrade.hpp`) is the only link between the connection and the server it came from, and does not keep the server alive:
+
+- `on_shutdown(callback)`: called once, on the io_context of the socket, when a [shutdown](#shutdown) starts its drain, so the handler finishes and closes the connection (with a WebSocket, a close 1001). Set after the drain started, it is still called once, posted. It is released before it is called, so it may own the socket. What it throws is logged.
+- `set_type(type)`: what the connection serves in the [statistics](#statistics) (`taken_over` by default).
+- `closed()`: the handler closed the connection. It no longer counts and is not told of a shutdown. Calling it again does nothing.
+
+The server counts the connection while the socket handed out lives (its copies, and a WebSocket built on it, included), or until `closed()`. Whatever is still open when the shutdown deadline comes is closed. A scope without a server does nothing: a default-constructed one, one whose server was destroyed, or one of a socket that did not come from a server.
+
+The handlers of `take_over()`, `upgrade_websocket()`, `upgrade_websocket_stream()` and `start_sse()` can be coroutines: they run on the io_context of the connection, detached (what they throw is logged); `upgrade_websocket()` starts reading messages once its coroutine completes. So can the middlewares with `next()` and the callbacks of the async client. Callbacks that are called and not awaited (`on_message()`, `on_shutdown()`, the error formatter, the reverse proxy `on_request`/`on_response` hooks, the OpenAPI hooks...) take only synchronous functions: a coroutine lambda there does not compile, instead of being dropped without running; `co_spawn()` the work from them instead.
 
 ```cpp
 server.get("/feed", [](http::request& req, http::response& res) {
@@ -704,7 +718,7 @@ All routes, with their documentation and metadata, are available from `server.ro
 
 ### Limits and Timeouts per Route
 
-Routes, groups and [virtual hosts](#virtual-hosts) can set their own maximum body size, request timeout and [decode limits](#body-types), instead of the application ones:
+Routes, groups and [virtual hosts](#virtual-hosts) can set their own maximum body size, timeout, request deadline and [decode limits](#body-types), instead of the application ones:
 
 ```cpp
 server.set_max_body_size(1024 * 1024);   // 1 MB for every route that does not set its own
@@ -738,23 +752,94 @@ The limit of a request is the one of its route, else of the group it was registe
 - [In-memory dispatch](#in-memory-dispatch): the same, from the body of the request.
 - A body left unread by the handler (e.g. a middleware answered `401` before it was read) is discarded only up to the smaller of `set_max_body_size()` and the route limit; a larger one closes the connection instead of being read, so a route accepting large bodies does not make the server read them for nothing.
 
-**Closing with the body unread**: when the connection closes after a response while the client may still be sending its request (`413`, `417`, a `401` before a body too large to discard, a request timeout, a header section too large...), it closes gracefully, as RFC 9112 (section 9.6) describes. Once the response is written, the server stops sending, so the client sees the end of the connection. It then reads and drops what keeps arriving until the client closes, 8 MiB were dropped, or 5 s passed, whichever comes first, and closes. Closed at once, the unread data would make the system reset the connection, and a client still sending its body would get `EPIPE` or a reset instead of the response. Meanwhile the connection timeout does not apply, and the connection holds no more memory than its read buffer. A body that arrived whole with the head leaves nothing to wait for, and a request that is not HTTP (`400`) closes at once, as Go does. A [graceful shutdown](#shutdown) closes the connections lingering at once (their responses were written whole), and the responses ending during it linger 0.5 s at most. A body within the limit that the handler left unread is still read and dropped to keep the connection alive, as Node does (Node reads any body to its end); a larger one is read only so the client gets its answer, as Go does.
+**Closing with the body unread**: when the connection closes after a response while the client may still be sending its request (`413`, `417`, a `401` before a body too large to discard, a request timeout, a header section too large...), it closes gracefully, as RFC 9112 (section 9.6) describes. Once the response is written, the server stops sending, so the client sees the end of the connection. It then reads and drops what keeps arriving until the client closes, 8 MiB were dropped, or 5 s passed (by default, see [Connection Options](#connection-options)), whichever comes first, and closes. Closed at once, the unread data would make the system reset the connection, and a client still sending its body would get `EPIPE` or a reset instead of the response. Meanwhile the connection timeout does not apply, and the connection holds no more memory than its read buffer. A body that arrived whole with the head leaves nothing to wait for, and a request that is not HTTP (`400`) closes at once, as Go does. A [graceful shutdown](#shutdown) closes the connections lingering at once (their responses were written whole), and the responses ending during it linger 0.5 s at most. A body within the limit that the handler left unread is still read and dropped to keep the connection alive, as Node does (Node reads any body to its end); a larger one is read only so the client gets its answer, as Go does.
 
 ```cpp
-// Up to 1 MiB or 2 s; 0 for either closes at once. It applies to every server of the process
-http::server::set_lingering_close(1024 * 1024, std::chrono::seconds(2));
+// Up to 1 MiB or 2 s; 0 for either closes at once. For this server only (see Connection Options)
+http::connection_options options;
+options.linger_max_bytes = 1024 * 1024;
+options.linger_timeout = std::chrono::seconds(2);
+server.set_connection_options(options);   // before listen()
 ```
 
 **Timeout** (`.timeout(duration, status = 504)`, none by default) is the maximum time from the dispatch of a request (its headers received and its route matched) until its response **starts**, middlewares and body reading included. If no answer has started by then, the request is answered with `504 Gateway Timeout` (or the status given, e.g. `503 Service Unavailable`) through the [error formatter](#error-format), with the message `No response within the timeout` and the headers set on the response so far (e.g. CORS headers of a middleware). As for any answer, set the status and headers (`res.status()`, `res.header()`) from the thread running the handler, before answering: a handler with a timeout that sets headers later, from another thread, would race with the timeout copying them.
 
-- **Handlers are not cancelled**: a coroutine goes on until it ends, and anything it sends afterwards (or a copy of the response, from another thread) is dropped: `has_responded()` is `true` for every copy, and late answers are logged at debug level only. Keep handlers bounded on their own (their own timeouts on what they wait for).
+- **Handlers are not interrupted unless their route says so**: after the `504`, the [cancellation scope](#cancellation) of the request is cancelled with `cancel_reason::timeout`. A coroutine goes on until it ends, finding the reason in `req.cancelled()`, and anything it sends afterwards (or a copy of the response, from another thread) is dropped: `has_responded()` is `true` for every copy, and late answers are logged at debug level only. A route declaring `.cancel_on({http::cancel_reason::timeout})` has its handler interrupted instead, at its next cancellable await. Keep the other handlers bounded on their own (their own timeouts on what they wait for, or `req.cancellation_slot()` bound to them).
 - **Started responses are never cut**: once the response starts (`send()`, `json()`, `start_stream()`, `start_chunked()`, `start_sse()`, WebSocket upgrades, `take_over()`), the timer is cancelled and the response takes as long as it needs.
 - **The connection**: if the body was read whole, the connection stays alive and serves the next request right away, while the handler may still run. If part of the body is still unread (the handler may be reading it), the response closes the connection, as nothing else can tell where the body ends; the handler then sees the body incomplete.
-- **Connection timeout**: while a request waits for its response within its own timeout, the connection timeout (`set_connection_timeout()`, 120 s) does not close the connection, so a route can wait longer than it; it applies again to the idle connection afterwards, and uploads extend it as before.
+- **Connection timeout**: while a request waits for its response within its own timeout, the connection timeout (`connection_options::idle_timeout`, 120 s) does not close the connection, so a route can wait longer than it; it applies again to the idle connection afterwards, and uploads extend it as before.
 - **Not-found handlers** get the timeout of their virtual host, if it sets one.
-- **In-memory dispatch** applies the route timeout too; `dispatch_options::timeout` still bounds the whole call (and cancels the handler), whichever expires first.
+- **In-memory dispatch** applies the route timeout too; `dispatch_options::timeout` still bounds the whole call, whichever expires first, and cancels the scope of the request with `timeout` too.
+
+**Request deadline** (`.request_timeout(duration)`, else `connection_options::request_timeout`, 300 s by default, see [Connection Options](#connection-options)) is the maximum time to **receive** a request, from its start (its first byte, or the start of serving the connection for its first request) until its body was read to its end, whatever the pace of its bytes: a slow upload (slow POST) cannot hold a connection and its handler for ever. A route receiving large uploads raises it, or turns it off with `0ms`, as it sets its own maximum body size:
+
+```cpp
+// Firmware images over slow links: up to 30 minutes to arrive
+server.post("/v1/firmware", upload_firmware).max_body_size(256 * 1024 * 1024).request_timeout(30min);
+
+// The routes of a group, and a whole host forwarded by a reverse proxy, without one
+auto media = server.group("/v1/media").request_timeout(0ms);
+media.put("/:file", store_file);
+server.host("files.example.com").request_timeout(0ms).set_not_found_handler(forward);
+```
+
+- **What it answers**: the [cancellation scope](#cancellation) of the request is cancelled with `cancel_reason::timeout` (a route declaring `.cancel_on({http::cancel_reason::timeout})` has its handler interrupted), a pending body read fails (`read_body()` returns `false`), and the request is answered `408 Request Timeout` with `Connection: close`; the connection then closes gracefully, as the body may still be arriving (see Closing with the body unread above), as Node does. What the handler reads or writes afterwards fails on the closed connection. If its response already started (a handler, or the [reverse proxy](#reverse-proxy), streaming it while the upload goes on), no `408` can be sent: the connection is closed, ending the response. It is also closed, without a `408`, when an earlier response on the connection is still being written (pipelined requests): a write in progress is never cut short to make room for it.
+- **What it bounds**: only the reception of the request. A request without a body is received with its head, so it never applies to it, nor to a body that arrived whole: what bounds the response is the timeout above. The time a client waits for its `100 Continue` (`Expect: 100-continue`, sent when the handler first reads the body) counts towards it, as in Node.
+- **From the start of the request**: a route deadline is applied once the route matched, measured from the start of the request, so one lower than the time already spent expires at once. A route `.timeout()` longer than it does not delay it.
+- **Precedence** as for the other limits: route > group > host (its not-found handler too) > `connection_options::request_timeout`. Its head is received before the route is known, so the head of a request is bounded by the connection option and `header_timeout` only. The deadlines of a connection do not apply to an [in-memory dispatch](#in-memory-dispatch), nor to a connection once taken over (WebSocket, SSE, `take_over()`).
 
 The [OpenAPI](#openapi) document shows the limits set on a route (or its group) as `x-max-body-size` (bytes) and `x-timeout-ms` extensions of its operation.
+
+### Cancellation
+
+Each request has a cancellation scope, which the server cancels once, for the first reason that comes (`http::cancel_reason`):
+
+- `client_gone`: the client reset the connection, a read or write on it failed (a reset or a broken pipe as the response is written), or the connection ended in the middle of the request body. A client that only closes its sending side after a complete request (a TCP FIN, as simple HTTP stacks do; over TLS a `close_notify`, or a FIN without one) has **not** left: its response is written, with `Connection: close`, and the connection closes after it. So a client that closes cleanly while its handler runs is noticed later, at the first write of its response or at the route timeout: a long poll declares `timeout` too.
+- `timeout`: the [timeout of the route](#limits-and-timeouts-per-route) expired, right after its `504`, or that of an [in-memory dispatch](#in-memory-dispatch).
+- `shutdown`: the [shutdown](#shutdown) reached its deadline with the request in progress.
+
+Cancellation is cooperative. The server interrupts a handler only on a route that declares the reason with `.cancel_on(reasons)`, and every handler at the shutdown deadline. On any other route the handler goes on, and looks at the scope where it chooses:
+
+```cpp
+using http::cancel_reason;
+
+// A long poll: interrupted once its client is gone or its timeout expired
+server.get("/v1/events", [&events](http::request& req, http::response& res) -> thinger::awaitable<void> {
+    auto event = co_await events.next();   // throws operation_aborted when interrupted
+    res.json(event);
+}).timeout(60s).cancel_on({cancel_reason::client_gone, cancel_reason::timeout});
+
+// A default route: it runs to its end, abandoning only the wait it binds to the scope
+server.get("/v1/report", [](http::request& req, http::response& res) -> thinger::awaitable<void> {
+    boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 5s);
+    co_await timer.async_wait(boost::asio::bind_cancellation_slot(req.cancellation_slot(), thinger::use_nothrow_awaitable));
+    if (req.cancelled() != cancel_reason::none) co_return;   // nobody waits for the report
+    res.json({{"status", "ready"}});
+}).timeout(10s);
+```
+
+- `req.cancelled()` returns the reason, `none` until the scope is cancelled, from any thread.
+- `co_await req.client_gone()` completes once the scope is cancelled, whatever the reason, and returns it (with `||`, alongside other work); `none` if the wait itself is cancelled. It never completes for a scope never cancelled.
+- `req.cancellation_slot()` is cancelled (terminal) with the scope while the handler runs: bind it with `boost::asio::bind_cancellation_slot` to the awaits the handler can abandon, one pending await at a time (asio's rule).
+- On a `cancel_on` route, asio cancels the handler coroutine: its pending await, or its next one, ends with `operation_aborted` (thrown, or returned with `as_tuple`), and so do those of the coroutines it awaits. Code that does not await is not interrupted. An interrupted handler is not a failure: no `500` (the timeout already answered, the client is gone, or the connection closes), its exception logged at debug level; a response it had started closes the connection after it. `cancel_on()` is set on each route (groups and hosts do not carry it), and `cancel_on({})` keeps the default.
+
+Work that must not be interrupted on such a route (a write and what follows it) runs outside the cancellation state of the handler, either for the rest of the handler or for that work only:
+
+```cpp
+// The rest of the handler: cancellation disabled (without a filter, reset_cancellation_state()
+// lets the terminal cancellation of the scope through)
+co_await boost::asio::this_coro::reset_cancellation_state(boost::asio::disable_cancellation());
+co_await store.save(record);
+
+// Only the work: a coroutine of its own, spawned with no slot, which the handler awaits to its
+// end (its next await is interrupted then)
+co_await co_spawn(co_await boost::asio::this_coro::executor, store.save(record),
+                  boost::asio::bind_cancellation_slot(boost::asio::cancellation_slot{}, thinger::use_awaitable));
+```
+
+The scope is cancelled once: a handler that disabled its cancellation checks `req.cancelled()` afterwards. The scope is cancelled on the thread of the connection (the strand of an in-memory dispatch), where the handler runs. An in-memory dispatch follows the same rules: its timeout is `timeout`, and a caller cancelling it is `client_gone`. The [reverse proxy](#reverse-proxy) stops the exchange with its target when the scope is cancelled.
+
+This is Go's model, where the context of the request is cancelled and the handler decides when to look; Node does not cancel handlers.
 
 ### OpenAPI
 
@@ -812,7 +897,7 @@ options.context.set(trace_key, trace_id);
 response = co_await server.dispatch(request, options);
 ```
 
-The server does not need to be listening. Chunked responses are collected whole. A `HEAD` request gets the response it gets on a connection: no content, with the `Content-Length` of the body of `GET`. Handlers can keep a copy of the response and answer later. The timeout covers the whole request, handler included: if it expires the result is `504` and the handler is cancelled (its pending awaits are aborted). WebSockets, SSE and `take_over()` answer `501`, as there is no connection. The request is served by the [virtual host](#virtual-hosts) of its URL (or `Host` header). `remote_ip` is the peer address: `get_request_ip()` returns it (or the forwarded client address, if it is a [trusted proxy](#client-ip-behind-proxies)), and it is empty unless set: internal calls never pass as a trusted local address by default. `context` holds the initial values of the [request context](#request-context) (empty by default): middlewares may replace them, and nothing is carried over from a request the caller is serving, so a gateway decides what to pass (or authenticates the call again). Copying `dispatch_options` copies its values; a value of a type that cannot be copied (e.g. `std::unique_ptr`) makes that copy throw `std::logic_error`, so move such options into `dispatch()`.
+The server does not need to be listening. Chunked responses are collected whole. A `HEAD` request gets the response it gets on a connection: no content, with the `Content-Length` of the body of `GET`. Handlers can keep a copy of the response and answer later. The timeout covers the whole request, handler included: if it expires the result is `504`, and the [cancellation scope](#cancellation) of the request is cancelled with `cancel_reason::timeout`; the handler goes on unless its route declared `.cancel_on({http::cancel_reason::timeout})`, which interrupts it (its pending awaits end with `operation_aborted`). A caller cancelling the coroutine awaiting `dispatch()` (a cancellation slot, or `||` with a timer) cancels the scope with `cancel_reason::client_gone`, which interrupts only a route declaring it, and `dispatch()` throws `operation_aborted`. WebSockets, SSE and `take_over()` answer `501`, as there is no connection. The request is served by the [virtual host](#virtual-hosts) of its URL (or `Host` header). `remote_ip` is the peer address: `get_request_ip()` returns it (or the forwarded client address, if it is a [trusted proxy](#client-ip-behind-proxies)), and it is empty unless set: internal calls never pass as a trusted local address by default. `context` holds the initial values of the [request context](#request-context) (empty by default): middlewares may replace them, and nothing is carried over from a request the caller is serving, so a gateway decides what to pass (or authenticates the call again). Copying `dispatch_options` copies its values; a value of a type that cannot be copied (e.g. `std::unique_ptr`) makes that copy throw `std::logic_error`, so move such options into `dispatch()`.
 
 Everything about routes, hosts, middlewares and request settings (error format, trusted proxies, body limit and decoders, CORS), `dispatch()` included, comes from `http::http_application`, which the server extends with its listeners, TLS and connection settings. An `http::http_application` can also be used on its own, without a server, only to dispatch requests in memory.
 
@@ -846,7 +931,7 @@ server.get("/", [](http::response& res) { res.send("default site"); });
 
 Hosts are matched in order: exact names, then patterns in registration order, then the default host (`server.host("*")` returns the server itself). Register them before `listen()`. Once the host is chosen, everything works as for a single host: routes and `404`/`405` come from that host only, and the global middlewares (`server.use()`) run for every host after route matching, with `req.get_matched_route()` set to the route of the matched host and `req.get_virtual_host()` to the host. `server.openapi()` documents the default host; for another one build a generator over its router: `http::openapi_generator(server.host("api.example.com").router(), &server.get_body_settings())` (the body settings document the [body types](#body-types) of the application).
 
-For HTTPS, the certificate is chosen per domain before any request is read, through SNI: register one per host name (wildcards such as `*.devices.example.com` included) with `thinger::asio::certificate_manager::instance().set_certificate(hostname, certificate, private_key)`. Virtual hosts then pick the routes for the same name from the `Host` header. See `examples/http_server/virtual_hosts_example.cpp`.
+For HTTPS, the certificate is chosen per domain before any request is read, through SNI: register one per host name (wildcards such as `*.devices.example.com` included) in the [certificate manager](#https-server) of the server, with `manager->set_certificate(hostname, certificate, private_key)`. Virtual hosts then pick the routes for the same name from the `Host` header. A request whose `Host` would get another client certificate mode or certificate entry than its SNI name is answered `421 Misdirected Request` before its host runs anything, so a [client certificate mode per host](#client-certificates) protects its virtual host; the same name, names sharing one configuration (a wildcard, the default certificate) and clients without SNI on the listener's mode are served. See `examples/http_server/virtual_hosts_example.cpp`.
 
 ### Error Format
 
@@ -946,7 +1031,9 @@ device.tls.ca_file = "/etc/ssl/private-ca.pem";  // trusted instead of the syste
 - **Forwarding headers**: `X-Forwarded-For`, `-Proto` and `-Host` by default, `Forwarded` (RFC 7239) or none (`options.forwarding`). They agree with `req.get_request_ip()`: the ones received from a [trusted proxy](#client-ip-behind-proxies) (the header it sets) are kept and extended with the peer; from any other peer they are dropped, as the client could forge them.
 - **Bodies** are streamed with flow control both ways: the request body goes to the target as the client sends it, and the response to the client as the target sends it (chunked responses and event streams included), each part read only once the previous one was written, so neither is ever held whole. `max_body_size` limits the request body (413), as does the [maximum body size of the route](#limits-and-timeouts-per-route): the smaller one wins.
 - **Upgrades**: a request with `Connection: upgrade` (WebSocket or any other protocol) gets the `101` of the target, then the connection becomes a byte tunnel to it, starting with whatever either side sent right after the handshake. `allow_upgrade = false` forwards them as plain requests.
-- **Errors**, through the [error formatter](#error-format): `502` if the target cannot be reached (connection refused, TLS verification) or its response is invalid, `504` if it times out. `connect_timeout` (10 s) covers the connection and TLS handshake, `idle_timeout` (60 s, `0` disables it, e.g. for event streams) the time without data in either direction, and `total_timeout` (none by default) the whole exchange. Once the response has started, a failure closes the connection with the client without ending the body, so it sees it incomplete.
+- **Tunnel idle timeout**: `tunnel_idle_timeout` (120 s, `0` disables it) closes both connections of a tunnel, to the client and to the target, once nothing was forwarded in either direction for that long. Any byte forwarded either way is activity, so WebSocket data, pings and pongs keep a tunnel open, also with traffic in one direction only; a byte counts once written to the other side, so a peer that stops reading ends the tunnel too, as do the bytes sent right after the handshake when their peer never reads them. A tunnel ended mid-frame is not closed with a WebSocket close frame: both connections close, as nginx does at `proxy_read_timeout`, and the client sees `1006`. It is separate from `idle_timeout`, which covers the exchange only: setting either to 0 leaves the other on. Like the other options, it can be set per `forward()` call. 120 s sits above the 60 s of nginx's `proxy_read_timeout` and AWS ALB and the 100 s of Cloudflare because a thinger-http WebSocket pings a quiet peer only after 60 s: a shorter deadline would cut a quiet WebSocket before its keepalive sends anything (a `static_assert` keeps the default above that ping interval). It equals the WebSocket and connection idle timeouts (120 s), so a tunnel never ends before its endpoints would notice a dead peer themselves.
+- **Errors**, through the [error formatter](#error-format): `502` if the target cannot be reached (connection refused, TLS verification) or its response is invalid, `504` if it times out. `connect_timeout` (10 s) covers the connection and TLS handshake, `idle_timeout` (60 s, `0` disables it, e.g. for event streams) the time without data in either direction during the exchange (a tunnel has its own, see above), and `total_timeout` (none by default) the whole exchange. Once the response has started, a failure closes the connection with the client without ending the body, so it sees it incomplete.
+- **A client gone**: the exchange stops, and its connection to the target closes, once the [cancellation scope](#cancellation) of the request is cancelled: the client reset the connection (within milliseconds, also while the target is silent, as an event stream may be), the route timed out, or the shutdown reached its deadline. The proxy never reads the connection of the client for it, and a client closing only its sending side after its request gets the response of the target.
 - **Hooks**: `on_request` changes the request for the target (method, path, headers), `on_response` the status and headers of its response (also of a `101`), before the body is relayed: they get the incoming request too, and can edit, remove or add any header, repeated ones included (each `Set-Cookie` is a header of its own in `get_headers()`). Headers they add with invalid characters fail the request (`500`) instead of being sent.
 
 The proxy never changes the end-to-end headers of the target by itself: frame protections, cookies and redirects reach the client as the target sent them. Rewriting them is an application policy, expressed with `on_response`, and each rule has a cost. `examples/http_server/device_proxy_example.cpp` (with `device_proxy_policy.hpp`) serves device web interfaces inside a console:
@@ -976,12 +1063,30 @@ thinger::http::server server;
 
 server.get("/", handler);
 
-// Enable SSL/TLS (requires certificates configured in socket layer)
-server.enable_ssl(true);
-server.start("0.0.0.0", 443);
+// The certificates of TLS: a manager the application creates and owns
+auto manager = std::make_shared<thinger::asio::certificate_manager>();
+if (auto ec = manager->set_default_certificate(certificate, private_key)) {
+    // ec is invalid_argument: the certificate or its key cannot be used (the reason is logged)
+}
+manager->set_certificate("api.example.com", api_certificate, api_private_key);  // by SNI
+
+// A TLS listener: the manager goes with its options
+thinger::asio::listener_options options;
+options.endpoint = thinger::asio::tcp_endpoint{"0.0.0.0", 443};
+options.tls = manager;
+if (auto ec = server.listen(options)) {
+    // invalid_argument (e.g. the manager has no default certificate), or the error binding
+}
+server.wait();
 ```
 
-The certificates are kept by `asio::certificate_manager::instance()`: a default one (`set_default_certificate()`, a self-signed one for development if none is set) and one per host name, selected by SNI (`set_certificate(host, certificate, key)`, `*.example.com` for a wildcard).
+The same server may listen on plain HTTP too, with another `listen()`: see [Listeners](#listeners).
+
+The certificates are kept by an `asio::certificate_manager` (`thinger/asio/ssl/certificate_manager.hpp`): a default one (`set_default_certificate()`, a self-signed one for development if none is set; `remove_default_certificate()` drops it, and no self-signed one is generated then; a null context is refused with `invalid_argument` and keeps the current one, it does not drop it) and one per host name, selected by SNI (`set_certificate(host, certificate, key)`, `*.example.com` for a wildcard). The application creates as many as it needs, always with `std::make_shared` (the SNI callback of its contexts reaches it through a `weak_ptr`), and each one keeps its own certificates, [TLS settings](#tls-settings) and [client certificate modes](#client-certificates): two servers with different managers serve different certificates for the same host name. A TLS listener listens with the default certificate of its manager, taken when it opens; replacing it later applies to the next handshakes. A manager without a default certificate (removed) makes `listen()` return `invalid_argument`, with an error logged. Each listener holds its manager until it stops, so a manager created for `listener_options::tls` and kept nowhere else lives as long as the listeners using it. A context the server listens with may outlive its manager (the application keeps it elsewhere, or a connection still uses it once the listener stopped): once the manager is gone, its handshakes stay on that context (its certificate, whatever the host name), without SNI.
+
+Host names are matched exactly, or by a wildcard `*.domain` for one more label (`*.example.com` matches `a.example.com`, not `example.com` nor `a.b.example.com`), case-insensitive: an exact name wins over a wildcard, and a lookup costs the same however many names are registered. `set_certificate()` takes a host name (labels of 1 to 63 letters, digits, hyphens or underscores, 253 characters at most) or `*.` followed by one, and refuses any other name with `invalid_argument`: no name is taken as a pattern. `get_registered_hosts()` lists the names lowercase, as registered, and `remove_certificate(name)` removes the certificate registered with that name (a wildcard by its `*.domain`), returning `false` if there is none.
+
+The setters return a `boost::system::error_code`: empty on success, so `if (ec)` means that it failed, and `invalid_argument` when what they are given cannot be used (an invalid PEM, a key that is not the certificate's, a name that is not a host name, options OpenSSL refuses), with the reason logged; nothing changes then.
 
 #### TLS Settings
 
@@ -993,38 +1098,116 @@ options.min_version = thinger::asio::tls_version::tls1_3;  // TLS 1.3 only
 options.prefer_server_ciphers = true;                       // in the order of `ciphers`
 // options.ciphers (TLS 1.2), options.ciphersuites (TLS 1.3), options.groups (curves),
 // options.security_level (OpenSSL)
-thinger::asio::certificate_manager::instance().set_tls_options(options);   // false if OpenSSL refuses them
+if (auto ec = manager->set_tls_options(options)) {
+    // OpenSSL refuses them: the current options are kept
+}
 ```
 
 The certificate of each host gets the same options, and SNI cannot weaken them: the versions, ciphers and security level of a handshake are those of the context the server listens with (the default one when it started listening), and the context SNI selects gives only its certificate (OpenSSL would take its ciphers and security level too: the manager keeps those of the listener). A context given ready-made (`set_default_certificate(context)`, `set_certificate(host, context)`) keeps its own settings; `asio::apply_tls_options(context, options)` sets them on it. The setters of earlier versions, `set_server_ciphers()` and `enable_legacy_protocols(true)` (which still allows TLS 1.0 and 1.1 for old clients), are deprecated: they change these options, validated as `set_tls_options()` does.
 
+### Listeners
+
+A server (`http::server`, `http::pool_server`, both deriving from `http::server_base`) serves its application on as many listeners as it opens: plain TCP, TLS and Unix domain sockets, each with a `listen()` of its own. Every listener serves the same routes, virtual hosts, middlewares and hooks: one server answers HTTP and HTTPS, and a route added after `listen()` answers on all of them (added before requests arrive, see [Server Lifecycle](#server-lifecycle)).
+
+```cpp
+thinger::http::server server;
+server.get("/", handler);
+
+if (auto ec = server.listen("0.0.0.0", 80)) { /* plain TCP; ec says why it cannot */ }
+
+thinger::asio::listener_options https;
+https.endpoint = thinger::asio::tcp_endpoint{"0.0.0.0", 443};
+https.tls = manager;
+if (auto ec = server.listen(https)) { /* ... */ }
+
+thinger::asio::listener_options local;
+local.endpoint = thinger::asio::unix_endpoint{"/run/app.sock"};
+server.listen(local);
+
+server.get("/health", health);   // answers on the three
+// server.listening_on(): {"http://0.0.0.0:80", "https://0.0.0.0:443", "unix:/run/app.sock"}
+server.wait();
+```
+
+`listen()` returns a `boost::system::error_code`, empty on success (`if (ec)` means it failed): the error of the listener (`invalid_argument` for options that cannot be used, such as a manager without a default certificate, or the error binding), `address_in_use` for an endpoint the server listens on already, or that another `listen()` is opening (the same Unix path, or the same host and port; a port 0 always opens a new one), `shut_down` while a [shutdown](#shutdown) is in progress, or `operation_aborted` when `stop_listening()`, `stop()` or a shutdown, called on another thread, stopped the listener while it opened (e.g. while it waited to bind again). A `listen()` that fails opens nothing and leaves the listeners open as they are. A listener accepts connections only once `listening_on()` lists it, so whatever stops the listeners, on any thread, stops every one: none outlives a `stop_listening()` or a shutdown it raced with. Every option of `listener_options` below applies (client certificates, handshake deadline, session cache, attempts, remotes allowed and forbidden), per listener. `listening_on()` lists where the server listens, one URL per listener in the order they opened, with the port the system chose for a port 0 (IPv6 hosts in brackets), and is empty while it does not listen. `stop()`, `shutdown()` and `is_listening()` act on every listener, and `stats()` counts the connections of all.
+
+The servers accept their connections with an `asio::listener` (`thinger/asio/listener.hpp`), which a protocol of the application (e.g. MQTT) uses on its own: one type for plain TCP, TLS (a `certificate_manager` in `tls`) and Unix domain sockets, set up with a `listener_options` and two `executor_provider`s, the executor to accept on and the next one to serve each connection on (where its handshake runs and the handler is called). In this release both must run on an `io_context` (its executor, or a strand of one): `open()` returns `invalid_argument` otherwise.
+
+```cpp
+boost::asio::io_context io;
+auto on_io = [&]() -> boost::asio::any_io_executor { return io.get_executor(); };
+
+thinger::asio::listener_options options;
+options.endpoint = thinger::asio::tcp_endpoint{"0.0.0.0", 8883};  // or unix_endpoint{"/run/x.sock"}
+options.tls = manager;                                             // null: plain connections
+// options.tcp_no_delay = true;          // TCP_NODELAY on every connection
+// options.max_listening_attempts = -1;  // a busy port is retried every 5 s; 1 fails at once
+// options.allowed_remotes, options.forbidden_remotes: addresses closed as they are accepted
+
+thinger::asio::listener listener(options, on_io, on_io);
+if (auto ec = listener.open()) {
+    // invalid_argument (options that cannot be used), already_open, or the error binding
+}
+listener.start([](std::shared_ptr<thinger::asio::socket> socket) {
+    // a TLS connection arrives once its handshake succeeded
+});
+// listener.url() is "https://0.0.0.0:8883", listener.local_port() the port bound (0 picks one)
+```
+
+`open()` resolves the host (synchronously), binds and listens, and `start()` accepts: a listener is used once, and a second `open()` returns `already_open` (after one that failed, it opens again with the same options). A Unix domain socket replaces a file already at its path and removes it when it stops; TLS is served on TCP endpoints only. The listener holds its manager from its construction until `stop()` (or its destructor), whatever `open()` returns, so the application need not keep a reference to it: its connections start with the default certificate `open()` found, and take the certificate and the client certificate mode of their host name (SNI) from the manager. Without `tls`, `client_verify` is ignored, with a warning logged.
+
+`stop()` closes the listening socket and the connections whose handshake is pending, which never reach the handler. It may be called from any thread, the handler included, and more than once; once it returns, no handler starts and none runs on another thread (it waits for them, so a handler must never wait for a thread calling `stop()`). The destructor stops the listener.
+
 #### Client Certificates
 
-A TLS listener may ask its clients for a certificate (mutual TLS), in one of three modes (`asio::client_verify`): `none` (the default: no certificate is asked for), `optional` (asked for; a client without one goes on) or `required` (the handshake fails without one; in TLS 1.3 the client learns it at its first read, from a `certificate_required` alert). A `tcp_socket_server` (e.g. the listener of a protocol such as MQTT) sets it with `enable_ssl()`:
+A TLS listener may ask its clients for a certificate (mutual TLS), in one of three modes (`asio::client_verify`): `none` (the default: no certificate is asked for), `optional` (asked for; a client without one goes on) or `required` (the handshake fails without one; in TLS 1.3 the client learns it at its first read, from a `certificate_required` alert). A listener (e.g. one of a protocol such as MQTT) sets it in `listener_options::client_verify`:
 
 ```cpp
-thinger::asio::client_verify_options verify;
-verify.mode = thinger::asio::client_verify::optional;
-// verify.trusted_cas = pem;      // validate against these CAs during the handshake
-// verify.max_depth = 4;          // intermediate CAs allowed (with trusted CAs)
-// verify.max_cert_list = 16384;  // bytes of the chain a client may send
-if (!listener.enable_ssl(true, verify)) { /* the trusted CAs cannot be read */ }
+thinger::asio::listener_options options;
+options.endpoint = thinger::asio::tcp_endpoint{"0.0.0.0", 8883};
+options.tls = manager;
+options.client_verify.mode = thinger::asio::client_verify::optional;
+// options.client_verify.trusted_cas = pem;      // validate against these CAs during the handshake
+// options.client_verify.max_depth = 4;          // intermediate CAs allowed (with trusted CAs)
+// options.client_verify.max_cert_list = 16384;  // bytes of the chain a client may send
+
+thinger::asio::listener listener(options, on_io, on_io);
+if (auto ec = listener.open()) { /* invalid_argument: e.g. the trusted CAs cannot be read */ }
 ```
 
-- **Deferred validation** (no `trusted_cas`, the usual case when each account brings its own CAs): the handshake accepts any well-formed chain, as long as the client proves it holds the key of its certificate, and the application validates the chain afterwards, from `socket->tls()->peer_chain_der` (or `ssl_socket::peer_certificate()` and `peer_chain()`, without copies). The library judges neither the issuer nor the dates, key types or algorithms: that policy belongs to the application.
-- **Trusted CAs**: OpenSSL validates the chain during the handshake, and a certificate presented that does not validate fails it, in `optional` mode too (a client without a certificate goes on in `optional`). `tls()->verify_result` is `X509_V_OK` then. Trusted CAs that cannot be read make `enable_ssl()` return `false`, and the server serves no connection rather than serve them without the validation asked for.
+- **Deferred validation** (no `trusted_cas`, the usual case when each account brings its own CAs): the handshake accepts any well-formed chain, as long as the client proves it holds the key of its certificate, and the application validates the chain afterwards, from `socket->tls()->peer_chain_der` (`req.tls()->peer_chain_der` on an HTTP route, or `ssl_socket::peer_certificate()` and `peer_chain()`, without copies). The library judges neither the issuer nor the dates, key types or algorithms: that policy belongs to the application.
+- **Trusted CAs**: OpenSSL validates the chain during the handshake, and a certificate presented that does not validate fails it, in `optional` mode too (a client without a certificate goes on in `optional`). `tls()->verify_result` is `X509_V_OK` then. Trusted CAs that cannot be read make `open()` return `invalid_argument`, and the listener binds nothing rather than serve connections without the validation asked for.
 - **Limits**: `max_cert_list` bounds the memory a client uses before it is authenticated (16 KiB by default); `max_depth` the intermediate CAs between the certificate and a trusted CA, as OpenSSL counts them (`SSL_set_verify_depth`: 1 allows one intermediate).
 
-The mode is set on each connection, never on the context the server listens with, which may be the default context of the `certificate_manager`, shared with other listeners (e.g. the HTTPS server keeps asking for none). A host name may ask for a mode of its own, e.g. the host of the devices on a port shared with a web console:
+The mode is set on each connection, never on the context the server listens with, which may be the default context of a `certificate_manager`, shared with other listeners (e.g. an HTTPS listener of a server keeps asking for none). A host name may ask for a mode of its own, e.g. the host of the devices on a port shared with a web console:
 
 ```cpp
-auto& manager = thinger::asio::certificate_manager::instance();
-manager.set_client_verify("devices.example.com", thinger::asio::client_verify::required);  // false if not a host name
-manager.set_client_verify("*.devices.example.com", thinger::asio::client_verify::optional);
-manager.remove_client_verify("devices.example.com");   // back to the mode of the listener
+auto manager = std::make_shared<thinger::asio::certificate_manager>();
+if (auto ec = manager->set_client_verify("devices.example.com", thinger::asio::client_verify::required)) {
+    // not a host name
+}
+manager->set_client_verify("*.devices.example.com", thinger::asio::client_verify::optional);
+manager->remove_client_verify("devices.example.com");   // back to the mode of the listener
 ```
 
-Host names (SNI) are matched as the certificates (exact, or `*.domain` for one more label), case-insensitive; other hosts keep the mode of their listener, whose trusted CAs and limits apply (deferred validation on a listener that asks for none, as an `http::server`). They apply to the next handshakes of the servers already listening.
+Host names (SNI) are matched as the certificates (exact, or `*.domain` for one more label), case-insensitive; other hosts keep the mode of their listener, whose trusted CAs and limits apply (deferred validation on a listener that asks for none, as a server's by default). They apply to the next handshakes of the servers already listening.
+
+The precedence, for each handshake:
+
+| Handshake | Mode |
+|---|---|
+| Names a host (SNI) with a mode set on the manager | the host's, stricter or weaker than the listener's: a `required` listener lets the clients of a host set to `none` in without a certificate |
+| Names no host, or one without a mode of its own | the listener's `client_verify` |
+
+The listener sets the mode on each connection (`ssl_socket::set_client_verify()` is internal: only the listener calls it, until 0.10), so two listeners sharing a manager keep their own modes.
+
+The mode of a host protects its [virtual host](#virtual-hosts) too: the handshake chose it by SNI, but the server picks the virtual host of each request by its `Host`, so an HTTPS request whose `Host` would get another TLS configuration than its SNI is answered `421 Misdirected Request` (RFC 9110 15.5.20, as nginx answers), before any middleware, route, upgrade or handler runs, and without reading its body (the connection closes after the response if the body was sent; otherwise it serves the next request). A TLS configuration is the client certificate mode of a name (its own, else the listener's) and its certificate entry (the exact name, the wildcard or the default certificate that serves it, by its registered name: replacing a certificate changes none, and a host name registered with the same certificate as the default is still an entry of its own). The request is served when:
+
+- its `Host` is the SNI name (case-insensitive, port and trailing dot ignored), whatever changed since the handshake;
+- its `Host` gets the same mode and the same certificate entry as the SNI name (e.g. two names of one wildcard, or two names of the default certificate);
+- the client sent no SNI, and its `Host` gets the mode of the listener (proxies often send none): without SNI only the mode is compared, as the client negotiated the default certificate for any host.
+
+Any other mode, in either direction (e.g. SNI `www.example.com` and `Host: devices.example.com` on the example above, or a `Host` that falls back to a `required` listener from a host set to `none`), or another certificate entry with SNI, gets the 421, logged at debug level with both names (the client decides how often). The check uses the manager of the listener, not the virtual hosts, so it applies to an application without them too; plain TCP, Unix sockets and [in-memory dispatch](#in-memory-dispatch) are never checked. A request without a host name, or with an IP address, gets the default certificate and the listener's mode.
 
 What a connection tells of TLS once its handshake is done, for any socket (`std::nullopt` for a plain one; a WebSocket answers for the socket it runs on, so there is nothing to cast):
 
@@ -1040,13 +1223,25 @@ Sessions are resumed with client certificates: every context of the manager has 
 
 #### Handshake Deadline
 
-A TLS client has 60 seconds to complete its handshake once accepted, as nginx's `ssl_handshake_timeout` (Node waits 120): otherwise the server closes the connection, which never reaches the handler, so a client that connects and sends nothing (or half a ClientHello) cannot hold a connection. `tcp_socket_server::set_handshake_timeout()` changes it for the connections accepted afterwards (0 disables it). `stop()` also closes the connections whose handshake is still pending.
+A TLS client has 60 seconds to complete its handshake once accepted, as nginx's `ssl_handshake_timeout` (Node waits 120): otherwise the listener closes the connection, which never reaches the handler, so a client that connects and sends nothing (or half a ClientHello) cannot hold a connection. `listener_options::handshake_timeout` changes it (0 disables it), on a listener of a server too. `stop()` also closes the connections whose handshake is still pending.
+
+`max_pending_handshakes` bounds the handshakes in progress at once on each IO thread (each serve executor), so that a storm of new clients cannot take every thread with the cryptography of their handshakes; 0, the default, is unbounded. A connection whose thread is at the bound waits for a slot before its handshake starts, while accepting goes on, and the wait counts against its deadline: a connection still waiting when it expires is closed then, without reaching the handler.
 
 ```cpp
-listener.set_handshake_timeout(std::chrono::seconds(10));
+options.handshake_timeout = std::chrono::seconds(10);  // from the connection accepted
+options.max_pending_handshakes = 64;                   // per IO thread; 0: no bound
 ```
 
 Handshakes that fail or time out are logged as warnings and at debug level, not as errors of the server: any client, or scanner, causes them.
+
+#### Session Cache
+
+`listener_options::session_cache` sets the resumption of earlier sessions on the contexts of the listener's manager: enabled by default, with 20,480 sessions in the server's cache (OpenSSL's default) and tickets; disabled, no session is resumed, by session id or by ticket, in TLS 1.2 and 1.3. It applies to every context of the manager, so the listeners sharing a manager must agree: `open()` returns `invalid_argument`, and binds nothing, when the cache of its options differs from the one another open listener of the manager applied (or when it is enabled with a `size` of 0). Once those listeners stopped, a new one may apply another.
+
+```cpp
+options.session_cache.enabled = false;   // no resumption
+// options.session_cache.size = 20480;   // sessions in the server's cache
+```
 
 ### Server Lifecycle
 
@@ -1054,8 +1249,10 @@ Handshakes that fail or time out are logged as warnings and at debug level, not 
 // Blocking start
 server.start("0.0.0.0", 8080);
 
-// Non-blocking
-server.listen("0.0.0.0", 8080);
+// Non-blocking: an error_code, empty on success (see Listeners)
+if (auto ec = server.listen("0.0.0.0", 8080)) {
+    // cannot listen
+}
 // ... do other work ...
 server.wait();  // Wait for shutdown
 
@@ -1063,56 +1260,113 @@ server.wait();  // Wait for shutdown
 server.stop();
 ```
 
-`stop()` stops listening right away and leaves the connections open as they are (on `http::server`, its io_context stops too). For a graceful stop, see below.
+`start()` listens on plain TCP and waits, returning `false` if it cannot listen. `stop()` stops the server right away: it stops listening on every listener, ends a [shutdown](#shutdown) in progress, and closes every connection still open, idle keep-alive ones, those handling a request and those taken over (WebSockets, event streams, tunnels) alike; on `http::server` its io_context stops too. The handlers still running are cancelled with `cancel_reason::shutdown`, whatever their route declared (their next cancellable await ends with `operation_aborted`), and are not waited for: each connection closes on its own thread, and what a handler sends afterwards is dropped. Destroying the server does the same. `stop_listening()` only stops listening: new connections are refused, and those open go on being served. For a graceful stop, see [Shutdown](#shutdown).
 
-Configure the server before `listen()`/`start()`: routes, [virtual hosts](#virtual-hosts), middlewares, the [error formatter](#error-format), [trusted proxies](#client-ip-behind-proxies), body size, decoders, types and limits, and CORS. Every request reads them, from any worker thread, without locks (they cost nothing per request), so changing them while the server is serving is a data race.
+Once `stop()` or the destructor returned, the library touches nothing of the server: each connection, and each handler running on it, shares what the server serves with (routes, virtual hosts, middlewares, hooks and settings), so a handler still running may finish its current step against them, which stay alive until it ends. What the handler captured itself (the server, objects of the application) is the application's to keep alive, or not to touch once the server is stopped. Both may be called from one of the server's own handlers, on any worker thread, as they do not wait: that handler goes on, and must not touch a server it destroyed. The connections closed are never served again, even if the server listens again.
+
+Configure the server before it serves requests: its [connection options](#connection-options) before `listen()`, and routes, [virtual hosts](#virtual-hosts), middlewares, the [error formatter](#error-format), [trusted proxies](#client-ip-behind-proxies), body size, decoders, types and limits, and CORS before `listen()` too, or after it but before any request arrives (an `http::server` serves nothing until `wait()`). Every request reads them, from any worker thread, without locks (they cost nothing per request), so changing them while the server is serving is a data race.
+
+### Connection Options
+
+How a server serves its connections is set per server with `set_connection_options()`: two servers of one process may set different values. Set it before `listen()`: it is copied once and read by each connection the server accepts afterwards, so a later call never changes the connections open.
+
+```cpp
+thinger::http::connection_options options;            // the defaults:
+options.idle_timeout = std::chrono::seconds(60);      // 120 s: an idle connection is closed
+options.header_timeout = std::chrono::seconds(30);    // 60 s: a request head not complete, 408
+options.request_timeout = std::chrono::minutes(10);   // 300 s: a request not received, 408
+options.write_timeout = std::chrono::seconds(30);     // 60 s: a response the client stopped reading
+options.linger_max_bytes = 1024 * 1024;               // 8 MiB  } closing with the body unread,
+options.linger_timeout = std::chrono::seconds(2);     // 5 s    } see Limits and Timeouts per Route
+options.logging = {true, 512};                        // off: see What the Message Logs Show
+server.set_connection_options(options);
+server.listen("0.0.0.0", 8080);
+```
+
+- `idle_timeout`: a connection with no request arriving and no response being written for this long is closed. A request waiting for its response does not count as idle (see [Limits and Timeouts per Route](#limits-and-timeouts-per-route)). Every byte received moves it: alone, it does not bound a client trickling its request, which is what the next two deadlines do.
+- `header_timeout` (60 s, Node's `headersTimeout`): the maximum time from the start of a request to the end of its head, whatever the pace of its bytes (Slowloris). A request starts at its first byte; the first one of a connection, when the server starts serving it (after the TLS handshake), and a pipelined one, when the server starts parsing it. A head not complete in time is answered `408 Request Timeout` with `Connection: close`, and the connection is closed at once; a connection on which no byte of a request arrived is closed without a response (as Go and nginx do: a `408` there could be taken for the answer to a request the client was just sending). Between two requests of a keep-alive connection, `idle_timeout` applies. Capped by `request_timeout`, as in Node.
+- `request_timeout` (300 s, Node's `requestTimeout`): the maximum time from the start of a request until its body was read to its end. Not received in time, it is answered `408 Request Timeout` with `Connection: close` (or its connection closed if its response already started), and its handler cancelled with `cancel_reason::timeout`. A route, a group or a virtual host sets its own: see the request deadline in [Limits and Timeouts per Route](#limits-and-timeouts-per-route).
+- `write_timeout` (60 s, nginx's `send_timeout`): a response write of which the socket accepts no 64 KiB slice (the whole write, if smaller) for this long closes the connection, as a client that stopped reading, whether it was to be kept alive or closed after the response. It bounds a stall, not the length of a response: a response larger than a slice is written slice by slice, each one moving the deadline, and a response being written does not count as idle. Unlike SSE and WebSocket writes, the client taking bytes from the socket is not checked: a slow client with a large send buffer (the system may wake the writer only once a third of it is free) can be cut while it still reads, if the socket accepts no slice for this long. Raise it, or turn it off, for slow downloads.
+- `0` disables any of the three; with the three at 0, a connection is served as in 0.8, with `idle_timeout` as its only deadline.
+- `linger_max_bytes` and `linger_timeout`: the bounds of a lingering close (RFC 9112, section 9.6, see [Limits and Timeouts per Route](#limits-and-timeouts-per-route)); 0 for either closes at once. During a graceful shutdown a connection lingers 0.5 s at most.
+- `logging`: the header values and the start of the bodies of the requests and responses, for debugging (see [What the Message Logs Show](#what-the-message-logs-show)).
+
+### Workers
+
+A `pool_server` and an `async_client` run on `asio::workers`: a pool of threads, each running an io_context of its own, that the application creates, starts, hands to them by reference and stops. Nothing starts or stops the workers by themselves. A `pool_server` accepts on a thread of its own and serves each connection on the next thread of the pool; several servers and clients may share one `workers`, and several `workers` may live in one process, sharing nothing. The workers must outlive what runs on them: stop the servers and the clients (or destroy them) before stopping the workers. A server stopped or destroyed this way has closed its connections, keep-alive ones included, and cancelled its handlers (see [Server Lifecycle](#server-lifecycle)), and a client has ended its requests in flight, so stopping the workers then drops none of them (see [Async Client](#async-client-async_client)). Handlers still running on the workers end there, without the server.
+
+```cpp
+thinger::asio::workers workers;
+workers.start();  // a thread per core; start(4) for four
+
+thinger::http::pool_server server(workers);
+// ... routes ...
+server.listen("0.0.0.0", 8080);
+
+thinger::http::async_client client(workers);  // the same threads
+
+// ... until the application ends
+server.stop();
+client.stop();
+workers.stop();
+```
+
+`start()` returns an `error_code`: `already_started` when they run (no thread is added), `invalid_argument` for 0 threads. `stop()` stops every thread and destroys the operations still pending; it can be called from any thread, one of the workers included, and more than once. For the application's own work, `next_executor()` returns the executor of the next thread of the pool (round-robin, without a lock), `isolated_executor(name)` the executor of a new thread out of the pool, named `name`, which runs until the workers stop (e.g. for work that blocks), and `in_worker_thread()` tells whether the calling thread is one of these workers' (a thread-local, without a lock). Both return a null executor when the workers do not run. `wait()` waits for a signal: see [Shutdown](#shutdown).
 
 ### Shutdown
 
-`shutdown(grace)` stops the server gracefully, e.g. before a deploy or on `SIGTERM`:
+A server stops in three steps: `stop_listening()` (quiesce), `shutdown(by)` (drain, until a deadline) and `stop()` (release). `co_await server.shutdown(by)`, with `by` a `std::chrono::steady_clock::time_point`, stops the server gracefully, e.g. before a deploy or on `SIGTERM`. `by` is the whole budget of the shutdown: nothing waits past it.
 
-- it stops listening right away: new connections are refused (TCP and Unix sockets; the socket file is removed);
+- it stops listening right away, if `stop_listening()` did not already: new connections are refused, on every listener (TCP and Unix sockets; the socket file is removed), those a `listen()` on another thread is still opening too. Until the shutdown ends, `listen()` fails with `shut_down` (from `on_shutdown()` too); once it ended, `listen()` serves again;
 - idle keep-alive connections are closed at once;
 - a connection handling a request finishes it: its response tells the client with `Connection: close` (unless the response already started: then the connection is closed after it), and the connection closes after it;
-- connections taken over are told (once, on their thread): a `websocket_connection` closes with 1001 (Going Away), an `sse_connection` closes, and others call what the application set with `on_shutdown()` (`websocket_connection`, `sse_connection`), or with `http::on_server_shutdown(socket, callback)` for the socket of `take_over()` or `upgrade_websocket_stream()`. Their `on_close()` tells when they closed. Proxied WebSockets (reverse proxy tunnels) are not told: they end when either side closes. The server calls `on_shutdown()` once when the shutdown starts, for anything else the application runs;
-- once every connection is gone, or the grace period passes, whatever is left is closed, and the server stops as with `stop()` (`wait()` returns).
+- connections taken over are told (once, on their thread): a `websocket_connection` closes with 1001 (Going Away), an `sse_connection` closes, and others call what the application set with `on_shutdown()` (`websocket_connection`, `sse_connection`), or with `scope.on_shutdown(callback)` for the connection of `take_over()` (`upgraded_connection`) or `upgrade_websocket_stream()` (`upgraded_websocket`), see [Taking Over the Connection](#taking-over-the-connection). Their `on_close()` tells when they closed. Proxied WebSockets (reverse proxy tunnels) are not told: they end when either side closes, or at their [idle timeout](#reverse-proxy). The server calls `on_shutdown()` once when the shutdown starts, for anything else the application runs (what it throws is logged, and the shutdown goes on);
+- once every connection is gone it returns `true`, at once for a server with none open; at `by`, every handler still running is interrupted (its [cancellation scope](#cancellation) is cancelled with `cancel_reason::shutdown`, whatever its route declared: its next cancellable await ends with `operation_aborted`), whatever is left is closed and it returns `false`, without waiting for the handlers it interrupted. Then the server stops as with `stop()` (`wait()` returns), once the connections closed on their threads. It does not call `stop()` itself, which may end on a thread of the server while a subclass is being destroyed: a `stop()` overridden in a subclass of `pool_server` or `server` runs only when the application calls it.
 
-`shutdown()` waits for that end, and returns whether every connection finished in time. `begin_shutdown(grace, on_done)` returns at once, and calls `on_done(clean)` at the end. Both can be called from any thread, several times (later calls wait for the same end), and from an `asio::signal_set` handler (not from a raw signal handler: they lock and allocate). On a thread of the server (a handler, or a worker of a `pool_server`) only `begin_shutdown()` can be used: `shutdown()` cannot wait there, so it starts it and returns `false`. `stop()` during a shutdown ends it at once (`false`).
+Every listener drains at once, under the same `by`. `shutdown(by)` may be awaited from any executor, a thread of the server included (a handler, or a worker of a `pool_server`), which it does not block: the other connections of that thread go on being served. It may be called several times, concurrently too: every call shares the same end and result, and the first one sets `by`. A handler starting the shutdown does not await it, as the drain waits for its own request: it spawns it, as the [server shutdown example](examples/http_server/server_shutdown_example.cpp) does:
 
 ```cpp
-thinger::http::pool_server server;
+server.post("/api/shutdown", [&](http::response& res) -> awaitable<void> {
+    res.json({{"message", "shutting down"}});
+    auto by = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    co_spawn(co_await boost::asio::this_coro::executor, server.shutdown(by), [](std::exception_ptr, bool clean) {
+        LOG_INFO("shut down{}", clean ? "" : " (some connections were cut)");
+    });
+});
+```
+
+`shutdown(grace)` does the same with `by` `grace` from now (30 s by default), blocking until it ends, for a thread that does not serve the server (e.g. `main()`); it returns the same result. On a thread of the server it would block the drain it waits for, so there it logs an error, starts the shutdown and returns `false` at once. Both may be called from an `asio::signal_set` handler, not from a raw signal handler (they lock and allocate). `stop()` during a shutdown ends it at once (`false`), closing the connections still open and cancelling their handlers, without waiting for them (see [Server Lifecycle](#server-lifecycle)). A server that is not running (an `http::server` whose `wait()` is not running, a `pool_server` whose workers stopped, or a server stopped) ends a shutdown at once: `true` if no connection is open. Workers stopping during a shutdown (`workers.stop()` on another thread, or on a worker awaiting it) make it end by its deadline, never throw.
+
+The signals are the application's. With a `pool_server`, `workers::wait()` blocks until `SIGINT`, `SIGTERM` or `SIGQUIT` arrives (or one of the signals given, as `workers.wait({SIGTERM})`) and returns it, and stops nothing: the workers keep running, so the requests in flight finish, with the `async_client`s they use. The application then shuts its servers down and stops the workers. `wait()` returns 0 when `stop()` releases it instead (from another thread), and at once when the workers do not run; with an empty set it waits for `stop()`. While it waits the signals do not take their default action; once it returned they do again, so a second Ctrl+C during the shutdown ends the process.
+
+```cpp
+thinger::asio::workers workers;
+workers.start();
+
+thinger::http::pool_server server(workers);
 // ... routes ...
 server.on_shutdown([&] { devices.disconnect_all(); });
 server.listen("0.0.0.0", 8080);
 
-boost::asio::signal_set signals(io_context, SIGINT, SIGTERM);
-signals.async_wait([&](auto, int) {
-    server.begin_shutdown(std::chrono::seconds(30), [](bool clean) {
-        LOG_INFO("shut down{}", clean ? "" : " (some connections were cut)");
-    });
-});
-server.wait();  // returns once the shutdown ends
+int signal = workers.wait();  // SIGINT, SIGTERM or SIGQUIT
+LOG_INFO("signal {}: shutting down", signal);
+bool clean = server.shutdown(std::chrono::seconds(30));
+LOG_INFO("shut down{}", clean ? "" : " (some connections were cut)");
+workers.stop();
 
 // a WebSocket that says goodbye its own way
-res.upgrade_websocket([](std::shared_ptr<thinger::http::websocket_connection> ws) {
+res.upgrade_websocket({}, [](std::shared_ptr<thinger::http::websocket_connection> ws) {
     ws->on_shutdown([ws] { ws->send_text("{\"event\":\"restarting\"}"); ws->stop(); });
 });
 ```
 
-A `pool_server` can leave the signals to the workers: `wait_graceful(grace)` waits for `SIGINT`, `SIGTERM` or `SIGQUIT` (or the signals given), and on the first one shuts every `pool_server` down gracefully, as `begin_shutdown(grace)` (the other worker clients, as `async_client`, keep working meanwhile, for the requests that are finishing), then stops the workers and returns. A second signal during the grace period stops them at once, as the first one does with `wait()`.
+An `asio::signal_set` of the application's own works too, as on an `http::server`: its handler spawns `shutdown(by)` (`co_spawn(io_context, server.shutdown(by), boost::asio::detached)`), and `server.wait()` returns once the shutdown ends.
 
-```cpp
-thinger::http::pool_server server;
-// ... routes ...
-server.listen("0.0.0.0", 8080);
-thinger::asio::get_workers().wait_graceful(std::chrono::seconds(30));  // on SIGINT, SIGTERM or SIGQUIT
-```
-
-Compared with Node.js: `server.close()` also stops listening, closes idle connections (since Node 19) and waits for the others, but has no grace period (that is `closeAllConnections()`, called by the application) and does not tell upgraded connections, which keep it waiting until they close. Here `shutdown(grace)` does `close()`, `closeIdleConnections()` and, once the grace period ends, `closeAllConnections()`, and new connections accepted meanwhile (e.g. in the middle of a TLS handshake) are closed at once.
+Compared with Node.js: `server.close()` also stops listening, closes idle connections (since Node 19) and waits for the others, but has no deadline (that is `closeAllConnections()`, called by the application) and does not tell upgraded connections, which keep it waiting until they close. Here `shutdown(by)` does `close()`, `closeIdleConnections()` and, at `by`, `closeAllConnections()`, and new connections accepted meanwhile (e.g. in the middle of a TLS handshake) are closed at once.
 
 ### Statistics
 
-`stats()` returns the connections open by what they serve (`http_connections`, `websocket_connections`, `sse_connections`, `tunnel_connections` for reverse proxy upgrades, `taken_over_connections` for other `take_over()`s, and `active_connections()`), and the connections served since the server was created (`total_connections`). Counting costs nothing per request: a connection joins or leaves a list (picked by its io_context, so threads do not contend for it) only when it opens, changes what it serves and closes; `stats()` reads those lists, so it is meant for a monitoring endpoint, not for every request. There is no request counter, nor bytes in and out: they would cost on every request (the [response hook](#response-hook) can count them). A connection taken over counts until its socket is destroyed, or until closed for `websocket_connection` and `sse_connection`.
+`stats()` returns the connections open by what they serve (`http_connections`, `websocket_connections`, `sse_connections`, `tunnel_connections` for reverse proxy upgrades, `taken_over_connections` for other `take_over()`s, and `active_connections()`), and the connections served since the server was created (`total_connections`). Counting costs nothing per request: a connection joins or leaves a list (picked by its io_context, so threads do not contend for it) only when it opens, changes what it serves and closes; `stats()` reads those lists, so it is meant for a monitoring endpoint, not for every request. There is no request counter, nor bytes in and out: they would cost on every request (the [response hook](#response-hook) can count them). A connection taken over counts until its socket is destroyed or its scope says it closed (`scope.closed()`), which `websocket_connection` and `sse_connection` do once closed; `scope.set_type()` changes what it counts as.
 
 ```cpp
 server.get("/v1/server/statistics", [&server](thinger::http::response& res) {
@@ -1202,7 +1456,7 @@ client.clear_connections();                // close the idle ones
 - **Retries**: if a request sent on a reused connection fails before any byte of its response arrives (the server closed the connection as the request was sent), it is sent once more on a new connection when that is safe, as Go does: nothing of it was written, or its method is idempotent (`GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE`, RFC 9110 §9.2.2), or it has an `Idempotency-Key` (or `X-Idempotency-Key`) header. A `POST` or `PATCH` is not sent again, as the server may have processed it: the error is returned. Neither are requests on new connections, nor after a timeout. curl retries any method; Node (`http.Agent`) does not retry, and undici only with its opt-in `RetryAgent`.
 - **Keys**: connections are shared by requests to the same origin (scheme, host, port, or Unix socket) reaching it the same way (directly or through the same proxy and credentials) and trusting the same CAs. Through a forwarding proxy (plain `http://`), the connection reaches the proxy, so it is shared by requests to any origin, as curl does; tunnels (`CONNECT`) belong to their origin.
 - **Nagle**: client connections set `TCP_NODELAY`, as Go, Node and curl do; otherwise a request on a reused connection may wait for the delayed ACK of the server (40 ms).
-- **Lifetime**: the `async_client` closes idle connections with a timer on its workers. The synchronous `client` runs its io_context only during a call, and nothing of it runs between calls: it closes the expired ones whenever a request starts or ends, and never reuses them. So after a call, the connections it used in the last idle timeout stay open until the next call, half-closed (`CLOSE_WAIT`) once their servers close them: usually one per server, never more than the limits. curl's easy interface and Python's requests (urllib3) keep them the same way; Go and Node close them on time, as their event loop always runs, and Java's `HttpURLConnection` with a thread of its own. A long-lived `client` making sporadic calls can call `clear_connections()` after them, or disable the pool. Destroying the client, or stopping the `async_client` (or the workers), closes its idle connections.
+- **Lifetime**: the `async_client` closes idle connections with a timer on its workers. The synchronous `client` runs its io_context only during a call, and nothing of it runs between calls: it closes the expired ones whenever a request starts or ends, and never reuses them. So after a call, the connections it used in the last idle timeout stay open until the next call, half-closed (`CLOSE_WAIT`) once their servers close them: usually one per server, never more than the limits. curl's easy interface and Python's requests (urllib3) keep them the same way; Go and Node close them on time, as their event loop always runs, and Java's `HttpURLConnection` with a thread of its own. A long-lived `client` making sporadic calls can call `clear_connections()` after them, or disable the pool. Destroying the client, or stopping the `async_client`, closes its idle connections; stopping its workers does not (stop the client first).
 
 ### Proxies
 
@@ -1382,12 +1636,17 @@ Responses are parsed as strictly as the server parses requests, so a response is
 
 ### Async Client (async_client)
 
-The async client supports three usage patterns: callbacks, coroutines, and the request builder.
+The async client supports three usage patterns: callbacks, coroutines, and the request builder. It runs its requests and callbacks on the [workers](#workers) it is given, which the application starts and keeps alive longer than the client (the snippets below use these `workers`).
+
+`stop()` and the destructor end the requests in flight before returning. They cancel them: their callbacks are not called (one that completed meanwhile may still call its own), and the coroutines of `run()` see their requests fail with `operation_aborted`. Called from a thread that is not one of the workers, they return once none of those requests runs, nor any callback of the client: a callback running then is waited for, not interrupted. Called from one of the workers (e.g. in a callback of the client), they do not wait for the requests, and none of them resumes anymore (the destructor still waits for the callbacks running on other workers). Either way, once the destructor returns no callback or coroutine of the client runs, so whatever they captured may be destroyed, and a client may be destroyed from one of its own callbacks. Requests started while `stop()` runs are not run; those started after it returned run as before. `stop()` also releases `wait()` and `wait_for()` and closes the idle connections. WebSockets already handed out (`websocket()`) belong to the application and stay open.
 
 #### Callback-based
 
 ```cpp
-thinger::http::async_client client;
+thinger::asio::workers workers;
+workers.start();
+
+thinger::http::async_client client(workers);
 
 // Simple callback
 client.get(url, [](auto& res) {
@@ -1408,7 +1667,7 @@ client.wait();
 #### Coroutines (co_await)
 
 ```cpp
-thinger::http::async_client client;
+thinger::http::async_client client(workers);
 
 client.run([&]() -> awaitable<void> {
     // Simple request
@@ -1427,7 +1686,7 @@ client.wait();
 #### Request Builder with Callbacks
 
 ```cpp
-thinger::http::async_client client;
+thinger::http::async_client client(workers);
 
 // Fluent API with callback (no coroutines needed)
 client.request("https://api.example.com/data")
@@ -1466,7 +1725,7 @@ server.get("/weather", [](thinger::http::response& res) -> thinger::awaitable<vo
 thinger::http::executor_client client(io_context);
 ```
 
-`for_current_coroutine()` takes the io_context of the calling coroutine, an io_context executor or a strand of one (as server handlers have), and throws `std::logic_error` on any other executor (e.g. a `thread_pool`); `thinger::asio::io_context_of(executor)` (in `<thinger/asio/io_context_of.hpp>`) tells which io_context an executor runs on, or null. Use the client on the threads running its io_context (with several threads, from a strand of it), and destroy it there, before the io_context. Cancelling the coroutine awaiting a request (a cancellation slot, or `||` with a timer) cancels the request and closes its connection. WebSockets opened through it (`websocket()`) run on the executor of the caller, its strand included: their keepalive and closing handshake never run at the same time as the caller.
+`for_current_coroutine()` takes the io_context of the calling coroutine, an io_context executor or a strand of one (as server handlers have), or the worker of a coroutine of `async_client::run()`, and throws `std::logic_error` on any other executor (e.g. a `thread_pool`); `thinger::asio::io_context_of(executor)` (in `<thinger/asio/io_context_of.hpp>`) tells which io_context an executor runs on, or null. Use the client on the threads running its io_context (with several threads, from a strand of it), and destroy it there, before the io_context. Cancelling the coroutine awaiting a request (a cancellation slot, or `||` with a timer) cancels the request and closes its connection. WebSockets opened through it (`websocket()`) run on the executor of the caller, its strand included: their keepalive and closing handshake never run at the same time as the caller.
 
 For many calls to the same host, as a gateway sending most requests to one backend, use a pooled client instead (`async_client`), whose connections are kept alive and shared by every request. `max_idle_connections_per_host()` enables keep-alive here too, but a client created per call does not keep its connections for the next one.
 
@@ -1476,7 +1735,7 @@ For many calls to the same host, as a gateway sending most requests to one backe
 
 ```cpp
 server.get("/ws", [](auto& req, auto& res) {
-    res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) {
+    res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection> ws) {
         // Message handler
         ws->on_message([ws](const std::string& msg, bool binary) {
             if (binary) {
@@ -1495,23 +1754,34 @@ server.get("/ws", [](auto& req, auto& res) {
 ### WebSocket Server with Protocols
 
 ```cpp
-std::set<std::string> protocols = {"chat", "json"};
-
-res.upgrade_websocket([](auto ws) {
+res.upgrade_websocket({.protocols = {"chat", "json"}}, [](auto ws) {
     ws->on_message([ws](const std::string& msg, bool binary) {
         ws->send_text(msg);
     });
-}, protocols);
+});
 ```
 
-A client offering several subprotocols (`Sec-WebSocket-Protocol: a, b`) gets the first one it offers that is in the set; one offering none of them, or none at all when the set is not empty, is answered with `400`.
+A client offering several subprotocols (`Sec-WebSocket-Protocol: a, b`) gets the first one it offers that is in the list. One offering only others is answered with `400`, and so is one offering any when the list is empty. One offering none is answered with `400` when the list is not empty, unless `protocol_required` is `false`: then it is accepted without a subprotocol.
+
+Both WebSocket upgrades take the same options, a `websocket_accept_options` (in `thinger/http/server/upgrade.hpp`):
+
+| Option | Default | Description |
+|---|---|---|
+| `protocols` | none | Subprotocols spoken, alternatives included. The first one the client offers (in its order of preference) that is in the list is accepted, returned in the response (and in `protocol` to the handler of the [byte stream](#websocket-as-a-socket)) |
+| `protocol_required` | `true` | With `protocols`: a client offering none of them is answered with `400`. If `false`, it is accepted without a subprotocol (and the handler gets an empty one) |
+| `binary` | `true` | As a byte stream: messages written are binary, or text (`ws->set_binary()` changes it later). The message interface writes each message as it is sent |
+| `max_message_size` | 16 MiB | With the message interface: the largest message received (at least 1 byte). A larger one closes the connection with `1009` (Message Too Big). A byte stream has no messages, and no limit |
+| `ping_interval` | unset | Ping the client once nothing was received from it for this long; `0` turns it off. Unset: 60 s with the message interface, off as a byte stream |
+| `idle_timeout` | unset | Close the connection once nothing was received for this long, pongs included; `0` turns it off. Unset: 120 s with the message interface, off as a byte stream |
+
+Without `protocols`, a client offering a subprotocol is answered with `400` by `upgrade_websocket()`, and accepted without one by `upgrade_websocket_stream()`.
 
 ### WebSocket Close
 
-`on_close()` is called once the WebSocket closed, whatever closed it (the client, a lost connection, `stop()`, the server shutdown, the overflow policy...), once, after its last message: nothing can be sent anymore. It tells how, as Node's `ws` `'close'` event: the status code of the client's close frame and its reason (when the server closed first and the client answered, the code of the answer, normally its echo), or the code the server closed with, or `1006` when no close frame was exchanged (the connection was lost, or closed by the server at the end of a shutdown's grace period).
+`on_close()` is called once the WebSocket closed, whatever closed it (the client, a lost connection, `stop()`, the server shutdown, the overflow policy...), once, after its last message: nothing can be sent anymore. It tells how, as Node's `ws` `'close'` event: the status code of the client's close frame and its reason (when the server closed first and the client answered, the code of the answer, normally its echo), or the code the server closed with, or `1006` when no close frame was exchanged (the connection was lost, or closed by the server at the deadline of a shutdown).
 
 ```cpp
-res.upgrade_websocket([&](std::shared_ptr<http::websocket_connection> ws) {
+res.upgrade_websocket({}, [&](std::shared_ptr<http::websocket_connection> ws) {
     auto id = subscribers.add(ws);
     ws->on_close([&, id](const http::websocket_close& close) {
         // close.code (1000, 1001, 1006...), close.reason, close.remote (the client closed first)
@@ -1525,7 +1795,8 @@ It is always posted to the thread of the connection, never called from within th
 The WebSocket used as a socket (`upgrade_websocket_stream()`, `thinger::asio::websocket`, see [WebSocket as a Socket](#websocket-as-a-socket)) has the same `on_close()`, with an `asio::websocket_close` (`http::websocket_close` is the same type): called once, whatever closed it, with the same guarantees. It has no read loop of its own: the connection is noticed lost by the operations running on it (a protocol always has a read pending; the keepalive), with `1006` when no close frame was exchanged, and closing the socket under it (the end of a server's shutdown) counts too. The callback must not own the WebSocket, which nothing would release: capture a `std::weak_ptr`.
 
 ```cpp
-res.upgrade_websocket_stream([&](std::shared_ptr<thinger::asio::websocket> ws, std::string protocol) {
+res.upgrade_websocket_stream({}, [&](http::upgraded_websocket upgraded) {
+    auto ws = std::move(upgraded.stream);
     ws->on_close([&sessions, id = sessions.add()](const thinger::asio::websocket_close& close) {
         sessions.remove(id);   // close.code, close.reason, close.remote
     });
@@ -1538,7 +1809,7 @@ res.upgrade_websocket_stream([&](std::shared_ptr<thinger::asio::websocket> ws, s
 `send_text()` and `send_binary()` queue the message and return. The queue holds up to 100 messages; one sent to a full queue is dropped (the newest), which suits sampled telemetry but not a stream that must arrive whole. For those, the server can follow the pace of the client, and stop reading a client whose data it cannot forward yet:
 
 ```cpp
-res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) -> thinger::awaitable<void> {
+res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection> ws) -> thinger::awaitable<void> {
     // Wait for each message to be written to the socket: one message queued at a time
     for (auto& chunk : chunks) {
         if (!co_await ws->send_binary_async(chunk)) co_return;   // closed
@@ -1564,8 +1835,8 @@ ws->on_message([ws, sink](std::string message, bool binary) {
 - **Limits** (`set_write_limits()`, a `http::write_limits`): `max_messages` (100 by default) and `max_bytes` (no limit by default) of the queue, the message being written included; an empty queue always takes a message. `queued_bytes()` and `queued_messages()` tell what is not written yet; they are atomic, so any thread may read them (as Node's `bufferedAmount`). `queue_full()` tells whether the overflow policy applies to the next message, which is not the watermark state.
 - **Watermarks**, as Netty's `WriteBufferWaterMark` and `isWritable()`: once the bytes queued reach `high_watermark` the connection is not writable, and `wait_writable()` waits, until they drain to `low_watermark`. `on_high_watermark()` and `on_low_watermark()` are told of each change asynchronously, posted to the thread of the connection as Node emits `'drain'`: never from within a send or a drop, so they may send themselves, and never once the connection is closing. Changing the limits re-evaluates the state: disabling the watermarks, or raising the low one above what is queued, makes it writable.
 - **Overflow policy** of a full queue, for the messages sent without waiting: `drop_newest` (the default), `drop_oldest` (the oldest messages queued, never the one being written nor an awaited one; when that is not enough, the new message is dropped, so the limits hold), or `close`, which closes the connection with `1013 Try Again Later` (the code the IANA registry has for a server shedding a client, which may reconnect later; `1008 Policy Violation` is about the messages a peer sends).
-- **Write timeout** (`write_timeout`, off by default): a message whose write to the socket does not complete in that time closes the connection with `1013`, as a client that stopped reading; awaited sends and `wait_writable()` then complete with `false`. It is measured per message, so set it well above the time a large message takes at the slowest rate a client may read.
-- **Pausing reads**: after `pause_reading()` nothing more is read from the socket: called from `on_message()`, the message being delivered is the last one; from another thread, one more may be delivered, so the TCP window of the client fills and its writes block, as `socket.pause()` in Node; `resume_reading()` goes on where it stopped. While paused, the pings and the close frame of the client are not seen (as in any WebSocket not being read: the client may time out), and the keepalive is suspended, as its pongs could not be read: a dead client is not noticed until reading resumes, so bound the pause, or set a `write_timeout`. `stop()` still closes it: the closing handshake reads up to the close frame of the client, discarding the messages before it.
+- **Write timeout** (`write_timeout`, 60 s by default, `0` disables it): a write that makes no progress for that long closes the connection with `1013`, as a client that stopped reading; awaited sends and `wait_writable()` then complete with `false`, and the queue is released. It bounds a stall, not the time a message takes: a write progresses while the socket takes bytes of it (a message over 64 KiB is written in 64 KiB slices, each one progress), or the client takes bytes from the socket, which is checked only once the socket took nothing for the timeout, for a quarter of it more. So a slow client that keeps reading gets every message, however large, and is never cut, and one that stopped reading is closed within the timeout and a quarter (75 s by default). 60 s is nginx's `send_timeout` and `proxy_send_timeout` (the time between two successive writes), and the server's own [`write_timeout`](#connection-options). `set_write_limits()` replaces every limit, but limits that do not name `write_timeout` keep the 60 s (as the examples above do). Changed while a write is stalled, the new value applies at once: 0 cancels the deadline, and another one counts from the last progress (from the call, if the deadline was off), so a shorter one may close the connection right away. 0.8 had no deadline by default: a client that stopped reading kept its connection, and its newest messages were dropped, until it left.
+- **Pausing reads**: after `pause_reading()` nothing more is read from the socket: called from `on_message()`, the message being delivered is the last one; from another thread, one more may be delivered, so the TCP window of the client fills and its writes block, as `socket.pause()` in Node; `resume_reading()` goes on where it stopped. While paused, the pings and the close frame of the client are not seen (as in any WebSocket not being read: the client may time out), and the keepalive is suspended, as its pongs could not be read: a dead client is not noticed until reading resumes, or until what the server sends it stalls for the write timeout (60 s by default), which then closes it. A paused connection that sends nothing has no deadline, so bound the pause. `stop()` still closes it: the closing handshake reads up to the close frame of the client, discarding the messages before it.
 
 ### WebSocket as a Socket
 
@@ -1574,8 +1845,9 @@ ws->on_message([ws, sink](std::string message, bool binary) {
 ```cpp
 server.get("/mqtt", [](http::request& req, http::response& res) {
     res.upgrade_websocket_stream({.protocols = {"mqtt", "mqttv3.1", "mqttv3.1.1"}},
-        [](std::shared_ptr<thinger::asio::websocket> ws, std::string protocol) {
-            // protocol: the subprotocol accepted, e.g. "mqttv3.1"
+        [](http::upgraded_websocket upgraded) {
+            // upgraded.protocol: the subprotocol accepted, e.g. "mqttv3.1"
+            auto ws = std::move(upgraded.stream);
             co_spawn(ws->get_io_context(), run_protocol(ws), thinger::detached);
         });
 });
@@ -1593,15 +1865,7 @@ thinger::awaitable<void> run_protocol(std::shared_ptr<thinger::asio::socket> soc
 }
 ```
 
-The handler runs on the io_context of the socket once the `101` response is written; like any socket, the WebSocket is used there (see [Thread Safety](#thread-safety)). Its options:
-
-| Option | Default | Description |
-|---|---|---|
-| `protocols` | none | Subprotocols spoken, alternatives included. The first one the client offers (in its order of preference) that is in the list is accepted, returned in the response and passed to the handler |
-| `protocol_required` | `true` | With `protocols`: a client offering none of them is answered with `400`. If `false`, it is accepted without a subprotocol (and the handler gets an empty one). Without `protocols`, any client is accepted without one |
-| `binary` | `true` | Messages written are binary, or text (`ws->set_binary()` changes it later) |
-| `ping_interval` | `0` (off) | Ping the client once nothing was received from it for this long |
-| `idle_timeout` | `0` (off) | Close the connection once nothing was received for this long, pongs included |
+The handler runs on the io_context of the socket once the `101` response is written, with an `http::upgraded_websocket`: the WebSocket (`stream`), the subprotocol negotiated (`protocol`, empty if none) and the `scope` of the connection (see [Taking Over the Connection](#taking-over-the-connection)), e.g. to close it when the server shuts down. Like any socket, the WebSocket is used there (see [Thread Safety](#thread-safety)). Its options are those of [`upgrade_websocket()`](#websocket-server-with-protocols), with no keepalive by default and no message limit.
 
 The handshake is checked as RFC 6455 requires: a request that is not a WebSocket upgrade, or of another version than 13, gets `426` (with `Sec-WebSocket-Version: 13`); one that is not a `GET`, lacks `Connection: Upgrade` or has an invalid `Sec-WebSocket-Key`, `400`. Frames the client sends right after its request, without waiting for the response, are kept for the first reads.
 
@@ -1621,7 +1885,8 @@ For message-oriented code `upgrade_websocket()` (above) remains; `ws->read_messa
 
 ```cpp
 server.get("/vnc", [](http::request& req, http::response& res) {
-    res.upgrade_websocket_stream({.protocols = {"binary"}}, [](std::shared_ptr<thinger::asio::websocket> ws, std::string) {
+    res.upgrade_websocket_stream({.protocols = {"binary"}}, [](http::upgraded_websocket upgraded) {
+        auto ws = std::move(upgraded.stream);
         co_spawn(ws->get_io_context(), [ws]() -> thinger::awaitable<void> {
             // the other end, on the io_context of the WebSocket
             auto target = std::make_shared<thinger::asio::tcp_socket>("vnc", ws->get_io_context());
@@ -1630,6 +1895,7 @@ server.get("/vnc", [](http::request& req, http::response& res) {
                 co_return;
             }
             auto pipe = std::make_shared<thinger::asio::socket_pipe>(ws, target);
+            pipe->set_idle_timeout(std::chrono::minutes(5));   // optional: none by default
             co_await pipe->run();   // until either end closes (or pipe->start() to run it detached)
         }, thinger::detached);
     });
@@ -1638,6 +1904,7 @@ server.get("/vnc", [](http::request& req, http::response& res) {
 
 - Each direction writes what it read before reading more, so a slow reader slows its writer down (flow control): nothing piles up in memory.
 - When either end closes (or fails), the pipe closes both: the WebSocket client gets a close frame when the other end closes, and the other end is closed when the client closes. `pipe->cancel()` ends it from any thread.
+- **Idle timeout**: `set_idle_timeout(timeout)`, before `run()` or `start()`, ends the pipe as `cancel()` does (both sockets closed, the on-end callback called once) once nothing was forwarded in either direction for that long. A byte counts once written to the other socket, so a peer that stops reading ends the pipe too. There is none by default, as in 0.8: a generic tunnel is often long-lived and quiet, with a keepalive of its own, so the deadline is the application's to choose (the [reverse proxy](#reverse-proxy) sets one on its tunnels). Each write moves one timer lazily, without a timer operation per chunk; as both directions move it, the pipe must then run on an io_context run by one thread (as the library's workers are) or on a strand.
 - Both sockets are used from the coroutine running the pipe: create the other one on the io_context of the WebSocket (`unix_socket` and `ssl_socket` take it in their constructors too).
 
 ### Client WebSocket as a Socket
@@ -1696,8 +1963,10 @@ Empty messages are messages, both ways (RFC 6455 allows them): `send_text("")` s
 
 ### WebSocket Client (Async Callback)
 
+The `async_client` runs on started [workers](#workers), as in [Async Client](#async-client-async_client).
+
 ```cpp
-thinger::http::async_client client;
+thinger::http::async_client client(workers);
 
 // Simple connect
 client.websocket("wss://server.com/ws", [](std::shared_ptr<http::websocket_client> ws) {
@@ -1727,7 +1996,7 @@ client.wait();
 ### WebSocket Client (Coroutine)
 
 ```cpp
-thinger::http::async_client client;
+thinger::http::async_client client(workers);
 
 client.run([&client]() -> awaitable<void> {
     // Simple connect
@@ -1760,7 +2029,7 @@ client.wait();
 ### WebSocket Client (Event-Driven)
 
 ```cpp
-thinger::http::async_client client;
+thinger::http::async_client client(workers);
 
 client.websocket("wss://server.com/ws", [](std::shared_ptr<http::websocket_client> ws) {
     if (!ws) return;
@@ -1796,7 +2065,7 @@ Protocols and tunnels work on `thinger::asio::socket`, so an application can def
 | `cancel()` | Pending operations complete with `operation_aborted`; the socket stays open |
 | `is_open()` | Whether it is open |
 
-Everything else has a default: `read()` (exact), `read(streambuf)`, `read_until()` and the other `write()` overloads are built on these; `connect()` and `wait()` answer `operation_not_supported`; `is_secure()` is `false`, `available()` 0 and the address getters empty. Override them when the socket can do better. As C++ hides the overloads of a name a class declares, add `using socket::read;` and `using socket::write;` to call the default overloads on the derived type.
+Everything else has a default: `read()` (exact), `read(streambuf)`, `read_until()` and the other `write()` overloads are built on these; `connect()`, `wait()` and `peer_closed()` answer `operation_not_supported` (then an HTTP server on the socket does not watch for a client leaving while its response is pending); `is_secure()` is `false`, `available()` and `send_backlog()` 0 and the address getters empty (`send_backlog()`, the bytes written that the peer has not taken yet, lets the write timeout of an SSE or WebSocket connection on the socket see a slow reader taking them). Override them when the socket can do better. As C++ hides the overloads of a name a class declares, add `using socket::read;` and `using socket::write;` to call the default overloads on the derived type.
 
 Sockets are not thread-safe: every call, `close()` and `cancel()` included, happens on a thread running the io_context passed to the constructor, and operations complete there. Data arriving from another thread (e.g. from the connection the virtual stream runs inside) is handed over by posting it to that io_context. At most one read and one write are pending at a time. Pending operations should support per-operation cancellation (asio operations and timers do), used by the awaitable operators (`||`); `close()` must end them anyway.
 
@@ -1806,7 +2075,7 @@ Sockets are not thread-safe: every call, `close()` and `cancel()` included, happ
 class virtual_stream : public thinger::asio::socket, public std::enable_shared_from_this<virtual_stream> {
 public:
     virtual_stream(boost::asio::io_context& io_context, std::function<void(std::string)> send)
-        : socket("virtual", io_context), signal_(io_context), send_(std::move(send)) {}
+        : socket("virtual", io_context), signal_(io_context.get_executor()), send_(std::move(send)) {}
 
     // keep the default overloads visible next to the ones implemented
     using socket::read;
@@ -1816,11 +2085,12 @@ public:
         boost::asio::post(io_context_, [self = shared_from_this(), data = std::move(data)] {
             if (data.empty()) self->eof_ = true;
             self->inbox_ += data;
-            self->signal_.cancel();     // wakes the pending read
+            self->signal_.set();        // wakes the pending read
         });
     }
 
     thinger::awaitable<thinger::io_result> read_some(uint8_t buffer[], size_t max_size) override {
+        cancelled_ = false;   // one read pending at a time: a cancel() before it does not count
         for (;;) {
             if (!open_) co_return thinger::io_result{boost::asio::error::bad_descriptor, 0};
             if (!inbox_.empty()) {
@@ -1830,12 +2100,9 @@ public:
                 co_return thinger::io_result{boost::system::error_code{}, bytes};
             }
             if (eof_) co_return thinger::io_result{boost::asio::error::eof, 0};
-            // wait for push(), close() or cancel(), or the cancellation of this read
-            auto generation = cancelled_;
-            signal_.expires_at(std::chrono::steady_clock::time_point::max());
-            co_await signal_.async_wait(thinger::use_nothrow_awaitable);
-            auto state = co_await boost::asio::this_coro::cancellation_state;
-            if (cancelled_ != generation || state.cancelled() != boost::asio::cancellation_type::none)
+            // wait for push(), close() or cancel(); false if this read was cancelled (`||`, a slot)
+            signal_.reset();
+            if (!co_await signal_.wait() || cancelled_)
                 co_return thinger::io_result{boost::asio::error::operation_aborted, 0};
         }
     }
@@ -1846,17 +2113,17 @@ public:
         co_return thinger::io_result{boost::system::error_code{}, size};
     }
 
-    void close() override { open_ = false; signal_.cancel(); }
-    void cancel() override { ++cancelled_; signal_.cancel(); }
+    void close() override { open_ = false; signal_.set(); }
+    void cancel() override { cancelled_ = true; signal_.set(); }
     bool is_open() const override { return open_; }
 
 private:
-    boost::asio::steady_timer signal_;
+    thinger::asio::async_event signal_;   // <thinger/asio/async_event.hpp>
     std::function<void(std::string)> send_;
     std::string inbox_;
     bool eof_ = false;
     bool open_ = true;
-    uint64_t cancelled_ = 0;
+    bool cancelled_ = false;
 };
 ```
 
@@ -1883,7 +2150,9 @@ server.get("/events", [](auto& req, auto& res) {
 });
 ```
 
-The queue of an SSE connection has the same flow control as a WebSocket, counting fields (`send_event()`, `send_data()`, `send_retry()`): `set_write_limits()` (up to 101 fields by default, dropping the newest), `queued_bytes()`, the watermarks, the write timeout and `wait_writable()`. `drop_oldest` drops whole events, never the rest of an event being written (fields of an event without its data yet are not dropped: the newest field is, then); `close` and the write timeout close the connection, and `EventSource` reconnects.
+The queue of an SSE connection has the same flow control as a WebSocket, counting fields (`send_event()`, `send_data()`, `send_retry()`): `set_write_limits()` (up to 101 fields by default, dropping the newest), `queued_bytes()`, the watermarks, the [write timeout](#websocket-flow-control) and `wait_writable()`. `drop_oldest` drops whole events, never the rest of an event being written (fields of an event without its data yet are not dropped: the newest field is, then); `close` and the write timeout close the connection, and `EventSource` reconnects.
+
+A client that stops reading is closed by the write timeout: `write_timeout`, 60 s by default, as nginx's `send_timeout` and the server's own [`write_timeout`](#connection-options). It bounds a stall, the time a field being written goes without the socket taking any byte of it nor the client taking any byte from the socket (checked once the socket took nothing for the timeout, for a quarter of it more: a stalled write closes within the timeout and a quarter), not the time an event or the stream takes: an event over 64 KiB is written in 64 KiB slices, each one progress, so a slow client that keeps reading gets every event, however large, and is never closed by it. When it passes, the connection closes, a warning is logged, `on_close()` is called, and the pending `send_async()` and `wait_writable()` complete with `false`, so a producer awaiting them ends. Limits given to `set_write_limits()` that do not name `write_timeout` (as in the example below) keep the 60 s; `write_timeout = 0` disables it, as in 0.8, where a client that stopped reading kept its connection, and its newest events were dropped, until the process ended.
 
 ```cpp
 res.start_sse([](std::shared_ptr<http::sse_connection> sse) -> thinger::awaitable<void> {
@@ -1897,12 +2166,12 @@ res.start_sse([](std::shared_ptr<http::sse_connection> sse) -> thinger::awaitabl
 
 `send_data()` sends each line of its value (split on CRLF, CR or LF) as a `data:` field of its own, so the client gets the value as sent (pretty-printed JSON included), with its line breaks as LF; a value cannot inject fields or events. `send_event()` and `send_id()` take one line: a value with CR or LF (or NUL, for an ID) is refused, an error logged, and they return `false`.
 
-A quiet stream is kept alive with a comment (`: keep-alive`, ignored by `EventSource`) every 15 seconds nothing else was sent, so proxies and load balancers with an idle timeout do not close it; `set_keepalive(interval)` changes it, and 0 disables it. The stream is not closed for being quiet: a client that left is noticed by reading the connection, and one that stopped reading by the write timeout (see `set_write_limits()`).
+A quiet stream is kept alive with a comment (`: keep-alive`, ignored by `EventSource`) every 15 seconds nothing else was sent, so proxies and load balancers with an idle timeout do not close it. The `keepalive` of the `http::sse_options` given to `start_sse()` sets it, and `set_keepalive(interval)` changes it later; 0 disables it. The keep-alive neither resets nor escapes the write timeout: it is written only when nothing else is queued or being written, so one coming due while a write is stalled is skipped, not queued behind it, and the deadline of that write is not moved; a keep-alive that cannot be written is bounded by the write timeout as any event is, and one that is written is progress like any other. The stream is not closed for being quiet: a client that left is noticed by reading the connection, and one that stopped reading by the write timeout. On a quiet stream that takes days, though: only keep-alives are written, about 13 bytes every 15 seconds, so the socket buffers of a client that stopped reading fill, and a write stalls, only after that long (the server does not set TCP keep-alive on its connections).
 
 ```cpp
 res.start_sse([](std::shared_ptr<http::sse_connection> sse) {
-    sse->set_keepalive(std::chrono::seconds(30));
-});
+    // ...
+}, {.keepalive = std::chrono::seconds(30)});
 ```
 
 `on_close()` tells when the stream closed: the client left (the connection reads the client, which sends nothing after its request, only to notice it closing), `stop()`, the server shutdown, the overflow policy or the write timeout. It is called once, as the WebSocket one: posted to the thread of the connection, never from within the call closing it (a send overflowing the queue, `stop()`), what it throws logged; set once the connection already closed (e.g. by a coroutine handler running late), it is posted at once. A client half-closing the connection has left.
@@ -1968,27 +2237,27 @@ thinger::logging::set_logger(logger);
 
 ### What a Server Logs When It Starts and Stops
 
-At `info`, a server logs one line when it starts listening, one when a graceful shutdown starts (with the connections open and the grace period) and one when it stopped, as Node and Go servers do; the workers log the signal that stops them (`wait()`, `wait_graceful()`). Warnings, as a self-signed certificate generated for want of one, stay. Each connection accepted, the threads and the steps of starting and stopping (workers, acceptors, worker clients) log at `debug`; the requests and responses are logged as described below.
+At `info`, a server logs one line for each listener it opens, one when a graceful shutdown starts (with the connections open and the time left until its deadline) and one when it stopped, as Node and Go servers do; `workers::wait()` logs the signal it returns. Warnings, as a self-signed certificate generated for want of one, stay. Each connection accepted, the threads and the steps of starting and stopping (workers, acceptors, clients) log at `debug`; the requests and responses are logged as described below.
 
 ```text
 listening on http://0.0.0.0:8080
 listening on https://0.0.0.0:8443
-received signal 15: stopping gracefully, within 30000 ms (a second signal stops at once)
-shutting down the server on http://0.0.0.0:8080: 3 connections open, grace period of 30000 ms
-shutting down the server on https://0.0.0.0:8443: 0 connections open, grace period of 30000 ms
-server on https://0.0.0.0:8443 stopped
-server on http://0.0.0.0:8080 stopped
+received signal 15
+shutting down the server on http://0.0.0.0:8080, https://0.0.0.0:8443: 3 connections open, grace period of 30000 ms
+server on http://0.0.0.0:8080, https://0.0.0.0:8443 stopped
 ```
 
 ### What the Message Logs Show
 
 The client and the server log each request and response: the request line or the status (`info`), the header names (`debug`) and the body size (`trace`). In the request line, the values of query parameters that carry credentials (`access_token`, `authorization`, `token`, `api_key`, `password`...) are shown as `[redacted]`. Header values, bodies and WebSocket messages are never logged by default, as they may hold credentials: tokens, cookies, passwords, private keys.
 
-For debugging, `log_bodies()` also logs the header values (`debug`) and the start of the bodies (`trace`), up to a maximum length, with control characters escaped. The values of `Authorization`, `Proxy-Authorization`, `Cookie` and `Set-Cookie` are redacted even then, and WebSocket messages are still logged by their size alone.
+For debugging, the `logging` of the server's [connection options](#connection-options) (`log_bodies()` on a client) also logs the header values (`debug`) and the start of the bodies (`trace`), up to a maximum length, with control characters escaped. The values of `Authorization`, `Proxy-Authorization`, `Cookie` and `Set-Cookie` are redacted even then, and WebSocket messages are still logged by their size alone.
 
 ```cpp
 http::server server;
-server.log_bodies(true, 512);      // before the server starts
+http::connection_options options;
+options.logging = {true, 512};
+server.set_connection_options(options);   // before listen()
 
 http::client client;
 client.log_bodies(true, 512);      // fluent, as the other client settings
@@ -2027,15 +2296,19 @@ See the [examples](examples/) directory for complete working examples:
 
 ## Thread Safety
 
-- `http::server` - Thread-safe, can handle concurrent requests
+- `http::server`, `http::pool_server` - Thread-safe, can handle concurrent requests. `listening_on()`, `is_listening()`, `stats()`, `stop_listening()`, `stop()` and `co_await shutdown(by)` from any thread, a thread of the server included; the blocking `shutdown(grace)` from a thread that does not serve the server (on one that does, it returns `false` at once, see [Shutdown](#shutdown)); `set_connection_options()`, `listen()` and the application (routes, middlewares...) from the thread setting the server up, before it serves (see [Server Lifecycle](#server-lifecycle)); a `listen()` of a `pool_server` may also run while other threads call `stop_listening()`, `stop()` or `shutdown()` (see [Listeners](#listeners))
 - `http::request_context` - Not synchronized: used by the coroutine processing its request (middlewares, then handler)
 - `http::response` - Copies share the response and can answer from any thread, even at the same time: only the first answer is sent. Chunks (`write_chunk()`, `end_chunked()`) are written in call order once `start_chunked()` returned `true`. Set the status and headers (`status()`, `header()`) from the thread running the handler, before answering, also on routes with a timeout: a timeout answer (504) copies the headers set so far
 - `http::client` - Single-threaded, create one per thread or use `async_client`
-- `http::async_client` - Thread-safe, uses internal worker threads
+- `http::async_client` - Thread-safe, runs on the `asio::workers` it is given
+- `asio::workers` - `next_executor()`, `isolated_executor()`, `in_worker_thread()`, `stop()` and `wait()` from any thread (`stop()` from one of its own threads too); never destroy them from one of their threads
 - `http::websocket_client` - Single connection, thread-safe send operations
 - `http::websocket_connection` - Server-side WebSocket, thread-safe send, callbacks on IO thread
+- `http::sse_connection` - Runs on its executor (`get_executor()`, a strand if given one), where its callbacks run: `start()`, the `send*()` methods, `stop()`, `execute()` and the flow control setters from any thread
+- `http::server_scope` - On the thread of the socket it came with
 - `http::http_application::on_response()` - The hook runs on the thread of the connection, once per request
 - `asio::socket` (TCP, TLS, Unix, `asio::websocket`, custom sockets) - Not thread-safe, like the asio objects they wrap: use a socket on a thread running its io_context (`get_io_context()`), dispatching there from other threads; an `asio::websocket` on its executor (`get_executor()`: the io_context of its socket, or the strand of the coroutine that opened it from a client), where it runs its keepalive and closing handshake too. `socket_pipe::cancel()` may be called from any thread
+- `asio::listener` - `stop()` from any thread, its handler included; `open()`, then `start()`, from one thread at a time. The handler runs on the serve executor of each connection
 
 ## License
 

@@ -14,6 +14,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,7 +33,10 @@ struct dispatch_options {
     std::string remote_ip;
 
     // Maximum time to wait for the response, handler execution included; 504 Gateway
-    // Timeout if exceeded (the handler is then cancelled: its pending awaits are aborted)
+    // Timeout if exceeded. The scope of the request is then cancelled with
+    // cancel_reason::timeout: its handler goes on, and sees it in request::cancelled(), unless
+    // its route declared the timeout (see route::cancel_on), which interrupts it. A caller
+    // cancelling the dispatch cancels the scope with cancel_reason::client_gone instead
     std::chrono::milliseconds timeout{30000};
 
     // Initial values of the request context (see request::context()), seen by the
@@ -61,11 +65,11 @@ using coroutine_middleware_function = std::function<thinger::awaitable<void>(req
 // requests are processed (error format, trusted proxies, limits). The application is the
 // default virtual host: the routes registered on it (see virtual_host for the registration
 // methods) answer every host without a virtual host of its own. A server (see
-// http_server_base) is an application served on a listener; an application can also be
+// server_base) is an application served on listeners; an application can also be
 // used on its own, to dispatch requests in memory, without a connection.
 class http_application : public virtual_host {
 public:
-    http_application() = default;
+    http_application();
 
     // Virtual hosts: the routes registered on the application itself answer any host,
     // unless the Host header (case-insensitive, port ignored) matches a host registered
@@ -81,7 +85,7 @@ public:
 
     // OpenAPI document generated from the routes of the default host (configure title,
     // hooks... here). For another host: openapi_generator(app.host(name).router()).
-    openapi_generator& openapi() { return openapi_; }
+    openapi_generator& openapi();
 
     // Serve the OpenAPI document as JSON at `path` (not served unless called)
     route& serve_openapi(const std::string& path = "/openapi.json");
@@ -135,27 +139,27 @@ public:
     // bounded by it (413 if larger), and an unread body larger than this is not discarded
     // after the response: the connection is closed instead
     void set_max_body_size(size_t size);
-    size_t get_max_body_size() const { return max_body_size_; }
+    size_t get_max_body_size() const;
 
     // Decoders of request bodies by media type, for the routes taking the body decoded:
     // JSON, MessagePack, CBOR, UBJSON, urlencoded forms, text and binary are built in (see
     // body_decoder_registry); remove or add decoders here. Set before serving.
-    body_decoder_registry& body_decoders() { return body_settings_.decoders; }
+    body_decoder_registry& body_decoders();
 
     // Body types accepted by the routes taking the body decoded that do not set their own
     // (route::accepts): names of decoders or media types; {"json"} by default. Others are
     // answered with 415 Unsupported Media Type. Set before serving.
     void accept_body_types(std::vector<std::string> types);
-    const std::vector<std::string>& get_body_types() const { return body_settings_.accepted; }
+    const std::vector<std::string>& get_body_types() const;
 
     // Limits of decoded bodies (nesting depth), for the routes that do not set their own
     // (route::decode_limits); set before serving
-    void set_body_limits(body_limits limits) { body_settings_.limits = limits; }
-    const body_limits& get_body_limits() const { return body_settings_.limits; }
+    void set_body_limits(body_limits limits);
+    const body_limits& get_body_limits() const;
 
     // Decoders, accepted types and limits together, e.g. for the openapi_generator of a
     // virtual host: openapi_generator(app.host(name).router(), &app.get_body_settings())
-    const body_settings& get_body_settings() const { return body_settings_; }
+    const body_settings& get_body_settings() const;
 
     // Format of the error responses: those sent with response::error() and the ones the
     // server generates (400 invalid body or schema validation, 404, 405, 413, 415, 500...).
@@ -199,43 +203,15 @@ public:
     // is allocated or measured. Set it before serving (listen()): it is read without locks.
     void on_response(response_hook hook);
 
+protected:
+    // What serves the requests of a connection: it keeps what they read (the hosts and their
+    // routes, the middlewares and the settings) alive, not the application, so the requests
+    // still running when a server is destroyed find it
+    std::function<awaitable<void>(std::shared_ptr<request>)> connection_handler() const;
+
 private:
-    // handle(), telling `created` the response once created (for in-memory dispatch, which
-    // answers its timeout)
-    awaitable<void> handle(std::shared_ptr<request> req, std::shared_ptr<response_sink> sink,
-                           std::function<void(const response&)> created);
-    virtual_host& resolve_host(request& req);
-    std::shared_ptr<http_response> make_error_response(http_response::status status, const std::string& message) const;
-    // Middlewares, body reading and handler of a matched request, then what is left of its body
-    awaitable<void> serve(std::shared_ptr<request> req, response& res, virtual_host& host, const route* matched_route);
-    // The same, within the timeout of the route (or of the host)
-    awaitable<void> serve_with_timeout(std::shared_ptr<request> req, response res, virtual_host& host,
-                                       const route* matched_route, std::chrono::milliseconds timeout,
-                                       http_response::status status);
-    awaitable<bool> run_middlewares(request& req, response& res);
-    awaitable<void> discard_unread_body(request& req);
-
-    // Body decoders, accepted types and limits (before openapi_, which documents them)
-    body_settings body_settings_;
-    openapi_generator openapi_{router_, &body_settings_};
-    std::vector<async_middleware_function> middlewares_;
-    bool cors_enabled_{false};
-
-    // Maximum allowed request body size
-    size_t max_body_size_{default_max_body_size};
-
-    // Virtual hosts by exact name, and by pattern (in registration order)
-    std::map<std::string, std::unique_ptr<virtual_host>> exact_hosts_;
-    std::vector<std::unique_ptr<virtual_host>> pattern_hosts_;
-
-    // Body of error responses (default format if null)
-    std::shared_ptr<const error_formatter> error_formatter_;
-
-    // Proxies allowed to report the client address (none if null)
-    std::shared_ptr<const trusted_proxies> trusted_proxies_;
-
-    // Called with every response (none if null)
-    std::shared_ptr<const response_hook> response_hook_;
+    class state;
+    std::shared_ptr<state> state_;
 };
 
 } // namespace thinger::http

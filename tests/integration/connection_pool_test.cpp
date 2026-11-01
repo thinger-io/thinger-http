@@ -14,8 +14,8 @@ TEST_CASE_METHOD(thinger::http::test::TestServerFixture, "HTTP Client connection
     
     SECTION("Each client instance has its own connection pool") {
         // Create two clients with different timeouts
-        http::async_client client1;
-        http::async_client client2;
+        http::async_client client1(workers);
+        http::async_client client2(workers);
         
         client1.timeout(std::chrono::seconds(10));
         client2.timeout(std::chrono::seconds(2));
@@ -57,7 +57,7 @@ TEST_CASE_METHOD(thinger::http::test::TestServerFixture, "HTTP Client connection
         
         // Create and destroy a client
         {
-            http::async_client client1;
+            http::async_client client1(workers);
             client1.timeout(std::chrono::seconds(10));
             
             client1.get(base_url + "/get", [&](const http::client_response& res) {
@@ -69,7 +69,7 @@ TEST_CASE_METHOD(thinger::http::test::TestServerFixture, "HTTP Client connection
         } // client1 destroyed here
         
         // Create a new client - should not reuse connections from destroyed client
-        http::async_client client2;
+        http::async_client client2(workers);
         client2.timeout(std::chrono::seconds(2)); // Different timeout
         
         // Request to slow endpoint
@@ -88,7 +88,7 @@ TEST_CASE_METHOD(thinger::http::test::TestServerFixture, "HTTP Client connection
     }
     
     SECTION("Connections are reused within the same client") {
-        http::async_client client;
+        http::async_client client(workers);
         std::vector<std::chrono::steady_clock::time_point> request_times;
         std::vector<bool> request_results;
         std::mutex mutex;
@@ -137,7 +137,7 @@ TEST_CASE_METHOD(thinger::http::test::TestServerFixture, "HTTP Client connection
     }
     
     SECTION("Different endpoints on same host reuse connections") {
-        http::async_client client;
+        http::async_client client(workers);
         
         int requests_complete = 0;
         std::vector<bool> request_results;
@@ -173,7 +173,7 @@ TEST_CASE_METHOD(thinger::http::test::TestServerFixture, "HTTP Client connection
         // Start a second test server on a different port
         thinger::http::test::TestServerFixture test_server2;
         
-        http::async_client client;
+        http::async_client client(workers);
         int server1_requests = 0;
         int server2_requests = 0;
         std::vector<bool> request_results;
@@ -207,7 +207,7 @@ TEST_CASE_METHOD(thinger::http::test::TestServerFixture, "HTTP Client connection
     }
     
     SECTION("Connection pool handles connection failures gracefully") {
-        http::async_client client;
+        http::async_client client(workers);
         
         // First request to invalid host
         bool first_failed = false;
@@ -231,6 +231,7 @@ TEST_CASE_METHOD(thinger::http::test::TestServerFixture, "HTTP Client connection
 }
 
 TEST_CASE("HTTP Client never hands out a connection busy with another request", "[http][client][pool]") {
+    thinger::http::test::running_workers workers;
     using namespace std::chrono_literals;
 
     // /hold answers once /release is served, or "expired" after a while. Both run on the
@@ -252,7 +253,7 @@ TEST_CASE("HTTP Client never hands out a connection busy with another request", 
     server_test::running_server running(server);
     std::string base_url = "http://127.0.0.1:" + std::to_string(running.port);
 
-    http::async_client client;
+    http::async_client client(workers);
     client.timeout(10s);
 
     std::string hold_result;

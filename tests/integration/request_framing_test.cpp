@@ -7,7 +7,7 @@
 using namespace thinger;
 using namespace std::chrono_literals;
 
-// Request body framing over raw TCP: Content-Length / Transfer-Encoding validation and
+// Request body framing over raw bytes (on every transport): Content-Length / Transfer-Encoding validation and
 // strict chunked decoding, so that a request body can never be read as another request
 // (request smuggling), nor the next request be lost
 
@@ -18,7 +18,6 @@ namespace {
     struct framing_server {
         http::server server;
         std::unique_ptr<running_server> running;
-        uint16_t port = 0;
         std::atomic<int> smuggled{0};
 
         framing_server() {
@@ -35,9 +34,8 @@ namespace {
             });
         }
 
-        void start() {
-            running = std::make_unique<running_server>(server);
-            port = running->port;
+        void start(transport kind) {
+            running = std::make_unique<running_server>(server, kind);
         }
     };
 
@@ -56,7 +54,7 @@ namespace {
     // The request is answered with a single 400 (or `status`), the connection is closed,
     // and nothing sent after it is run as another request
     void require_rejected(framing_server& fixture, const std::string& request, const std::string& status = "400") {
-        auto result = raw_exchange(fixture.port, request + smuggled_request);
+        auto result = raw_exchange(*fixture.running, request + smuggled_request);
         INFO("response: " << result.data);
         REQUIRE(result.data.starts_with("HTTP/1.1 " + status));
         REQUIRE(count(result.data, "HTTP/1.1 ") == 1);
@@ -65,9 +63,10 @@ namespace {
     }
 }
 
-TEST_CASE("Transfer-Encoding other than chunked is rejected", "[server][framing][smuggling][integration]") {
+TEST_CASE("Transfer-Encoding other than chunked is rejected", "[server][framing][smuggling][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
-    fixture.start();
+    fixture.start(kind);
     const std::string body = "5\r\nhello\r\n0\r\n\r\n";
 
     SECTION("Coding list ending in chunked") {
@@ -87,9 +86,10 @@ TEST_CASE("Transfer-Encoding other than chunked is rejected", "[server][framing]
     }
 }
 
-TEST_CASE("Transfer-Encoding in an HTTP/1.0 request is rejected", "[server][framing][smuggling][integration]") {
+TEST_CASE("Transfer-Encoding in an HTTP/1.0 request is rejected", "[server][framing][smuggling][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
-    fixture.start();
+    fixture.start(kind);
 
     // RFC 9112 section 6.1: an HTTP/1.0 message with Transfer-Encoding has faulty framing
     SECTION("Chunked") {
@@ -100,9 +100,10 @@ TEST_CASE("Transfer-Encoding in an HTTP/1.0 request is rejected", "[server][fram
     }
 }
 
-TEST_CASE("Content-Length together with Transfer-Encoding is rejected", "[server][framing][smuggling][integration]") {
+TEST_CASE("Content-Length together with Transfer-Encoding is rejected", "[server][framing][smuggling][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
-    fixture.start();
+    fixture.start(kind);
 
     SECTION("Content-Length first") {
         require_rejected(fixture, post_headers("Content-Length: 3\r\nTransfer-Encoding: chunked\r\n") + "5\r\nhello\r\n0\r\n\r\n");
@@ -112,9 +113,10 @@ TEST_CASE("Content-Length together with Transfer-Encoding is rejected", "[server
     }
 }
 
-TEST_CASE("Invalid Content-Length is rejected", "[server][framing][smuggling][integration]") {
+TEST_CASE("Invalid Content-Length is rejected", "[server][framing][smuggling][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
-    fixture.start();
+    fixture.start(kind);
 
     SECTION("Repeated with different values") {
         require_rejected(fixture, post_headers("Content-Length: 5\r\nContent-Length: 6\r\n") + "hello!");
@@ -142,23 +144,25 @@ TEST_CASE("Invalid Content-Length is rejected", "[server][framing][smuggling][in
     }
 }
 
-TEST_CASE("Repeated Content-Length with the same value is accepted", "[server][framing][integration]") {
+TEST_CASE("Repeated Content-Length with the same value is accepted", "[server][framing][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
-    fixture.start();
+    fixture.start(kind);
 
-    auto result = raw_exchange(fixture.port, post_headers("Content-Length: 5\r\nContent-Length: 5\r\n") + "hello" + health_close_request);
+    auto result = raw_exchange(*fixture.running, post_headers("Content-Length: 5\r\nContent-Length: 5\r\n") + "hello" + health_close_request);
     REQUIRE(result.data.starts_with("HTTP/1.1 200"));
     REQUIRE(result.data.find("body=[hello]") != std::string::npos);
     REQUIRE(result.data.find("healthy") != std::string::npos);
 }
 
-TEST_CASE("Chunk extensions are skipped, not read as the chunk size", "[server][framing][chunked-request][smuggling][integration]") {
+TEST_CASE("Chunk extensions are skipped, not read as the chunk size", "[server][framing][chunked-request][smuggling][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
-    fixture.start();
+    fixture.start(kind);
 
     SECTION("Last chunk with an extension ends the body") {
         // "0;a" is the last chunk: the "a" of the extension is not a hex digit of the size
-        auto result = raw_exchange(fixture.port, chunked_post("5\r\nhello\r\n0;a\r\n\r\n") + health_close_request);
+        auto result = raw_exchange(*fixture.running, chunked_post("5\r\nhello\r\n0;a\r\n\r\n") + health_close_request);
         INFO("response: " << result.data);
         REQUIRE(count(result.data, "HTTP/1.1 200") == 2);
         REQUIRE(result.data.find("body=[hello]") != std::string::npos);
@@ -166,7 +170,7 @@ TEST_CASE("Chunk extensions are skipped, not read as the chunk size", "[server][
     }
 
     SECTION("Extensions with values, on any chunk") {
-        auto result = raw_exchange(fixture.port,
+        auto result = raw_exchange(*fixture.running,
             chunked_post("5;name=value\r\nhello\r\n1;ext;other=\"quoted\"\r\n!\r\n0;last=1\r\n\r\n") + health_close_request);
         INFO("response: " << result.data);
         REQUIRE(count(result.data, "HTTP/1.1 200") == 2);
@@ -174,9 +178,10 @@ TEST_CASE("Chunk extensions are skipped, not read as the chunk size", "[server][
     }
 }
 
-TEST_CASE("Malformed chunked bodies are rejected with 400 and close", "[server][framing][chunked-request][smuggling][integration]") {
+TEST_CASE("Malformed chunked bodies are rejected with 400 and close", "[server][framing][chunked-request][smuggling][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
-    fixture.start();
+    fixture.start(kind);
 
     SECTION("Non-hex chunk size") {
         require_rejected(fixture, chunked_post("zz\r\nhello\r\n0\r\n\r\n"));
@@ -219,11 +224,12 @@ TEST_CASE("Malformed chunked bodies are rejected with 400 and close", "[server][
     }
 }
 
-TEST_CASE("Trailer section is consumed completely", "[server][framing][chunked-request][pipelining][integration]") {
+TEST_CASE("Trailer section is consumed completely", "[server][framing][chunked-request][pipelining][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
-    fixture.start();
+    fixture.start(kind);
 
-    auto result = raw_exchange(fixture.port,
+    auto result = raw_exchange(*fixture.running,
         chunked_post("5\r\nhello\r\n0\r\nX-Trailer: a\r\nX-Other: b\r\n\r\n") + health_request + health_close_request);
     INFO("response: " << result.data);
     REQUIRE(count(result.data, "HTTP/1.1 ") == 3);
@@ -232,9 +238,10 @@ TEST_CASE("Trailer section is consumed completely", "[server][framing][chunked-r
     REQUIRE(count(result.data, "healthy") == 2);
 }
 
-TEST_CASE("Requests pipelined after a small chunked body are not lost", "[server][framing][chunked-request][pipelining][integration]") {
+TEST_CASE("Requests pipelined after a small chunked body are not lost", "[server][framing][chunked-request][pipelining][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
-    fixture.start();
+    fixture.start(kind);
 
     // Well over the decoder batch size: all of it arrives with the chunked request headers
     std::string pipelined = chunked_post("5\r\nhello\r\n0\r\n\r\n");
@@ -243,7 +250,7 @@ TEST_CASE("Requests pipelined after a small chunked body are not lost", "[server
     pipelined += health_close_request;
     REQUIRE(pipelined.size() > 1500);
 
-    auto result = raw_exchange(fixture.port, pipelined);
+    auto result = raw_exchange(*fixture.running, pipelined);
     INFO("response: " << result.data);
     REQUIRE(count(result.data, "HTTP/1.1 200") == follow_ups + 1);
     REQUIRE(result.data.find("body=[hello]") != std::string::npos);
@@ -251,7 +258,8 @@ TEST_CASE("Requests pipelined after a small chunked body are not lost", "[server
     REQUIRE(result.closed);
 }
 
-TEST_CASE("Chunked body read in small pieces by the handler", "[server][framing][chunked-request][deferred][pipelining][integration]") {
+TEST_CASE("Chunked body read in small pieces by the handler", "[server][framing][chunked-request][deferred][pipelining][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
     fixture.server.post("/pieces", [](http::request& req, http::response& res) -> thinger::awaitable<void> {
         std::string received;
@@ -261,46 +269,46 @@ TEST_CASE("Chunked body read in small pieces by the handler", "[server][framing]
         }
         res.send("pieces=[" + received + "]");
     });
-    fixture.start();
+    fixture.start(kind);
 
     std::string body = "4\r\nThe \r\n6\r\nquick \r\n6;x=y\r\nbrown \r\n3\r\nfox\r\n0\r\nTrailer: t\r\n\r\n";
     std::string pipelined = "POST /pieces HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n" + body;
     for (int i = 0; i < 20; i++) pipelined += health_request;
     pipelined += health_close_request;
 
-    auto result = raw_exchange(fixture.port, pipelined);
+    auto result = raw_exchange(*fixture.running, pipelined);
     INFO("response: " << result.data);
     REQUIRE(result.data.find("pieces=[The quick brown fox]") != std::string::npos);
     REQUIRE(count(result.data, "HTTP/1.1 200") == 22);
     REQUIRE(count(result.data, "healthy") == 21);
 }
 
-TEST_CASE("Chunked body split across many TCP writes", "[server][framing][chunked-request][integration]") {
+TEST_CASE("Chunked body split across many writes", "[server][framing][chunked-request][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
-    fixture.start();
+    fixture.start(kind);
 
-    // Send one byte at a time: every framing state has to wait for more data
+    // Send one byte at a time (a TLS record each over TLS): every framing state has to wait
+    // for more data
     std::string request = chunked_post("5;e=1\r\nhello\r\n6\r\n world\r\n0\r\nT: v\r\n\r\n") + health_close_request;
 
-    boost::asio::io_context ioc;
-    boost::asio::ip::tcp::socket sock(ioc);
-    sock.connect({boost::asio::ip::make_address("127.0.0.1"), fixture.port});
-    sock.set_option(boost::asio::ip::tcp::no_delay(true));
+    http::test::raw_connection connection(fixture.running->endpoint(), true);
     for (char c : request) {
-        boost::asio::write(sock, boost::asio::buffer(&c, 1));
+        REQUIRE(connection.write(std::string_view(&c, 1)));
         std::this_thread::sleep_for(1ms);
     }
 
-    auto data = read_until_closed(ioc, sock, 3s).data;
+    auto data = connection.read_until_closed(3s).data;
 
     INFO("response: " << data);
     REQUIRE(data.find("body=[hello world]") != std::string::npos);
     REQUIRE(count(data, "HTTP/1.1 200") == 2);
 }
 
-TEST_CASE("Folded header lines (obs-fold) are rejected", "[server][framing][smuggling][integration]") {
+TEST_CASE("Folded header lines (obs-fold) are rejected", "[server][framing][smuggling][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
-    fixture.start();
+    fixture.start(kind);
 
     // A line starting with whitespace continues the previous one (obsolete line folding):
     // it must never be merged into the previous header name, which turned
@@ -329,9 +337,10 @@ TEST_CASE("Folded header lines (obs-fold) are rejected", "[server][framing][smug
 // CONNECT is not served, and what follows its header section is tunnel data, not content nor
 // another request (RFC 9110 section 9.3.6). Reading a body or a next request after it framed
 // the stream unlike a proxy that implements CONNECT
-TEST_CASE("CONNECT requests are rejected", "[server][framing][smuggling][integration]") {
+TEST_CASE("CONNECT requests are rejected", "[server][framing][smuggling][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
-    fixture.start();
+    fixture.start(kind);
 
     SECTION("Authority form") {
         require_rejected(fixture, "CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n");
@@ -344,9 +353,10 @@ TEST_CASE("CONNECT requests are rejected", "[server][framing][smuggling][integra
 // Found by differential fuzzing against llhttp: bytes above 0x7F were accepted in the request
 // target. They must be percent-encoded (RFC 9112 section 3.2), and an invalid request line is
 // rejected rather than autocorrected (RFC 9112 section 3)
-TEST_CASE("Request target with bytes other than ASCII is rejected", "[server][framing][integration]") {
+TEST_CASE("Request target with bytes other than ASCII is rejected", "[server][framing][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
-    fixture.start();
+    fixture.start(kind);
 
     SECTION("UTF-8 in the path") {
         require_rejected(fixture, "GET /health\xc3\xa9 HTTP/1.1\r\nHost: localhost\r\n\r\n");
@@ -355,7 +365,7 @@ TEST_CASE("Request target with bytes other than ASCII is rejected", "[server][fr
         require_rejected(fixture, "GET /health?a=\xff HTTP/1.1\r\nHost: localhost\r\n\r\n");
     }
     SECTION("Percent-encoded is accepted") {
-        auto result = raw_exchange(fixture.port, "GET /health?a=%C3%A9 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        auto result = raw_exchange(*fixture.running, "GET /health?a=%C3%A9 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         INFO("response: " << result.data);
         REQUIRE(result.data.starts_with("HTTP/1.1 200"));
     }
@@ -364,9 +374,10 @@ TEST_CASE("Request target with bytes other than ASCII is rejected", "[server][fr
 // Found by differential fuzzing against llhttp: the target was checked to start with "/" once
 // percent-decoded, so "%2Fhealth" was served as "/health", though it is not in origin form
 // (RFC 9112 section 3.2.1)
-TEST_CASE("Request target starting with an encoded slash is rejected", "[server][framing][integration]") {
+TEST_CASE("Request target starting with an encoded slash is rejected", "[server][framing][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
-    fixture.start();
+    fixture.start(kind);
     require_rejected(fixture, "GET %2Fhealth HTTP/1.1\r\nHost: localhost\r\n\r\n");
 }
 
@@ -386,12 +397,13 @@ namespace {
     }
 }
 
-TEST_CASE("Request header section limits", "[server][framing][limits][integration]") {
+TEST_CASE("Request header section limits", "[server][framing][limits][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     framing_server fixture;
-    fixture.start();
+    fixture.start(kind);
 
     SECTION("100 header lines are accepted") {
-        auto result = raw_exchange(fixture.port, request_with_headers(100) + health_close_request);
+        auto result = raw_exchange(*fixture.running, request_with_headers(100) + health_close_request);
         INFO("response: " << result.data);
         REQUIRE(count(result.data, "HTTP/1.1 200") == 2);
     }
@@ -405,7 +417,7 @@ TEST_CASE("Request header section limits", "[server][framing][limits][integratio
         require_rejected(fixture, request + "\r\nhello", "431");
     }
     SECTION("A 16 KB header section is accepted") {
-        auto result = raw_exchange(fixture.port, request_of_size(16 * 1024) + health_close_request);
+        auto result = raw_exchange(*fixture.running, request_of_size(16 * 1024) + health_close_request);
         INFO("response: " << result.data.substr(0, 200));
         REQUIRE(count(result.data, "HTTP/1.1 200") == 2);
     }

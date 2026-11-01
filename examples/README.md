@@ -47,8 +47,10 @@ if (auto ws = client.websocket("wss://echo.websocket.org")) {
     auto [msg, binary] = ws->receive();
 }
 
-// Via http::async_client (async callback)
-thinger::http::async_client pool;
+// Via http::async_client (async callback), on workers the application starts and stops
+thinger::asio::workers workers;
+workers.start();
+thinger::http::async_client pool(workers);
 pool.websocket("wss://echo.websocket.org", [](auto ws) {
     if (ws) {
         ws->send_text("Hello!");
@@ -56,6 +58,7 @@ pool.websocket("wss://echo.websocket.org", [](auto ws) {
     }
 });
 pool.wait();
+workers.stop();
 ```
 
 ### HTTP Server

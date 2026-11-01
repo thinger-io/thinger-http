@@ -11,6 +11,7 @@
 #include <boost/asio/io_context.hpp>
 #include "../../asio/sockets/socket.hpp"
 #include "../../util/types.hpp"
+#include "upgrade.hpp"
 
 namespace thinger::http {
 
@@ -67,18 +68,22 @@ protected:
     void untrack();
     void set_type(connection_type type);
 
-    const std::shared_ptr<connection_tracker>& tracker() const { return tracker_; }
-    bool tracked() const { return tracker_ != nullptr; }
+    // The tracker, while tracked (it is held weakly: it is not kept alive by its connections)
+    std::shared_ptr<connection_tracker> tracker() const { return tracker_.lock(); }
+    bool tracked() const { return !tracker_.expired(); }
 
     // On the io_context of the connection, while the server shuts down: finish what the
     // connection is doing and close (or tell its owner to), or close it right away
     virtual void shutdown_drain() = 0;
     virtual void shutdown_close() = 0;
+    // On the io_context of the connection, at the deadline of the shutdown, before it is
+    // closed: cancel the requests whose handlers still run (nothing by default)
+    virtual void shutdown_cancel() {}
 
 private:
     friend class connection_tracker;
 
-    std::shared_ptr<connection_tracker> tracker_;
+    std::weak_ptr<connection_tracker> tracker_;
     std::weak_ptr<void> self_;
     boost::asio::io_context* io_context_ = nullptr;
     // In the list of its shard (guarded by the mutex of the shard)
@@ -106,15 +111,22 @@ public:
     // Connections open
     size_t active() const;
 
+    // Call `empty` once no connection is left: right away, on this thread, if none is; else
+    // on the thread of the last one to leave, as it leaves. Once, replacing the one set before
+    // (none with null). For a shutdown waiting for its connections: a connection leaving does
+    // nothing more while none is set
+    void notify_when_empty(std::function<void()> empty);
+
     // Call shutdown_drain() on every connection, on its io_context (does not wait)
     void drain_all();
-    // Call shutdown_close() on every connection, on its io_context; then `done` (on the thread
-    // of the last one, or right away if there is none)
-    void close_all(std::function<void()> done);
+    // Call shutdown_cancel() and then shutdown_close() on every connection, in one call on its
+    // io_context, so the handlers interrupted resume on a closed connection; then `done` (on
+    // the thread of the last one, or right away if there is none), once what was posted on
+    // each io_context before its close ran too (the first resumption of those handlers)
+    void cancel_and_close_all(std::function<void()> done);
 
 private:
     friend class tracked_connection;
-    friend class taken_over_connection;
 
     static constexpr size_t shard_count = 16;
 
@@ -130,69 +142,64 @@ private:
     void add(tracked_connection& connection);
     void remove(tracked_connection& connection);
     void retype(tracked_connection& connection, connection_type type);
+    // Call the callback of notify_when_empty() if no connection is left
+    void check_empty();
 
     // The connections open (owned while they are acted on)
     std::vector<std::pair<std::shared_ptr<void>, tracked_connection*>> snapshot() const;
 
     std::array<shard, shard_count> shards_;
     std::atomic<phase> phase_{phase::serving};
+    // What notify_when_empty() set, and whether it did (read by every connection leaving)
+    std::mutex empty_mutex_;
+    std::function<void()> on_empty_;
+    std::atomic<bool> watching_{false};
 };
 
-// A connection taken over from the server (a WebSocket, an event stream, a tunnel...), tracked
-// while its socket lives (it is attached to it), or until untracked by its new owner once
-// closed. On shutdown it calls the callback set with on_server_shutdown() (if any), and once
-// the grace period ends its socket is closed.
-class taken_over_connection : public tracked_connection,
-                              public asio::socket_attachment,
-                              public std::enable_shared_from_this<taken_over_connection> {
-public:
-    // Track `socket`, taken over from a connection of `tracker`, and attach it there
-    static std::shared_ptr<taken_over_connection> track(std::shared_ptr<connection_tracker> tracker,
-                                                        const std::shared_ptr<asio::socket>& socket);
-    // The tracking attached to `socket`, if any
-    static std::shared_ptr<taken_over_connection> of(const asio::socket& socket);
+namespace detail {
 
-    ~taken_over_connection() override;
+// A connection taken over from the server (a WebSocket, an event stream, a tunnel...). It owns
+// the socket, and the socket handed out (see hand_out()) owns it: tracked while that socket
+// lives (the handles copied from it, and a WebSocket built on it, included), or until its
+// owner closes it (server_scope::closed()). On shutdown it calls the callback set with
+// server_scope::on_shutdown() (if any), and once the grace period ends its socket is closed.
+// On the thread of the socket.
+class taken_over_tracking final : public tracked_connection,
+                                  public std::enable_shared_from_this<taken_over_tracking> {
+public:
+    // Track `socket`, taken over from a connection of `tracker`
+    static std::shared_ptr<taken_over_tracking> track(std::shared_ptr<connection_tracker> tracker,
+                                                      std::shared_ptr<asio::socket> socket);
+
+    ~taken_over_tracking();
+
+    // The connection to hand to the new owner: the socket (owning this tracking) and its scope
+    upgraded_connection hand_out(std::string buffered);
 
     // Once the handler took the socket: drained or closed if the server shuts down meanwhile
     void handed_over();
 
-    // On the thread of the socket
+    // What server_scope does
     void set_type(connection_type type) { tracked_connection::set_type(type); }
-    void on_shutdown(sync_callback<void()> callback) { on_shutdown_ = std::move(callback); }
-    // The new owner closed the connection: it no longer counts
-    void closed() {
-        on_shutdown_ = nullptr;
-        untrack();
-    }
+    void on_shutdown(sync_callback<void()> callback);
+    void closed();
 
 private:
-    taken_over_connection() = default;
+    explicit taken_over_tracking(std::shared_ptr<asio::socket> socket) : socket_(std::move(socket)) {}
 
     void shutdown_drain() override;
     void shutdown_close() override;
+    // Call the callback of on_shutdown(), logging what it throws
+    static void notify(const sync_callback<void()>& callback);
 
-    std::weak_ptr<asio::socket> socket_;
+    std::shared_ptr<asio::socket> socket_;
     sync_callback<void()> on_shutdown_;
+    // The drain started (shutdown_drain()), and the owner was told (or will be, posted)
+    bool draining_ = false;
     bool notified_ = false;
 };
 
-// What the connection of `socket`, taken over from a server, now serves (nothing happens if the
-// server does not track it). On the thread of the socket
-void set_connection_type(const asio::socket& socket, connection_type type);
-
-// `wrapper` (e.g. a WebSocket) now runs on the connection of `socket`, taken over from a server:
-// tracked as `type`, and reachable from `wrapper` too (see on_server_shutdown()). On the thread
-// of the socket
-void wrap_connection(const asio::socket& socket, asio::socket& wrapper, connection_type type);
-
-// Ask a connection taken over from the server (the socket of a take_over() handler, or the
-// WebSocket of upgrade_websocket_stream()) to be told when the server shuts down gracefully:
-// `callback` is called once, on the io_context of the socket, so its owner can finish and
-// close it (e.g. with a WebSocket close 1001 Going Away). Whatever is still open at the end of
-// the grace period is closed. Nothing happens for a socket that does not come from a server.
-// On the thread of the socket.
-void on_server_shutdown(asio::socket& socket, sync_callback<void()> callback);
+}
 
 }
 

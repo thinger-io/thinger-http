@@ -21,7 +21,11 @@ std::string format_bytes(size_t bytes) {
 int main() {
     std::cout << "Streaming Download Example (Coroutines)\n" << std::endl;
 
-    http::async_client client;
+    // The workers the clients run on: the application starts them, and stops them at the end
+    asio::workers workers;
+    workers.start();
+
+    http::async_client client(workers);
 
     // =========================================
     // Example 1: Single streaming GET
@@ -97,5 +101,6 @@ int main() {
 
     std::cout << "\nAll done!" << std::endl;
 
+    workers.stop();
     return 0;
 }

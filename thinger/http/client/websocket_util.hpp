@@ -30,6 +30,11 @@ std::optional<url_components> parse_websocket_url(const std::string& url);
 std::string generate_websocket_key();
 
 /**
+ * The Sec-WebSocket-Accept value answering a Sec-WebSocket-Key (RFC 6455 section 4.2.2).
+ */
+std::string accept_key(const std::string& sent_key);
+
+/**
  * Validate the Sec-WebSocket-Accept key from server response.
  */
 bool validate_accept_key(const std::string& accept_key, const std::string& sent_key);

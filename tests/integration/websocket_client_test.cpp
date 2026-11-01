@@ -1,20 +1,30 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <thinger/http/client/websocket_client.hpp>
 #include <thinger/http/client/client.hpp>
 #include <thinger/http/client/async_client.hpp>
+#include <thinger/http/client/executor_client.hpp>
+#include <thinger/asio/io_context_of.hpp>
 #include <thinger/http/server/server_standalone.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
+#include <thinger/http/server/websocket_connection.hpp>
 #include <thread>
 #include <chrono>
 #include <future>
 #include <thinger/util/base64.hpp>
 #include <thinger/util/sha1.hpp>
+#include "../fixtures/hostile_peer.hpp"
+#include "../fixtures/running_workers.hpp"
+#include "../fixtures/server_listen.hpp"
 
 using namespace thinger;
 using namespace std::chrono_literals;
 
 namespace {
+
+// Period of the messages of /ws/ticks: longer than the idle timeout of the keepalive tests
+constexpr auto TICK_PERIOD = 1500ms;
 
 // WebSocket test server fixture
 struct WebSocketServerFixture {
@@ -40,7 +50,7 @@ private:
         // Echo WebSocket endpoint - echoes back any message received
         // Note: ws->start() is called automatically by the server after the handler
         server.get("/ws/echo", [](http::request& req, http::response& res) {
-            res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) {
+            res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection> ws) {
                 ws->on_message([ws](std::string message, bool binary) {
                     // Echo back the message with same type
                     if (binary) {
@@ -52,9 +62,34 @@ private:
             });
         });
 
+        // Receives and drops the messages: answers only the pings (as any server reads)
+        server.get("/ws/sink", [](http::request& req, http::response& res) {
+            res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection> ws) {
+                ws->on_message([](std::string, bool) {});
+            });
+        });
+
+        // Sends "tick" every TICK_PERIOD, a few times
+        server.get("/ws/ticks", [](http::request& req, http::response& res) {
+            res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection> ws) {
+                co_spawn(ws->get_executor(), [weak = std::weak_ptr(ws)]() -> awaitable<void> {
+                    boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor);
+                    for (int i = 0; i < 10; ++i) {
+                        timer.expires_after(TICK_PERIOD);
+                        auto [ec] = co_await timer.async_wait(use_nothrow_awaitable);
+                        auto ws = weak.lock();
+                        if (ec || !ws) co_return;
+                        ws->send_text("tick");
+                    }
+                }, boost::asio::detached);
+            });
+        });
+
+        server.get("/hello", [](http::request& req, http::response& res) { res.send("hello"); });
+
         // WebSocket endpoint that sends a welcome message on connect
         server.get("/ws/welcome", [](http::request& req, http::response& res) {
-            res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) {
+            res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection> ws) {
                 ws->on_message([ws](std::string message, bool binary) {
                     ws->send_text("received: " + message);
                 });
@@ -65,8 +100,8 @@ private:
     }
 
     void start_server() {
-        REQUIRE(server.listen("127.0.0.1", 0));
-        port = server.local_port();
+        REQUIRE_FALSE(server.listen("127.0.0.1", 0));
+        port = http::test::listening_port(server);
         ws_url = "ws://127.0.0.1:" + std::to_string(port);
 
         std::promise<void> ready;
@@ -249,10 +284,11 @@ TEST_CASE("HTTP Client WebSocket Integration", "[websocket][client][integration]
 }
 
 TEST_CASE("Async Client WebSocket Integration", "[websocket][client][integration]") {
+    thinger::http::test::running_workers workers;
     WebSocketServerFixture fixture;
 
     SECTION("Connect via async_client.websocket() - async") {
-        http::async_client client;
+        http::async_client client(workers);
 
         std::atomic<bool> connected{false};
         std::atomic<bool> callback_called{false};
@@ -272,7 +308,7 @@ TEST_CASE("Async Client WebSocket Integration", "[websocket][client][integration
     }
 
     SECTION("Send/receive via async_client.websocket()") {
-        http::async_client client;
+        http::async_client client(workers);
 
         std::string received_message;
         std::atomic<bool> done{false};
@@ -294,7 +330,7 @@ TEST_CASE("Async Client WebSocket Integration", "[websocket][client][integration
     }
 
     SECTION("Invalid URL calls callback with nullptr") {
-        http::async_client client;
+        http::async_client client(workers);
 
         std::atomic<bool> callback_called{false};
         std::shared_ptr<http::websocket_client> received_ws;
@@ -358,4 +394,237 @@ TEST_CASE("WebSocket client keeps the frames received along with the handshake r
         ws->close();
     }
     server_thread.join();
+}
+
+namespace {
+
+    using clock_type = std::chrono::steady_clock;
+
+    // The keepalive of the timing cases: a ping after 300 ms without receiving, closed after 1 s
+    constexpr auto PING_INTERVAL = 300ms;
+    constexpr auto IDLE_TIMEOUT = 1s;
+    // At least 3 idle timeouts
+    constexpr auto USE_FOR = 3500ms;
+    // A blocking call returns once its own operation completes
+    constexpr auto PROMPT = 500ms;
+
+    // A client WebSocket of an executor_client running on `ioc`, on this thread. Awaited inside a
+    // coroutine: the awaitable of websocket() refers to its arguments (the default subprotocol is a
+    // temporary), so it is not handed to co_spawn by itself
+    http::websocket_client open_on(boost::asio::io_context& ioc, http::executor_client& client, const std::string& url) {
+        auto connect = [&]() -> awaitable<std::optional<http::websocket_client>> {
+            co_return co_await client.websocket(url);
+        };
+        auto future = co_spawn(ioc, connect, boost::asio::use_future);
+        asio::run_until(ioc, [&] { return future.wait_for(0s) == std::future_status::ready; });
+        auto websocket = future.get();
+        REQUIRE(websocket.has_value());
+        return std::move(*websocket);
+    }
+
+    std::chrono::milliseconds elapsed_since(clock_type::time_point start) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(clock_type::now() - start);
+    }
+
+}
+
+// Every client WebSocket has a deadline on its reads and writes by default: the keepalive of
+// the server (asio::websocket::start_timeout())
+TEST_CASE("Client WebSocket keepalive: the default and the setter", "[websocket][client][keepalive][integration]") {
+    WebSocketServerFixture fixture;
+    const auto url = fixture.ws_url + "/ws/echo";
+    constexpr auto PING = std::chrono::milliseconds(asio::websocket::CONNECTION_TIMEOUT_SECONDS);
+    constexpr auto IDLE = 2 * PING;
+    STATIC_REQUIRE(PING == 60s);
+
+    SECTION("60 s and 120 s from the synchronous client") {
+        http::client client;
+        auto ws = client.websocket(url);
+        REQUIRE(ws.has_value());
+        CHECK(ws->get_ping_interval() == PING);
+        CHECK(ws->get_idle_timeout() == IDLE);
+        ws->close();
+    }
+
+    SECTION("60 s and 120 s from a coroutine client") {
+        boost::asio::io_context ioc;
+        http::executor_client client(ioc);
+        auto ws = open_on(ioc, client, url);
+        CHECK(ws.get_ping_interval() == PING);
+        CHECK(ws.get_idle_timeout() == IDLE);
+    }
+
+    SECTION("60 s and 120 s from async_client") {
+        thinger::http::test::running_workers workers;
+        http::async_client client(workers);
+        std::atomic<bool> checked{false};
+        client.websocket(url, [&](std::shared_ptr<http::websocket_client> ws) {
+            if (ws && ws->get_ping_interval() == PING && ws->get_idle_timeout() == IDLE) checked = true;
+            if (ws) ws->close();
+        });
+        client.wait();
+        CHECK(checked);
+    }
+
+    SECTION("The setter changes them, (0, 0) turns the keepalive off") {
+        http::client client;
+        auto ws = client.websocket(url);
+        REQUIRE(ws.has_value());
+        ws->set_keepalive(PING_INTERVAL, IDLE_TIMEOUT);
+        CHECK(ws->get_ping_interval() == PING_INTERVAL);
+        CHECK(ws->get_idle_timeout() == IDLE_TIMEOUT);
+        ws->set_keepalive(0ms, 0ms);
+        CHECK(ws->get_ping_interval() == 0ms);
+        CHECK(ws->get_idle_timeout() == 0ms);
+        ws->close();
+    }
+
+    SECTION("The keepalive stays on the WebSocket released") {
+        http::client client;
+        auto ws = client.websocket(url);
+        REQUIRE(ws.has_value());
+        ws->set_keepalive(PING_INTERVAL, IDLE_TIMEOUT);
+        auto released = ws->release_socket();
+        REQUIRE(released);
+        CHECK(released->get_ping_interval() == PING_INTERVAL);
+        CHECK(released->get_idle_timeout() == IDLE_TIMEOUT);
+        CHECK(ws->get_ping_interval() == 0ms);
+        released->close();
+    }
+}
+
+// The keepalive closes a dead peer: off, it does not
+TEST_CASE("Client WebSocket keepalive: set and turned off against a silent peer", "[websocket][client][keepalive][integration]") {
+    using namespace thinger::http::test;
+    const bool on = GENERATE(true, false);
+    INFO("keepalive " << (on ? "300 ms / 1 s" : "(0, 0) after 300 ms / 1 s"));
+    hostile_peer peer(transport::tcp, hostile_behaviour::silent, hostile_start::after_101);
+    boost::asio::io_context ioc;
+    http::executor_client client(ioc);
+    std::atomic<bool> closed{false};
+    auto ws = open_on(ioc, client, peer.websocket_url("/ws"));
+    ws.on_close([&] { closed = true; });
+
+    ws.set_keepalive(PING_INTERVAL, IDLE_TIMEOUT);
+    if (!on) ws.set_keepalive(0ms, 0ms);
+    ws.run();
+    ioc.run_for(IDLE_TIMEOUT + 500ms);
+    CHECK(ws.is_open() == !on);
+    CHECK(closed == on);
+    ws.stop();
+    ioc.run_for(100ms);
+}
+
+// A peer answering the pings is never closed by the keepalive, however the client is used
+TEST_CASE("Client WebSocket keepalive: a responsive peer stays connected", "[websocket][client][keepalive][integration]") {
+    WebSocketServerFixture fixture;
+
+    SECTION("In the message loop of run()") {
+        boost::asio::io_context ioc;
+        http::executor_client client(ioc);
+        std::atomic<bool> closed{false};
+        auto ws = open_on(ioc, client, fixture.ws_url + "/ws/echo");
+        ws.set_keepalive(PING_INTERVAL, IDLE_TIMEOUT);
+        ws.on_close([&] { closed = true; });
+        ws.run();
+        // nothing sent nor received but the pings and pongs
+        ioc.run_for(USE_FOR);
+        CHECK(ws.is_open());
+        CHECK_FALSE(closed);
+        ws.stop();
+        ioc.run_for(100ms);
+    }
+
+    SECTION("In a loop of blocking receive() calls") {
+        // a message every 1.5 s: each receive() waits longer than the idle timeout
+        http::client client;
+        auto ws = client.websocket(fixture.ws_url + "/ws/ticks");
+        REQUIRE(ws.has_value());
+        ws->set_keepalive(PING_INTERVAL, IDLE_TIMEOUT);
+        auto start = clock_type::now();
+        int ticks = 0;
+        while (clock_type::now() - start < USE_FOR) {
+            auto [message, binary] = ws->receive();
+            REQUIRE(ws->is_open());
+            REQUIRE(message == "tick");
+            ++ticks;
+            std::this_thread::sleep_for(200ms);
+        }
+        CHECK(ticks >= 3);
+        ws->close();
+    }
+
+    SECTION("Sending periodically, never calling receive()") {
+        http::client client;
+        auto ws = client.websocket(fixture.ws_url + "/ws/sink");
+        REQUIRE(ws.has_value());
+        ws->set_keepalive(PING_INTERVAL, IDLE_TIMEOUT);
+        auto start = clock_type::now();
+        while (clock_type::now() - start < USE_FOR) {
+            REQUIRE(ws->send_text("data"));
+            std::this_thread::sleep_for(200ms);
+        }
+        CHECK(ws->is_open());
+        ws->close();
+    }
+
+    SECTION("Sending less often than the idle timeout, never calling receive()") {
+        // nothing runs between the calls: the first check of the next one, late, pings
+        // before it closes, and the pong that arrived meanwhile counts as received
+        http::client client;
+        auto ws = client.websocket(fixture.ws_url + "/ws/sink");
+        REQUIRE(ws.has_value());
+        ws->set_keepalive(PING_INTERVAL, IDLE_TIMEOUT);
+        for (int i = 0; i < 3; ++i) {
+            INFO("send " << i);
+            REQUIRE(ws->send_text("data"));
+            REQUIRE(ws->is_open());
+            std::this_thread::sleep_for(IDLE_TIMEOUT + 500ms);
+        }
+        CHECK(ws->send_text("data"));
+        CHECK(ws->is_open());
+        ws->close();
+    }
+}
+
+// The keepalive keeps the io_context busy: a blocking call waits for its own operation only
+TEST_CASE("Client WebSocket keepalive: the blocking calls return once their operation completes", "[websocket][client][keepalive][integration]") {
+    WebSocketServerFixture fixture;
+    const bool set = GENERATE(false, true);
+    INFO("keepalive " << (set ? "2 s / 4 s" : "the default"));
+    http::client client;
+
+    auto start = clock_type::now();
+    auto ws = client.websocket(fixture.ws_url + "/ws/echo");
+    REQUIRE(ws.has_value());
+    CHECK(elapsed_since(start) < PROMPT);
+    if (set) ws->set_keepalive(2s, 4s);
+
+    start = clock_type::now();
+    REQUIRE(ws->send_text("text"));
+    CHECK(elapsed_since(start) < PROMPT);
+
+    start = clock_type::now();
+    auto [text, text_binary] = ws->receive();
+    CHECK(text == "text");
+    CHECK(elapsed_since(start) < PROMPT);
+
+    start = clock_type::now();
+    REQUIRE(ws->send_binary(std::string_view("binary")));
+    CHECK(elapsed_since(start) < PROMPT);
+    auto [binary, is_binary] = ws->receive();
+    CHECK(binary == "binary");
+    CHECK(is_binary);
+
+    // an HTTP request of the same client, the WebSocket open
+    start = clock_type::now();
+    auto response = client.get("http://127.0.0.1:" + std::to_string(fixture.port) + "/hello");
+    CHECK(response.ok());
+    CHECK(response.body() == "hello");
+    CHECK(elapsed_since(start) < PROMPT);
+
+    start = clock_type::now();
+    ws->close();
+    CHECK_FALSE(ws->is_open());
+    CHECK(elapsed_since(start) < PROMPT);
 }

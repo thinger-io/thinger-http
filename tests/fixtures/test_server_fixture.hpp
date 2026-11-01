@@ -5,6 +5,8 @@
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <nlohmann/json.hpp>
+#include "transport_matrix.hpp"
+#include "running_workers.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <chrono>
@@ -13,16 +15,20 @@
 
 namespace thinger::http::test {
 
-// Test server fixture that starts a local HTTP server for testing
+// Test server fixture that starts a local HTTP server for testing, on any transport of the matrix
+// (see transport_matrix.hpp): base_url is the URL of the server, and configure() points a client
+// at it (the CA over TLS, the socket path over Unix)
 struct TestServerFixture {
+    running_workers workers;  // For the async clients of the tests (they outlive them)
     http::server server;  // Single-threaded standalone server
     uint16_t port = 0;
     std::string base_url;
+    transport_endpoint endpoint;
     std::thread server_thread;  // Thread to run the server
     
-    TestServerFixture() {
+    explicit TestServerFixture(transport kind = transport::tcp) {
         setup_default_endpoints();
-        start_server();
+        start_server(kind);
     }
     
     virtual ~TestServerFixture() {
@@ -31,50 +37,31 @@ struct TestServerFixture {
             server_thread.join();
         }
     }
+
+    template<typename Client>
+    Client& configure(Client& client) const { return endpoint.configure(client); }
     
 protected:
     // Setup default test endpoints - can be overridden in derived classes
     virtual void setup_default_endpoints() {
         // /delay/:seconds endpoint
-        server.get("/delay/:seconds", [](http::request& req, http::response& res) {
+        server.get("/delay/:seconds", [](http::request& req, http::response& res) -> awaitable<void> {
             auto seconds_str = req["seconds"];
             int seconds = seconds_str.empty() ? 1 : std::stoi(seconds_str);
-            
-            // Get io_context from the connection's socket
-            auto connection = req.get_http_connection();
-            if (!connection) {
+
+            // The handler runs on its connection's executor
+            boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, std::chrono::seconds(seconds));
+            auto [ec] = co_await timer.async_wait(use_nothrow_awaitable);
+            if (!ec) {
+                nlohmann::json response;
+                response["delay"] = seconds;
+                response["status"] = "ok";
+                res.json(response);
+            } else {
+                // Timer was cancelled or error occurred
                 res.status(http::http_response::status::internal_server_error);
-                res.send("No connection available");
-                return;
+                res.send("Timer error");
             }
-            
-            auto socket = connection->get_socket();
-            if (!socket) {
-                res.status(http::http_response::status::internal_server_error);
-                res.send("No socket available");
-                return;
-            }
-            
-            auto& io_context = socket->get_io_context();
-            
-            // Create an async timer
-            auto timer = std::make_shared<boost::asio::steady_timer>(io_context);
-            timer->expires_after(std::chrono::seconds(seconds));
-            
-            // Capture response by move to ensure it stays alive
-            timer->async_wait([res = std::move(res), seconds, timer](const boost::system::error_code& ec) mutable {
-                if (!ec) {
-                    // Timer expired normally
-                    nlohmann::json response;
-                    response["delay"] = seconds;
-                    response["status"] = "ok";
-                    res.json(response);
-                } else {
-                    // Timer was cancelled or error occurred
-                    res.status(http::http_response::status::internal_server_error);
-                    res.send("Timer error");
-                }
-            });
         });
         
         // /get endpoint
@@ -240,10 +227,20 @@ protected:
     }
     
 private:
-    void start_server() {
-        REQUIRE(server.listen("0.0.0.0", 0));
-        port = server.local_port();
-        base_url = "http://localhost:" + std::to_string(port);
+    std::unique_ptr<transport_listener> listener_;
+
+    void start_server(transport kind) {
+        if (kind == transport::tcp) {
+            REQUIRE_FALSE(server.listen("0.0.0.0", 0));
+            port = listening_port(server);
+            base_url = "http://localhost:" + std::to_string(port);
+            endpoint = {transport::tcp, port, {}};
+        } else {
+            listener_ = std::make_unique<transport_listener>(server, kind);
+            endpoint = listener_->endpoint();
+            port = endpoint.port;
+            base_url = endpoint.base_url();
+        }
 
         std::promise<void> ready;
         server_thread = std::thread([this, &ready]() {

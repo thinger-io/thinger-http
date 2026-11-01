@@ -40,14 +40,16 @@ std::string generate_websocket_key() {
     return ::thinger::util::base64::encode(bytes.data(), bytes.size());
 }
 
-bool validate_accept_key(const std::string& accept_key, const std::string& sent_key) {
-    std::string combined = sent_key + WS_GUID;
-    std::string sha1_hash = ::thinger::util::sha1::hash(combined);
-    std::string expected = ::thinger::util::base64::encode(
+std::string accept_key(const std::string& sent_key) {
+    std::string sha1_hash = ::thinger::util::sha1::hash(sent_key + WS_GUID);
+    return ::thinger::util::base64::encode(
         reinterpret_cast<const unsigned char*>(sha1_hash.data()),
         sha1_hash.size()
     );
-    return accept_key == expected;
+}
+
+bool validate_accept_key(const std::string& accept_key, const std::string& sent_key) {
+    return accept_key == websocket_util::accept_key(sent_key);
 }
 
 } // namespace thinger::http::websocket_util

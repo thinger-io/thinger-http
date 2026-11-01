@@ -12,7 +12,11 @@ int main(int argc, char* argv[]) {
         url = argv[1];
     }
 
-    http::async_client client;
+    // The workers the clients run on: the application starts them, and stops them at the end
+    asio::workers workers;
+    workers.start();
+
+    http::async_client client(workers);
 
     // ============================================
     // Example 1: Simple callback API
@@ -117,5 +121,6 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\nAll examples completed!" << std::endl;
 
+    workers.stop();
     return 0;
 }

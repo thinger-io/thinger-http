@@ -4,8 +4,10 @@
 #include <memory>
 #include <functional>
 #include <atomic>
+#include <chrono>
 
 #include "sockets/socket.hpp"
+#include "watchdog.hpp"
 #include "../util/types.hpp"
 
 namespace thinger::asio {
@@ -18,7 +20,9 @@ namespace thinger::asio {
 /// the tunnel closes the other.
 /// Both sockets are used from the coroutine running run() (start() runs it on the io_context
 /// of the source), so they must belong to that io_context.
-/// set_on_end() must be called before run()/start().
+/// set_on_end() and set_idle_timeout() must be called before run()/start(). With an idle
+/// deadline, both directions move one timer, so run() must run where they never run at once:
+/// an io_context run by one thread (as the library's workers are), or a strand.
 /// cancel(), the transfer stats and the socket getters may be called from any thread.
 class socket_pipe : public std::enable_shared_from_this<socket_pipe> {
 public:
@@ -40,6 +44,13 @@ public:
     /// Completion callback (called from destructor).
     void set_on_end(sync_callback<void()> listener);
 
+    /// End the pipe (both sockets closed, as cancel() does) once nothing was forwarded in
+    /// either direction for `timeout`. A byte counts once written to the other socket, so a
+    /// peer that does not read lets the pipe end too. Off by default (zero), as in 0.8: a
+    /// generic tunnel, often long-lived and quiet with its own keepalive, has no deadline
+    /// unless one is set (the reverse proxy sets one, see proxy_options::tunnel_idle_timeout).
+    void set_idle_timeout(std::chrono::milliseconds timeout);
+
     /// Transfer stats (safe to read from any thread after run() completes).
     size_t bytes_source_to_target() const;
     size_t bytes_target_to_source() const;
@@ -49,15 +60,18 @@ public:
     std::shared_ptr<socket> get_target() const;
 
 private:
-    /// Forward data in one direction: from -> to.
+    /// Forward data in one direction: from -> to, moving the idle deadline (if any) after
+    /// each write.
     awaitable<void> forward(
         std::shared_ptr<socket> from,
         std::shared_ptr<socket> to,
-        std::atomic<size_t>& bytes_transferred);
+        std::atomic<size_t>& bytes_transferred,
+        watchdog* idle);
 
     std::shared_ptr<socket> source_;
     std::shared_ptr<socket> target_;
     sync_callback<void()> on_end_;
+    std::chrono::milliseconds idle_timeout_{0};
     std::atomic<bool> cancelled_{false};
     std::atomic<size_t> bytes_s2t_{0};
     std::atomic<size_t> bytes_t2s_{0};

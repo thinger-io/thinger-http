@@ -48,11 +48,13 @@ public:
 
     // wait
     awaitable<boost::system::error_code> wait(boost::asio::socket_base::wait_type type) override;
+    awaitable<boost::system::error_code> peer_closed() override;
 
     // some getters to check the state
     bool is_open() const override;
     bool is_secure() const override;
     size_t available() const override;
+    size_t send_backlog() const override;
     bool readable_now() const override;
     std::string get_remote_ip() const override;
     std::string get_local_port() const override;

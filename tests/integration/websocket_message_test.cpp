@@ -3,6 +3,7 @@
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
+#include <thinger/http/server/websocket_connection.hpp>
 
 #include "server_test_helpers.hpp"
 #include "../fixtures/stream_test_helpers.hpp"
@@ -19,7 +20,7 @@ namespace {
 
     void echo_route(http::server& server) {
         server.get("/echo", [](http::request& req, http::response& res) {
-            res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) {
+            res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection> ws) {
                 ws->on_message([ws](std::string message, bool binary) {
                     if (binary) ws->send_binary(std::move(message));
                     else ws->send_text(std::move(message));
@@ -37,15 +38,17 @@ namespace {
 
 }
 
-TEST_CASE("WebSocket messages larger than a read are echoed whole", "[websocket][message][integration]") {
+TEST_CASE("WebSocket messages larger than a read are echoed whole", "[websocket][message][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     http::server server;
     echo_route(server);
-    running_server running(server);
-    auto url = "ws://127.0.0.1:" + std::to_string(running.port) + "/echo";
+    running_server running(server, kind);
+    auto url = running.url("/echo");
 
     for (size_t size : {size_t(64 * 1024), size_t(100 * 1024), size_t(1024 * 1024)}) {
         DYNAMIC_SECTION("Library client, " << size << " bytes") {
             http::client client;
+            running.configure(client);
             auto ws = client.websocket(url);
             REQUIRE(ws);
 
@@ -65,7 +68,7 @@ TEST_CASE("WebSocket messages larger than a read are echoed whole", "[websocket]
         }
 
         DYNAMIC_SECTION("Raw client, one frame and fragmented, " << size << " bytes") {
-            raw_ws_client client(running.port);
+            raw_ws_client client(running.endpoint());
             REQUIRE(client.handshake("/echo").starts_with("HTTP/1.1 101"));
 
             auto binary = pattern(size, unsigned(size) + 1);

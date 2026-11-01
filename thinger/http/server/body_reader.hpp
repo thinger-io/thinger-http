@@ -28,8 +28,9 @@ namespace thinger::http {
      */
     class body_reader {
     public:
-        /// Reads up to `size` bytes from the connection: 0 on end of stream or error
-        using source = std::function<thinger::awaitable<size_t>(uint8_t* buffer, size_t size)>;
+        /// Reads up to `size` bytes from the connection: 0 on end of stream or error (see
+        /// detail::request_source::read_body_some())
+        using source = std::function<thinger::awaitable<io_result>(uint8_t* buffer, size_t size)>;
 
         /// Bytes read from the connection at once while decoding chunked framing (never more
         /// than the connection read buffer, as the excess is handed to the next request)
@@ -51,7 +52,9 @@ namespace thinger::http {
         size_t limit() const { return limit_; }
 
         void set_read_ahead(const uint8_t* data, size_t size);
-        size_t read_ahead_available() const;
+
+        /// Read-ahead bytes not consumed yet
+        size_t buffered() const;
 
         /// Remove and return the unconsumed read-ahead bytes (data following the body)
         std::vector<uint8_t> take_read_ahead();

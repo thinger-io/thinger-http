@@ -7,6 +7,7 @@
 #include <thinger/http/server/http_application.hpp>  // routes, hosts and middlewares a server serves
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
+#include <thinger/http/server/upgrade.hpp>       // what upgrades and takeovers hand out (server_scope...)
 #include <thinger/http/server/reverse_proxy.hpp>     // forwarding requests to other servers
 
 // Routing

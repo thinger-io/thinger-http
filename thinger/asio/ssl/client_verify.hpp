@@ -10,7 +10,7 @@ namespace thinger::asio {
 
 // The client certificate policy of a TLS listener (see client_verify_options), set on the SSL
 // of each of its connections before the handshake, never on the context it listens with: that
-// context may be shared with other listeners (e.g. the default certificate of the
+// context may be shared with other listeners (e.g. the default certificate of a
 // certificate_manager), which keep their own policies.
 //
 // Each connection gets a session id context of its own policy (a digest of its options), so a

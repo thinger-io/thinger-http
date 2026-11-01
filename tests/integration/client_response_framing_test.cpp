@@ -10,6 +10,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include "../fixtures/running_workers.hpp"
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -109,7 +110,8 @@ namespace {
     }
 
     http::client_response async_get(const std::string& url) {
-        http::async_client client;
+        thinger::http::test::running_workers workers;
+        http::async_client client(workers);
         client.timeout(5s);
         http::client_response result;
         client.get(url, [&](http::client_response& res) { result = res; });

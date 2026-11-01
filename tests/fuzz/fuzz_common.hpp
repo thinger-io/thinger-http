@@ -127,7 +127,7 @@ namespace fuzz {
     /**
      * Process the request at the start of `data` as the server does: parse the request line
      * and headers with request_factory in headers-only mode (server_connection), reject
-     * ambiguous framing (http_server_base::process_request), then read the body with
+     * ambiguous framing (http_application::handle), then read the body with
      * body_reader from the bytes following the headers (the read-ahead), which never reads
      * past the end of the body. The request ends where the read-ahead left by the body
      * reader starts. As there is no connection to read more data from, a request that needs
@@ -185,7 +185,7 @@ namespace fuzz {
         }
         check(!reader.has_pending(), "body read completed with pending data");
 
-        size_t leftover = reader.read_ahead_available();
+        size_t leftover = reader.buffered();
         check(leftover <= available, "read-ahead grew while reading the body");
         r.end = size - leftover;
         check(r.end >= r.header_end, "request ends before its headers");

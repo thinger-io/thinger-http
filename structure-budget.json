@@ -1,0 +1,101 @@
+{
+  "_comment": "Budgets of the guardrails H1-H10 (target design §6), checked by .github/scripts/structure_budget.py. They only go down: lower a value when a change improves it; raising one needs the code owners review. H10 values are line counts that only warn.",
+  "H1.headers": 105,
+  "H1.public": 105,
+  "H1.dead": 4,
+  "H2.singletons": 0,
+  "H2.singleton_uses": 0,
+  "H2.get_workers": 0,
+  "H2.namespace_mutables": 0,
+  "H2.static_counters": 3,
+  "H3.max_timers": 0,
+  "H3.generation_counters": 0,
+  "H3.detached": 2,
+  "H3.detached_allowed": 13,
+  "H4.socket_casts": 6,
+  "H4.frame_casts": 0,
+  "H6.matrix_cases": 186,
+  "H6.matrix_suites": 24,
+  "H7.using_namespace": 1,
+  "H7.logger_includes": 6,
+  "H7.camel_case": 2,
+  "H8.error_fields": 2,
+  "H8.last_error": 1,
+  "H8.optional_returns": 4,
+  "H9.server_client": 2,
+  "H9.asio_http": 0,
+  "H9.common_up": 3,
+  "H9.public_detail": 0,
+  "H10.server_connection.cpp": 762,
+  "H10.response.cpp": 786,
+  "H10.websocket_session.cpp": 885,
+  "H10.http_client_base.cpp": 714,
+  "H10.http_application.cpp": 806,
+  "_detached_allow_list": [
+    {
+      "file": "thinger/asio/listener.cpp",
+      "spawns": "serve_tls",
+      "reason": "The TLS handshake of an accepted connection, then its delivery: listed in the listener's pending handshakes until it ends, bounded by the handshake deadline; stop() closes it and waits for its delivery."
+    },
+    {
+      "file": "thinger/http/server/http_application.cpp",
+      "spawns": "dispatch",
+      "reason": "An in-memory dispatch with a callback: ends within the dispatch timeout (its handler may go on, counted apart), then calls the callback once."
+    },
+    {
+      "file": "thinger/http/server/server_connection.cpp",
+      "spawns": "socket_->write",
+      "reason": "The writer of the connection: one write at a time (writing_), holding the connection until it returns the turn."
+    },
+    {
+      "file": "thinger/http/server/server_connection.cpp",
+      "spawns": "drop_input",
+      "reason": "The graceful close of a lingering connection: holds it, bounded by the linger byte limit and timeout."
+    },
+    {
+      "file": "thinger/http/server/sse_connection.cpp",
+      "spawns": "read_loop",
+      "reason": "The read loop of an SSE stream: holds it and ends when the client goes or the stream stops; it owns the stream."
+    },
+    {
+      "file": "thinger/http/server/websocket_connection.cpp",
+      "spawns": "read_messages",
+      "reason": "The read loop of a WebSocket connection: holds it, ends when it closes or is released, and breaks the callback cycles when it ends."
+    },
+    {
+      "file": "thinger/http/server/websocket_connection.cpp",
+      "spawns": "close_graceful",
+      "reason": "The closing handshake of a WebSocket connection: holds it, bounded by the websocket's CLOSE_TIMEOUT, and wakes its reader when it ends."
+    },
+    {
+      "file": "thinger/http/server/detail/push_queue.hpp",
+      "spawns": "write_loop",
+      "reason": "The writer of a push connection's queue (WebSocket, SSE): one at a time (writing_), holding its owner until the queue is empty or closed."
+    },
+    {
+      "file": "thinger/asio/sockets/websocket.cpp",
+      "spawns": "flush_control",
+      "reason": "The writer of the control frames queued during a write: holds the websocket, which keeps the write turn until they are sent."
+    },
+    {
+      "file": "thinger/asio/sockets/websocket.cpp",
+      "spawns": "linger",
+      "reason": "The closing handshake once the websocket closed: owns its socket, bounded by CLOSE_TIMEOUT."
+    },
+    {
+      "file": "thinger/asio/socket_pipe.cpp",
+      "spawns": "run",
+      "reason": "The loop of a socket pipe: holds it and ends when either socket ends or cancel() is called, closing both."
+    },
+    {
+      "file": "thinger/http/server/reverse_proxy/proxy_tunnel.cpp",
+      "spawns": "run_tunnel",
+      "reason": "The loop of an upgraded proxy tunnel: owns both sockets and ends when either one closes."
+    },
+    {
+      "file": "thinger/http/client/websocket_client.cpp",
+      "spawns": "message_loop",
+      "reason": "The message loop of a WebSocket client (run()): ends when reading fails; stop() and the destructor close the connection."
+    }
+  ]
+}

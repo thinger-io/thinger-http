@@ -2,6 +2,8 @@
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
+#include <thinger/http/server/sse_connection.hpp>
+#include <thinger/http/server/websocket_connection.hpp>
 
 #include "server_test_helpers.hpp"
 #include "../fixtures/stream_test_helpers.hpp"
@@ -284,7 +286,7 @@ TEST_CASE("Response hook reports connections handed over once their response is 
     log.attach(server);
     std::promise<std::weak_ptr<http::websocket_connection>> created;
     server.get("/ws", [&](http::response& res) {
-        res.upgrade_websocket([&](std::shared_ptr<http::websocket_connection> ws) {
+        res.upgrade_websocket({}, [&](std::shared_ptr<http::websocket_connection> ws) {
             ws->on_message([](std::string, bool) {});
             created.set_value(ws);
         });
@@ -344,6 +346,10 @@ TEST_CASE("Response hook reports requests never answered", "[server][response_ho
             sock.connect({boost::asio::ip::make_address("127.0.0.1"), running.port});
             boost::asio::write(sock, boost::asio::buffer(std::string("GET /never HTTP/1.1\r\nHost: localhost\r\n\r\n")));
             REQUIRE(eventually([&] { return kept->load() > 0; }));
+            // A reset: a half-close (a FIN alone) is no leaving, the response is still awaited.
+            // Closed here: asio clears the linger option of a socket closed by its destructor
+            sock.set_option(boost::asio::socket_base::linger(true, 0));
+            sock.close();
         }
         auto reported = log.single();
         REQUIRE(reported.path == "/never");

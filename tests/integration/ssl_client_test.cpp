@@ -3,6 +3,7 @@
 #include <thinger/http/client/async_client.hpp>
 #include <thinger/util/types.hpp>
 #include "../fixtures/ssl_test_server_fixture.hpp"
+#include "../fixtures/running_workers.hpp"
 #include <chrono>
 #include <future>
 #include <atomic>
@@ -204,11 +205,12 @@ TEST_CASE("HTTPS Client Redirects", "[ssl][integration]") {
 }
 
 TEST_CASE("HTTPS Async Client", "[ssl][integration][async]") {
+    thinger::http::test::running_workers workers;
     thinger::http::test::SSLTestServerFixture fixture;
     auto& base_url = fixture.base_url;
 
     SECTION("Async GET request to HTTPS endpoint with callback") {
-        http::async_client client;
+        http::async_client client(workers);
         client.timeout(10s);
         client.verify_ssl(false);
 
@@ -226,7 +228,7 @@ TEST_CASE("HTTPS Async Client", "[ssl][integration][async]") {
     }
 
     SECTION("Async POST request to HTTPS endpoint with callback") {
-        http::async_client client;
+        http::async_client client(workers);
         client.timeout(10s);
         client.verify_ssl(false);
 
@@ -250,7 +252,7 @@ TEST_CASE("HTTPS Async Client", "[ssl][integration][async]") {
     }
 
     SECTION("Async request using coroutine pattern") {
-        http::async_client client;
+        http::async_client client(workers);
         client.timeout(10s);
         client.verify_ssl(false);
 

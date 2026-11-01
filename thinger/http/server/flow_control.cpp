@@ -6,8 +6,9 @@ namespace thinger::http {
     write_flow::write_flow(boost::asio::any_io_executor executor, write_limits limits) :
         executor_(std::move(executor)),
         state_(std::make_shared<shared_state>()),
-        drained_(executor_, boost::asio::steady_timer::time_point::max()),
-        write_timer_(executor_)
+        drained_(executor_),
+        // a member: never called once this is gone
+        write_timer_(executor_, [this]{ write_expired(); })
     {
         set_limits(limits);
     }
@@ -18,10 +19,17 @@ namespace thinger::http {
     }
 
     void write_flow::set_limits(const write_limits& limits){
+        auto timed = limits_.write_timeout.count() > 0;
         limits_ = limits;
         // the low watermark is never above the high one
         limits_.low_watermark = std::min(limits_.low_watermark, limits_.high_watermark);
         update_watermarks();
+        // a pending write gets the new deadline at once: from its last progress, or from now
+        // if it had none (0 disarms it)
+        if(write_watched_ && !closed_){
+            if(!timed) write_progress_ = std::chrono::steady_clock::now();
+            arm_write_timer();
+        }
     }
 
     bool write_flow::overflows(size_t size, size_t dropped_bytes, size_t dropped_messages) const{
@@ -54,10 +62,11 @@ namespace thinger::http {
         auto queued = queued_bytes();
         if(!congested_ && limits_.high_watermark && queued >= limits_.high_watermark){
             congested_ = true;
+            drained_.reset();
             notify(true);
         }else if(congested_ && (!limits_.high_watermark || queued <= limits_.low_watermark)){
             congested_ = false;
-            drained_.cancel();
+            drained_.set();
             notify(false);
         }
     }
@@ -75,7 +84,7 @@ namespace thinger::http {
 
     awaitable<bool> write_flow::wait_writable(){
         while(congested_ && !closed_){
-            co_await drained_.async_wait(use_nothrow_awaitable);
+            co_await drained_.wait();
             auto state = co_await boost::asio::this_coro::cancellation_state;
             if(state.cancelled() != boost::asio::cancellation_type::none) co_return false;
         }
@@ -108,21 +117,75 @@ namespace thinger::http {
         return on_executor(executor_, std::move(owner), wait_writable());
     }
 
-    void write_flow::watch_write(sync_callback<void()> on_timeout){
+    void write_flow::write_started(sync_callback<void()> on_timeout){
+        if(closed_) return;
+        // watched also without a deadline, which set_limits() may give it meanwhile
         write_watched_ = true;
-        auto generation = ++state_->write_generation;
-        write_timer_.expires_after(limits_.write_timeout);
-        write_timer_.async_wait([state = state_, generation, on_timeout = std::move(on_timeout)](const boost::system::error_code& ec){
-            if(ec || state->closed || state->write_generation != generation) return;
-            on_timeout();
-        });
+        on_write_timeout_ = std::move(on_timeout);
+        write_progressed();
+    }
+
+    void write_flow::write_progressed(){
+        if(!write_watched_ || limits_.write_timeout.count() <= 0) return;
+        write_progress_ = std::chrono::steady_clock::now();
+        backlog_checked_ = false;
+        arm_write_timer();
+    }
+
+    void write_flow::set_send_backlog(sync_callback<size_t()> backlog){
+        send_backlog_ = std::move(backlog);
+    }
+
+    namespace {
+        std::chrono::milliseconds backlog_interval(std::chrono::milliseconds timeout){
+            return std::max(timeout / write_flow::BACKLOG_CHECKS, std::chrono::milliseconds(1));
+        }
+    }
+
+    void write_flow::arm_write_timer(){
+        if(limits_.write_timeout.count() <= 0){
+            write_timer_.cancel();
+            return;
+        }
+        // a later deadline does not touch the timer (see watchdog): the backlog is checked only
+        // once it passes, so a write that progresses within it costs no timer operation
+        write_timer_.expires_at(write_progress_ + limits_.write_timeout);
+    }
+
+    void write_flow::write_expired(){
+        // the deadline of a write already finished (see write_finished())
+        if(!write_watched_) return;
+        if(send_backlog_ && limits_.write_timeout.count() > 0){
+            auto now = std::chrono::steady_clock::now();
+            auto backlog = send_backlog_();
+            // the first check, at the deadline, watches the backlog for BACKLOG_WATCH more (a peer
+            // may take bytes in bursts, e.g. a window of one segment, 64 KiB over loopback); then
+            // the peer taking bytes since the last check is progress, as the socket taking some
+            auto deadline = now + limits_.write_timeout / BACKLOG_WATCH;
+            if(backlog_checked_){
+                if(backlog < backlog_seen_) write_progress_ = now;
+                deadline = std::min(now + backlog_interval(limits_.write_timeout), write_progress_ + limits_.write_timeout);
+            }
+            backlog_seen_ = backlog;
+            backlog_checked_ = true;
+            if(now < deadline){
+                write_timer_.expires_at(deadline);
+                return;
+            }
+        }
+        // on_timeout may destroy this, so nothing of it is touched after the call
+        auto on_timeout = std::move(on_write_timeout_);
+        on_write_timeout_ = nullptr;
+        if(on_timeout) on_timeout();
     }
 
     void write_flow::write_finished(){
         if(!write_watched_) return;
         write_watched_ = false;
-        ++state_->write_generation;
-        write_timer_.cancel();
+        // the timer is left armed: the next write's deadline, later, does not touch it (see
+        // watchdog), so a stream of writes costs no timer operation each; an expiry with no
+        // write pending does nothing
+        on_write_timeout_ = nullptr;
     }
 
     void write_flow::close(){
@@ -131,8 +194,9 @@ namespace thinger::http {
         state_->closed = true;
         state_->on_high = nullptr;
         state_->on_low = nullptr;
-        drained_.cancel();
+        drained_.set();
         write_timer_.cancel();
+        on_write_timeout_ = nullptr;
     }
 
 }

@@ -98,7 +98,8 @@ struct proxy_options {
 
     // Maximum time without any data exchanged once connected (waiting for the response
     // included): 504 if the response has not started, or the connection to the client is
-    // closed if it has. Zero disables it (e.g. for event streams).
+    // closed if it has. Zero disables it (e.g. for event streams). It covers the exchange
+    // only: a tunnel has its own, tunnel_idle_timeout.
     std::chrono::milliseconds idle_timeout{60000};
 
     // Maximum time for the whole exchange, connection included; zero for no limit
@@ -112,6 +113,18 @@ struct proxy_options {
 
     // Forward protocol upgrades (WebSocket...) as a tunnel between the client and the target
     bool allow_upgrade = true;
+
+    // Default of tunnel_idle_timeout: above the 60 s after which a thinger-http WebSocket
+    // pings a quiet peer, so a quiet WebSocket is not cut before its keepalive sends anything,
+    // and equal to its WebSocket and connection idle timeouts (120 s). nginx (60 s), AWS ALB
+    // (60 s) and Cloudflare (100 s) close idle tunnels earlier
+    static constexpr std::chrono::milliseconds DEFAULT_TUNNEL_IDLE_TIMEOUT{120000};
+
+    // Maximum time a tunnel (see allow_upgrade) stays open with nothing forwarded in either
+    // direction: then the connections to the client and to the target are closed. Any byte
+    // forwarded counts, so WebSocket data, pings and pongs keep it open, while a peer that
+    // stops reading lets it end. Independent of idle_timeout: zero disables it.
+    std::chrono::milliseconds tunnel_idle_timeout = DEFAULT_TUNNEL_IDLE_TIMEOUT;
 
     // Change the request sent to the target before it is sent: its method, path (get_uri())
     // and headers, e.g. to add credentials or remove the Authorization of the client. The

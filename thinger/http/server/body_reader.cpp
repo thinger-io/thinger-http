@@ -33,12 +33,12 @@ namespace thinger::http {
         }
     }
 
-    size_t body_reader::read_ahead_available() const {
+    size_t body_reader::buffered() const {
         return read_ahead_.size() > read_ahead_offset_ ? read_ahead_.size() - read_ahead_offset_ : 0;
     }
 
     std::vector<uint8_t> body_reader::take_read_ahead() {
-        std::vector<uint8_t> data(read_ahead_.begin() + static_cast<std::ptrdiff_t>(read_ahead_.size() - read_ahead_available()),
+        std::vector<uint8_t> data(read_ahead_.begin() + static_cast<std::ptrdiff_t>(read_ahead_.size() - buffered()),
                                   read_ahead_.end());
         read_ahead_.clear();
         read_ahead_offset_ = 0;
@@ -51,20 +51,21 @@ namespace thinger::http {
     }
 
     thinger::awaitable<size_t> body_reader::read_raw(uint8_t* buffer, size_t max_size) {
-        if (size_t available = read_ahead_available()) {
+        if (size_t available = buffered()) {
             size_t bytes = std::min(available, max_size);
             std::memcpy(buffer, read_ahead_.data() + read_ahead_offset_, bytes);
             read_ahead_offset_ += bytes;
             co_return bytes;
         }
         if (!source_) co_return 0;
-        co_return co_await source_(buffer, max_size);
+        auto [ec, bytes] = co_await source_(buffer, max_size);
+        co_return bytes;
     }
 
     thinger::awaitable<bool> body_reader::fill_read_ahead() {
         read_ahead_.resize(framing_read_size);
         read_ahead_offset_ = 0;
-        size_t bytes = source_ ? co_await source_(read_ahead_.data(), read_ahead_.size()) : 0;
+        size_t bytes = source_ ? std::get<1>(co_await source_(read_ahead_.data(), read_ahead_.size())) : 0;
         read_ahead_.resize(bytes);
         co_return bytes > 0;
     }
@@ -83,10 +84,10 @@ namespace thinger::http {
 
     thinger::awaitable<size_t> body_reader::read_some_chunked(uint8_t* buffer, size_t max_size) {
         while (!decoder_.done()) {
-            if (read_ahead_available() == 0) {
+            if (buffered() == 0) {
                 // Within chunk data: read it straight into the caller buffer
                 if (size_t pending = decoder_.data_pending()) {
-                    size_t bytes = source_ ? co_await source_(buffer, std::min(pending, max_size)) : 0;
+                    size_t bytes = source_ ? std::get<1>(co_await source_(buffer, std::min(pending, max_size))) : 0;
                     if (bytes == 0) {
                         if (!co_await cancelled()) error_ = body_error::incomplete;
                         co_return 0;
@@ -103,7 +104,7 @@ namespace thinger::http {
             }
 
             size_t produced = 0;
-            read_ahead_offset_ += decoder_.decode(read_ahead_.data() + read_ahead_offset_, read_ahead_available(),
+            read_ahead_offset_ += decoder_.decode(read_ahead_.data() + read_ahead_offset_, buffered(),
                                                   buffer, max_size, produced);
             if (decoder_.failed()) {
                 error_ = body_error::malformed;

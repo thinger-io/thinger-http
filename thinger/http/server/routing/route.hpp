@@ -6,6 +6,7 @@
 #include <type_traits>
 #include <map>
 #include <functional>
+#include <initializer_list>
 #include <regex>
 #include <string>
 #include <vector>
@@ -260,7 +261,9 @@ public:
     // matched) until its response starts, middlewares and body reading included. On expiry
     // the request is answered with `status` (504 Gateway Timeout by default, or e.g. 503
     // Service Unavailable) through the error formatter, and later answers from the callback
-    // are dropped; the callback is not cancelled: it goes on until it ends. Responses started
+    // are dropped. Then the scope of the request is cancelled with cancel_reason::timeout: the
+    // callback goes on until it ends, unless the route declared cancel_on(timeout), which
+    // interrupts it (see cancel_on). Responses started
     // in time (streams, chunked responses, SSE, WebSocket and other takeovers) are never cut.
     // If the body was not read whole, the connection is closed after the response. Unset,
     // the timeout of its virtual host applies, if any (see virtual_host::timeout); zero for
@@ -271,6 +274,38 @@ public:
     // Timeout set for the route (nullopt if unset, zero for none), and its status
     const std::optional<std::chrono::milliseconds>& get_timeout() const { return timeout_; }
     http_response::status get_timeout_status() const { return timeout_status_; }
+
+    // Maximum time to receive a request, its body read to its end, from its start (its first
+    // byte), instead of the one of its virtual host or the connection (see
+    // virtual_host::request_timeout, connection_options::request_timeout): e.g. longer for a
+    // route receiving large uploads. On expiry its scope is cancelled (cancel_reason::timeout),
+    // a pending body read fails, and the request is answered 408 Request Timeout unless its
+    // response started (the connection is closed then); later answers from the callback are
+    // dropped, and the connection is closed. A request without a body is received with its
+    // head: it never applies to it (its response time is what timeout() bounds). Zero for no
+    // deadline.
+    route& request_timeout(std::chrono::milliseconds timeout);
+
+    // Request deadline set for the route (nullopt if unset, zero for none)
+    const std::optional<std::chrono::milliseconds>& get_request_timeout() const { return request_timeout_; }
+
+    // The reasons for which the library interrupts the callback (see cancel_reason): when
+    // the scope of its request is cancelled for one of them, the awaits of the callback end
+    // with operation_aborted (asio cancels its coroutine; its next co_await throws). None
+    // by default: the callback goes on and finds the reason in request::cancelled(), or binds
+    // request::cancellation_slot() to the awaits it can abandon. Shutdown at the drain
+    // deadline interrupts every callback, declared or not. none is ignored, so {} or {none}
+    // keep the default. Set on each route: groups and hosts do not carry it. Work that must
+    // not be interrupted on such a route runs outside the cancellation state of the callback:
+    // after co_await boost::asio::this_coro::reset_cancellation_state(
+    // boost::asio::disable_cancellation()) (without a filter, the reset lets the terminal
+    // cancellation through), or in a coroutine of its own, co_spawned with no slot
+    // (bind_cancellation_slot(boost::asio::cancellation_slot{}, use_awaitable)). The scope is
+    // cancelled once: check request::cancelled() afterwards
+    route& cancel_on(std::initializer_list<cancel_reason> reasons);
+
+    // The reasons set with cancel_on(), as bits 1 << reason (0 for none)
+    uint8_t get_cancel_on() const { return cancel_on_; }
 
     // Limits of the body decoded for the callback, instead of those of its virtual host or
     // the application (see virtual_host::decode_limits, http_application::set_body_limits)
@@ -352,7 +387,9 @@ private:
     std::optional<size_t> max_body_size_;
     std::optional<std::chrono::milliseconds> timeout_;
     http_response::status timeout_status_ = http_response::status::gateway_timeout;
+    std::optional<std::chrono::milliseconds> request_timeout_;
     std::optional<body_limits> decode_limits_;
+    uint8_t cancel_on_ = 0;
 
     // Documentation and metadata
     std::string summary_;

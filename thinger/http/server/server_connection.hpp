@@ -1,7 +1,7 @@
 #ifndef THINGER_SERVER_HTTP_SERVER_CONNECTION_HPP
 #define THINGER_SERVER_HTTP_SERVER_CONNECTION_HPP
 
-#include <queue>
+#include <deque>
 #include <atomic>
 #include "request_factory.hpp"
 #include "../common/http_frame.hpp"
@@ -9,28 +9,38 @@
 #include "../common/http_response.hpp"
 #include "http_stream.hpp"
 #include "connection_tracker.hpp"
+#include "../../asio/async_event.hpp"
+#include "../../asio/watchdog.hpp"
 #include "../../util/types.hpp"
 
 namespace thinger::http {
 
 class request;
+struct connection_options;
+
+namespace detail {
+    class connection_source;
+}
 
 class server_connection : public std::enable_shared_from_this<server_connection>, public tracked_connection {
 
     static constexpr size_t MAX_BUFFER_SIZE = 4096;
-    static constexpr auto DEFAULT_TIMEOUT = std::chrono::seconds{120};
 
 public:
-    explicit server_connection(std::shared_ptr<asio::socket> socket);
+    // A connection served with the settings of `options` (its server's, see
+    // server_base::set_connection_options()): the defaults if null
+    explicit server_connection(std::shared_ptr<asio::socket> socket,
+                               std::shared_ptr<const connection_options> options = nullptr);
     virtual ~server_connection();
 
     // Count the connection among those of a server (its statistics, and its shutdown), before
     // start(). A connection taken over then counts as such, while its socket lives
     void track(const std::shared_ptr<connection_tracker>& tracker);
 
-    // Start processing requests (spawns the read loop coroutine). Closed right away if the
-    // server it is tracked by shuts down
-    void start(std::chrono::seconds timeout = DEFAULT_TIMEOUT);
+    // Start processing requests (spawns the read loop coroutine), closed once idle for the
+    // idle_timeout of its options, or at the deadlines of a request (see connection_options).
+    // Closed right away if the server it is tracked by shuts down
+    void start();
 
     // Release the socket for upgrades (WebSocket, etc.)
     std::shared_ptr<asio::socket> release_socket();
@@ -64,35 +74,24 @@ public:
     // reading the request body (on the connection thread)
     void extend_timeout();
 
-    // Keep the connection open at least until `time`, whatever its activity: a request with
-    // a timeout of its own (see route::timeout) may wait for its response longer than the
-    // connection timeout (on the connection thread)
+    // Do not close the connection as idle before `time`: a request with a timeout of its own
+    // (see route::timeout) may wait for its response longer than the idle timeout. The
+    // deadlines of a request still apply (on the connection thread)
     void hold_until(std::chrono::steady_clock::time_point time);
 
-    // Lingering close (RFC 9112 section 9.6), for the connections of every server in the
-    // process: a connection closed after a response while input of its request may still be
-    // arriving (e.g. a body over the limit, answered 413 before it was read) stops sending, then
-    // reads and drops what arrives until the client closes, `max_bytes` were dropped or `timeout`
-    // passed, whatever comes first, and closes. Closed at once instead, the unread data makes the
-    // system reset the connection, and a client still sending may never read the response. Zero
-    // for either closes at once (also on sockets that cannot half-close, such as custom ones).
-    // A graceful shutdown of the server closes the connections lingering at once
-    static constexpr size_t default_linger_max_bytes = 8 * 1024 * 1024;
-    static constexpr std::chrono::milliseconds default_linger_timeout{5000};
-    static void set_lingering_close(size_t max_bytes, std::chrono::milliseconds timeout);
-
-    // Whether the connection closes gracefully (see set_lingering_close()): nothing more is read
-    // from it but by itself (on the connection thread)
+    // Whether the connection closes gracefully (see linger()): nothing more is read from it but
+    // by itself (on the connection thread)
     bool lingering() const { return lingering_; }
 
     void set_handler(std::function<awaitable<void>(std::shared_ptr<request>)> handler) {
         handler_ = std::move(handler);
     }
 
-    // How the requests and responses are logged (see body_logging)
-    void set_body_logging(const body_logging& options) { body_logging_ = options; }
-
 private:
+    // The source of a request read here, for its stream (see detail::request_source)
+    friend class detail::connection_source;
+    std::unique_ptr<detail::request_source> make_source(http_stream& stream);
+
     // Read requests, one after another, and hand each to the handler
     awaitable<void> read_loop();
 
@@ -113,30 +112,49 @@ private:
     // The connection ended without being taken over
     void stop_reading();
 
+    // Once reading stops after a request whose response ended: close gracefully if its body
+    // still comes
+    void linger_unread(const http_stream& stream);
+
     // The server shuts down: close once idle, or after the response in progress (which tells
-    // the client); or close right away
+    // the client); or close right away. At the deadline, before the close, the handlers still
+    // running are cancelled (cancel_reason::shutdown)
     void shutdown_drain() override;
+    void shutdown_cancel() override;
     void shutdown_close() override;
 
-    // A frame is queued while frame_watch_ is set. Kept out of queue_frame(), which only tests
-    // the flags on the way of every frame
-    [[gnu::noinline, gnu::cold]] void watch_frame(const std::shared_ptr<http_stream>& stream,
-                                                  const std::shared_ptr<http_frame>& frame);
+    // A frame of `stream` is queued while frame_watch_ is set. Kept out of queue_frame(), which
+    // only tests the flags on the way of every frame
+    [[gnu::noinline, gnu::cold]] void watch_frame(http_stream& stream);
 
     // Wait until the response of a stream has started, or the connection is closed
     awaitable<void> wait_response(const http_stream& stream);
 
-    // Wait until the client sends data or closes the connection; a socket that cannot wait
-    // (e.g. one defined by an application) is not watched
-    enum class peer_state { data, closed, not_watchable };
-    awaitable<peer_state> wait_peer_closed();
+    // The peer watcher: the only reader of the socket while a request is handled, and until
+    // its response starts (the read loop reads it otherwise). Once the body of the request
+    // was read, it waits for the socket to be readable: data (the next request) stays there,
+    // a half-close makes the connection close after the response, and anything else (a reset)
+    // cancels the scope of the request (client_gone) and closes the connection. A socket that
+    // cannot wait (e.g. one defined by an application) is not watched
+    awaitable<void> watch_loop();
+    awaitable<void> watch_peer(http_stream& stream);
+    // Watch the client for `stream`; stop it (on its own, but for a read in progress over
+    // TLS, see watch_reading_); stop it for good, as the read loop stops
+    void watch(const std::shared_ptr<http_stream>& stream);
+    void unwatch();
+    void stop_watcher();
+    // Wake the watcher for the stream it watches: started then, the first time
+    void wake_watcher();
+    // Whether the watcher still watches for `stream`
+    bool watching(const http_stream& stream) const;
 
     // Queue a response frame (on the connection executor)
     void queue_frame(const std::shared_ptr<http_stream>& stream, std::shared_ptr<http_frame> frame);
 
-    // Once a frame of `stream` is written (or its write failed): close the connection or
-    // hand it over when its response ends, as required
-    void frame_written(http_stream& stream, const std::shared_ptr<http_frame>& frame, bool written);
+    // Once a frame of `stream` is written (or its write failed, with `ec`): close the
+    // connection or hand it over when its response ends, as required
+    void frame_written(http_stream& stream, const std::shared_ptr<http_frame>& frame,
+                       const boost::system::error_code& ec);
 
     // A frame of a stream whose response is observed (see http_application::on_response) is
     // about to be written
@@ -148,15 +166,6 @@ private:
     // Handle stock error responses
     void handle_stock_error(std::shared_ptr<http_stream> stream, http_response::status status);
 
-    // Extend the connection deadline after some activity
-    void reset_timeout();
-
-    // Wait for the timer up to the deadline (it is re-armed there if the deadline moved)
-    void arm_timeout();
-
-    // Stop the timer (the next reset_timeout() arms it again)
-    void cancel_timeout();
-
     // Close connection
     void close();
 
@@ -164,48 +173,114 @@ private:
     // request may still be arriving (see linger()), else at once
     void close_after(const http_stream& stream);
 
-    // Close gracefully (RFC 9112 section 9.6): stop sending, drop what keeps arriving (see
-    // set_lingering_close()), then close. At once if the socket cannot half-close
+    // Close gracefully (RFC 9112 section 9.6): stop sending, drop what keeps arriving (up to
+    // the linger limits of its options, see connection_options), then close. At once if the
+    // socket cannot half-close, or either limit is zero; briefly if the server shuts down
     void linger();
     awaitable<void> drop_input(size_t max_bytes, std::chrono::milliseconds timeout);
 
     // Hand the socket over once the response is written and the read loop has stopped
     void complete_takeover(http_stream& stream);
 
+    // The deadlines of the connection (server_connection_deadlines.cpp), all on timeout_timer_,
+    // armed at the earliest of those that apply: idle (from the last activity, not before the
+    // hold); while the head of a request is read, the header deadline, and while its body is,
+    // the request deadline (both from the start of the request, see connection_options); while
+    // a response waits for the socket, the write deadline instead of idle (from its last
+    // progress). On expiry, the one that passed acts (see deadline_expired()); none passed (the
+    // head completed, the body was read, or the write went on, meanwhile), it is armed again
+    using clock = std::chrono::steady_clock;
+    void arm_deadline();
+    clock::time_point next_deadline() const;
+    void deadline_expired();
+    // Idle, or the write deadline while a response waits for the socket (see write_timeout)
+    clock::time_point idle_deadline() const;
+    // A frame waits for the socket (see process_output_queue()): its write deadline starts
+    void write_started();
+    // Whether `buffers` are written in slices, each one moving the write deadline (see
+    // asio::socket::write_slices()): a write deadline applies and they exceed one
+    bool write_in_slices(const std::vector<boost::asio::const_buffer>& buffers) const;
+    // The deadline of the head being read, if any applies (false otherwise)
+    bool head_deadline(clock::time_point& deadline) const;
+    // Bytes of a request head are about to be parsed (`pipelined`: read with the request before
+    // it): the first ones start the request, at the read that got them, or now for a pipelined
+    // one. A read leaving its head incomplete arms its header deadline (see head_incomplete())
+    void head_started(bool pipelined);
+    void head_incomplete();
+    // The head of a request was not complete at its deadline: 408, or a silent close if no
+    // byte of it arrived
+    void head_timed_out();
+    // The deadline of the body of the request in progress, while it is not read to its end, if
+    // any applies (false otherwise)
+    bool body_deadline(clock::time_point& deadline) const;
+    // The request deadline of the request of `stream`, set by its route (see
+    // route::request_timeout), from the start of the request; zero for none
+    void set_request_deadline(const http_stream& stream, std::chrono::milliseconds deadline);
+    // The body of the request of `stream` was not read to its end at its deadline: its scope is
+    // cancelled (cancel_reason::timeout), and it is answered 408 unless its response started,
+    // or another one is being written; the connection is closed after it (or at once). What
+    // the handler reads or writes afterwards fails
+    void request_timed_out(http_stream& stream);
+    // Answer `status` with a stock reply on a stream of its own, closing the connection after
+    // it (gracefully if `input_pending`)
+    void answer_and_close(http_response::status status, detail::close_reason reason, bool input_pending);
+
 private:
     std::shared_ptr<asio::socket> socket_;
 
-    // The connection is closed when its deadline passes. Activity just moves the deadline:
-    // the timer is not touched on every request, it only checks the deadline on expiry
-    boost::asio::steady_timer timeout_timer_;
-    std::chrono::steady_clock::time_point deadline_;
-    // Not closed before this time either (see hold_until)
-    std::chrono::steady_clock::time_point hold_{};
-    bool timeout_armed_{false};
+    // The connection is closed when a deadline passes (see arm_deadline()): activity moves the
+    // idle one later (see extend_timeout()), a request holds it (see hold_until())
+    asio::watchdog timeout_timer_;
 
-    // Cancelled when a response starts, waking the read loop waiting for it
-    boost::asio::steady_timer response_started_;
+    // Set when a response starts, waking the read loop waiting for it (created by its first wait)
+    std::optional<asio::async_event> response_started_;
 
-    // Rare cases where a queued frame is looked at, all tested at once on the way of every
-    // frame: the read loop waits for a response to start, the connection drains, or the
-    // request in progress waits for its 100 Continue
+    // Bound to the read loop, which runs the handlers: the scope of the request being handled
+    // emits it to interrupt its handler (see http_stream::bind_handler())
+    boost::asio::cancellation_signal handler_signal_;
+
+    // The peer watcher (see watch_peer()): the stream it watches for (none while idle), set
+    // by the read loop, which wakes it (see wake_watcher()); the slot of its coroutine, emitted
+    // to end its wait; set once a read of it ends. Its events are created as it starts
+    std::shared_ptr<http_stream> watched_;
+    std::optional<asio::async_event> watch_wake_;
+    boost::asio::cancellation_signal watch_stop_;
+    std::optional<asio::async_event> watch_idle_;
+
+    // Rare cases where a queued frame matters, all tested at once on the way of every frame:
+    // the read loop waits for a response to start, the connection drains, or the request in
+    // progress waits for its 100 Continue
     enum : uint8_t { watch_response_start = 1, watch_draining = 2, watch_continue = 4 };
     uint8_t frame_watch_{0};
 
     // Stream of the request the read loop is handling, none while it waits for a request
     http_stream* in_progress_{nullptr};
-    std::chrono::seconds timeout_{DEFAULT_TIMEOUT};
+    // The idle timeout (from the options, see update_connection_timeout())
+    std::chrono::seconds timeout_;
+    // The last activity (a read, a frame written), the idle deadline counting from it; the
+    // connection is never closed as idle before the hold (see hold_until())
+    clock::time_point last_activity_{};
+    clock::time_point hold_{};
+    // The start of the request being read: its first byte, the start of serving the connection
+    // for the first one, or the start of parsing a pipelined one
+    clock::time_point request_start_{};
+    // The last progress of the frame waiting for the socket (see write_started())
+    clock::time_point write_progress_{};
+    // The request deadline of the request in progress while its body is read: the options',
+    // or its route's (zero: none)
+    std::chrono::milliseconds request_deadline_{0};
 
     uint8_t buffer_[MAX_BUFFER_SIZE];
     request_factory request_parser_;
 
     // Queue for HTTP pipelining (only used from the connection thread, as everything that
     // reads or writes the connection)
-    std::queue<std::shared_ptr<http_stream>> request_queue_;
+    std::deque<std::shared_ptr<http_stream>> request_queue_;
 
     std::function<awaitable<void>(std::shared_ptr<request>)> handler_;
 
-    body_logging body_logging_;
+    // The settings of its server, shared by its connections
+    std::shared_ptr<const connection_options> options_;
 
     // Buffers of the frame being written (kept, so they are not allocated for every frame)
     std::vector<boost::asio::const_buffer> write_buffers_;
@@ -217,6 +292,14 @@ private:
     bool reader_stopped_{false};
     // Closing gracefully (see linger()). Where it takes no room
     bool lingering_{false};
+    // The watcher waits (for the body to be read, or the socket to be readable): unwatch()
+    // ends the wait. Or it reads (peer_closed(), which may wait for a TLS record)
+    bool watch_waiting_{false};
+    bool watch_reading_{false};
+    // The head of a request is being read, incomplete: its header deadline applies
+    bool reading_head_{false};
+    // A frame waits for the socket, within its write deadline (see write_started())
+    bool write_waits_{false};
     stream_id request_id_{0};
 };
 

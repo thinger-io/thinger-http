@@ -40,6 +40,10 @@ namespace thinger::asio{
         return true;
     }
 
+    void worker_thread::shutdown() {
+        worker_.shutdown();
+    }
+
     boost::asio::io_context &worker_thread::get_io_context() {
         return worker_.get_io_context();
     }

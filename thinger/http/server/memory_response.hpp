@@ -6,9 +6,12 @@
 #include "../../util/types.hpp"
 #include <boost/asio/experimental/concurrent_channel.hpp>
 #include <boost/asio/steady_timer.hpp>
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
 
 namespace thinger::http {
 
@@ -112,6 +115,34 @@ private:
     std::shared_ptr<response_observer> observer_;
     boost::asio::experimental::concurrent_channel<void(boost::system::error_code)> done_;
 };
+
+namespace detail {
+
+// Source of a request dispatched in memory (see http_application::dispatch): its body, as if
+// just received from a client, then the end. Its peer is the address the dispatch gives, without
+// TLS, and no socket is ever read
+class memory_source : public request_source {
+public:
+    memory_source(std::string body, std::string peer_ip)
+        : body_(std::move(body)), peer_ip_(std::move(peer_ip)) {}
+
+    awaitable<io_result> read_body_some(uint8_t* buffer, size_t size) override {
+        size_t bytes = std::min(size, body_.size() - read_);
+        if (bytes == 0) co_return io_result{boost::asio::error::eof, 0};
+        std::memcpy(buffer, body_.data() + read_, bytes);
+        read_ += bytes;
+        co_return io_result{boost::system::error_code{}, bytes};
+    }
+
+    connection_info info() const override { return {.peer_ip = peer_ip_}; }
+
+private:
+    std::string body_;
+    size_t read_ = 0;
+    std::string peer_ip_;
+};
+
+} // namespace detail
 
 } // namespace thinger::http
 

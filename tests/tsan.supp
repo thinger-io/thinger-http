@@ -1,0 +1,8 @@
+# ThreadSanitizer suppressions for the test suites: TSAN_OPTIONS="suppressions=tests/tsan.supp"
+#
+# asio's signal handler runs in signal context, on the thread the signal interrupts, and reads
+# the global signal state that signal_set::add() wrote under asio's mutex before installing the
+# handler with sigaction(). A signal handler cannot take that mutex, and TSan does not see
+# sigaction() and kill() as the synchronization they are: it reports the read as a race
+# (workers::wait() tests, which raise the signal they wait for)
+race:boost_asio_signal_handler

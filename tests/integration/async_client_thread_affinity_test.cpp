@@ -11,7 +11,7 @@ using namespace thinger;
 TEST_CASE_METHOD(thinger::http::test::TestServerFixture, "HTTP Async Client thread affinity", "[http][client][threading]") {
 
     SECTION("Callbacks execute on worker threads") {
-        http::async_client client;
+        http::async_client client(workers);
 
         std::thread::id main_thread_id = std::this_thread::get_id();
         std::thread::id callback_thread_id;
@@ -31,7 +31,7 @@ TEST_CASE_METHOD(thinger::http::test::TestServerFixture, "HTTP Async Client thre
     }
 
     SECTION("Multiple requests use worker pool") {
-        http::async_client client;
+        http::async_client client(workers);
 
         std::mutex results_mutex;
         std::set<std::thread::id> worker_threads_used;
@@ -60,7 +60,7 @@ TEST_CASE_METHOD(thinger::http::test::TestServerFixture, "HTTP Async Client thre
     }
 
     SECTION("Connection pooling works with async requests") {
-        http::async_client client;
+        http::async_client client(workers);
         client.timeout(std::chrono::seconds(10));
 
         std::atomic<int> completed{0};

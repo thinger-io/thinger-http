@@ -1,0 +1,6 @@
+# The structure budget only goes down: raising a guardrail, adding a public header or changing how
+# they are measured needs the owner's review (target design §6)
+/structure-budget.json                  @alvarolb
+/public-headers.txt                     @alvarolb
+/.github/scripts/structure_budget.py    @alvarolb
+/.github/CODEOWNERS                     @alvarolb

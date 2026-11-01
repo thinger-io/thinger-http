@@ -6,7 +6,11 @@ using namespace thinger;
 int main() {
     std::cout << "Simple Async Client Example (Callbacks)\n" << std::endl;
 
-    http::async_client client;
+    // The workers the clients run on: the application starts them, and stops them at the end
+    asio::workers workers;
+    workers.start();
+
+    http::async_client client(workers);
 
     // Simple GET request with callback
     client.get("https://api.github.com/users/github", [](http::client_response& res) {
@@ -52,5 +56,6 @@ int main() {
 
     std::cout << "\nAll requests completed!" << std::endl;
 
+    workers.stop();
     return 0;
 }

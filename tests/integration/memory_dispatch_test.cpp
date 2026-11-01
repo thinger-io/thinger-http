@@ -1,7 +1,10 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <thinger/http/server/server_standalone.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
+#include <thinger/http/server/sse_connection.hpp>
+#include <thinger/http/server/websocket_connection.hpp>
 #include <thinger/util/types.hpp>
 #include <boost/asio.hpp>
 #include <boost/asio/use_future.hpp>
@@ -9,6 +12,7 @@
 #include <chrono>
 #include <future>
 #include <thread>
+#include "../fixtures/handler_probe.hpp"
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -150,13 +154,13 @@ TEST_CASE("In-memory dispatch of features that need a connection", "[server][dis
     http::server server;
 
     server.get("/ws", [](http::request& req, http::response& res) {
-        res.upgrade_websocket([](std::shared_ptr<http::websocket_connection>) {});
+        res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection>) {});
     });
     server.get("/sse", [](http::response& res) {
         res.start_sse([](std::shared_ptr<http::sse_connection>) {});
     });
     server.get("/tunnel", [](http::response& res) {
-        res.take_over([](std::shared_ptr<thinger::asio::socket>, std::string) {});
+        res.take_over([](http::upgraded_connection) {});
     });
 
     for (std::string path : {"/ws", "/sse", "/tunnel"}) {
@@ -183,14 +187,14 @@ TEST_CASE("In-memory dispatch of handlers answering later", "[server][dispatch][
 
     server.get("/never", [](http::response&) {});
 
-    // Coroutine that would hang far longer than the timeout
+    // Coroutine that would hang far longer than the timeout, on a route its timeout interrupts
     std::atomic<bool> cancelled{false};
     server.get("/hangs", [&cancelled](http::response& res) -> thinger::awaitable<void> {
         boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 30s);
         auto [ec] = co_await timer.async_wait(boost::asio::as_tuple(thinger::use_awaitable));
         if (ec == boost::asio::error::operation_aborted) cancelled = true;
         res.send("too late");
-    });
+    }).cancel_on({http::cancel_reason::timeout});
 
     SECTION("Response sent later from a copy") {
         auto response = run_dispatch(server, make_request(http::method::GET, "/later"));
@@ -205,7 +209,7 @@ TEST_CASE("In-memory dispatch of handlers answering later", "[server][dispatch][
         REQUIRE(std::chrono::steady_clock::now() - start < 2s);
     }
 
-    SECTION("Timeout also covers a handler that is still running, which is cancelled") {
+    SECTION("Timeout also covers a handler that is still running, interrupted if its route declares it") {
         auto start = std::chrono::steady_clock::now();
         auto response = run_dispatch(server, make_request(http::method::GET, "/hangs"), {.timeout = 100ms});
         REQUIRE(response->get_status_code() == 504);
@@ -221,6 +225,67 @@ TEST_CASE("In-memory dispatch of handlers answering later", "[server][dispatch][
         ioc.run();
         REQUIRE(result);
         REQUIRE(result->get_content() == "late answer");
+    }
+}
+
+TEST_CASE("In-memory dispatch follows the cancellation scope of the route", "[server][dispatch][cancellation][integration]") {
+    using clock = std::chrono::steady_clock;
+    http::test::handler_probe probe;
+    http::server server;
+    http::test::waiting_route(server, "/default", probe, 300ms);
+    http::test::waiting_route(server, "/timeout", probe, 10s).cancel_on({http::cancel_reason::timeout});
+    http::test::waiting_route(server, "/gone", probe, 10s).cancel_on({http::cancel_reason::client_gone});
+
+    SECTION("Its timeout answers 504; a default route runs to its end, and finds the reason") {
+        auto response = run_dispatch(server, make_request(http::method::GET, "/default"), {.timeout = 100ms});
+        CHECK(response->get_status_code() == 504);
+        // run_dispatch runs its io_context until the handler ends too
+        REQUIRE(probe.ended);
+        CHECK_FALSE(probe.interrupted);
+        CHECK(probe.reason == http::cancel_reason::timeout);
+        CHECK(probe.end_time() - probe.start_time() >= 290ms);
+    }
+
+    SECTION("Its timeout interrupts a route declaring it within 50 ms") {
+        auto expiry = clock::now() + 100ms;
+        auto response = run_dispatch(server, make_request(http::method::GET, "/timeout"), {.timeout = 100ms});
+        CHECK(response->get_status_code() == 504);
+        REQUIRE(probe.ended);
+        INFO("interrupted " << probe.ended_after(expiry).count() << " ms after the timeout");
+        CHECK(probe.interrupted);
+        CHECK(probe.reason == http::cancel_reason::timeout);
+        CHECK(probe.ended_after(expiry) <= 50ms);
+    }
+
+    SECTION("A caller cancelling the dispatch cancels the scope with client_gone") {
+        bool declared = GENERATE(false, true);
+        INFO((declared ? "cancel_on(client_gone)" : "default route"));
+        boost::asio::io_context ioc;
+        boost::asio::cancellation_signal signal;
+        std::exception_ptr error;
+        co_spawn(ioc, server.dispatch(make_request(http::method::GET, declared ? "/gone" : "/default")),
+                 boost::asio::bind_cancellation_slot(signal.slot(),
+                     [&error](std::exception_ptr e, std::shared_ptr<http::http_response>) { error = e; }));
+        boost::asio::steady_timer timer(ioc, 50ms);
+        timer.async_wait([&signal](const boost::system::error_code&) {
+            signal.emit(boost::asio::cancellation_type::terminal);
+        });
+        // Until the handler ends too
+        ioc.run();
+
+        // The dispatch ends with operation_aborted
+        REQUIRE(error);
+        boost::system::error_code ec;
+        try {
+            std::rethrow_exception(error);
+        } catch (const boost::system::system_error& e) {
+            ec = e.code();
+        }
+        CHECK(ec == boost::asio::error::operation_aborted);
+        // And its handler is interrupted only where the route declared it
+        REQUIRE(probe.ended);
+        CHECK(probe.reason == http::cancel_reason::client_gone);
+        CHECK(probe.interrupted == declared);
     }
 }
 

@@ -204,11 +204,9 @@ int main(int argc, char* argv[]) {
     
     // WebSocket echo endpoint
     server.get("/ws/echo", [](http::request& req, http::response& res) {
-        // Supported protocols (optional)
-        std::set<std::string> protocols = {"chat", "echo"};
-        
-        // Upgrade to WebSocket
-        res.upgrade_websocket([&req](std::shared_ptr<http::websocket_connection> ws) {
+        // Upgrade to WebSocket, speaking the "chat" or "echo" subprotocol (the first one the
+        // client offers; a client offering neither is rejected with 400)
+        res.upgrade_websocket({.protocols = {"chat", "echo"}}, [&req](std::shared_ptr<http::websocket_connection> ws) {
             LOG_INFO("New WebSocket connection from %s", req.get_request_ip().c_str());
             
             // Add to active connections
@@ -266,12 +264,12 @@ int main(int argc, char* argv[]) {
             // Send welcome message
             ws->send_text("Welcome to the WebSocket echo server!");
             ws->send_text("Send 'BROADCAST:message' to broadcast to all connected clients");
-        }, protocols);
+        });
     });
     
     // WebSocket endpoint without protocol negotiation
     server.get("/ws/simple", [](http::request& req, http::response& res) {
-        res.upgrade_websocket([&req](std::shared_ptr<http::websocket_connection> ws) {
+        res.upgrade_websocket({}, [&req](std::shared_ptr<http::websocket_connection> ws) {
             LOG_INFO("Simple WebSocket connection from %s", req.get_request_ip().c_str());
             
             ws->on_message([ws](const std::string& message, bool binary) {

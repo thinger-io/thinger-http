@@ -11,23 +11,18 @@ using namespace thinger;
 using namespace std::chrono_literals;
 using TestServerFixture = thinger::http::test::TestServerFixture;
 
-// Test fixture that also starts workers
+// The fixture, with four worker threads for the async clients
 struct AsyncClientTestFixture : TestServerFixture {
     AsyncClientTestFixture() : TestServerFixture() {
-        // Start worker threads for async client
-        asio::get_workers().start(4);
-    }
-
-    ~AsyncClientTestFixture() {
-        // Stop worker threads
-        asio::get_workers().stop();
+        workers.stop();
+        workers.start(4);
     }
 };
 
 TEST_CASE_METHOD(AsyncClientTestFixture, "Async HTTP Client wait() functionality", "[http][client][async][wait]") {
     
     SECTION("wait() blocks until all requests complete") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<int> completed_requests{0};
         const int total_requests = 5;
         
@@ -56,7 +51,7 @@ TEST_CASE_METHOD(AsyncClientTestFixture, "Async HTTP Client wait() functionality
     }
     
     SECTION("Multiple threads can wait simultaneously") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<int> waiters_unblocked{0};
         std::atomic<int> requests_completed{0};
         
@@ -94,7 +89,7 @@ TEST_CASE_METHOD(AsyncClientTestFixture, "Async HTTP Client wait() functionality
     }
     
     SECTION("wait() with concurrent requests from multiple threads") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<int> completed_requests{0};
         const int threads_count = 4;
         const int requests_per_thread = 3;
@@ -125,7 +120,7 @@ TEST_CASE_METHOD(AsyncClientTestFixture, "Async HTTP Client wait() functionality
     }
     
     SECTION("wait_for() with cancel_on_timeout from multiple threads") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<int> completed_requests{0};
         std::atomic<int> successful_requests{0};
         
@@ -163,8 +158,11 @@ TEST_CASE_METHOD(AsyncClientTestFixture, "Async HTTP Client wait() functionality
         // At least one waiter should have timed out
         REQUIRE(timed_out >= 1);
 
-        // Note: wait_for() timing out doesn't cancel requests automatically
-        // Requests may still complete after wait_for returns false
-        // This is expected behavior - wait_for just stops waiting, doesn't cancel
+        // wait_for() timing out does not cancel the requests: they are still in flight, and
+        // none answered yet (5 s each)
+        REQUIRE(client.pending_requests() == 5);
+        REQUIRE(successful_requests == 0);
+        // The destructor of the client, at the end of the section, cancels them: none of these
+        // callbacks, which capture locals of the section, runs after it returns
     }
 }

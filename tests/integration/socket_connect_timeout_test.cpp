@@ -9,6 +9,7 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
+#include "../fixtures/hostile_peer.hpp"
 
 // The connect timeout of the TCP and Unix sockets: a connect completing right at the timeout
 // (a timeout of 0, so the timer and the connect complete together) must leave nothing behind
@@ -128,34 +129,36 @@ TEST_CASE("Unix connect completing at the timeout leaves nothing behind", "[sock
 }
 
 TEST_CASE("TCP connect not completing in time ends with timed_out", "[socket][connect][timeout][integration]") {
-    // A listener that never accepts, with the smallest backlog: once its queue is full, the
-    // system drops the connection requests, so a connect waits until the client gives up
-    boost::asio::io_context ioc;
-    boost::asio::ip::tcp::acceptor acceptor(ioc);
-    boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::make_address("127.0.0.1"), 0);
-    acceptor.open(endpoint.protocol());
-    acceptor.bind(endpoint);
-    acceptor.listen(0);
-    auto port = std::to_string(acceptor.local_endpoint().port());
+    // A peer that never accepts (its queue full): a connect waits until the client gives up
+    http::test::pending_connect_peer peer(http::test::transport::tcp);
+    INFO(peer.reason());
+    REQUIRE(peer.pending());
+    const std::string host = "127.0.0.1";
+    const auto port = std::to_string(peer.endpoint().port);
 
-    std::vector<std::shared_ptr<asio::tcp_socket>> sockets;
+    // a socket connected before, on the same io_context, to a peer that greets it
+    boost::asio::io_context ioc;
+    boost::asio::ip::tcp::acceptor acceptor(ioc, {boost::asio::ip::make_address("127.0.0.1"), 0});
+    std::vector<std::shared_ptr<boost::asio::ip::tcp::socket>> accepted;
+    accept_and_greet(acceptor, accepted);
+    const auto greeter_port = std::to_string(acceptor.local_endpoint().port());
+    auto connected = std::make_shared<asio::tcp_socket>("test", ioc);
+
     std::optional<boost::system::error_code> timeout_result;
     std::chrono::steady_clock::duration elapsed{};
     bool done = false;
     co_spawn(ioc, [&]() -> awaitable<void> {
-        for (int i = 0; i < 16 && !timeout_result; ++i) {
-            auto socket = std::make_shared<asio::tcp_socket>("test", ioc);
-            auto start = std::chrono::steady_clock::now();
-            auto ec = co_await socket->connect("127.0.0.1", port, 1s);
-            if (ec == boost::asio::error::timed_out) {
-                elapsed = std::chrono::steady_clock::now() - start;
-                timeout_result = ec;
-                CHECK_FALSE(socket->is_open());
-            } else {
-                REQUIRE_FALSE(ec);
-                sockets.push_back(socket);
-            }
-        }
+        REQUIRE_FALSE(co_await connected->connect(host, greeter_port, 1s));
+        auto socket = std::make_shared<asio::tcp_socket>("test", ioc);
+        auto start = std::chrono::steady_clock::now();
+        timeout_result = co_await socket->connect(host, port, 1s);
+        elapsed = std::chrono::steady_clock::now() - start;
+        CHECK_FALSE(socket->is_open());
+        // the socket connected before is still usable
+        uint8_t byte = 0;
+        auto [read_ec, bytes] = co_await connected->read(&byte, 1);
+        CHECK_FALSE(read_ec);
+        CHECK(byte == 'y');
         done = true;
     }, [](std::exception_ptr e) { if (e) std::rethrow_exception(e); });
     run_until(ioc, done, 60s);
@@ -165,7 +168,6 @@ TEST_CASE("TCP connect not completing in time ends with timed_out", "[socket][co
     CHECK(*timeout_result == boost::asio::error::timed_out);
     CHECK(elapsed >= 900ms);
     CHECK(elapsed < 5s);
-
-    // the sockets connected before are still usable
-    for (auto& socket : sockets) CHECK(socket->is_open());
+    CHECK(connected->is_open());
+    acceptor.close();
 }

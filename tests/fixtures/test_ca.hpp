@@ -150,34 +150,39 @@ private:
     std::string pem_;
 };
 
-// The certificate the TLS test servers present for a name (SNI) while it exists
+// The certificate a TLS test server presents for a name (SNI) while it exists: set in the
+// certificate manager of that server
 struct server_certificate {
+    std::shared_ptr<asio::certificate_manager> manager;
     std::string host;
 
-    server_certificate(std::string name, const std::pair<std::string, std::string>& certificate)
-        : host(std::move(name)) {
-        asio::certificate_manager::instance().set_certificate(host, certificate.first, certificate.second);
+    server_certificate(std::shared_ptr<asio::certificate_manager> certificates, std::string name,
+                       const std::pair<std::string, std::string>& certificate)
+        : manager(std::move(certificates)), host(std::move(name)) {
+        manager->set_certificate(host, certificate.first, certificate.second);
     }
 
     ~server_certificate() {
-        asio::certificate_manager::instance().remove_certificate(host);
+        manager->remove_certificate(host);
     }
 
     server_certificate(const server_certificate&) = delete;
     server_certificate& operator=(const server_certificate&) = delete;
 };
 
-// The client certificate mode of a host name (see certificate_manager::set_client_verify())
-// while it exists: the manager is shared by the servers of the process
+// The client certificate mode of a host name (see certificate_manager::set_client_verify()) in
+// a certificate manager, while it exists
 struct client_verify_host {
+    std::shared_ptr<asio::certificate_manager> manager;
     std::string host;
     bool set;
 
-    client_verify_host(std::string name, asio::client_verify mode)
-        : host(std::move(name)), set(asio::certificate_manager::instance().set_client_verify(host, mode)) {}
+    client_verify_host(std::shared_ptr<asio::certificate_manager> certificates, std::string name,
+                       asio::client_verify mode)
+        : manager(std::move(certificates)), host(std::move(name)), set(!manager->set_client_verify(host, mode)) {}
 
     ~client_verify_host() {
-        asio::certificate_manager::instance().remove_client_verify(host);
+        manager->remove_client_verify(host);
     }
 
     client_verify_host(const client_verify_host&) = delete;

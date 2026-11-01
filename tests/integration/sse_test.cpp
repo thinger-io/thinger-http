@@ -3,123 +3,80 @@
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/sse_connection.hpp>
-#include <boost/asio.hpp>
+#include "server_test_helpers.hpp"
 #include <chrono>
 #include <thread>
 #include <future>
+#include <optional>
+#include <string>
 
 using namespace thinger;
 using namespace std::chrono_literals;
 
-// Fixture for SSE tests
+using server_test::running_server;
+using http::test::transport;
+
+// Fixture for SSE tests: the server, run on the transport of the case once its routes are set
 struct SSETestFixture {
     http::server server;
-    uint16_t port = 0;
-    std::thread server_thread;
-    bool server_started = false;
+    std::optional<running_server> running;
 
-    SSETestFixture() = default;
-
-    void start_server() {
-        if (server_started) return;
-        REQUIRE(server.listen("0.0.0.0", 0));
-        port = server.local_port();
-        server_started = true;
-
-        std::promise<void> ready;
-        server_thread = std::thread([this, &ready]() {
-            ready.set_value();
-            server.wait();
-        });
-        ready.get_future().wait();
-    }
-
-    ~SSETestFixture() {
-        if (server_started) {
-            server.stop();
-            if (server_thread.joinable()) {
-                server_thread.join();
-            }
-        }
+    void start_server(transport kind) {
+        if (!running) running.emplace(server, kind);
     }
 };
 
-// Helper: connect a raw TCP socket
-static boost::asio::ip::tcp::socket raw_connect(boost::asio::io_context& ioc, uint16_t port) {
-    boost::asio::ip::tcp::socket sock(ioc);
-    boost::asio::ip::tcp::resolver resolver(ioc);
-    auto results = resolver.resolve("127.0.0.1", std::to_string(port));
-    boost::asio::connect(sock, results);
-    return sock;
-}
+// A raw client of an SSE stream over any transport; every read waits up to a timeout
+struct sse_reader {
+    http::test::raw_connection connection;
+    std::string buffer;
+
+    explicit sse_reader(const running_server& running) : connection(running.endpoint()) {}
+
+    // What arrived up to and including `delimiter` (consumed), or "" if it did not in time
+    std::string read_until(const std::string& delimiter, std::chrono::milliseconds timeout = 5s) {
+        if (!connection.read_until(buffer, delimiter, timeout)) return "";
+        auto end = buffer.find(delimiter) + delimiter.size();
+        std::string data = buffer.substr(0, end);
+        buffer.erase(0, end);
+        return data;
+    }
+
+    void close() { connection.close(); }
+};
 
 // Helper: send an HTTP GET request for SSE
-static void send_sse_request(boost::asio::ip::tcp::socket& sock, const std::string& path) {
+static void send_sse_request(sse_reader& sock, const std::string& path) {
     std::string request =
         "GET " + path + " HTTP/1.1\r\n"
         "Host: localhost\r\n"
         "Accept: text/event-stream\r\n"
         "Connection: keep-alive\r\n"
         "\r\n";
-    boost::asio::write(sock, boost::asio::buffer(request));
+    REQUIRE(sock.connection.write(request));
 }
 
 // Helper: read HTTP response headers (up to \r\n\r\n)
-static std::string read_response_headers(boost::asio::ip::tcp::socket& sock,
-                                          boost::asio::streambuf& buf) {
-    boost::system::error_code ec;
-    boost::asio::read_until(sock, buf, "\r\n\r\n", ec);
-    if (ec) return "";
-    std::string data(boost::asio::buffers_begin(buf.data()),
-                     boost::asio::buffers_end(buf.data()));
-    // Consume the headers from the buffer
-    auto header_end = data.find("\r\n\r\n");
-    if (header_end != std::string::npos) {
-        buf.consume(header_end + 4);
-    }
-    return data.substr(0, header_end + 4);
+static std::string read_response_headers(sse_reader& sock) {
+    return sock.read_until("\r\n\r\n");
 }
 
 // Helper: read SSE data until double newline (\n\n) which marks end of a data event
-static std::string read_sse_event(boost::asio::ip::tcp::socket& sock,
-                                   boost::asio::streambuf& buf) {
-    boost::system::error_code ec;
-    boost::asio::read_until(sock, buf, "\n\n", ec);
-    if (ec) return "";
-    std::string data(boost::asio::buffers_begin(buf.data()),
-                     boost::asio::buffers_end(buf.data()));
-    // Find the \n\n boundary and consume it
-    auto end = data.find("\n\n");
-    if (end != std::string::npos) {
-        std::string event = data.substr(0, end + 2);
-        buf.consume(end + 2);
-        return event;
-    }
-    return data;
+static std::string read_sse_event(sse_reader& sock) {
+    return sock.read_until("\n\n");
 }
 
 // Helper: read a single SSE line (ending with \n)
-static std::string read_sse_line(boost::asio::ip::tcp::socket& sock,
-                                  boost::asio::streambuf& buf) {
-    boost::system::error_code ec;
-    boost::asio::read_until(sock, buf, "\n", ec);
-    if (ec) return "";
-    std::string data(boost::asio::buffers_begin(buf.data()),
-                     boost::asio::buffers_end(buf.data()));
-    auto end = data.find("\n");
-    if (end != std::string::npos) {
-        std::string line = data.substr(0, end + 1);
-        buf.consume(end + 1);
-        return line;
-    }
-    return data;
+static std::string read_sse_line(sse_reader& sock) {
+    return sock.read_until("\n");
 }
 
 // ============================================================================
 // SSE Response Headers Tests
 // ============================================================================
 
-TEST_CASE("SSE response includes correct headers", "[server][sse][integration]") {
+TEST_CASE("SSE response includes correct headers", "[server][sse][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     SSETestFixture fixture;
 
     std::promise<void> sse_ready;
@@ -132,15 +89,13 @@ TEST_CASE("SSE response includes correct headers", "[server][sse][integration]")
         });
     });
 
-    fixture.start_server();
+    fixture.start_server(kind);
 
-    boost::asio::io_context ioc;
-    auto sock = raw_connect(ioc, fixture.port);
-    boost::asio::streambuf buf;
+    sse_reader sock(*fixture.running);
 
     send_sse_request(sock, "/events");
 
-    std::string headers = read_response_headers(sock, buf);
+    std::string headers = read_response_headers(sock);
 
     REQUIRE(headers.find("HTTP/1.1 200") != std::string::npos);
     REQUIRE(headers.find("Content-Type: text/event-stream") != std::string::npos);
@@ -158,7 +113,8 @@ TEST_CASE("SSE response includes correct headers", "[server][sse][integration]")
 // SSE send_data Tests
 // ============================================================================
 
-TEST_CASE("SSE send_data delivers data event to client", "[server][sse][integration]") {
+TEST_CASE("SSE send_data delivers data event to client", "[server][sse][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     SSETestFixture fixture;
 
     std::promise<void> sse_ready;
@@ -171,14 +127,12 @@ TEST_CASE("SSE send_data delivers data event to client", "[server][sse][integrat
         });
     });
 
-    fixture.start_server();
+    fixture.start_server(kind);
 
-    boost::asio::io_context ioc;
-    auto sock = raw_connect(ioc, fixture.port);
-    boost::asio::streambuf buf;
+    sse_reader sock(*fixture.running);
 
     send_sse_request(sock, "/events");
-    read_response_headers(sock, buf);
+    read_response_headers(sock);
 
     REQUIRE(sse_ready.get_future().wait_for(5s) == std::future_status::ready);
 
@@ -186,7 +140,7 @@ TEST_CASE("SSE send_data delivers data event to client", "[server][sse][integrat
     sse_conn->send_data("hello world");
 
     // Read the SSE event — format: "data: hello world\n\n"
-    std::string event = read_sse_event(sock, buf);
+    std::string event = read_sse_event(sock);
     REQUIRE(event == "data: hello world\n\n");
 
     sse_conn->stop();
@@ -197,7 +151,8 @@ TEST_CASE("SSE send_data delivers data event to client", "[server][sse][integrat
 // SSE send_event Tests
 // ============================================================================
 
-TEST_CASE("SSE send_event followed by send_data", "[server][sse][integration]") {
+TEST_CASE("SSE send_event followed by send_data", "[server][sse][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     SSETestFixture fixture;
 
     std::promise<void> sse_ready;
@@ -210,14 +165,12 @@ TEST_CASE("SSE send_event followed by send_data", "[server][sse][integration]") 
         });
     });
 
-    fixture.start_server();
+    fixture.start_server(kind);
 
-    boost::asio::io_context ioc;
-    auto sock = raw_connect(ioc, fixture.port);
-    boost::asio::streambuf buf;
+    sse_reader sock(*fixture.running);
 
     send_sse_request(sock, "/events");
-    read_response_headers(sock, buf);
+    read_response_headers(sock);
 
     REQUIRE(sse_ready.get_future().wait_for(5s) == std::future_status::ready);
 
@@ -226,11 +179,11 @@ TEST_CASE("SSE send_event followed by send_data", "[server][sse][integration]") 
     sse_conn->send_data("pong");
 
     // Read the event line — format: "event: ping\n"
-    std::string event_line = read_sse_line(sock, buf);
+    std::string event_line = read_sse_line(sock);
     REQUIRE(event_line == "event: ping\n");
 
     // Read the data event — format: "data: pong\n\n"
-    std::string data_event = read_sse_event(sock, buf);
+    std::string data_event = read_sse_event(sock);
     REQUIRE(data_event == "data: pong\n\n");
 
     sse_conn->stop();
@@ -241,7 +194,8 @@ TEST_CASE("SSE send_event followed by send_data", "[server][sse][integration]") 
 // SSE send_retry Tests
 // ============================================================================
 
-TEST_CASE("SSE send_retry delivers retry directive to client", "[server][sse][integration]") {
+TEST_CASE("SSE send_retry delivers retry directive to client", "[server][sse][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     SSETestFixture fixture;
 
     std::promise<void> sse_ready;
@@ -254,14 +208,12 @@ TEST_CASE("SSE send_retry delivers retry directive to client", "[server][sse][in
         });
     });
 
-    fixture.start_server();
+    fixture.start_server(kind);
 
-    boost::asio::io_context ioc;
-    auto sock = raw_connect(ioc, fixture.port);
-    boost::asio::streambuf buf;
+    sse_reader sock(*fixture.running);
 
     send_sse_request(sock, "/events");
-    read_response_headers(sock, buf);
+    read_response_headers(sock);
 
     REQUIRE(sse_ready.get_future().wait_for(5s) == std::future_status::ready);
 
@@ -269,7 +221,7 @@ TEST_CASE("SSE send_retry delivers retry directive to client", "[server][sse][in
     sse_conn->send_retry(3000);
 
     // Read the retry line — format: "retry: 3000\n"
-    std::string retry_line = read_sse_line(sock, buf);
+    std::string retry_line = read_sse_line(sock);
     REQUIRE(retry_line == "retry: 3000\n");
 
     sse_conn->stop();
@@ -280,7 +232,8 @@ TEST_CASE("SSE send_retry delivers retry directive to client", "[server][sse][in
 // SSE Multiple Messages Tests
 // ============================================================================
 
-TEST_CASE("SSE multiple data messages arrive in order", "[server][sse][integration]") {
+TEST_CASE("SSE multiple data messages arrive in order", "[server][sse][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     SSETestFixture fixture;
 
     std::promise<void> sse_ready;
@@ -293,14 +246,12 @@ TEST_CASE("SSE multiple data messages arrive in order", "[server][sse][integrati
         });
     });
 
-    fixture.start_server();
+    fixture.start_server(kind);
 
-    boost::asio::io_context ioc;
-    auto sock = raw_connect(ioc, fixture.port);
-    boost::asio::streambuf buf;
+    sse_reader sock(*fixture.running);
 
     send_sse_request(sock, "/events");
-    read_response_headers(sock, buf);
+    read_response_headers(sock);
 
     REQUIRE(sse_ready.get_future().wait_for(5s) == std::future_status::ready);
 
@@ -310,13 +261,13 @@ TEST_CASE("SSE multiple data messages arrive in order", "[server][sse][integrati
     sse_conn->send_data("message 3");
 
     // Read all three events in order
-    std::string event1 = read_sse_event(sock, buf);
+    std::string event1 = read_sse_event(sock);
     REQUIRE(event1 == "data: message 1\n\n");
 
-    std::string event2 = read_sse_event(sock, buf);
+    std::string event2 = read_sse_event(sock);
     REQUIRE(event2 == "data: message 2\n\n");
 
-    std::string event3 = read_sse_event(sock, buf);
+    std::string event3 = read_sse_event(sock);
     REQUIRE(event3 == "data: message 3\n\n");
 
     sse_conn->stop();
@@ -327,7 +278,8 @@ TEST_CASE("SSE multiple data messages arrive in order", "[server][sse][integrati
 // SSE Connection Counter Tests
 // ============================================================================
 
-TEST_CASE("SSE connections are counted in the server statistics", "[server][sse][integration]") {
+TEST_CASE("SSE connections are counted in the server statistics", "[server][sse][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     SSETestFixture fixture;
 
     std::promise<void> sse_ready;
@@ -340,16 +292,14 @@ TEST_CASE("SSE connections are counted in the server statistics", "[server][sse]
         });
     });
 
-    fixture.start_server();
+    fixture.start_server(kind);
 
     REQUIRE(fixture.server.stats().sse_connections == 0);
 
-    boost::asio::io_context ioc;
-    auto sock = raw_connect(ioc, fixture.port);
-    boost::asio::streambuf buf;
+    sse_reader sock(*fixture.running);
 
     send_sse_request(sock, "/events");
-    read_response_headers(sock, buf);
+    read_response_headers(sock);
 
     REQUIRE(sse_ready.get_future().wait_for(5s) == std::future_status::ready);
 
@@ -376,7 +326,8 @@ TEST_CASE("SSE connections are counted in the server statistics", "[server][sse]
 // SSE Handler Sends Data Immediately Tests
 // ============================================================================
 
-TEST_CASE("SSE handler sends initial data on connect", "[server][sse][integration]") {
+TEST_CASE("SSE handler sends initial data on connect", "[server][sse][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
     SSETestFixture fixture;
 
     // Handler that sends data immediately when SSE is established
@@ -388,27 +339,25 @@ TEST_CASE("SSE handler sends initial data on connect", "[server][sse][integratio
         });
     });
 
-    fixture.start_server();
+    fixture.start_server(kind);
 
-    boost::asio::io_context ioc;
-    auto sock = raw_connect(ioc, fixture.port);
-    boost::asio::streambuf buf;
+    sse_reader sock(*fixture.running);
 
     send_sse_request(sock, "/events");
 
-    std::string headers = read_response_headers(sock, buf);
+    std::string headers = read_response_headers(sock);
     REQUIRE(headers.find("HTTP/1.1 200") != std::string::npos);
 
     // Read the retry line
-    std::string retry_line = read_sse_line(sock, buf);
+    std::string retry_line = read_sse_line(sock);
     REQUIRE(retry_line == "retry: 5000\n");
 
     // Read the event name
-    std::string event_line = read_sse_line(sock, buf);
+    std::string event_line = read_sse_line(sock);
     REQUIRE(event_line == "event: welcome\n");
 
     // Read the data event
-    std::string data_event = read_sse_event(sock, buf);
+    std::string data_event = read_sse_event(sock);
     REQUIRE(data_event == "data: {\"connected\":true}\n\n");
 
     sock.close();

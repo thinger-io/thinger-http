@@ -20,12 +20,10 @@ awaitable<bool> proxy_exchange::write_target(const std::vector<boost::asio::cons
 
 void proxy_exchange::request_done() {
     request_sent_ = true;
-    if (request_sent_signal_) request_sent_signal_->cancel();
 }
 
 void proxy_exchange::close_client_after_response() {
-    if (auto stream = req_.get_http_stream()) stream->set_keep_alive(false);
-    incoming_->set_keep_alive(false);
+    if (auto stream = req_.get_http_stream()) stream->must_close(detail::close_reason::body_error);
 }
 
 void proxy_exchange::reject_large_body() {
@@ -100,8 +98,8 @@ awaitable<void> proxy_exchange::stream_body() {
     // the body is not read: the server discards it, or closes the connection
     if (target_open && !req_.has_pending_body()) request_done();
 
-    // The response ends the exchange, not the body
-    co_await wait_forever();
+    // The response ends the exchange, not the body: its head ends this wait (see exchange())
+    co_await head_read_->wait();
 }
 
 }

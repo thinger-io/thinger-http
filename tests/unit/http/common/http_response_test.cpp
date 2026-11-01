@@ -215,6 +215,7 @@ TEST_CASE("HTTP Response status line formatting", "[http][response][unit]") {
             {http_response::status::conflict, "409 Conflict"},
             {http_response::status::payload_too_large, "413 Payload Too Large"},
             {http_response::status::expectation_failed, "417 Expectation Failed"},
+            {http_response::status::misdirected_request, "421 Misdirected Request"},
             {http_response::status::request_header_fields_too_large, "431 Request Header Fields Too Large"},
             {http_response::status::upgrade_required, "426 Upgrade Required"},
             {http_response::status::too_many_requests, "429 Too Many Requests"},
@@ -374,6 +375,7 @@ TEST_CASE("HTTP Response additional methods", "[http][response][unit]") {
             http_response::status::timed_out,
             http_response::status::payload_too_large,
             http_response::status::expectation_failed,
+            http_response::status::misdirected_request,
             http_response::status::request_header_fields_too_large
         };
         for (auto code : codes) {

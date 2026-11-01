@@ -3,6 +3,7 @@
 #include <thinger/http/server/server_standalone.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
+#include <thinger/http/server/websocket_connection.hpp>
 #include <thinger/util/base64.hpp>
 #include <nlohmann/json.hpp>
 #include <boost/asio.hpp>
@@ -15,6 +16,8 @@
 #include <thread>
 #include <vector>
 #include "../fixtures/test_ca.hpp"
+#include "../fixtures/running_workers.hpp"
+#include "../fixtures/server_listen.hpp"
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -200,15 +203,16 @@ namespace {
         }
     };
 
-    // An origin server (on every address, so 0.0.0.0 reaches it), plain or TLS
+    // An origin server (on every address, so 0.0.0.0 reaches it), plain or TLS with the
+    // certificates of `certificates`
     struct origin_server {
         http::server server;
         uint16_t port = 0;
         std::thread thread;
         bool tls;
 
-        explicit origin_server(bool use_tls = false) : tls(use_tls) {
-            if (tls) server.enable_ssl(true);
+        explicit origin_server(bool use_tls = false, std::shared_ptr<asio::certificate_manager> certificates = {})
+            : tls(use_tls) {
             server.get("/headers", [](http::request& req, http::response& res) {
                 nlohmann::json json;
                 auto request = req.get_http_request();
@@ -235,14 +239,15 @@ namespace {
                 res.redirect(req.query("to"));
             });
             server.get("/ws", [](http::request&, http::response& res) {
-                res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) {
+                res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection> ws) {
                     ws->on_message([ws](std::string message, bool) {
                         ws->send_text("echo: " + message);
                     });
                 });
             });
-            REQUIRE(server.listen("0.0.0.0", 0));
-            port = server.local_port();
+            if (tls && !certificates) certificates = std::make_shared<asio::certificate_manager>();
+            REQUIRE_FALSE(server.listen(http::test::listen_options("0.0.0.0", 0, tls ? std::move(certificates) : nullptr)));
+            port = http::test::listening_port(server);
             thread = std::thread([this] { server.wait(); });
         }
 
@@ -310,6 +315,7 @@ namespace {
 }
 
 TEST_CASE("HTTP client sends plain requests to the proxy in absolute-form", "[http][client][proxy][integration]") {
+    thinger::http::test::running_workers workers;
     test_proxy proxy("user@corp:p:ss");
     origin_server origin;
     auto url = origin.url("origin.test", "/headers?x=1");
@@ -338,7 +344,7 @@ TEST_CASE("HTTP client sends plain requests to the proxy in absolute-form", "[ht
     }
 
     SECTION("Async client") {
-        http::async_client client;
+        http::async_client client(workers);
         client.timeout(5s).proxy(proxy.url("user%40corp:p%3Ass"));
         check(async_get(client, url));
     }
@@ -357,10 +363,12 @@ TEST_CASE("HTTP client sends plain requests to the proxy in absolute-form", "[ht
 }
 
 TEST_CASE("HTTP client reaches HTTPS origins through a CONNECT tunnel", "[http][client][proxy][tls][integration]") {
+    thinger::http::test::running_workers workers;
     http::test::test_ca ca;
-    http::test::server_certificate certificate("origin.test", ca.issue("origin.test"));
+    auto certificates = std::make_shared<asio::certificate_manager>();
+    http::test::server_certificate certificate(certificates, "origin.test", ca.issue("origin.test"));
     test_proxy proxy("user:secret");
-    origin_server origin(true);
+    origin_server origin(true, certificates);
     auto url = origin.url("origin.test");
     auto authority = "origin.test:" + std::to_string(origin.port);
 
@@ -368,7 +376,7 @@ TEST_CASE("HTTP client reaches HTTPS origins through a CONNECT tunnel", "[http][
         for (bool async : {false, true}) {
             http::client_response res;
             if (async) {
-                http::async_client client;
+                http::async_client client(workers);
                 client.timeout(5s).proxy(proxy.url("user:secret")).add_ca_pem(ca.pem());
                 res = async_get(client, url);
             } else {
@@ -401,7 +409,7 @@ TEST_CASE("HTTP client reaches HTTPS origins through a CONNECT tunnel", "[http][
     }
 
     SECTION("The certificate must be issued for the origin, not for the proxy nor another name") {
-        http::test::server_certificate other("wrong.test", ca.issue("origin.test"));
+        http::test::server_certificate other(certificates, "wrong.test", ca.issue("origin.test"));
         http::client client;
         client.timeout(5s).proxy(proxy.url("user:secret")).add_ca_pem(ca.pem());
         auto res = client.get(origin.url("wrong.test"));
@@ -418,9 +426,10 @@ TEST_CASE("HTTP client reaches HTTPS origins through a CONNECT tunnel", "[http][
 
 TEST_CASE("HTTP client reports a proxy refusing the tunnel", "[http][client][proxy][integration]") {
     http::test::test_ca ca;
-    http::test::server_certificate certificate("origin.test", ca.issue("origin.test"));
+    auto certificates = std::make_shared<asio::certificate_manager>();
+    http::test::server_certificate certificate(certificates, "origin.test", ca.issue("origin.test"));
     test_proxy proxy("user:secret");
-    origin_server origin(true);
+    origin_server origin(true, certificates);
     http::client client;
     client.timeout(5s).add_ca_pem(ca.pem());
 
@@ -591,13 +600,15 @@ TEST_CASE("HTTP client takes the proxy from the environment", "[http][client][pr
 }
 
 TEST_CASE("HTTP client opens WebSockets through the proxy", "[http][client][proxy][websocket][integration]") {
+    thinger::http::test::running_workers workers;
     http::test::test_ca ca;
-    http::test::server_certificate certificate("origin.test", ca.issue("origin.test"));
+    auto certificates = std::make_shared<asio::certificate_manager>();
+    http::test::server_certificate certificate(certificates, "origin.test", ca.issue("origin.test"));
     test_proxy proxy("user:secret");
 
     for (bool tls : {false, true}) {
         INFO((tls ? "wss" : "ws"));
-        origin_server origin(tls);
+        origin_server origin(tls, certificates);
         auto authority = "origin.test:" + std::to_string(origin.port);
         auto before = proxy.received_requests().size();
 
@@ -619,8 +630,8 @@ TEST_CASE("HTTP client opens WebSockets through the proxy", "[http][client][prox
     }
 
     SECTION("Async client, with the request builder") {
-        origin_server origin(true);
-        http::async_client client;
+        origin_server origin(true, certificates);
+        http::async_client client(workers);
         client.timeout(5s).proxy(proxy.url("user:secret"));
         std::string echo;
         client.run([&]() -> awaitable<void> {
@@ -666,11 +677,12 @@ TEST_CASE("HTTP client decides the proxy again for each redirect", "[http][clien
 }
 
 TEST_CASE("HTTP client never shares a connection between direct and proxied requests", "[http][client][proxy][pool][integration]") {
+    thinger::http::test::running_workers workers;
     test_proxy proxy;
     origin_server origin;
     auto url = origin.url("0.0.0.0");
 
-    http::async_client client;
+    http::async_client client(workers);
     client.timeout(5s).proxy(proxy.url());
     std::shared_ptr<http::client_connection> direct, proxied, direct_again;
     bool all_ok = false;
@@ -702,12 +714,13 @@ TEST_CASE("HTTP client never shares a connection between direct and proxied requ
 
 TEST_CASE("HTTP client streams chunked responses through the proxy", "[http][client][proxy][streaming][integration]") {
     http::test::test_ca ca;
-    http::test::server_certificate certificate("origin.test", ca.issue("origin.test"));
+    auto certificates = std::make_shared<asio::certificate_manager>();
+    http::test::server_certificate certificate(certificates, "origin.test", ca.issue("origin.test"));
     test_proxy proxy;
 
     for (bool tls : {false, true}) {
         INFO((tls ? "tunnel" : "forwarded"));
-        origin_server origin(tls);
+        origin_server origin(tls, certificates);
         http::client client;
         client.timeout(5s).proxy(proxy.url()).add_ca_pem(ca.pem());
         auto url = origin.url("origin.test", "/chunked");

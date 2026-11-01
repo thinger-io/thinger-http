@@ -2,12 +2,14 @@
 #include <thinger/http/client/client.hpp>
 #include <thinger/http/client/async_client.hpp>
 #include <thinger/http/server/server_standalone.hpp>
+#include <thinger/http/server/websocket_connection.hpp>
 #include <thinger/util/logger.hpp>
 #include "../fixtures/test_server_fixture.hpp"
 #include <chrono>
 #include <atomic>
 #include <future>
 #include <thread>
+#include "../fixtures/server_listen.hpp"
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -38,7 +40,7 @@ private:
     void setup_websocket_endpoints() {
         // Basic echo WebSocket endpoint (no protocol required)
         server.get("/ws/echo", [](http::request& req, http::response& res) {
-            res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) {
+            res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection> ws) {
                 ws->on_message([ws](std::string message, bool binary) {
                     ws->send_text("echo: " + message);
                 });
@@ -47,18 +49,17 @@ private:
 
         // Echo WebSocket endpoint that requires a protocol
         server.get("/ws/echo-with-protocol", [](http::request& req, http::response& res) {
-            std::set<std::string> protocols = {"echo", "chat", "json"};
-            res.upgrade_websocket([](std::shared_ptr<http::websocket_connection> ws) {
+            res.upgrade_websocket({.protocols = {"echo", "chat", "json"}}, [](std::shared_ptr<http::websocket_connection> ws) {
                 ws->on_message([ws](std::string message, bool binary) {
                     ws->send_text("echo: " + message);
                 });
-            }, protocols);
+            });
         });
     }
 
     void start_server() {
-        REQUIRE(server.listen("127.0.0.1", 0));
-        port = server.local_port();
+        REQUIRE_FALSE(server.listen("127.0.0.1", 0));
+        port = http::test::listening_port(server);
         ws_url = "ws://127.0.0.1:" + std::to_string(port);
 
         std::promise<void> ready;
@@ -215,12 +216,13 @@ TEST_CASE("Request Builder with sync client", "[http][client][request_builder][s
 // ============================================
 
 TEST_CASE("Request Builder with async client (awaitable)", "[http][client][request_builder][async][awaitable]") {
+    thinger::http::test::running_workers workers;
 
     thinger::http::test::TestServerFixture fixture;
     auto& base_url = fixture.base_url;
 
     SECTION("GET with headers using builder and co_await") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<bool> success{false};
 
         client.run([&]() -> awaitable<void> {
@@ -236,7 +238,7 @@ TEST_CASE("Request Builder with async client (awaitable)", "[http][client][reque
     }
 
     SECTION("POST with body using builder and co_await") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<bool> success{false};
 
         client.run([&]() -> awaitable<void> {
@@ -253,7 +255,7 @@ TEST_CASE("Request Builder with async client (awaitable)", "[http][client][reque
     }
 
     SECTION("Multiple requests with builder using co_await") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<int> completed{0};
 
         for (int i = 0; i < 5; ++i) {
@@ -273,7 +275,7 @@ TEST_CASE("Request Builder with async client (awaitable)", "[http][client][reque
     }
 
     SECTION("PUT using builder and co_await") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<bool> success{false};
 
         client.run([&]() -> awaitable<void> {
@@ -289,7 +291,7 @@ TEST_CASE("Request Builder with async client (awaitable)", "[http][client][reque
     }
 
     SECTION("DELETE using builder and co_await") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<bool> success{false};
 
         client.run([&]() -> awaitable<void> {
@@ -309,12 +311,13 @@ TEST_CASE("Request Builder with async client (awaitable)", "[http][client][reque
 // ============================================
 
 TEST_CASE("Request Builder with async client (callback)", "[http][client][request_builder][async][callback]") {
+    thinger::http::test::running_workers workers;
 
     thinger::http::test::TestServerFixture fixture;
     auto& base_url = fixture.base_url;
 
     SECTION("GET with callback using builder") {
-        http::async_client client;
+        http::async_client client(workers);
         std::promise<bool> promise;
         auto future = promise.get_future();
 
@@ -329,7 +332,7 @@ TEST_CASE("Request Builder with async client (callback)", "[http][client][reques
     }
 
     SECTION("POST with callback using builder") {
-        http::async_client client;
+        http::async_client client(workers);
         std::promise<bool> promise;
         auto future = promise.get_future();
 
@@ -344,7 +347,7 @@ TEST_CASE("Request Builder with async client (callback)", "[http][client][reques
     }
 
     SECTION("PUT with callback using builder") {
-        http::async_client client;
+        http::async_client client(workers);
         std::promise<bool> promise;
         auto future = promise.get_future();
 
@@ -359,7 +362,7 @@ TEST_CASE("Request Builder with async client (callback)", "[http][client][reques
     }
 
     SECTION("PATCH with callback using builder") {
-        http::async_client client;
+        http::async_client client(workers);
         std::promise<bool> promise;
         auto future = promise.get_future();
 
@@ -374,7 +377,7 @@ TEST_CASE("Request Builder with async client (callback)", "[http][client][reques
     }
 
     SECTION("DELETE with callback using builder") {
-        http::async_client client;
+        http::async_client client(workers);
         std::promise<bool> promise;
         auto future = promise.get_future();
 
@@ -389,7 +392,7 @@ TEST_CASE("Request Builder with async client (callback)", "[http][client][reques
     }
 
     SECTION("HEAD with callback using builder") {
-        http::async_client client;
+        http::async_client client(workers);
         std::promise<bool> promise;
         auto future = promise.get_future();
 
@@ -405,7 +408,7 @@ TEST_CASE("Request Builder with async client (callback)", "[http][client][reques
     }
 
     SECTION("OPTIONS with callback using builder") {
-        http::async_client client;
+        http::async_client client(workers);
         std::promise<bool> promise;
         auto future = promise.get_future();
 
@@ -419,7 +422,7 @@ TEST_CASE("Request Builder with async client (callback)", "[http][client][reques
     }
 
     SECTION("Multiple callback requests in parallel") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<int> completed{0};
         const int num_requests = 10;
 
@@ -438,7 +441,7 @@ TEST_CASE("Request Builder with async client (callback)", "[http][client][reques
     }
 
     SECTION("Mixed callback and awaitable requests") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<int> callback_done{0};
         std::atomic<int> awaitable_done{0};
 
@@ -470,6 +473,7 @@ TEST_CASE("Request Builder with async client (callback)", "[http][client][reques
 // ============================================
 
 TEST_CASE("Request Builder API consistency between sync and async", "[http][client][request_builder][consistency]") {
+    thinger::http::test::running_workers workers;
 
     thinger::http::test::TestServerFixture fixture;
     auto& base_url = fixture.base_url;
@@ -484,7 +488,7 @@ TEST_CASE("Request Builder API consistency between sync and async", "[http][clie
         REQUIRE(sync_response.ok());
 
         // Async client (with awaitable)
-        http::async_client async_client;
+        http::async_client async_client(workers);
         std::atomic<bool> async_success{false};
 
         async_client.run([&]() -> awaitable<void> {
@@ -499,7 +503,7 @@ TEST_CASE("Request Builder API consistency between sync and async", "[http][clie
         REQUIRE(async_success);
 
         // Async client (with callback)
-        http::async_client callback_client;
+        http::async_client callback_client(workers);
         std::promise<bool> promise;
         auto future = promise.get_future();
 
@@ -589,10 +593,11 @@ TEST_CASE("Request Builder WebSocket with sync client", "[http][client][request_
 }
 
 TEST_CASE("Request Builder WebSocket with async client", "[http][client][request_builder][websocket][async]") {
+    thinger::http::test::running_workers workers;
     WebSocketBuilderFixture fixture;
 
     SECTION("WebSocket connect using builder with awaitable") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<bool> success{false};
 
         client.run([&]() -> awaitable<void> {
@@ -612,7 +617,7 @@ TEST_CASE("Request Builder WebSocket with async client", "[http][client][request
     }
 
     SECTION("WebSocket connect with protocol using builder (awaitable)") {
-        http::async_client client;
+        http::async_client client(workers);
         std::atomic<bool> success{false};
 
         client.run([&]() -> awaitable<void> {
@@ -634,7 +639,7 @@ TEST_CASE("Request Builder WebSocket with async client", "[http][client][request
     }
 
     SECTION("WebSocket connect using builder with callback") {
-        http::async_client client;
+        http::async_client client(workers);
         std::promise<bool> promise;
         auto future = promise.get_future();
 
@@ -656,7 +661,7 @@ TEST_CASE("Request Builder WebSocket with async client", "[http][client][request
     }
 
     SECTION("WebSocket connect with protocol using builder (callback)") {
-        http::async_client client;
+        http::async_client client(workers);
         std::promise<bool> promise;
         auto future = promise.get_future();
 
