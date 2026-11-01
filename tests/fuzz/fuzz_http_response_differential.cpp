@@ -264,26 +264,6 @@ namespace {
         return heads;
     }
 
-    // Replace `from` with `to` in the values of the `name` header lines of a head
-    bool replace_in_header(std::string& input, size_t begin, size_t end, std::string_view name, char from, char to) {
-        bool found = false;
-        size_t pos = input.find("\r\n", begin) + 2;
-        while (pos + 2 < end) {
-            size_t line_end = input.find("\r\n", pos);
-            size_t colon = input.find(':', pos);
-            if (colon < line_end && boost::iequals(std::string_view(input).substr(pos, colon - pos), name)) {
-                for (size_t i = colon + 1; i < line_end; i++) {
-                    if (input[i] == from) {
-                        input[i] = to;
-                        found = true;
-                    }
-                }
-            }
-            pos = line_end + 2;
-        }
-        return found;
-    }
-
     bool has_header(const std::string& input, size_t begin, size_t end, std::string_view name) {
         std::string copy = input.substr(begin, end - begin);
         return fuzz::neutralize_header(copy, copy.size(), name);
@@ -361,7 +341,7 @@ namespace {
         // by the end of the connection. Made SP
         auto [final_begin, final_end] = heads.back();
         if (ours.framing == body_framing::chunked && !theirs.chunked &&
-            replace_in_header(input, final_begin, final_end, "Transfer-Encoding", '\t', ' ')) {
+            fuzz::replace_in_header(input, final_begin, final_end, "Transfer-Encoding", '\t', ' ')) {
             return "HTAB around chunked";
         }
 

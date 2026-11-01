@@ -340,7 +340,7 @@ namespace thinger::http{
     void websocket_connection::push_message(std::string data, bool binary){
         // (once closed, nothing is sent: not a congestion)
         if(queue_->push(out_message{std::move(data), binary}) == detail::push_queue<out_message>::admission::drop && !queue_->closed()){
-            LOG_WARNING("websocket is congested. discarding packets!");
+            LOG_DEBUG("websocket is congested. discarding packets!");
         }
     }
 

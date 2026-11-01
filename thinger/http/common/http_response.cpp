@@ -426,7 +426,8 @@ namespace thinger::http{
         return status_ == status::temporary_redirect ||
                status_ == status::moved_temporarily ||
                status_ == status::permanent_redirect ||
-               status_ == status::moved_permanently;
+               status_ == status::moved_permanently ||
+               get_status_code() == 303; // See Other, followed with a GET
     }
 
     void http_response::set_status(uint16_t status_code){

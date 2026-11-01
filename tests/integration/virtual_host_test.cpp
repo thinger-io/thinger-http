@@ -6,11 +6,15 @@
 #include <nlohmann/json.hpp>
 #include <boost/asio.hpp>
 #include <boost/asio/use_future.hpp>
+#include <atomic>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <thread>
+#include <pthread.h>
 #include "../fixtures/server_listen.hpp"
 
 using namespace thinger;
@@ -262,5 +266,122 @@ TEST_CASE("Virtual hosts in in-memory dispatch", "[server][vhost][dispatch][inte
         REQUIRE(&server.host("*") == &server);
         REQUIRE(&server.host("API.example.com") == &server.host("api.example.com"));
         REQUIRE(&server.host("*.example.com") == &server.host("*.example.com"));
+    }
+}
+
+namespace {
+
+    // In-memory dispatch of a GET of `path` with the given Host header
+    std::shared_ptr<http::http_response> dispatch_with_host(http::server& server, const std::string& path,
+                                                           const std::string& host) {
+        boost::asio::io_context ioc;
+        auto request = http::http_request::create_http_request(http::method::GET, "http://localhost" + path);
+        request->set_header(http::header::host, host);
+        auto result = co_spawn(ioc, server.dispatch(request), boost::asio::use_future);
+        ioc.run();
+        return result.get();
+    }
+
+    // Run `function` on a thread with a stack of `stack_size` bytes, as a deep recursion
+    // would overflow it (and crash the test) instead of passing on a default 8 MiB stack
+    void run_on_small_stack(size_t stack_size, std::function<void()> function) {
+        struct task {
+            std::function<void()> function;
+            std::exception_ptr error;
+        } work{std::move(function), nullptr};
+        pthread_attr_t attributes;
+        REQUIRE(pthread_attr_init(&attributes) == 0);
+        REQUIRE(pthread_attr_setstacksize(&attributes, stack_size) == 0);
+        pthread_t thread;
+        auto entry = [](void* argument) -> void* {
+            auto& work = *static_cast<task*>(argument);
+            try {
+                work.function();
+            } catch (...) {
+                work.error = std::current_exception();
+            }
+            return nullptr;
+        };
+        REQUIRE(pthread_create(&thread, &attributes, entry, &work) == 0);
+        pthread_attr_destroy(&attributes);
+        REQUIRE(pthread_join(thread, nullptr) == 0);
+        if (work.error) std::rethrow_exception(work.error);
+    }
+
+#if defined(__SANITIZE_ADDRESS__)
+    constexpr bool sanitized = true;
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+    constexpr bool sanitized = true;
+#  else
+    constexpr bool sanitized = false;
+#  endif
+#else
+    constexpr bool sanitized = false;
+#endif
+
+}
+
+// A Host longer than any DNS name (253 bytes) is never run through the regex of a pattern host,
+// whose libstdc++ matcher recurses about once per byte: it is served by the default host, as any
+// name no virtual host matches. Node and Go do not limit the Host either, beyond their header
+// size limits, so the name is not refused
+TEST_CASE("Host names over 253 bytes skip the pattern hosts", "[server][vhost][integration]") {
+    running_server s;
+    auto& server = s.server;
+    std::atomic<bool> wildcard_called = false;
+    server.get("/", [](http::response& res) { res.send("default"); });
+    server.host("*.example.com").get("/", [&wildcard_called](http::response& res) {
+        wildcard_called = true;
+        res.send("wildcard");
+    });
+    server.host_regex("(.+)\\.devices\\.example\\.org").get("/", [](http::response& res) { res.send("devices"); });
+    server.host("api.example.com").get("/", [](http::response& res) { res.send("api"); });
+
+    // A single label that fills the 16 KiB header section, with the request line and the other
+    // headers (over it, the request would be answered 431 and prove nothing)
+    const std::string long_label(16000, 'a');
+    const std::string long_host = long_label + ".example.com";
+
+    SECTION("over a connection, the default host answers and the server keeps serving") {
+        s.start();
+        auto response = request_with_host(s.port, "GET", "/", long_host);
+        REQUIRE(response.status == 200);
+        REQUIRE(response.body == "default");
+        REQUIRE_FALSE(wildcard_called);
+        REQUIRE(request_with_host(s.port, "GET", "/", "dev1.example.com").body == "wildcard");
+    }
+
+    SECTION("253 bytes match the pattern, 254 do not") {
+        const std::string suffix = ".example.com";
+        const std::string name_253 = std::string(253 - suffix.size(), 'a') + suffix;
+        const std::string name_254 = std::string(254 - suffix.size(), 'a') + suffix;
+        REQUIRE(name_253.size() == 253);
+        REQUIRE(dispatch_with_host(server, "/", name_253)->get_content() == "wildcard");
+        REQUIRE(dispatch_with_host(server, "/", name_254)->get_content() == "default");
+
+        // the length is that of the normalized name: without the port and one trailing dot
+        REQUIRE(dispatch_with_host(server, "/", name_253 + ".")->get_content() == "wildcard");
+        REQUIRE(dispatch_with_host(server, "/", name_253 + ":8080")->get_content() == "wildcard");
+        REQUIRE(dispatch_with_host(server, "/", name_253 + ".:8080")->get_content() == "wildcard");
+        REQUIRE(dispatch_with_host(server, "/", name_254 + ":8080")->get_content() == "default");
+    }
+
+    SECTION("host_regex() hosts are skipped too, exact hosts are still found") {
+        REQUIRE(dispatch_with_host(server, "/", long_label + ".devices.example.org")->get_content() == "default");
+        REQUIRE(dispatch_with_host(server, "/", "dev1.devices.example.org")->get_content() == "devices");
+        REQUIRE(dispatch_with_host(server, "/", "API.example.com:443")->get_content() == "api");
+    }
+
+    SECTION("resolving a 16 KiB Host does not need a deep stack") {
+        // The stack used by host resolution does not grow with the Host length (sanitizers
+        // enlarge the frames of the dispatch itself)
+        const size_t stack_size = sanitized ? 1024 * 1024 : 256 * 1024;
+        std::string content;
+        run_on_small_stack(stack_size, [&]() {
+            content = dispatch_with_host(server, "/", long_host)->get_content();
+        });
+        REQUIRE(content == "default");
+        REQUIRE_FALSE(wildcard_called);
     }
 }

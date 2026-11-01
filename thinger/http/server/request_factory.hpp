@@ -121,9 +121,14 @@ namespace thinger::http {
             switch (state_) {
                 case uri: return c != ' ' && is_char(c) && !is_ctl(c);
                 case header_name: return is_char(c) && !is_ctl(c) && !is_tspecial(c);
-                case header_value: return !is_ctl(c);
+                case header_value: return !is_ctl(c) || c == '\t';
                 default: return false;
             }
+        }
+
+        /// Check if a byte is optional whitespace (OWS, RFC 9110 section 5.6.3).
+        static bool is_ows(int c) {
+            return c == ' ' || c == '\t';
         }
 
         /// Check if a byte is an HTTP character.
@@ -162,6 +167,7 @@ namespace thinger::http {
         size_t header_lines_ = 0;
         size_t header_section_size_ = 0;
         bool header_section_too_large_ = false;
+        bool host_field_ = false;
 
         /// Fail the parsing for exceeding the header section limits
         bool header_section_exceeded() {

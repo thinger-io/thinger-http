@@ -967,6 +967,17 @@ TEST_CASE("Reverse proxy rewrites paths and hosts, and runs hooks", "[proxy][hoo
         REQUIRE(raw_request(proxy.port, request).json()["headers"]["host"] == "front.example");
     }
 
+    // An HTTP/1.0 request may have no Host; the HTTP/1.1 request forwarded carries an empty one,
+    // as a target without an authority (RFC 9112 section 3.2), or the target answers 400
+    SECTION("Preserved host of a request without one") {
+        mode.set("preserve");
+        auto res = raw_request(proxy.port, "GET /api/items/7 HTTP/1.0\r\n\r\n");
+        REQUIRE(res.status == 200);
+        auto headers = res.json()["headers"];
+        REQUIRE(headers.contains("host"));
+        REQUIRE(headers["host"] == "");
+    }
+
     SECTION("Custom host") {
         mode.set("custom");
         REQUIRE(raw_request(proxy.port, request).json()["headers"]["host"] == "internal.example");

@@ -2,6 +2,8 @@
 #include <catch2/catch_template_test_macros.hpp>
 #include <thinger/http/client/client.hpp>
 #include <thinger/http/client/async_client.hpp>
+#include <thinger/http/client/websocket_util.hpp>
+#include <string>
 #include <type_traits>
 #include "../../../fixtures/running_workers.hpp"
 
@@ -258,4 +260,19 @@ TEST_CASE("Standalone Client specific features", "[http][client][standalone][uni
         // The synchronous methods handle io_context.run() automatically
         REQUIRE(true);
     }
+}
+
+TEST_CASE("WebSocket URL parsing refuses a URL over 8192 bytes", "[http][client][websocket][unit][url_cap]") {
+    auto url_of = [](size_t size) {
+        std::string url = "ws://example.com/";
+        url.append(size - url.size(), 'a');
+        return url;
+    };
+
+    auto parsed = http::websocket_util::parse_websocket_url(url_of(8192));
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->host == "example.com");
+    REQUIRE(parsed->path.size() == 8192 - std::string("ws://example.com").size());
+
+    REQUIRE_FALSE(http::websocket_util::parse_websocket_url(url_of(8193)).has_value());
 }

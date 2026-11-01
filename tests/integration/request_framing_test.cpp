@@ -84,6 +84,12 @@ TEST_CASE("Transfer-Encoding other than chunked is rejected", "[server][framing]
     SECTION("Identity") {
         require_rejected(fixture, post_headers("Transfer-Encoding: identity\r\n") + body);
     }
+    SECTION("Empty") {
+        require_rejected(fixture, post_headers("Transfer-Encoding:\r\n") + body);
+    }
+    SECTION("Only whitespace") {
+        require_rejected(fixture, post_headers("Transfer-Encoding: \t\r\n") + body);
+    }
 }
 
 TEST_CASE("Transfer-Encoding in an HTTP/1.0 request is rejected", "[server][framing][smuggling][integration][matrix]") {
@@ -127,8 +133,10 @@ TEST_CASE("Invalid Content-Length is rejected", "[server][framing][smuggling][in
     SECTION("Negative") {
         require_rejected(fixture, post_headers("Content-Length: -1\r\n") + "hello");
     }
-    SECTION("Leading space") {
-        require_rejected(fixture, post_headers("Content-Length:  5\r\n") + "hello");
+    // (Optional whitespace around the value is accepted: see "Field values with optional
+    // whitespace frame the body")
+    SECTION("Space inside the value") {
+        require_rejected(fixture, post_headers("Content-Length: 5 5\r\n") + "hello");
     }
     SECTION("Plus sign") {
         require_rejected(fixture, post_headers("Content-Length: +5\r\n") + "hello");
@@ -136,11 +144,82 @@ TEST_CASE("Invalid Content-Length is rejected", "[server][framing][smuggling][in
     SECTION("Empty") {
         require_rejected(fixture, post_headers("Content-Length: \r\n") + "hello");
     }
+    SECTION("Empty, without whitespace") {
+        require_rejected(fixture, post_headers("Content-Length:\r\n") + "hello");
+    }
+    SECTION("Only whitespace") {
+        require_rejected(fixture, post_headers("Content-Length: \t \r\n") + "hello");
+    }
+    SECTION("List of values without a space") {
+        require_rejected(fixture, post_headers("Content-Length: 5,5\r\n") + "hello");
+    }
     SECTION("Overflow") {
         require_rejected(fixture, post_headers("Content-Length: 99999999999999999999999\r\n") + "hello");
     }
     SECTION("List of values") {
         require_rejected(fixture, post_headers("Content-Length: 5, 5\r\n") + "hello");
+    }
+}
+
+// RFC 9112 section 5.1 allows optional whitespace (SP or HTAB) before and after a field value,
+// which is not part of it (RFC 9110 section 5.5): Node (llhttp) and Go accept these forms, which
+// hand-written HTTP stacks of devices send, and frame the body with the trimmed value. The
+// framing fields stay strict on that value
+TEST_CASE("Field values with optional whitespace frame the body", "[server][framing][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    framing_server fixture;
+    fixture.start(kind);
+
+    auto require_echoed = [&](const std::string& request) {
+        auto result = raw_exchange(*fixture.running, request + health_close_request);
+        INFO("response: " << result.data);
+        REQUIRE(count(result.data, "HTTP/1.1 200") == 2);
+        REQUIRE(result.data.find("body=[hello]") != std::string::npos);
+        REQUIRE(result.data.find("healthy") != std::string::npos);
+        REQUIRE(fixture.smuggled == 0);
+    };
+
+    // Node and Go: served with the 5-byte body
+    SECTION("Content-Length with trailing SP") {
+        require_echoed(post_headers("Content-Length: 5 \r\n") + "hello");
+    }
+    SECTION("Content-Length between HTABs") {
+        require_echoed(post_headers("Content-Length:\t5\t\r\n") + "hello");
+    }
+    SECTION("Content-Length without whitespace") {
+        require_echoed(post_headers("Content-Length:5\r\n") + "hello");
+    }
+    // Rejected in 0.9.0 as "Leading space"
+    SECTION("Content-Length with two leading spaces") {
+        require_echoed(post_headers("Content-Length:  5\r\n") + "hello");
+    }
+    // Node and Go: read as chunked
+    SECTION("Transfer-Encoding with trailing SP") {
+        require_echoed(post_headers("Transfer-Encoding: chunked \r\n") + "5\r\nhello\r\n0\r\n\r\n");
+    }
+    SECTION("Transfer-Encoding after an HTAB") {
+        require_echoed(post_headers("Transfer-Encoding:\tchunked\r\n") + "5\r\nhello\r\n0\r\n\r\n");
+    }
+    SECTION("Other fields with any OWS") {
+        require_echoed(post_headers("X-A:value\r\nX-B:\r\nX-C:\t a\tb \t\r\nContent-Length: 5\r\n") + "hello");
+    }
+}
+
+// RFC 9112 section 5.1: a server MUST reject whitespace between a field name and the colon
+// with 400; llhttp and Go reject it too
+TEST_CASE("Whitespace before the colon of a field is rejected", "[server][framing][smuggling][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    framing_server fixture;
+    fixture.start(kind);
+
+    SECTION("Content-Length") {
+        require_rejected(fixture, post_headers("Content-Length : 5\r\n") + "hello");
+    }
+    SECTION("Transfer-Encoding") {
+        require_rejected(fixture, post_headers("Transfer-Encoding\t: chunked\r\n") + "5\r\nhello\r\n0\r\n\r\n");
+    }
+    SECTION("Other field") {
+        require_rejected(fixture, "GET /health HTTP/1.1\r\nHost: localhost\r\nX-A\t: b\r\n\r\n");
     }
 }
 
@@ -382,6 +461,184 @@ TEST_CASE("Request target starting with an encoded slash is rejected", "[server]
 }
 
 namespace {
+
+    // Routes that echo what they see of the target
+    struct target_server {
+        http::server server;
+        std::unique_ptr<running_server> running;
+
+        target_server() {
+            server.get("/api/items", [](http::request& req, http::response& res) {
+                res.send("range=[" + req.query("range") + "]");
+            });
+            server.get("/files/:file", [](http::request& req, http::response& res) {
+                res.send("file=[" + req["file"] + "]");
+            });
+            server.get("/p/:name", [](http::request& req, http::response& res) {
+                res.send("path=[" + req.get_http_request()->get_path() + "] name=[" + req["name"] + "] resource=[" +
+                         req.get_http_request()->get_resource() + "] q=[" + req.query("q") + "]");
+            });
+        }
+
+        void start(transport kind) {
+            running = std::make_unique<running_server>(server, kind);
+        }
+
+        std::string get(const std::string& target) {
+            auto result = raw_exchange(*running, "GET " + target + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            return result.data;
+        }
+    };
+}
+
+// Only ".." path segments are refused; Node and Go accept "1..5" in a query or "v1..v2.txt" in a
+// path, which are no traversal
+TEST_CASE("Request targets with \"..\" outside path segments are served", "[server][framing][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    target_server fixture;
+    fixture.start(kind);
+
+    auto range = fixture.get("/api/items?range=1..5");
+    INFO("response: " << range);
+    REQUIRE(range.starts_with("HTTP/1.1 200"));
+    REQUIRE(range.find("range=[1..5]") != std::string::npos);
+
+    auto file = fixture.get("/files/v1..v2.txt");
+    INFO("response: " << file);
+    REQUIRE(file.starts_with("HTTP/1.1 200"));
+    REQUIRE(file.find("file=[v1..v2.txt]") != std::string::npos);
+
+    for (const char* target : {"/files/...", "/files/..a", "/files/a..", "/api/items?q=a%2E%2Eb", "/api/items?../.."}) {
+        INFO("target: " << target);
+        REQUIRE(fixture.get(target).starts_with("HTTP/1.1 200"));
+    }
+}
+
+// A ".." segment of the percent-decoded path is refused with 400 before any route, as in 0.9.0
+TEST_CASE("Request targets with \"..\" path segments are rejected", "[server][framing][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    framing_server fixture;
+    fixture.start(kind);
+    for (const char* target : {"/..", "/../health", "/a/../health", "/health/..", "/health/..?x=1", "/%2E%2E/health",
+                               "/.%2e/health", "/a%2F..%2Fhealth"}) {
+        INFO("target: " << target);
+        require_rejected(fixture, "GET " + std::string(target) + " HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    }
+}
+
+// "+" is literal in a path (Node's URL.pathname, Go's URL.Path) and a space in the query (Node's
+// URLSearchParams, Go's URL.Query())
+TEST_CASE("Plus is literal in the path and a space in the query", "[server][framing][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    target_server fixture;
+    fixture.start(kind);
+
+    auto plus = fixture.get("/p/a+b?q=c+d");
+    INFO("response: " << plus);
+    REQUIRE(plus.starts_with("HTTP/1.1 200"));
+    REQUIRE(plus.find("path=[/p/a+b] name=[a+b] resource=[/p/a+b] q=[c d]") != std::string::npos);
+
+    auto encoded = fixture.get("/p/a%2Bb");
+    INFO("response: " << encoded);
+    REQUIRE(encoded.starts_with("HTTP/1.1 200"));
+    REQUIRE(encoded.find("resource=[/p/a+b]") != std::string::npos);
+}
+
+namespace {
+
+    // A route and a middleware that count the requests reaching them
+    struct host_server {
+        http::server server;
+        std::unique_ptr<running_server> running;
+        std::atomic<int> middleware_calls{0};
+        std::atomic<int> handler_calls{0};
+
+        host_server() {
+            server.use([this](http::request&, http::response&, std::function<void()> next) {
+                middleware_calls++;
+                next();
+            });
+            server.get("/host", [this](http::request& req, http::response& res) {
+                handler_calls++;
+                res.send("host=[" + req.get_http_request()->get_host() + "]");
+            });
+        }
+
+        void start(transport kind) {
+            running = std::make_unique<running_server>(server, kind);
+        }
+
+        // Answered 400 and closed, before any middleware or handler, and nothing sent after it
+        // runs as another request
+        void require_rejected(const std::string& head) {
+            auto result = raw_exchange(*running, head + "\r\n" + "GET /host HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            INFO("response: " << result.data);
+            REQUIRE(result.data.starts_with("HTTP/1.1 400"));
+            REQUIRE(count(result.data, "HTTP/1.1 ") == 1);
+            REQUIRE(result.closed);
+            REQUIRE(middleware_calls == 0);
+            REQUIRE(handler_calls == 0);
+        }
+
+        std::string served(const std::string& head) {
+            auto result = raw_exchange(*running, head + "Connection: close\r\n\r\n");
+            INFO("response: " << result.data);
+            REQUIRE(result.data.starts_with("HTTP/1."));
+            REQUIRE(result.data.find(" 200 ") != std::string::npos);
+            return result.data;
+        }
+    };
+}
+
+// RFC 9110 section 7.2: an HTTP/1.1 request without Host is answered 400, as Node
+// (requireHostHeader) and Go ("missing required Host header") do; HTTP/1.0 may omit it, and an
+// empty Host is present (Node and Go check presence only)
+TEST_CASE("HTTP/1.1 requests without Host are rejected", "[server][framing][host][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    host_server fixture;
+    fixture.start(kind);
+
+    SECTION("HTTP/1.1 without Host: 400 and close") {
+        fixture.require_rejected("GET /host HTTP/1.1\r\n");
+        fixture.require_rejected("GET /host HTTP/1.1\r\nX-Host: localhost\r\n");
+    }
+    SECTION("HTTP/1.0 without Host is served") {
+        auto response = fixture.served("GET /host HTTP/1.0\r\n");
+        REQUIRE(response.find("host=[]") != std::string::npos);
+        REQUIRE(fixture.handler_calls == 1);
+    }
+    SECTION("HTTP/1.1 with an empty Host is served by the default host") {
+        auto response = fixture.served("GET /host HTTP/1.1\r\nHost:\r\n");
+        REQUIRE(response.find("host=[]") != std::string::npos);
+        fixture.served("GET /host HTTP/1.1\r\nHost: \r\n");
+        REQUIRE(fixture.handler_calls == 2);
+    }
+}
+
+// RFC 9110 section 7.2: more than one Host field is answered 400. Go answers 400 ("too many Host
+// headers"), Node keeps the first one; they differ, so the RFC decides. Two Hosts may route
+// differently along a proxy chain
+TEST_CASE("Requests with more than one Host are rejected", "[server][framing][host][smuggling][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    host_server fixture;
+    fixture.start(kind);
+
+    SECTION("Different values") {
+        fixture.require_rejected("GET /host HTTP/1.1\r\nHost: localhost\r\nHost: evil.example\r\n");
+    }
+    SECTION("Equal values") {
+        fixture.require_rejected("GET /host HTTP/1.1\r\nHost: localhost\r\nHost: localhost\r\n");
+    }
+    SECTION("Any letter case") {
+        fixture.require_rejected("GET /host HTTP/1.1\r\nHost: localhost\r\nhost: localhost\r\n");
+        fixture.require_rejected("GET /host HTTP/1.1\r\nHOST: a\r\nX-A: b\r\nhOsT: b\r\n");
+    }
+    SECTION("In HTTP/1.0") {
+        fixture.require_rejected("GET /host HTTP/1.0\r\nHost: localhost\r\nHost: localhost\r\n");
+    }
+}
+
+namespace {
     // GET /health with `count` headers in all (Host included)
     std::string request_with_headers(int count) {
         std::string request = "GET /health HTTP/1.1\r\nHost: localhost\r\n";
@@ -424,7 +681,10 @@ TEST_CASE("Request header section limits", "[server][framing][limits][integratio
     SECTION("A header section over 16 KB is rejected with 431") {
         require_rejected(fixture, request_of_size(16 * 1024 + 1), "431");
     }
+    // A target alone over the 16 KB section: 431, as Node (HPE_HEADER_OVERFLOW) and Go
+    // (MaxHeaderBytes) answer, since the request line and the headers share one budget
     SECTION("A request line over 16 KB is rejected with 431") {
+        require_rejected(fixture, "GET /health/" + std::string(16 * 1024, 'a') + " HTTP/1.1\r\nHost: localhost\r\n\r\n", "431");
         require_rejected(fixture, "GET /health?q=" + std::string(16 * 1024, 'a') + " HTTP/1.1\r\nHost: localhost\r\n\r\n", "431");
     }
 }

@@ -16,6 +16,9 @@ namespace thinger::http {
             co_return state.cancelled() != boost::asio::cancellation_type::none;
         }
 
+        // The first piece of a Content-Length body read whole (see read_all())
+        constexpr size_t body_first_piece = 64 * 1024;
+
     }
 
     void body_reader::set_framing(bool chunked, size_t content_length) {
@@ -151,12 +154,22 @@ namespace thinger::http {
                 error_ = body_error::too_large;
                 co_return false;
             }
+            // Grown as its bytes arrive, not to its announced size at once: a head announcing a
+            // large body takes no memory for bytes that never come (as Go's io.ReadAll). The
+            // first piece holds a small body whole; each next one doubles what arrived
             size_t offset = body.size();
-            size_t pending = remaining_;
-            body.resize(offset + pending);
-            size_t bytes = co_await read(reinterpret_cast<uint8_t*>(body.data()) + offset, pending);
-            body.resize(offset + bytes);
-            co_return bytes == pending;
+            size_t end = offset + remaining_;
+            while (body.size() < end) {
+                size_t size = body.size();
+                size_t piece = std::min(end - size, std::max(body_first_piece, size - offset));
+                body.resize(size + piece);
+                size_t bytes = co_await read(reinterpret_cast<uint8_t*>(body.data()) + size, piece);
+                if (bytes < piece) {
+                    body.resize(size + bytes);
+                    co_return false;
+                }
+            }
+            co_return true;
         }
 
         uint8_t buffer[8192];

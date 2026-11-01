@@ -8,12 +8,13 @@ reverse proxy), which reads what any server sends.
 
 | Target | What it checks |
 |---|---|
-| `fuzz_http_request_parser` | `request_factory` (full and headers-only modes) and the framing rules: same outcome however the input is split; an accepted header section is well formed (CRLF line endings, no folding, within limits, `HTTP/1.DIGIT`); `has_valid_framing()` agrees with an independent check of the raw `Content-Length` / `Transfer-Encoding` lines; then the whole request goes through `body_reader` |
+| `fuzz_http_request_parser` | `request_factory` (full and headers-only modes) and the framing rules: same outcome however the input is split; an accepted header section is well formed (CRLF line endings, no folding, no whitespace before a colon, no control character but HTAB in values, within limits, `HTTP/1.DIGIT`, one `Host` field, which only HTTP/1.0 may omit); `has_valid_framing()` agrees with an independent check of the raw `Content-Length` / `Transfer-Encoding` lines; then the whole request goes through `body_reader` |
 | `fuzz_http_response_parser` | `response_factory`, on what a server sent before closing the connection, as the response to `GET`, `HEAD` and `CONNECT`: same outcome, error, end, framing and body however the input is split; each head (interim responses included), parsed alone as the reverse proxy does, is well formed when accepted (`HTTP/1.DIGIT`, a status from 100 to 599, CRLF line endings, no folding, valid names and values, within limits) and fails as the client fails on it; its framing agrees with an independent check of the raw `Content-Length` / `Transfer-Encoding` lines and with RFC 9112 section 6.3 (no body for `HEAD`, 1xx, 204, 304 and a 2xx to `CONNECT`); the body of the final response is the one an independent reading gives (`Content-Length` bytes, what `chunked_decoder` decodes from the same bytes, or the rest of the input); a connection kept alive never had a body delimited by its end nor switched protocols |
 | `fuzz_http_response_differential` | Three-way differential of responses, as the client reads them: against llhttp in response mode; Beast's disagreements with llhttp are only counted (see below) |
 | `fuzz_chunked_decoder` | `chunked_decoder`: no out-of-bounds access (every piece and output buffer is an exact-size heap allocation); the same body, outcome and bytes consumed however the input is split, whatever the output buffer size, and when chunk data is read straight from the input (`data_pending` / `data_consumed`); errors and the end of the body are final; bytes after the body are never consumed nor looked at |
 | `fuzz_http_differential` | Differential against `boost::beast::http::request_parser` (see below) |
 | `fuzz_http_differential3` | Three-way differential: against llhttp, Node.js's parser, in its strict default mode; Beast's disagreements with llhttp are only counted (see below) |
+| `fuzz_host_route_matchers` | Virtual host resolution and route matching, through in-memory dispatch, on a Host value and a request target of up to 16 KiB (the size of a header section; see below): no crash, stack overflow or timeout, and the host and route found agree with an independent reading of the name and the path |
 | `fuzz_url_decode`, `fuzz_utf8_validate` | No crash or undefined behavior |
 | `fuzz_body_decoders` | Every built-in body decoder (`body_decoder_registry`: JSON, MessagePack, CBOR, UBJSON, form, text, binary) on the same input: it decodes within the limits (nesting depth, at most one value per byte) or fails with `body_decode_error` (400), nothing else; a decoded value dumps (valid UTF-8), and its JSON, MessagePack and CBOR encodings decode to the same value; it is validated against a JSON Schema without crashing. The input is also parsed as a Content-Type and an Accept header |
 | `fuzz_multipart` | `multipart_parser`, with a boundary and limits picked by the first byte: the same parts, headers, content, end or error however the body is split (pieces from the input hash, and byte by byte), every piece an exact-size allocation; errors and the end are final; content never holds a delimiter, parts stay within the limits, header names are tokens and values have no CR, LF or NUL, safe filenames are never paths; the parts written again as a body parse to the same parts; the `multipart` body decoder fails only with `400` or `413`, and decodes exactly the bodies the parser reads whole (with valid UTF-8) |
@@ -24,8 +25,10 @@ reproduces from the input alone.
 
 Seeds are in `corpus/`: `http_request_parser` is used by the three request targets,
 `http_response_parser` by the two response targets, `chunked_decoder` has chunked bodies,
-each followed by another request. Every seed fits the
-`-max_len=4096` used by CI, and a seed is only added if no other has the same bytes.
+each followed by another request, and `host_route_matchers` has host names and paths for
+`fuzz_host_route_matchers`. Every seed but those of `host_route_matchers` fits the
+`-max_len=4096` used by CI (the matcher target runs with `-max_len=16384`, as its long names
+and paths are the point), and a seed is only added if no other has the same bytes.
 
 | Seeds | Origin |
 |---|---|
@@ -38,6 +41,7 @@ each followed by another request. Every seed fits the
 | `http_request_parser/quirks/`, `chunked_decoder/quirks/` | Generated by `tools/generate_smuggling_seeds.py`: one request per parsing quirk of the classes [HTTP Garden](https://github.com/narfindustries/http-garden) found in real parsers (line terminators, whitespace and stray bytes in the request line, field names and values, Content-Length and chunk sizes read as their longest valid prefix or with `+`, `-`, `0x`, `_`, Transfer-Encoding lists, trailer fields, pipelined, split and shifted requests). HTTP Garden is GPL-3.0: none of its code or payloads is used, only its published bug classes, written here from scratch |
 | `http_response_parser/cases/`, `http_response_parser/quirks/` | Generated by `tools/generate_response_seeds.py`, written for this project: the responses of `tests/unit/http/client/response_factory_test.cpp` and `tests/integration/client_response_framing_test.cpp`, and one response per quirk of the classes above applied to responses (status lines, line terminators, field names and values, the `Content-Length` and `Transfer-Encoding` obfuscations and chunk quirks of `generate_smuggling_seeds.py`, interim responses, responses without a body whatever their headers, bodies delimited by the end of the connection, response splitting) |
 | `http_response_parser/llhttp/` | The responses of llhttp's test suite (`test/response/*.md` of llhttp v9.4.3), extracted by `tools/extract_llhttp_seeds.py` |
+| `host_route_matchers/*.txt` | Written for this project: a Host and a target for each host and route of the target, names of 253 and 254 bytes (with a port and a trailing dot), Hosts of 16 KiB on each kind of pattern host, and paths of 16 KiB for each kind of route (parameters, character classes, text mixed with parameters, the `std::regex` fallbacks, catch-alls) |
 | `http_request_parser/obfuscation/` | Generated by `tools/generate_smuggling_seeds.py`: the Transfer-Encoding and Content-Length obfuscations request smuggling scanners try, in the CL.TE, TE.CL and TE.TE shapes, each followed by a smuggled request. Written for this project, no scanner's code or payload list is copied |
 
 To regenerate them (the llhttp ones from a source checkout of the llhttp release, which has
@@ -146,11 +150,13 @@ that reference recognizes it and rewrites the input (keeping its framing) so the
 longer rejects it for that reason, then compares again, so the rest of the request is still
 checked. Cases where all three agree (bare CR or LF, `Content-Length` with a sign or other
 than digits, both `Content-Length` and `Transfer-Encoding`, chunk sizes with `0x`, signs or
-overflow, chunk data longer than its size...) are not listed.
+overflow, chunk data longer than its size, optional whitespace around field values, trimmed:
+`Name:value`, `Name:`, SP and HTAB before and after the value, HTAB inside it, framing
+fields included but for the first case below...) are not listed.
 
 | Case | Ours | Beast | llhttp |
 |---|---|---|---|
-| Field value without exactly one space after the colon (`Name:value`, `Name:  value`), trailing whitespace, HTAB in it | rejected (so are such `Content-Length` and `Transfer-Encoding`) | accepted, OWS trimmed | accepted, OWS trimmed |
+| HTAB after `chunked` (`Transfer-Encoding: chunked\t`) | chunked: the whitespace around a value is not part of it (RFC 9110 section 5.5) | chunked | another coding, which a request must not have: rejected, **normalized** (HTAB made SP) |
 | Obsolete line folding, in headers or trailers | rejected | unfolded | rejected |
 | Whitespace before the first header line or a field name | rejected | accepted | rejected |
 | `Content-Length: 5, 5` | rejected | accepted (same values) | rejected |
@@ -158,9 +164,11 @@ overflow, chunk data longer than its size...) are not listed.
 | `Transfer-Encoding` other than a single `chunked` (`gzip, chunked`, `chunked, chunked`, two headers, `identity`, unknown codings) | rejected | chunked if the last coding is chunked; otherwise **no body**, so the bytes that follow are the next request | chunked if the last coding (of any header) is chunked; otherwise rejected |
 | Empty `Transfer-Encoding` | rejected | accepted | rejected |
 | `Transfer-Encoding` in an HTTP/1.0 request | rejected (RFC 9112 section 6.1) | accepted | accepted |
+| HTTP/1.1 request without `Host` | rejected (RFC 9110 section 7.2; Node's and Go's servers reject it too) | accepted | accepted (Node's server checks it, not the parser) |
+| More than one `Host` field, whatever the values | rejected (RFC 9110 section 7.2; Go rejects it too, Node keeps the first) | accepted | accepted |
 | Request target other than origin form (absolute form, authority form, `*`) | rejected | accepted | accepted |
 | Request target starting with an encoded slash (`%2Fa`) | rejected (fixed, see above) | accepted | rejected |
-| Request target with invalid percent-encoding or `..` | rejected | accepted | accepted |
+| Request target with invalid percent-encoding, or a `..` segment in its percent-decoded path (`/a/../b`, `/%2E%2E/x`; the path ends at the first `?`, and `..` elsewhere, as in `/v1..v2` or the query, is accepted) | rejected | accepted | accepted |
 | Request target with bytes above 0x7F | rejected (fixed, see above) | accepted | rejected |
 | `CONNECT` | rejected (fixed, see above) | parsed as any other request (body read) | no content: what follows is tunnel data |
 | Methods llhttp does not know (any token, lowercase, RTSP methods like `DESCRIBE` in HTTP) | accepted as `UNKNOWN` (RFC 9110 section 9.1), for the application to answer | accepted | rejected, **normalized** (replaced by `GET`) |
@@ -254,3 +262,32 @@ llhttp no longer does it for that reason, and compared again.
 
 Not compared: keep-alive beyond the framing (whether the connection is delimited by its end),
 and header fields other than the framing ones.
+
+## Virtual host and route matchers
+
+`fuzz_host_route_matchers` serves a fixed application in memory (`http_application::dispatch()`,
+which resolves the host and matches the route as for a request from a connection): a host of
+each kind (exact `api.example.com`, `*.example.com`, `:tenant.example.org`,
+`:device([a-z0-9-]+).devices.example.net` and a `host_regex()`), each with the same routes, one
+of each kind the route tree matches: static, `:id`, character classes with repetitions
+(`[0-9]+`, a UUID, `[a-zA-Z0-9_-]{1,32}`), word alternatives (`properties|buckets|logs`), text
+mixed with parameters (`:name.:ext`, `:a([a-z]+)-:b([a-z0-9-]+)`), a group and a word boundary
+(which fall back to `std::regex`, on the segment and on the whole path), `/:path(.+)/raw` and
+`/static/:path(.*)` as `serve_static()` registers it. Each handler answers with its host, route
+and parameter. An input is a Host value, a newline and the request target.
+
+The target aborts when a host or route is found that the name or path cannot give: the exact
+host not found; a name over 253 bytes served by a pattern host (they are never run through a
+pattern's regex, whose libstdc++ matcher recurses about once per byte, see
+[Virtual Hosts](../../README.md#virtual-hosts)); a name served by `*.example.com` that is not one
+label followed by `.example.com`, or such a name served by another host; a parameter that is not
+the part of the path its route matches. A stack overflow is reported by AddressSanitizer as a
+crash, and a matcher that backtracks too much as a timeout (`-timeout`, 1200 s by default: use
+`-timeout=10` or so).
+
+```sh
+cmake --build build-fuzz --target fuzz_host_route_matchers
+mkdir -p corpus-matchers
+UBSAN_OPTIONS=halt_on_error=1 build-fuzz/tests/fuzz/fuzz_host_route_matchers corpus-matchers \
+  tests/fuzz/corpus/host_route_matchers -max_len=16384 -timeout=10 -max_total_time=600
+```

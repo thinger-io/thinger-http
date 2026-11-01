@@ -10,7 +10,7 @@
 // The deadlines of a server connection (see connection_options) in the cases the hostile-peer
 // matrix does not cover (server_hostile_peer_test.cpp), over TCP: what the handler of a request
 // timed out sees, the header deadline of a later request and without one, the request deadline of a route, a group or a virtual host, the requests it
-// never applies to, and a response started before it
+// never applies to, a response started before it, and the idle deadline while a handler runs
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -391,4 +391,80 @@ TEST_CASE("Without a request deadline, a slow upload is not cut", "[server][dead
     running_server running(server);
 
     CHECK(upload(running.endpoint(), "/upload").starts_with("HTTP/1.1 200"));
+}
+
+// A request received whole whose handler runs is not idle, as in Node and Go: a handler longer
+// than the idle timeout, on a route without a timeout of its own, gets its response to the client.
+// Kept alive afterwards, the connection is idle again, from the response
+TEST_CASE("A handler that runs longer than the idle timeout is not cut", "[server][deadline][integration]") {
+    http::server server;
+    http::connection_options options;
+    options.idle_timeout = 1s;
+    server.set_connection_options(options);
+    std::atomic<int> handled{0};
+    server.get("/slow", [&handled](http::request&, http::response& res) -> awaitable<void> {
+        co_await sleep_for(2500ms);
+        handled++;
+        res.send("done");
+    });
+    running_server running(server);
+
+    http::test::raw_connection connection(running.endpoint());
+    auto start = steady::now();
+    REQUIRE(connection.write("GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+    std::string received;
+    REQUIRE(connection.read_until(received, "\r\n\r\ndone", 5s));
+    auto answered = steady::now();
+    INFO("received: " << received);
+    CHECK(received.starts_with("HTTP/1.1 200"));
+    CHECK_FALSE(connection.eof());
+    CHECK(handled == 1);
+    check_at(answered - start, 2500ms);
+
+    // Nothing more sent: closed at the idle deadline, counting from the response
+    auto result = connection.read_until_closed(1s + TOLERANCE + 1s);
+    CHECK(result.closed);
+    CHECK(result.data.empty());
+    check_at(steady::now() - answered, 1s);
+}
+
+// A body still arriving keeps the deadlines that bound a silent client: its request deadline (408),
+// and without any request deadline, the idle one, though its handler runs (it reads the body)
+TEST_CASE("A client silent in the middle of its body is not held by its running handler",
+          "[server][deadline][integration]") {
+    http::server server;
+    http::connection_options options;
+    server.post("/upload", answer_size);
+
+    SECTION("Answered 408 at the request deadline") {
+        options.idle_timeout = 5s;
+        options.request_timeout = 1s;
+        server.set_connection_options(options);
+        running_server running(server);
+
+        http::test::raw_connection connection(running.endpoint());
+        auto start = steady::now();
+        REQUIRE(connection.write(post_head("/upload", 1000) + std::string(100, 'x')));
+        auto result = connection.read_until_closed(1s + TOLERANCE + 1s);
+        INFO("received: " << result.data);
+        CHECK(result.data.starts_with("HTTP/1.1 408"));
+        check_at(steady::now() - start, 1s);
+    }
+    SECTION("Closed at the idle deadline with all request deadlines off") {
+        options.idle_timeout = 1s;
+        options.header_timeout = 0ms;
+        options.request_timeout = 0ms;
+        options.write_timeout = 0ms;
+        server.set_connection_options(options);
+        running_server running(server);
+
+        http::test::raw_connection connection(running.endpoint());
+        auto start = steady::now();
+        REQUIRE(connection.write(post_head("/upload", 1000) + std::string(100, 'x')));
+        auto result = connection.read_until_closed(1s + TOLERANCE + 1s);
+        INFO("received: " << result.data);
+        CHECK(result.closed);
+        CHECK(result.data.empty());
+        check_at(steady::now() - start, 1s);
+    }
 }

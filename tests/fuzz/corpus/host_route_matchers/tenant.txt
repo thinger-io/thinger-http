@@ -1,0 +1,2 @@
+acme.example.org
+/devices/d1/properties

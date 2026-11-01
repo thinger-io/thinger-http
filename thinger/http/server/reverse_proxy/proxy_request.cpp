@@ -300,7 +300,9 @@ bool proxy_exchange::prepare() {
     auto outgoing = std::make_shared<http_request>();
     outgoing->set_method(incoming_->get_method());
     outgoing->set_uri(target_path());
-    if (auto host = target_host(); !host.empty()) outgoing->add_header(header::host, host);
+    // Always sent, empty when the preserved one is (an HTTP/1.0 request may have none): an
+    // HTTP/1.1 request without Host is rejected (RFC 9112 section 3.2)
+    outgoing->add_header(header::host, target_host());
     copy_request_headers(*outgoing, connection);
     add_forwarding_headers(*outgoing);
 

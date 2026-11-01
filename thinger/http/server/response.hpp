@@ -150,7 +150,9 @@ public:
     // answered with 304 Not Modified while it does not change; a GET with a single byte range
     // (Range, and If-Range with the Last-Modified date) with 206 Partial Content, or 416 if
     // it starts past the end. 404 if the file does not exist, 403 if it is not a regular file.
-    // With force_download, Content-Disposition: attachment.
+    // With force_download, Content-Disposition: attachment. A body (the file or its range) over
+    // 1 MiB is streamed in pieces of 64 KiB at the pace of the client, unless it is a text file
+    // compressed on the fly for the client; files over 4 MiB are never compressed on the fly.
     void send_file(const std::filesystem::path& path, bool force_download = false);
 
     // Redirect response

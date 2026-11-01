@@ -210,10 +210,16 @@ virtual_host& http_application::state::resolve_host(request& req) {
     const auto& host_header = http_request->get_header(header::host);
     auto name = virtual_host::normalize_host(host_header.empty() ? http_request->get_host() : host_header);
 
+    // A name longer than any DNS name (RFC 1035 section 2.3.4: 253 bytes without the trailing
+    // dot) cannot be one of a pattern host, and is not run through its regex: libstdc++ matches
+    // recursively, about one frame per byte, so a Host of kilobytes could overflow the stack.
+    // It is served by the default host, as any other name no virtual host matches
+    constexpr size_t max_host_name_size = 253;
+
     virtual_host* host = default_host_.get();
     if (auto it = exact_hosts_.find(name); it != exact_hosts_.end()) {
         host = it->second.get();
-    } else {
+    } else if (name.size() <= max_host_name_size) {
         for (const auto& candidate : pattern_hosts_) {
             std::smatch matches;
             if (!candidate->matches(name, matches)) continue;
@@ -505,8 +511,8 @@ awaitable<void> http_application::state::handle(std::shared_ptr<request> req, st
     // Ambiguous body framing (invalid Content-Length, unsupported Transfer-Encoding, or
     // both): where this request ends, and so where the next one starts, is unknown
     if (!http_request->has_valid_framing()) {
-        LOG_WARNING("Rejecting request with invalid body framing: {} {}",
-                    get_method(http_request->get_method()), http_request->get_path());
+        LOG_DEBUG("Rejecting request with invalid body framing: {} {}",
+                  get_method(http_request->get_method()), http_request->get_path());
         must_close(*req, detail::close_reason::body_error);
         res.error(http_response::status::bad_request, "Invalid request framing");
         co_return;
@@ -633,8 +639,8 @@ awaitable<void> http_application::state::serve_with_timeout(std::shared_ptr<requ
             if (pending_body) must_close(*req, detail::close_reason::route_timeout);
             if (res.answer_timeout(status)) {
                 auto http_request = req->get_http_request();
-                LOG_WARNING("Request timed out: {} {}{}", get_method(http_request->get_method()),
-                            http_request->get_path(), pending_body ? " (body not read, closing the connection)" : "");
+                LOG_DEBUG("Request timed out: {} {}{}", get_method(http_request->get_method()),
+                          http_request->get_path(), pending_body ? " (body not read, closing the connection)" : "");
                 deadline->expired = true;
                 deadline->wake.set();
             }

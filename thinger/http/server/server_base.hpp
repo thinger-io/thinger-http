@@ -19,8 +19,8 @@ namespace thinger::http {
 
 // How the connections of a server are served (see server_base::set_connection_options())
 struct connection_options {
-    // A connection idle for this long (no request arriving, nor a response being written) is
-    // closed
+    // A connection idle for this long (no request arriving, nor a response being written, nor
+    // the handler of a request received whole running) is closed
     std::chrono::seconds idle_timeout{120};
 
     // Deadlines of a request, whatever the pace of its bytes (Node's headersTimeout and

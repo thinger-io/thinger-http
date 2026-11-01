@@ -6,6 +6,7 @@
 #include "../response.hpp"
 #include "../response_compression.hpp"
 #include "../virtual_host.hpp"
+#include "../../util/url.hpp"
 #include <optional>
 
 namespace thinger::http::file_server {
@@ -103,7 +104,22 @@ namespace {
 }
 
 void serve(request& req, response& res, const fs::path& directory, const static_options& options) {
+    // The path parameter is raw: percent-decoded here as a path, where "+" is literal (as Node's
+    // send does), so escaped first for url_decode, which reads it as a form space. A decoded "/"
+    // separates directories; a NUL could not name a file
     std::string path = req["path"];
+    if (path.find('%') != std::string::npos) {
+        std::string escaped;
+        escaped.reserve(path.size());
+        for (char c : path) {
+            if (c == '+') escaped.append("%2B");
+            else escaped.push_back(c);
+        }
+        if (!util::url::url_decode(escaped, path) || path.find('\0') != std::string::npos) {
+            res.error(http_response::status::bad_request, "Invalid path");
+            return;
+        }
+    }
     auto root = fs::canonical(directory);
     auto send = [&](const fs::path& file) {
         if (!options.cache_control.empty()) res.header(header::cache_control, options.cache_control);

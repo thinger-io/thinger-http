@@ -9,6 +9,9 @@
 namespace thinger::http::websocket_util {
 
 std::optional<url_components> parse_websocket_url(const std::string& url) {
+    // Longer URLs are refused before the regex, whose matching recurses per character in
+    // libstdc++
+    if (url.size() > 8192) return std::nullopt;
     // Compiled once (thread-safe), not on every call
     static const std::regex url_regex(R"(^(wss?)://([^/:]+)(?::(\d+))?(/.*)?$)", std::regex::icase);
     std::smatch match;

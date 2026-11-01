@@ -6,10 +6,13 @@
 //  - headers-only parsing gives the same outcome, and stops at the same byte, however the
 //    input is split across reads
 //  - an accepted header section is well formed: it ends at the first empty line, every line
-//    ends in CRLF (no bare CR or LF), no line is folded (starts with whitespace), and it is
-//    within the header section limits
+//    ends in CRLF (no bare CR or LF), no line is folded (starts with whitespace), no field
+//    name has whitespace before its colon, no value has a control character other than HTAB,
+//    and it is within the header section limits; it has one Host field (none only in
+//    HTTP/1.0)
 //  - framing: has_valid_framing() agrees with an independent check of the raw header lines.
-//    Content-Length is accepted only as 1*DIGIT (no sign, whitespace, list or overflow),
+//    Content-Length is accepted only as 1*DIGIT once its optional whitespace is trimmed (no
+//    sign, inner whitespace, list or overflow),
 //    repeated only with the same value; Transfer-Encoding only as a single "chunked", from
 //    HTTP/1.1 on, and never together with Content-Length. The body length the server would
 //    read follows from them.
@@ -81,6 +84,13 @@ namespace {
         return value;
     }
 
+    // Without the optional whitespace (SP and HTAB) around it
+    std::string_view trim_ows(std::string_view s) {
+        size_t first = s.find_first_not_of(" \t");
+        if (first == std::string_view::npos) return {};
+        return s.substr(first, s.find_last_not_of(" \t") - first + 1);
+    }
+
     // Independent check of an accepted header section: its shape, and the framing it implies
     void check_accepted(std::string_view head, const thinger::http::http_request& request, const std::string& input) {
         // Ends at the first empty line, every line terminated by CRLF
@@ -111,9 +121,9 @@ namespace {
         fuzz::check(request.get_http_version_major() == major && request.get_http_version_minor() == minor,
                     "HTTP version differs from the request line", input);
 
-        // Header lines: name ":" SP value, none folded
+        // Header lines: name ":" OWS value OWS (RFC 9112 section 5), none folded
         std::vector<std::string_view> content_lengths, transfer_encodings;
-        size_t lines = 0;
+        size_t lines = 0, hosts = 0;
         size_t pos = line_end + 2;
         while (pos < head.size() - 2) {
             size_t end = head.find("\r\n", pos);
@@ -123,13 +133,21 @@ namespace {
             fuzz::check(!line.empty() && line[0] != ' ' && line[0] != '\t', "folded or empty header line accepted", input);
             size_t colon = line.find(':');
             fuzz::check(colon != std::string_view::npos && colon > 0, "header line without a name", input);
-            fuzz::check(line.substr(colon + 1, 1) == " ", "header value not after \": \"", input);
             std::string_view name = line.substr(0, colon);
-            std::string_view value = line.substr(colon + 2);
+            fuzz::check(name.find_first_of(" \t") == std::string_view::npos, "whitespace before the colon accepted", input);
+            std::string_view value = trim_ows(line.substr(colon + 1));
+            for (char c : value) {
+                auto byte = static_cast<unsigned char>(c);
+                fuzz::check(byte == '\t' || (byte >= 32 && byte != 127), "control character in a header value accepted", input);
+            }
             if (boost::iequals(name, "Content-Length")) content_lengths.push_back(value);
             if (boost::iequals(name, "Transfer-Encoding")) transfer_encodings.push_back(value);
+            if (boost::iequals(name, "Host")) hosts++;
         }
         fuzz::check(lines <= request_factory::max_header_lines, "more header lines than the limit", input);
+        // RFC 9110 section 7.2: one Host field, which only an HTTP/1.0 request may omit
+        fuzz::check(hosts <= 1, "more than one Host field accepted", input);
+        fuzz::check(hosts == 1 || minor == 0, "HTTP/1.1 request without Host accepted", input);
 
         // Framing (RFC 9112 section 6): the only forms accepted
         std::optional<uint64_t> length;

@@ -100,10 +100,31 @@ namespace fuzz {
             size_t end = input.find("\r\n", pos);
             size_t colon = input.find(':', pos);
             if (colon < end && boost::iequals(std::string_view(input).substr(pos, colon - pos), name)) {
-                for (size_t i = colon + 2; i < end; i++) input[i] = 'x';
+                for (size_t i = colon + 1; i < end; i++) input[i] = 'x';
                 found = true;
             }
             pos = end + 2;
+        }
+        return found;
+    }
+
+    // Replace `from` with `to` in the values of the `name` header lines of a head (the header
+    // section between `begin` and `end` of `input`). Returns whether there was any.
+    inline bool replace_in_header(std::string& input, size_t begin, size_t end, std::string_view name, char from, char to) {
+        bool found = false;
+        size_t pos = input.find("\r\n", begin) + 2;
+        while (pos + 2 < end) {
+            size_t line_end = input.find("\r\n", pos);
+            size_t colon = input.find(':', pos);
+            if (colon < line_end && boost::iequals(std::string_view(input).substr(pos, colon - pos), name)) {
+                for (size_t i = colon + 1; i < line_end; i++) {
+                    if (input[i] == from) {
+                        input[i] = to;
+                        found = true;
+                    }
+                }
+            }
+            pos = line_end + 2;
         }
         return found;
     }

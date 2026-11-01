@@ -87,6 +87,8 @@ protected:
                 for (const auto& header : headers) {
                     response["headers"][header.first] = header.second;
                 }
+                // Every Content-Length line (the object above keeps one per name)
+                response["content_length_lines"] = http_req->get_headers_with_key("Content-Length");
             }
 
             res.json(response);

@@ -319,6 +319,14 @@ TEST_CASE("Static files keep the SPA fallback and stay inside their directory", 
         REQUIRE(sibling.status == 400);
         REQUIRE(sibling.body.find("top secret") == std::string::npos);
         REQUIRE(get(site.port, "/static/docs/../../www-secret/secret.txt").status == 400);
+        REQUIRE(get(site.port, "/static/%2E%2E/www-secret/secret.txt").status == 400);
+    }
+
+    SECTION("Names with two dots that are not a dot segment are served") {
+        write_file(site.root / "v1..v2.txt", "diff");
+        auto response = get(site.port, "/static/v1..v2.txt");
+        REQUIRE(response.status == 200);
+        REQUIRE(response.body == "diff");
     }
 }
 

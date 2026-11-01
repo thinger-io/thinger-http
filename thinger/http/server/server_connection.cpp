@@ -96,7 +96,7 @@ void server_connection::start() {
 void server_connection::close() {
     running_ = false;
     timeout_timer_.cancel();
-    if (response_started_) response_started_->set();
+    if (reader_wake_) reader_wake_->set();
     stop_watcher();
     socket_->close();
     // Nothing left to drain, even if the connection is still referenced
@@ -127,7 +127,7 @@ void server_connection::linger() {
     lingering_ = true;
     running_ = false;
     timeout_timer_.cancel();
-    if (response_started_) response_started_->set();
+    if (reader_wake_) reader_wake_->set();
     stop_watcher();
     socket_->cancel();
     co_spawn(socket_->get_io_context(),
@@ -168,6 +168,12 @@ awaitable<void> server_connection::read_loop() {
         // (its stream may be gone): none is in progress until this one starts
         bool pipelined = buffered > 0;
         in_progress_ = nullptr;
+        // Not while the responses back up (the client does not read them): they would pile up.
+        // Then from the top: the loop ends if the connection stopped meanwhile
+        if (reading_paused()) [[unlikely]] {
+            co_await wait_output();
+            continue;
+        }
         if (buffered == 0) {
             auto [ec, bytes] = co_await socket_->read_some(buffer_, MAX_BUFFER_SIZE);
             // (or stopped meanwhile: its head was answered at its deadline)
@@ -306,10 +312,10 @@ void server_connection::reject_request() {
     // Bad request, or a header section over the limits
     auto status = http_response::status::bad_request;
     if (request_parser_.header_section_too_large()) {
-        LOG_ERROR("http request header section too large");
+        LOG_DEBUG("http request header section too large");
         status = http_response::status::request_header_fields_too_large;
     } else {
-        LOG_ERROR("invalid http request");
+        LOG_DEBUG("invalid http request");
     }
     // The rest of a header section too large may still be arriving (big cookies, say), and its
     // client is worth an answer; not that of a request that is not HTTP, as Go does
@@ -345,12 +351,24 @@ awaitable<void> server_connection::wait_response(const http_stream& stream) {
     // The watcher still watches the client meanwhile (see watch_peer()): a client resetting
     // the connection before a late response closes it now, not at the connection timeout
     frame_watch_ |= watch_response_start;
-    if (!response_started_) response_started_.emplace(socket_->get_io_context().get_executor());
+    if (!reader_wake_) reader_wake_.emplace(socket_->get_io_context().get_executor());
     while (!stream.responded() && running_ && socket_->is_open()) {
-        response_started_->reset();   // woken by the next frame, not by one before
-        co_await response_started_->wait();
+        reader_wake_->reset();   // woken by the next frame, not by one before
+        co_await reader_wake_->wait();
     }
     frame_watch_ &= ~watch_response_start;
+}
+
+awaitable<void> server_connection::wait_output() {
+    // Within the deadlines of the connection: the write deadline while the front response waits
+    // for the socket, the idle one otherwise. Its close (or a stop) wakes it
+    output_waited_ = true;
+    if (!reader_wake_) reader_wake_.emplace(socket_->get_io_context().get_executor());
+    while (output_backed_up() && running_ && socket_->is_open()) {
+        reader_wake_->reset();
+        co_await reader_wake_->wait();
+    }
+    output_waited_ = false;
 }
 
 void server_connection::watch(const std::shared_ptr<http_stream>& stream) {
@@ -501,10 +519,15 @@ void server_connection::frame_written(http_stream& stream, const std::shared_ptr
             } else {
                 close();
             }
+        } else if (!written) [[unlikely]] {
+            // The connection broke (the client reset it, say): closed, so the requests it read
+            // ahead (pipelined) are not handled for a client gone, as Go and Node do
+            close();
         } else {
             if (!request_queue_.empty()) {
                 stream.detach();
                 request_queue_.pop_front();
+                output_progressed();
             }
         }
     }
@@ -559,6 +582,7 @@ void server_connection::process_output_queue() {
                 writing_ = false;
 
                 process_output_queue();
+                output_progressed();
             },
             detached);
     }
@@ -581,7 +605,7 @@ void server_connection::queue_frame(const std::shared_ptr<http_stream>& stream, 
 
 void server_connection::watch_frame(http_stream& stream) {
     // The waiter wakes up once this call returns, with the frame queued
-    if (frame_watch_ & watch_response_start) response_started_->set();
+    if (frame_watch_ & watch_response_start) reader_wake_->set();
 
     // A response starting while the connection drains is the last one: its head tells the client
     if ((frame_watch_ & watch_draining) && !stream.responded() && !stream.takes_over()) {

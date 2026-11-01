@@ -17,12 +17,12 @@ Requests per second with [wrk](https://github.com/wg/wrk) on Linux (2× Intel Xe
 
 | | **thinger-http** | nginx 1.24 + njs 0.8 | [Crow](https://github.com/CrowCpp/Crow) 1.2.1 | [cpp-httplib](https://github.com/yhirose/cpp-httplib) 0.14.3 | Node.js 24, 8 processes | Node.js 24, 1 process |
 |---|--:|--:|--:|--:|--:|--:|
-| GET "Hello World!" | 533,603 | 436,056 | 398,276 | 155,638 | 188,349 | 22,874 |
-| GET with path parameters, JSON answer | 396,260 | 284,629 | 3,105 ¹ | 136,233 | 174,683 | 22,406 |
-| POST a JSON body, echoed as JSON | 316,636 | 275,039 | 3,102 ¹ | 123,080 | 128,428 | 16,474 |
-| GET on a new connection per request | 125,826 | 125,841 | 105,992 | 70,103 | 15,968 | 8,180 |
+| GET "Hello World!" | 485,127 | 417,739 | 386,738 | 153,313 | 214,450 | 25,946 |
+| GET with path parameters, JSON answer | 383,279 | 286,000 | 3,098 ¹ | 134,998 | 196,137 | 24,334 |
+| POST a JSON body, echoed as JSON | 290,347 | 268,435 | 3,118 ¹ | 123,758 | 134,752 | 17,056 |
+| GET on a new connection per request | 118,297 | 122,774 | 107,879 | 68,935 | 16,366 | 8,532 |
 
-thinger-http answers with a median latency of 235 µs, 318 µs, 398 µs and 108 µs in these four cases (p99 under 430 µs with keep-alive). JSON bodies are decoded within the default [limits](#body-types) (nesting depth, values, UTF-8).
+thinger-http answers with a median latency of 259 µs, 329 µs, 434 µs and 114 µs in these four cases (p99 under 470 µs with keep-alive). JSON bodies are decoded within the default [limits](#body-types) (nesting depth, values, UTF-8).
 
 Every route is a handler: nginx runs all of them in njs, rather than answering from its configuration.
 ¹ With its default settings Crow stalls about 40 ms on each of these responses (Nagle's algorithm and delayed ACKs); its `/hello` is not affected.
@@ -117,7 +117,7 @@ include(FetchContent)
 FetchContent_Declare(
     thinger-http
     GIT_REPOSITORY https://github.com/thinger-io/thinger-http.git
-    GIT_TAG v0.9.0
+    GIT_TAG v0.9.1
 )
 FetchContent_MakeAvailable(thinger-http)
 
@@ -204,7 +204,7 @@ server.get("/files/:path(.+)", [](auto& req, auto& res) {
 
 Routes are matched segment by segment (the text between slashes) on a tree, so the cost of finding a route hardly depends on how many there are. Whatever the registration order, a segment is matched first by static text (`/users/me`), then by a constrained parameter (`:id([0-9]+)`, or text mixed with parameters as `:name.:ext`), then by a parameter (`:id`), and last by a parameter that may match slashes (`:path(.+)`), which takes the rest of the path; if the rest of the path does not match below the first option, the next one is tried. Different constraints at the same position are tried in the order they were first registered there, and wildcards in registration order. Registering a route with the same structure as another one (it would never match) logs a warning, and so does adding a constraint (or wildcard) next to another one that may overlap with it (unless they cannot start with the same character), as only that order decides between them. A parameter regex that depends on its surroundings (anchors, word boundaries, lookaheads, back-references) makes its route match the whole path, after every other option.
 
-Paths are matched as received, before percent-decoding (`%2F` is not a slash, and parameters get the encoded text), and trailing slashes and empty segments are significant: `/users` does not match `/users/`, nor `/users/:id/devices` match `/users//devices`. Simple regexes (characters, classes, quantifiers, alternative words) are checked without `std::regex`, which is kept for the rest.
+Paths are matched as received, before percent-decoding (`%2F` is not a slash), and path parameters are raw: `req["name"]` of `/files/my%20file.png` is `my%20file.png`, so a handler decodes it if it needs to (`serve_static()` decodes its own path, see [Static Files](#static-files)). Trailing slashes and empty segments are significant: `/users` does not match `/users/`, nor `/users/:id/devices` match `/users//devices`. Simple regexes (characters, classes, quantifiers, alternative words) are checked without `std::regex`, which is kept for the rest.
 
 ### Query Parameters
 
@@ -242,10 +242,13 @@ The server reads the body before calling the handler, decompressing it if it has
 
 Request framing is strict, as a lenient parser could read a request differently than a proxy in front of it (request smuggling). These requests are answered with `400` and the connection is closed:
 
-- Header lines starting with a space or tab (obsolete line folding), which are never joined to the previous line.
-- `Content-Length` that is not a plain number (`12abc`, `-1`, ` 5`, too large), or repeated with different values.
+- Header lines starting with a space or tab (obsolete line folding), which are never joined to the previous line, and whitespace between a field name and its colon (`Content-Length : 5`).
+- `Content-Length` that is not a plain number (`12abc`, `-1`, `+5`, `5 5`, empty, too large), or repeated with different values.
 - `Transfer-Encoding` other than exactly `chunked` (e.g. `gzip, chunked`, `chunked, chunked`, or repeated), together with `Content-Length`, or in an HTTP/1.0 request.
 - Malformed chunked bodies: chunk sizes that are not hexadecimal, empty or overflowing; missing CRLF after a chunk size or its data; bare LF line endings; chunk extensions or trailer sections that are too long. Chunk extensions and trailer fields are accepted and ignored.
+- An HTTP/1.1 request without a `Host` field, or any request with more than one (whatever their values and letter case), as RFC 9110 section 7.2 requires and Node and Go do. An HTTP/1.0 request may omit it, and an empty `Host:` is served by the default [virtual host](#virtual-hosts). [In-memory dispatch](#in-memory-dispatch) does not check it.
+
+The whitespace (spaces and tabs) around a header value is not part of it, as RFC 9112 section 5.1 allows and Node, Go and Beast read it: `Name:value`, `Name:` (an empty value), `Name:\tvalue` and trailing spaces or tabs are accepted, and tabs inside a value are kept. So `Content-Length: 5 ` frames a 5-byte body and `Transfer-Encoding:\tchunked` a chunked one, still checked as above on the value without that whitespace.
 
 The request line and headers are limited to 16 KB and 100 header lines: larger requests are answered with `431 Request Header Fields Too Large` and the connection is closed.
 
@@ -446,7 +449,9 @@ server.serve_static("/assets", "/var/www/app/assets", {
 });
 ```
 
-`serve_static()` answers `GET` requests, and `HEAD` requests through its `GET` route (so the `GET` routes of the paths it covers, such as an API next to `serve_static("/", ...)`, answer their `HEAD` requests too). The fallback file is served for a directory (its own one), and for the paths without a file (the one of the root directory, as single page applications expect). Paths resolving outside the directory (through symlinks; request targets with `..` are already rejected with `400`) are answered with `403`.
+`serve_static()` answers `GET` requests, and `HEAD` requests through its `GET` route (so the `GET` routes of the paths it covers, such as an API next to `serve_static("/", ...)`, answer their `HEAD` requests too). The fallback file is served for a directory (its own one), and for the paths without a file (the one of the root directory, as single page applications expect). Paths resolving outside the directory (through symlinks; request targets with a `..` segment in their percent-decoded path, as `/a/../b` or `/%2E%2E/x`, are already rejected with `400`, while `..` elsewhere, as in `/files/v1..v2.txt` or a query, is served) are answered with `403`.
+
+The path under the prefix is percent-decoded before looking for the file, so `/static/my%20file.png` serves `my file.png` and `/static/informe-%C3%B1.pdf` serves `informe-ñ.pdf` (UTF-8 names). `+` is literal (`a+b.txt` is that file, as Node's `send` reads it), a decoded `%2F` separates directories, and a malformed escape or a decoded NUL (`%00`) gets `400`. The decoded path is still checked to resolve inside the directory (`403` otherwise).
 
 Files are served with validators, so that browsers download them once and only check them afterwards:
 
@@ -454,7 +459,8 @@ Files are served with validators, so that browsers download them once and only c
 - `Cache-Control: no-cache` by default: caches keep the file, but revalidate it on every use. Set another policy with `cache_control` (e.g. `max-age` for hashed assets).
 - Conditional requests are answered with `304 Not Modified`, without body, while the file does not change: `If-None-Match` with `*` or a list of entity tags (weak comparison, `W/` ignored), or else `If-Modified-Since` (ignored when there is an `If-None-Match`, or when it is not a valid date) with a date not earlier than the modification time. The `304` carries the validators and the `Cache-Control`.
 - `Accept-Ranges: bytes`: a `GET` with a single byte range (`Range: bytes=0-99`, `bytes=100-`, `bytes=-100`) gets `206 Partial Content`, or `416` if it starts past the end. Several ranges, or an invalid one, get the whole file; so does a range with an `If-Range` other than the `Last-Modified` date (the weak `ETag` never matches it).
-- Text files of 200 bytes or more are compressed for clients accepting gzip or deflate (see [Response Types](#response-types), with `Vary: Accept-Encoding`); ranges are sent as they are. A `HEAD` gets the headers of the `GET` with the length of the file, without reading it.
+- Text files of 200 bytes or more, up to 4 MiB, are compressed for clients accepting gzip or deflate (see [Response Types](#response-types), with `Vary: Accept-Encoding`); ranges are sent as they are. Larger files are sent uncompressed (and without `Vary`), unless they have a precompressed sibling (below): compressing on the fly needs the body whole in memory. A `HEAD` gets the headers of the `GET` with the length of the file, without reading it.
+- Bodies over 1 MiB (the file, the range or the sibling sent) are streamed: read and written 64 KiB at a time, each piece once the previous one is written, so a response holds about one piece whatever the size of the file and the pace of the client (a client that stops reading is closed by the [`write_timeout`](#connection-options) of the connection). Smaller bodies, the text files compressed for the client (up to 4 MiB) and the responses of [In-Memory Dispatch](#in-memory-dispatch), which has no connection to stream to, are read whole, as before. nginx and Node's `send` (behind `express.static`) never read a file whole either; 64 KiB is the piece of Node's file streams, and 1 MiB keeps a single read for the files of a usual web application.
 
 #### Precompressed Files
 
@@ -929,7 +935,7 @@ server.host_regex("(.+)\\.proxy\\.example\\.com").get("/:path(.*)", proxy_handle
 server.get("/", [](http::response& res) { res.send("default site"); });
 ```
 
-Hosts are matched in order: exact names, then patterns in registration order, then the default host (`server.host("*")` returns the server itself). Register them before `listen()`. Once the host is chosen, everything works as for a single host: routes and `404`/`405` come from that host only, and the global middlewares (`server.use()`) run for every host after route matching, with `req.get_matched_route()` set to the route of the matched host and `req.get_virtual_host()` to the host. `server.openapi()` documents the default host; for another one build a generator over its router: `http::openapi_generator(server.host("api.example.com").router(), &server.get_body_settings())` (the body settings document the [body types](#body-types) of the application).
+Hosts are matched in order: exact names, then patterns in registration order, then the default host (`server.host("*")` returns the server itself). Register them before `listen()`. A name longer than any DNS name (253 bytes, without the port and one trailing dot) is never matched against the patterns, whose regular expressions would run on whatever a client sends: it is served by the default host, as any name no virtual host matches (exact names are still found). Once the host is chosen, everything works as for a single host: routes and `404`/`405` come from that host only, and the global middlewares (`server.use()`) run for every host after route matching, with `req.get_matched_route()` set to the route of the matched host and `req.get_virtual_host()` to the host. `server.openapi()` documents the default host; for another one build a generator over its router: `http::openapi_generator(server.host("api.example.com").router(), &server.get_body_settings())` (the body settings document the [body types](#body-types) of the application).
 
 For HTTPS, the certificate is chosen per domain before any request is read, through SNI: register one per host name (wildcards such as `*.devices.example.com` included) in the [certificate manager](#https-server) of the server, with `manager->set_certificate(hostname, certificate, private_key)`. Virtual hosts then pick the routes for the same name from the `Host` header. A request whose `Host` would get another client certificate mode or certificate entry than its SNI name is answered `421 Misdirected Request` before its host runs anything, so a [client certificate mode per host](#client-certificates) protects its virtual host; the same name, names sharing one configuration (a wildcard, the default certificate) and clients without SNI on the listener's mode are served. See `examples/http_server/virtual_hosts_example.cpp`.
 
@@ -1283,7 +1289,7 @@ server.set_connection_options(options);
 server.listen("0.0.0.0", 8080);
 ```
 
-- `idle_timeout`: a connection with no request arriving and no response being written for this long is closed. A request waiting for its response does not count as idle (see [Limits and Timeouts per Route](#limits-and-timeouts-per-route)). Every byte received moves it: alone, it does not bound a client trickling its request, which is what the next two deadlines do.
+- `idle_timeout`: a connection with no request arriving and no response being written for this long is closed. A request received whole (its body read to its end, or none) whose handler is running does not count as idle, however long the handler takes, as in Node and Go; nor does a request waiting for its response within the timeout of its route (see [Limits and Timeouts per Route](#limits-and-timeouts-per-route)). A request whose handler returned without answering it (to answer later, from a copy of the response) counts as idle, unless its route sets that timeout. Every byte received moves it, a body still arriving included: alone, it does not bound a client trickling its request, which is what the next two deadlines do.
 - `header_timeout` (60 s, Node's `headersTimeout`): the maximum time from the start of a request to the end of its head, whatever the pace of its bytes (Slowloris). A request starts at its first byte; the first one of a connection, when the server starts serving it (after the TLS handshake), and a pipelined one, when the server starts parsing it. A head not complete in time is answered `408 Request Timeout` with `Connection: close`, and the connection is closed at once; a connection on which no byte of a request arrived is closed without a response (as Go and nginx do: a `408` there could be taken for the answer to a request the client was just sending). Between two requests of a keep-alive connection, `idle_timeout` applies. Capped by `request_timeout`, as in Node.
 - `request_timeout` (300 s, Node's `requestTimeout`): the maximum time from the start of a request until its body was read to its end. Not received in time, it is answered `408 Request Timeout` with `Connection: close` (or its connection closed if its response already started), and its handler cancelled with `cancel_reason::timeout`. A route, a group or a virtual host sets its own: see the request deadline in [Limits and Timeouts per Route](#limits-and-timeouts-per-route).
 - `write_timeout` (60 s, nginx's `send_timeout`): a response write of which the socket accepts no 64 KiB slice (the whole write, if smaller) for this long closes the connection, as a client that stopped reading, whether it was to be kept alive or closed after the response. It bounds a stall, not the length of a response: a response larger than a slice is written slice by slice, each one moving the deadline, and a response being written does not count as idle. Unlike SSE and WebSocket writes, the client taking bytes from the socket is not checked: a slow client with a large send buffer (the system may wake the writer only once a third of it is free) can be cut while it still reads, if the socket accepts no slice for this long. Raise it, or turn it off, for slow downloads.

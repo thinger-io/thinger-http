@@ -54,6 +54,7 @@ jobs:
           mkdir -p build-fuzz/corpus/body_decoders
           mkdir -p build-fuzz/corpus/content_decoding
           mkdir -p build-fuzz/corpus/multipart
+          mkdir -p build-fuzz/corpus/host_route_matchers
           cp -rn tests/fuzz/corpus/http_request_parser/* build-fuzz/corpus/http_request_parser/ 2>/dev/null || true
           cp -rn tests/fuzz/corpus/http_response_parser/* build-fuzz/corpus/http_response_parser/ 2>/dev/null || true
           # The response differential parses the same responses as the response parser target
@@ -66,6 +67,7 @@ jobs:
           cp -rn tests/fuzz/corpus/body_decoders/* build-fuzz/corpus/body_decoders/ 2>/dev/null || true
           cp -rn tests/fuzz/corpus/content_decoding/* build-fuzz/corpus/content_decoding/ 2>/dev/null || true
           cp -rn tests/fuzz/corpus/multipart/* build-fuzz/corpus/multipart/ 2>/dev/null || true
+          cp -rn tests/fuzz/corpus/host_route_matchers/* build-fuzz/corpus/host_route_matchers/ 2>/dev/null || true
 
       - name: Fuzz HTTP request parser
         env:
@@ -126,6 +128,13 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: build-fuzz/tests/fuzz/fuzz_multipart build-fuzz/corpus/multipart -max_total_time=300 -max_len=4096
+
+      - name: Fuzz virtual host and route matchers
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        # Host names and paths up to the size of a header section
+        run: build-fuzz/tests/fuzz/fuzz_host_route_matchers build-fuzz/corpus/host_route_matchers -max_total_time=300 -max_len=16384 -timeout=10
 
       - name: Upload crash artifacts
         if: failure()

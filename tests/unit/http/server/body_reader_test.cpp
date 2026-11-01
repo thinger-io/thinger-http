@@ -4,6 +4,8 @@
 #include <boost/asio/use_future.hpp>
 #include <algorithm>
 #include <cstring>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -92,6 +94,46 @@ namespace {
 
     std::string as_string(const std::vector<uint8_t>& bytes) {
         return {bytes.begin(), bytes.end()};
+    }
+
+    // Connection that delivers `data` in reads of the sizes of `pieces`, in turn, calling
+    // `on_read` with the bytes delivered so far before each read
+    struct piecewise_connection {
+        std::string data;
+        std::vector<size_t> pieces;
+        std::function<void(size_t)> on_read;
+        size_t position = 0;
+        size_t reads = 0;
+
+        body_reader::source source() {
+            return [this](uint8_t* buffer, size_t size) -> thinger::awaitable<thinger::io_result> {
+                if (on_read) on_read(position);
+                size_t piece = pieces[reads++ % pieces.size()];
+                size_t bytes = std::min({size, piece, data.size() - position});
+                std::memcpy(buffer, data.data() + position, bytes);
+                position += bytes;
+                if (bytes == 0) co_return thinger::io_result{boost::asio::error::eof, 0};
+                co_return thinger::io_result{boost::system::error_code{}, bytes};
+            };
+        }
+    };
+
+    // Bytes that differ from one position to the next, so a misplaced piece shows
+    std::string patterned(size_t size) {
+        std::string data(size, '\0');
+        for (size_t i = 0; i < size; ++i) data[i] = static_cast<char>((i * 31 + i / 251) & 0xff);
+        return data;
+    }
+
+    constexpr size_t KiB = 1024;
+    constexpr size_t MiB = 1024 * KiB;
+
+    // The memory a Content-Length body may take once `received` bytes of it arrived: a first
+    // piece of 64 KiB, then twice what arrived, over what the body held before. With a 1/64
+    // margin for the allocator's rounding (libc++ aligns its capacities, and doubles them so)
+    size_t body_memory_bound(size_t received, size_t held) {
+        size_t bound = std::max(64 * KiB, 2 * received) + held;
+        return bound + bound / 64;
     }
 
     const std::string next_request = "GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n";
@@ -397,6 +439,136 @@ TEST_CASE("Content-Length body reads", "[body_reader][unit]") {
         REQUIRE(body == "hel");
         REQUIRE_FALSE(run(reader.discard(1024)));
     }
+}
+
+// A head announcing a large body takes memory as the body arrives, not when the head does: a
+// client cannot make the server hold far more than it sent
+TEST_CASE("Content-Length bodies take memory as their bytes arrive", "[body_reader][limit][unit]") {
+    SECTION("Announced, never sent: one first piece at most") {
+        piecewise_connection connection{"", {4096}};
+        body_reader reader;
+        reader.set_framing(false, 8 * MiB);
+        reader.set_source(connection.source());
+
+        std::string body;
+        size_t held = body.capacity();
+        size_t peak = 0;
+        connection.on_read = [&](size_t) { peak = std::max(peak, body.capacity()); };
+        REQUIRE_FALSE(run(reader.read_all(body, 8 * MiB)));
+        REQUIRE(reader.error() == body_error::incomplete);
+        CHECK(body.empty());
+        CHECK(peak <= body_memory_bound(0, held));
+    }
+
+    SECTION("Sent in pieces: twice what arrived, at every read") {
+        auto data = patterned(8 * MiB);
+        for (size_t piece : {size_t{1000}, size_t{4096}, size_t{65536}, size_t{MiB}}) {
+            INFO("piece: " << piece);
+            piecewise_connection connection{data, {piece}};
+            body_reader reader;
+            reader.set_framing(false, data.size());
+            reader.set_source(connection.source());
+
+            std::string body;
+            size_t held = body.capacity();
+            size_t worst_received = 0, worst_capacity = 0;
+            bool within = true;
+            connection.on_read = [&](size_t received) {
+                if (within && body.capacity() > body_memory_bound(received, held)) {
+                    within = false;
+                    worst_received = received;
+                    worst_capacity = body.capacity();
+                }
+            };
+            REQUIRE(run(reader.read_all(body, 8 * MiB)));
+            INFO("capacity " << worst_capacity << " with " << worst_received << " bytes received");
+            CHECK(within);
+            CHECK(body == data);
+        }
+    }
+}
+
+TEST_CASE("Content-Length bodies of every size are read whole, in any pieces", "[body_reader][unit]") {
+    const std::vector<std::vector<size_t>> ways = {
+        {std::numeric_limits<size_t>::max()},   // whole
+        {7},
+        {4096},
+        {1, 4095, 13, 65536, 777, 100003},      // arbitrary
+    };
+    for (size_t size : {size_t{0}, size_t{1}, 64 * KiB, 64 * KiB + 1, 8 * MiB}) {
+        auto data = patterned(size);
+        auto pieces = ways;
+        if (size <= 64 * KiB + 1) pieces.push_back({1});
+        for (const auto& way : pieces) {
+            INFO("size " << size << ", first piece " << way.front());
+            piecewise_connection connection{data, way};
+            body_reader reader;
+            reader.set_framing(false, size);
+            reader.set_source(connection.source());
+
+            std::string body;
+            REQUIRE(run(reader.read_all(body, 8 * MiB)));
+            CHECK(reader.error() == body_error::none);
+            CHECK_FALSE(reader.has_pending());
+            CHECK(body == data);
+        }
+
+        // Its start in the read-ahead (read with the head), the rest from the connection
+        size_t ahead = std::min<size_t>(size, 1000);
+        piecewise_connection connection{data.substr(ahead), {4096}};
+        body_reader reader;
+        reader.set_framing(false, size);
+        reader.set_read_ahead(reinterpret_cast<const uint8_t*>(data.data()), ahead);
+        reader.set_source(connection.source());
+
+        std::string body;
+        INFO("size " << size << ", " << ahead << " bytes read ahead");
+        REQUIRE(run(reader.read_all(body, 8 * MiB)));
+        CHECK(body == data);
+    }
+}
+
+TEST_CASE("Content-Length bodies are appended to what the body held", "[body_reader][unit]") {
+    auto data = patterned(200 * KiB);
+    piecewise_connection connection{data, {4096}};
+    body_reader reader;
+    reader.set_framing(false, data.size());
+    reader.set_source(connection.source());
+
+    std::string body = "already here:";
+    REQUIRE(run(reader.read_all(body, 8 * MiB)));
+    CHECK(body == "already here:" + data);
+}
+
+TEST_CASE("Content-Length bodies cut short keep the bytes received", "[body_reader][unit]") {
+    // Within the first piece, at its end, and past it
+    for (size_t sent : {size_t{1000}, 64 * KiB, 64 * KiB + 1, 300 * KiB}) {
+        INFO("sent " << sent);
+        auto data = patterned(sent);
+        piecewise_connection connection{data, {4096}};
+        body_reader reader;
+        reader.set_framing(false, 1 * MiB);
+        reader.set_source(connection.source());
+
+        std::string body;
+        REQUIRE_FALSE(run(reader.read_all(body, 8 * MiB)));
+        CHECK(reader.error() == body_error::incomplete);
+        CHECK(body == data);
+    }
+}
+
+TEST_CASE("Content-Length bodies over the limit take no memory", "[body_reader][limit][unit]") {
+    piecewise_connection connection{std::string(100, 'x'), {100}};
+    body_reader reader;
+    reader.set_framing(false, 8 * MiB + 1);
+    reader.set_source(connection.source());
+
+    std::string body;
+    size_t held = body.capacity();
+    REQUIRE_FALSE(run(reader.read_all(body, 8 * MiB)));
+    CHECK(reader.error() == body_error::too_large);
+    CHECK(connection.reads == 0);
+    CHECK(body.capacity() == held);
 }
 
 TEST_CASE("Body size limit of every read", "[body_reader][limit][unit]") {

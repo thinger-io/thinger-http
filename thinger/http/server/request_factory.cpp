@@ -1,10 +1,53 @@
+#include <algorithm>
+#include <cctype>
 #include <sstream>
+#include <string_view>
 #include "request_factory.hpp"
 #include "../common/http_request.hpp"
 #include "../util/url.hpp"
+#include "../../util/ascii.hpp"
 #include "../../util/logger.hpp"
 
 namespace thinger::http {
+
+    namespace {
+
+        bool is_percent_encoded(std::string_view text) {
+            for (auto percent = text.find('%'); percent != std::string_view::npos; percent = text.find('%', percent + 3)) {
+                if (percent + 2 >= text.size() || !std::isxdigit(static_cast<unsigned char>(text[percent + 1])) ||
+                    !std::isxdigit(static_cast<unsigned char>(text[percent + 2]))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool has_dot_dot_segment(std::string_view path) {
+            for (size_t start = 0; start < path.size();) {
+                auto end = std::min(path.find('/', start), path.size());
+                if (end - start == 2 && path[start] == '.' && path[start + 1] == '.') return true;
+                start = end + 1;
+            }
+            return false;
+        }
+
+        // A target in origin form is accepted when it starts with "/" as sent (RFC 9112 section
+        // 3.2.1: an encoded "%2F" is not one), its percent-encoding is valid, and no segment of
+        // its decoded path is "..". The path ends at the first "?" as sent (an encoded "%3F" is
+        // part of it) and the query is not checked for "..", as "?range=1..5" or
+        // "/v1..v2.txt" are no traversal
+        bool is_accepted_target(std::string_view target) {
+            if (target.empty() || target[0] != '/') return false;
+            auto query = target.find('?');
+            if (query != std::string_view::npos && !is_percent_encoded(target.substr(query + 1))) return false;
+            auto path = target.substr(0, query);
+            // without escapes, the path is checked as sent
+            if (path.find('%') == std::string_view::npos) return !has_dot_dot_segment(path);
+            std::string decoded;
+            return util::url::detail::path_decode(path, decoded) && !has_dot_dot_segment(decoded);
+        }
+
+    }
 
     request_factory::request_factory() : state_(method_start) {
     }
@@ -54,25 +97,15 @@ namespace thinger::http {
                 }
             case uri:
                 if (input == ' ') {
-                    // decode get uri
-                    std::string parsed_uri;
-                    bool parsed_ok = util::url::url_decode(tempString1_, parsed_uri);
-                    if (parsed_ok) {
-                        // The target must be in origin form, starting with "/" as sent (RFC 9112
-                        // section 3.2.1: an encoded "%2F" is not one), and its decoded path must
-                        // not contain ".."
-                        if (tempString1_.empty() || tempString1_[0] != '/' || parsed_uri.find("..") != std::string::npos) {
-                            return false;
-                        }
-                        on_http_uri(tempString1_);
-                        tempString1_.clear();
-                        // next step reading http version
-                        state_ = http_version_h;
-                        return boost::indeterminate;
-                    } else {
+                    if (!is_accepted_target(tempString1_)) {
                         tempString1_.clear();
                         return false;
                     }
+                    on_http_uri(tempString1_);
+                    tempString1_.clear();
+                    // next step reading http version
+                    state_ = http_version_h;
+                    return boost::indeterminate;
                 }
                 // The request-target is ASCII (RFC 9112 section 3.2, RFC 3986): other bytes must
                 // be percent-encoded. An invalid request line is rejected, not autocorrected, as
@@ -172,8 +205,11 @@ namespace thinger::http {
                     state_ = header_name;
                     return boost::indeterminate;
                 }
+            // field-line = field-name ":" OWS field-value OWS (RFC 9112 section 5): no whitespace
+            // between the name and the colon (a header name is a token, so it fails here)
             case header_name:
                 if (input == ':') {
+                    tempString2_.clear();
                     state_ = space_before_header_value;
                     return boost::indeterminate;
                 }
@@ -184,20 +220,31 @@ namespace thinger::http {
                     tempString1_.push_back(input);
                     return boost::indeterminate;
                 }
+            // Any SP and HTAB before the value are skipped, as Node, Go and Beast do; the value
+            // may be empty
             case space_before_header_value:
-                if (input == ' ') {
-                    tempString2_.clear();
-                    state_ = header_value;
+                if (is_ows(input)) {
                     return boost::indeterminate;
                 }
-                return false;
+                state_ = header_value;
+                [[fallthrough]];
+            // Trailing SP and HTAB are not part of the value (RFC 9110 section 5.5): trimmed
+            // before the field is stored, so framing fields are validated without them
             case header_value:
                 if (input == '\r') {
+                    tempString2_.erase(tempString2_.find_last_not_of(" \t") + 1);
+                    // A single Host field (RFC 9110 section 7.2), whatever the values: two may
+                    // route differently along a proxy chain (Go rejects them too; Node keeps the
+                    // first)
+                    if (::thinger::util::ascii::iequals(tempString1_, header::host)) {
+                        if (host_field_) return false;
+                        host_field_ = true;
+                    }
                     on_http_header(tempString1_, tempString2_);
                     state_ = expecting_newline_2;
                     return boost::indeterminate;
                 }
-                else if (is_ctl(input)) {
+                else if (is_ctl(input) && input != '\t') {
                     return false;
                 }
                 else {
@@ -212,6 +259,11 @@ namespace thinger::http {
                 return false;
             case expecting_newline_3:
                 if (input == '\n'){
+                    // An HTTP/1.1 request carries a Host field, maybe empty (RFC 9110 section
+                    // 7.2), as Node and Go require; an HTTP/1.0 one may omit it
+                    if (!host_field_ && req->get_http_version_minor() >= 1) {
+                        return false;
+                    }
                     if(headers_only_ || get_content_length() == 0){
                         return true;
                     }
@@ -239,6 +291,7 @@ namespace thinger::http {
         header_lines_ = 0;
         header_section_size_ = 0;
         header_section_too_large_ = false;
+        host_field_ = false;
         return request;
     }
 

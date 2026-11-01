@@ -199,6 +199,14 @@ namespace {
             if (fuzz::rename_repeated_header(input, ours.header_end, "Content-Length")) return "repeated identical Content-Length";
         }
 
+        // HTAB after "chunked" (OWS, not part of the value: RFC 9110 section 5.5): llhttp only
+        // takes SP after it, and reads "chunked\t" as another coding, which a request must not
+        // have. Made SP
+        if (theirs.error == HPE_INVALID_TRANSFER_ENCODING && req.is_chunked_transfer() &&
+            fuzz::replace_in_header(input, 0, ours.header_end, "Transfer-Encoding", '\t', ' ')) {
+            return "HTAB after chunked";
+        }
+
         if (req.is_chunked_transfer()) {
             // Whitespace in chunk extensions: the grammar allows BWS before and after ";" and
             // "=" (RFC 9112 section 7.1.1), llhttp does not. They are skipped, after the size

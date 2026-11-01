@@ -68,7 +68,8 @@ namespace thinger::http {
         thinger::awaitable<size_t> read_some(uint8_t* buffer, size_t max_size);
 
         /// Append the rest of the body to `body`, failing (too_large) if `body` would exceed
-        /// `max_size` bytes. A Content-Length body is checked before reading anything.
+        /// `max_size` bytes. A Content-Length body is checked before reading anything, and
+        /// `body` grows as its bytes arrive, not to the announced length at once.
         thinger::awaitable<bool> read_all(std::string& body, size_t max_size);
 
         /// Read and drop the rest of the body; false if it exceeds `max_size` bytes or fails

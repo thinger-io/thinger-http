@@ -3,6 +3,7 @@
 #include <random>
 #include <regex>
 #include <sstream>
+#include <string>
 #include <vector>
 
 using namespace thinger::http;
@@ -122,6 +123,42 @@ TEST_CASE("HTTP Request configuration", "[http][request][unit]") {
         REQUIRE(req.is_default_port() == true);
     }
     
+    // A bracketed IPv6 literal keeps its brackets in the host, as WHATWG URL.host and
+    // URL.hostname (Node) and virtual_host::host_name() do; its port follows the "]"
+    SECTION("Host with an IPv6 literal") {
+        req.set_host("[::1]:8080");
+        REQUIRE(req.get_host() == "[::1]");
+        REQUIRE(req.get_port() == "8080");
+        REQUIRE(req.get_header("Host") == "[::1]:8080");
+
+        http_request no_port;
+        no_port.set_host("[2001:DB8::1]");
+        REQUIRE(no_port.get_host() == "[2001:db8::1]");
+        REQUIRE(no_port.get_port() == "80");
+        REQUIRE(no_port.get_header("Host") == "[2001:db8::1]");
+
+        http_request named;
+        named.set_host("example.com:8080");
+        REQUIRE(named.get_host() == "example.com");
+        REQUIRE(named.get_port() == "8080");
+        REQUIRE(named.get_header("Host") == "example.com:8080");
+
+        // without "]", or with no ":" right after it, the value is the host whole
+        for (const char* host : {"[::1", "[::1:8080", "[::1]8080", "[::1]x:8080"}) {
+            INFO("host: " << host);
+            http_request invalid;
+            invalid.set_host(host);
+            REQUIRE(invalid.get_host() == host);
+            REQUIRE(invalid.get_port() == "80");
+        }
+
+        // received in a Host field
+        http_request received;
+        received.process_header("Host", "[::1]:8443");
+        REQUIRE(received.get_host() == "[::1]");
+        REQUIRE(received.get_port() == "8443");
+    }
+
     SECTION("Content configuration") {
         REQUIRE(req.has_content() == false);
         
@@ -280,6 +317,26 @@ TEST_CASE("HTTP Request URI and Path handling", "[http][request][unit]") {
         REQUIRE(req.get_uri() == "/?key=value");
     }
     
+    SECTION("Plus is literal in the path, a space in the query") {
+        // Node: new URL("http://h/a+b?q=c+d") has pathname "/a+b" and searchParams q = "c d";
+        // Go: url.Parse gives Path "/a+b" and Query().Get("q") == "c d"
+        req.set_uri("/a+b?q=c+d");
+        REQUIRE(req.get_path() == "/a+b");
+        REQUIRE(req.get_resource() == "/a+b");
+        REQUIRE(req.get_uri_parameters() == std::multimap<std::string, std::string>{{"q", "c d"}});
+
+        http_request encoded;
+        encoded.set_uri("/a%2Bb");
+        REQUIRE(encoded.get_resource() == "/a+b");
+
+        // rebuilt from the resource, the "+" stays a "+" (and not a space)
+        http_request rebuilt;
+        rebuilt.set_uri("/a+b");
+        rebuilt.add_uri_parameter("k", "v");
+        rebuilt.refresh_uri();
+        REQUIRE(rebuilt.get_uri() == "/a%2Bb?k=v");
+    }
+
     SECTION("Path extraction from URLs") {
         // Test URL parsing with query parameters
         REQUIRE(req.set_url("http://example.com/api/test?foo=bar&baz=qux") == true);
@@ -352,7 +409,12 @@ namespace {
 
         static const std::regex resource_regex("(\\/[^\\?#]*)");
         if(std::regex_search(start, end, what, resource_regex)){
-            resource = thinger::http::util::url::url_decode(std::string(what[0].first, what[1].second));
+            // except that "+" is now literal in the path (a space only in the query)
+            std::string raw(what[0].first, what[1].second);
+            for (auto plus = raw.find('+'); plus != std::string::npos; plus = raw.find('+', plus)) {
+                raw.replace(plus, 1, "%2B");
+            }
+            resource = thinger::http::util::url::url_decode(raw);
             start = what[0].second;
         }
 
@@ -443,4 +505,35 @@ TEST_CASE("HTTP Request Expect header", "[http][request][expect][unit]") {
     http_request request;
     request.process_header("expect", "100-continue");
     REQUIRE(request.get_expectation() == expectation::continue_100);
+}
+TEST_CASE("HTTP Request refuses a URL over 8192 bytes", "[http][request][unit][url_cap]") {
+    http_request req;
+    REQUIRE(req.set_url("https://before.example.com:8443/kept?x=1"));
+
+    auto url_of = [](size_t size) {
+        std::string url = "http://example.com/";
+        url.append(size - url.size(), 'a');
+        return url;
+    };
+
+    SECTION("8192 bytes are parsed") {
+        REQUIRE(req.set_url(url_of(8192)));
+        REQUIRE(req.get_host() == "example.com");
+        REQUIRE(req.get_uri().size() == 8192 - std::string("http://example.com").size());
+    }
+
+    SECTION("8193 bytes are refused, and the request keeps its URL") {
+        REQUIRE_FALSE(req.set_url(url_of(8193)));
+        REQUIRE(req.get_host() == "before.example.com");
+        REQUIRE(req.get_port() == "8443");
+        REQUIRE(req.get_uri() == "/kept?x=1");
+        REQUIRE(req.is_ssl());
+    }
+
+    SECTION("a 16 KiB string shaped to backtrack is refused before the regex") {
+        std::string url = "http://";
+        while (url.size() < 16384) url += ":@";
+        REQUIRE_FALSE(req.set_url(url));
+        REQUIRE(req.get_host() == "before.example.com");
+    }
 }

@@ -77,6 +77,14 @@ void server_connection::deadline_expired() {
         return;
     }
     if (now >= idle_deadline()) {
+        // Nor is a request received whole whose handler runs idle, as in Node and Go: looked at
+        // again an idle timeout later (the watchdog is never left unarmed, whatever ends the
+        // handler). Checked as it expires, so that a request costs nothing more. A body still
+        // arriving is bounded by it, as every byte moves it
+        if (!write_waits_ && in_progress_ && in_progress_->handler_running() && !in_progress_->input_pending()) {
+            timeout_timer_.expires_at(now + std::max(timeout_, std::chrono::seconds{1}));
+            return;
+        }
         if (write_waits_) {
             LOG_DEBUG("http server connection closed: the client took no byte of its response within its write deadline");
         } else {

@@ -230,7 +230,7 @@ awaitable<io_result> websocket::read_payload(uint8_t buffer[], size_t max_size) 
 }
 
 boost::system::error_code websocket::fail(const char* reason) {
-    LOG_WARNING("websocket protocol error: {}", reason);
+    LOG_DEBUG("websocket protocol error: {}", reason);
     close(CLOSE_PROTOCOL_ERROR);
     return protocol_error();
 }

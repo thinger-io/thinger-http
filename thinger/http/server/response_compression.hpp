@@ -38,6 +38,9 @@ namespace compression {
     // Qualities the Accept-Encoding headers of a request give (they make one list)
     accepted_codings accepted_by(const http_request& request);
 
+    // Content coding a response to `request` is compressed with (see negotiate_content_coding)
+    content_coding negotiated(const http_request& request);
+
     // Whether a body of `size` bytes and `content_type` is compressed for the clients
     // accepting it, given the headers of `message`
     bool compressible(const http_response& message, size_t size, std::string_view content_type);

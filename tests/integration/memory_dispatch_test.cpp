@@ -315,6 +315,26 @@ TEST_CASE("In-memory dispatch replaces every Content-Length header", "[server][d
     }
 }
 
+// Host is required only of requests received from a connection: a dispatched request is built
+// by its caller (the core dispatches requests made with set_method() and set_uri() only)
+TEST_CASE("In-memory dispatch serves requests without Host", "[server][dispatch][host][integration]") {
+    http::server server;
+    server.get("/items/:id", [](http::request& req, http::response& res) {
+        res.send("id=[" + req["id"] + "] host=[" + req.get_http_request()->get_host() + "]");
+    });
+
+    auto request = std::make_shared<http::http_request>();
+    request->set_method(http::method::GET);
+    request->set_uri("/items/7");
+    REQUIRE_FALSE(request->has_header("Host"));
+    REQUIRE(request->get_http_version_major() == 1);
+    REQUIRE(request->get_http_version_minor() == 1);
+
+    auto response = run_dispatch(server, request);
+    REQUIRE(response->get_status() == http::http_response::status::ok);
+    REQUIRE(response->get_content() == "id=[7] host=[]");
+}
+
 TEST_CASE("Response copies share the response", "[server][dispatch][response][integration]") {
     http::server server;
     std::atomic<bool> original_saw_answer{false};

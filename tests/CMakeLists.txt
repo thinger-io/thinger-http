@@ -369,6 +369,12 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/server_hostile_peer_test.cpp)
     add_thinger_test(test_integration_server_hostile_peer integration/server_hostile_peer_test.cpp)
 endif()
 
+# Integration tests - Server memory bounds: what one hostile client makes the server hold
+# (allocated bytes, handlers run) stays near what it sent
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/server_memory_bounds_test.cpp)
+    add_thinger_test(test_integration_server_memory_bounds integration/server_memory_bounds_test.cpp)
+endif()
+
 # Integration tests - Server deadlines: the request deadline of a route, a group or a virtual
 # host, what a handler timed out sees, and the requests it never applies to
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/server_deadlines_test.cpp)
@@ -511,6 +517,16 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/static_files_test.cpp)
     add_thinger_test(test_integration_static_files integration/static_files_test.cpp)
 endif()
 
+# Integration tests - Static files over 1 MiB, streamed (memory bound, ranges, compression cap)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/static_streaming_test.cpp)
+    add_thinger_test(test_integration_static_streaming integration/static_streaming_test.cpp)
+endif()
+
+# Integration tests - Static file paths percent-decoded, and encoded traversal attempts
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/static_paths_test.cpp)
+    add_thinger_test(test_integration_static_paths integration/static_paths_test.cpp)
+endif()
+
 # Integration tests - Reverse proxy
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/reverse_proxy_test.cpp)
     add_thinger_test(test_integration_reverse_proxy integration/reverse_proxy_test.cpp)
@@ -566,6 +582,8 @@ endif()
 # sanitizers, which replace it themselves
 if(NOT THINGER_HTTP_ENABLE_SANITIZERS)
     add_thinger_test(test_response_allocations unit/http/server/response_allocations.cpp)
+    # The memory held for a static file over 1 MiB sent to a slow or non-reading client
+    add_thinger_test(test_static_streaming_memory integration/static_streaming_memory.cpp)
 endif()
 
 # ==================== ALL TESTS RUNNER ====================

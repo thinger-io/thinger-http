@@ -55,25 +55,35 @@ namespace thinger::http::util::url{
         return result;
     }
 
-    bool url_decode(const std::string &in, std::string &out) {
-        out.clear();
-        out.reserve(in.size());
+    namespace {
+        bool percent_decode(std::string_view in, std::string &out, bool plus_is_space) {
+            out.clear();
+            out.reserve(in.size());
 
-        for (size_t i = 0; i < in.size(); ++i) {
-            if (in[i] == '%') {
-                if (i + 2 >= in.size()) return false;
-                int hi = hex_digit(in[i + 1]);
-                int lo = hex_digit(in[i + 2]);
-                if (hi < 0 || lo < 0) return false;
-                out += static_cast<char>((hi << 4) | lo);
-                i += 2;
-            } else if (in[i] == '+') {
-                out += ' ';
-            } else {
-                out += in[i];
+            for (size_t i = 0; i < in.size(); ++i) {
+                if (in[i] == '%') {
+                    if (i + 2 >= in.size()) return false;
+                    int hi = hex_digit(in[i + 1]);
+                    int lo = hex_digit(in[i + 2]);
+                    if (hi < 0 || lo < 0) return false;
+                    out += static_cast<char>((hi << 4) | lo);
+                    i += 2;
+                } else if (in[i] == '+' && plus_is_space) {
+                    out += ' ';
+                } else {
+                    out += in[i];
+                }
             }
+            return true;
         }
-        return true;
+    }
+
+    bool url_decode(const std::string &in, std::string &out) {
+        return percent_decode(in, out, true);
+    }
+
+    bool detail::path_decode(std::string_view in, std::string &out) {
+        return percent_decode(in, out, false);
     }
 
     std::string url_decode(const std::string &in) {

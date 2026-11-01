@@ -1,0 +1,2 @@
+sensor-01.devices.example.net:443
+/files/report.final.pdf

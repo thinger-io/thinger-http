@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 #include <boost/algorithm/string.hpp>
 
 namespace thinger::http {
@@ -106,6 +107,54 @@ namespace {
             return method::GET;
         }
         return original;
+    }
+
+    // Whether a reference has a scheme: text before a ':' that comes before any '/', '?' or '#'
+    bool has_scheme(std::string_view reference) {
+        auto end = reference.find_first_of(":/?#");
+        return end != std::string_view::npos && reference[end] == ':';
+    }
+
+    // RFC 3986 section 5.2.4: drop each "." segment, and each ".." with the segment before it,
+    // stopping at the root
+    std::string remove_dot_segments(std::string_view path) {
+        std::vector<std::string_view> segments;
+        bool directory = false;
+        for (size_t start = path.starts_with('/') ? 1 : 0; start <= path.size();) {
+            size_t end = std::min(path.find('/', start), path.size());
+            auto segment = path.substr(start, end - start);
+            directory = segment == "." || segment == "..";
+            if (segment == ".." && !segments.empty()) segments.pop_back();
+            else if (!directory) segments.push_back(segment);
+            start = end + 1;
+        }
+        std::string result;
+        for (auto segment : segments) (result += '/') += segment;
+        if (result.empty() || directory) result += '/';
+        return result;
+    }
+
+    // The URL a Location points to, resolved against the request when it is relative (RFC 3986
+    // section 5.2.2); one with a scheme is taken as it is
+    std::string resolve_location(const http_request& request, const std::string& location) {
+        if (has_scheme(location)) return location;
+        std::string_view reference = location;
+        std::string origin = request.get_base_path();
+        std::string_view current = request.get_uri();
+        current = current.substr(0, current.find_first_of("?#"));
+        std::string path;
+        if (reference.starts_with("//")) {
+            auto authority = std::min(reference.find_first_of("/?#", 2), reference.size());
+            origin = (request.is_ssl() ? "https:" : "http:") + std::string(reference.substr(0, authority));
+            reference.remove_prefix(authority);
+            current = "/"; // an empty path is the root of that host
+        }
+        auto path_end = std::min(reference.find_first_of("?#"), reference.size());
+        auto relative = reference.substr(0, path_end);
+        if (relative.starts_with('/')) path = relative;
+        else if (relative.empty()) path = current;
+        else path = std::string(current.substr(0, current.rfind('/') + 1)).append(relative);
+        return origin + remove_dot_segments(path) + std::string(reference.substr(path_end));
     }
 
     // ws:// and wss:// URLs, or http:// and https:// ones
@@ -609,32 +658,38 @@ awaitable<client_response> http_client_base::send_with_redirects(std::shared_ptr
         std::string location = response->get_header("Location");
         LOG_DEBUG("Following redirect #{} to: {}", redirect_count + 1, location);
         request = redirect_request(*request, *response, location);
+        // A Location that is not a URL the client can reach ends the chain, with the redirect
+        if (!request) co_return client_response(boost::asio::error::invalid_argument, response);
     }
 }
 
 bool http_client_base::should_follow(const http_response& response, unsigned int redirect_count) const {
     return follow_redirects_ && response.is_redirect_response() && redirect_count < max_redirects_ &&
-           response.has_header("Location");
+           !response.get_header("Location").empty();
 }
 
 std::shared_ptr<http_request> http_client_base::redirect_request(http_request& request, const http_response& response,
                                                                  const std::string& location) {
     int status = response.get_status_code();
-    auto next = create_request(redirect_method(status, request.get_method()), location);
+    auto url = resolve_location(request, location);
+    auto next = std::make_shared<http_request>();
+    if (!next->set_url(url)) return nullptr;
+    next->set_method(redirect_method(status, request.get_method()));
+    // A Location on the same host reaches it over the same Unix socket
+    bool same_authority = !has_scheme(location) && !location.starts_with("//");
+    next->set_unix_socket(same_authority ? request.get_unix_socket() : unix_socket_);
+    apply_default_headers(next);
 
-    // 307 and 308 send the body again
+    // 307 and 308 send the body again (set_content sets its Content-Length)
     if ((status == 307 || status == 308) && !request.get_body().empty()) {
         next->set_content(request.get_body());
         if (request.has_header("Content-Type")) {
             next->add_header("Content-Type", request.get_header("Content-Type"));
         }
-        if (request.has_header("Content-Length")) {
-            next->add_header("Content-Length", request.get_header("Content-Length"));
-        }
     }
 
     // Credentials only to the same origin
-    if (request.has_header("Authorization") && is_same_origin(request.get_url(), location)) {
+    if (request.has_header("Authorization") && is_same_origin(request.get_url(), url)) {
         next->add_header("Authorization", request.get_header("Authorization"));
         LOG_DEBUG("Preserving Authorization header for same-origin redirect");
     }

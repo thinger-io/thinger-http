@@ -104,6 +104,10 @@ namespace compression {
         return parse_accept_encoding(accept_encoding);
     }
 
+    content_coding negotiated(const http_request& request) {
+        return negotiate(accepted_by(request));
+    }
+
     bool compressible(const http_response& message, size_t size, std::string_view content_type) {
         return size >= threshold && is_compressible_content_type(content_type) && !no_transform(message);
     }
@@ -128,7 +132,7 @@ namespace compression {
         add_vary(message, "Accept-Encoding");
         if (message.has_header("Content-Encoding")) return;
 
-        auto coding = negotiate(accepted_by(request));
+        auto coding = negotiated(request);
         if (coding == content_coding::identity) return;
         const auto& content = message.get_content();
         auto compressed = coding == content_coding::gzip ? ::thinger::util::gzip::compress(content)

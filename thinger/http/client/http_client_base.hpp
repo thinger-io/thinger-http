@@ -230,7 +230,8 @@ private:
     awaitable<client_response> send_with_redirects(std::shared_ptr<http_request> request,
                                                    std::shared_ptr<client_connection>* used = nullptr);
     bool should_follow(const http_response& response, unsigned int redirect_count) const;
-    // The request following a redirect to `location`, taking the cookies `response` sets
+    // The request following a redirect to `location`, taking the cookies `response` sets;
+    // null if `location` does not give a URL the client can parse
     std::shared_ptr<http_request> redirect_request(http_request& request, const http_response& response,
                                                    const std::string& location);
 

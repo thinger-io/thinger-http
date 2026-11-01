@@ -14,6 +14,7 @@
 #include "server_connection.hpp"
 #include "http_stream.hpp"
 #include "connection_tracker.hpp"
+#include "detail/spawn_handler.hpp"
 #include "websocket_connection.hpp"
 #include "sse_connection.hpp"
 #include "../../asio/sockets/websocket.hpp"
@@ -457,24 +458,17 @@ std::shared_ptr<http_response> response::websocket_handshake(const std::vector<s
     return response;
 }
 
-namespace {
-
-    // Run a coroutine handler on `executor` (or an io_context), detached: what it throws is logged
-    template<typename Executor, typename F>
-    void spawn_handler(Executor&& executor, const char* what, F&& run) {
-        co_spawn(std::forward<Executor>(executor), std::forward<F>(run), [what](const std::exception_ptr& error) {
-            if (!error) return;
-            try {
-                std::rethrow_exception(error);
-            } catch (const std::exception& e) {
-                LOG_ERROR("Exception in the {} handler: {}", what, e.what());
-            } catch (...) {
-                LOG_ERROR("Unknown exception in the {} handler", what);
-            }
-        });
+void detail::log_handler_exception(const char* what, const std::exception_ptr& error) {
+    try {
+        std::rethrow_exception(error);
+    } catch (const std::exception& e) {
+        LOG_ERROR("Exception in the {} handler: {}", what, e.what());
+    } catch (...) {
+        LOG_ERROR("Unknown exception in the {} handler", what);
     }
-
 }
+
+using detail::spawn_handler;
 
 void response::upgrade_websocket(const websocket_accept_options& options, websocket_handler handler) {
     accept_websocket(options, [handler = std::move(handler)](std::shared_ptr<websocket_connection> connection,

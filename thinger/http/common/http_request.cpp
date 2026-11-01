@@ -121,6 +121,9 @@ namespace thinger::http {
     }
 
     bool http_request::set_url(const std::string& url){
+        // Longer URLs are refused before the regex, whose matching recurses per character in
+        // libstdc++ (a Location comes from the peer)
+        if(url.size() > 8192) return false;
         static const std::regex uri_regex(R"((wss?|https?):\/\/(?:(.*):(.*)@)?([a-zA-Z\.\-0-9_]+)(?::(\d+))*(.*))");
         std::match_results<std::string::const_iterator> results;
         if (std::regex_match(url, results, uri_regex)) {
@@ -285,7 +288,13 @@ namespace thinger::http {
         // after it, or the end. Without any '/', it is left as is
         if(auto slash = uri.find('/'); slash != std::string::npos){
             auto resource_end = std::min(uri.find_first_of("?#", slash), uri.size());
-            resource_ = util::url::url_decode(uri.substr(slash, resource_end - slash));
+            // "+" is literal in a path (a space only in the query); empty on an invalid escape.
+            // Decoded apart, as `uri` may be the resource itself
+            std::string resource;
+            if (!util::url::detail::path_decode(std::string_view(uri).substr(slash, resource_end - slash), resource)) {
+                resource.clear();
+            }
+            resource_ = std::move(resource);
             start = uri.begin() + static_cast<std::ptrdiff_t>(resource_end);
         }
 
@@ -342,7 +351,14 @@ namespace thinger::http {
     }
 
     void http_request::set_host(std::string host){
+        // A bracketed IPv6 literal ("[::1]:8080") keeps its brackets, as WHATWG URL.host does:
+        // its port follows the "]". Without a "]" it is the host whole
         auto position = host.find(':');
+        if(!host.empty() && host[0] == '['){
+            auto bracket = host.find(']');
+            position = bracket != std::string::npos && bracket + 1 < host.size() && host[bracket + 1] == ':' ?
+                       bracket + 1 : std::string::npos;
+        }
         if(position==std::string::npos){
             host_ = std::move(host);
         }else{

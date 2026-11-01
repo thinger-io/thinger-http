@@ -7,6 +7,49 @@ All notable changes to thinger-http are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-01
+
+Patch release: the memory one peer could make the server take, the request parser and `Host`, static files and the client's redirects. One behaviour change, a missing or repeated `Host` (under Changed); no API change. Rebuild what links the library (see the ABI note under Changed).
+
+### Added
+
+- Fuzz target `fuzz_host_route_matchers`, with its seed corpus: virtual host resolution and route matching, through in-memory dispatch, on Host values and request targets of up to 16 KiB, for every kind of host pattern and route pattern. See `tests/fuzz/README.md`.
+- `compression::negotiated(request)` (`http/server/response_compression.hpp`): the content coding a response to `request` would be compressed with, as `negotiate_content_coding` chooses it. The static file sender uses it to read a file whole only when it will be compressed (see Fixed).
+
+### Changed
+
+- **Behavior change:** an HTTP/1.1 request without a `Host` field, or any request with more than one `Host` field (whatever their values and letter case), is answered `400` and its connection closed, before any middleware or handler, as RFC 9110 section 7.2 requires. Node and Go reject a missing `Host` too, and Go a repeated one. HTTP/1.1 clients that omit `Host` must send it; an HTTP/1.0 request may still omit it, and an empty `Host:` is still accepted (served by the default host). Requests passed to `dispatch()` are not checked. The reverse proxy sends a `Host` to its target in every case (see Fixed).
+- 0.9.1 keeps the API of 0.9.0 and the SONAME `libthinger_http.so.0.9`, with the same class sizes, but not every layout: `server_connection` has a new private member, which moves another one, and `request_factory` (its request parser) one more in its padding; inline members of `server_connection` read them. Code built against the 0.9.0 headers must be rebuilt against 0.9.1.
+
+### Removed
+
+- `thinger/http/data/out_sendfile.hpp` and `thinger/http/data/out_buffer.hpp`, left over from the callback API of the sockets (`out_sendfile.hpp` overrode a callback `to_socket()` that no longer exists, so it did not compile) and included by no file. The install rules of `CMakeLists.txt` are commented out, so no installed set of headers shipped them.
+
+### Fixed
+
+- The idle timeout no longer closes a connection while the handler of its request runs, once the request was received whole: a handler longer than `idle_timeout`, on a route without `.timeout()`, gets its response to the client, as the README said and as Node and Go do. The header, request and write deadlines apply as before, and a body still arriving keeps moving the idle deadline, so a client that goes silent mid-body is still closed with every request deadline off. A handler that returned without answering (to answer later from a copy of the response) is still idle-timed unless its route sets `.timeout()`.
+- A keep-alive response whose write fails closes the connection, as Go and Node do, so the requests a gone client pipelined behind it are not handled.
+- Request header fields accept optional whitespace around their value, as RFC 9112 section 5.1 allows and Node, Go and Beast do: `Name:value`, `Name:` (an empty value), `Name:\tvalue`, several spaces after the colon, trailing spaces and tabs, and tabs inside the value. 0.9.0 answered all of them with `400`, which refused hand-written HTTP clients of devices. The whitespace around the value is not part of it: `Content-Length: 5 ` frames a 5-byte body and `Transfer-Encoding:\tchunked` a chunked one, while `Content-Length` and `Transfer-Encoding` stay as strict as before on the trimmed value. Whitespace between a field name and its colon, folded lines and control characters other than the tab are still `400`.
+- A request target is refused for `..` only when it is a segment of the percent-decoded path (`/..`, `/a/../b`, `/%2E%2E/x`, `/a%2F..%2Fb`); the path ends at the first `?` as sent. 0.9.0 refused any `..` in the target, query included, so `/api/items?range=1..5` and `/files/v1..v2.txt` got `400`; they are now served, also by `serve_static()`.
+- `+` is literal in the path of a request, as in Node's `URL.pathname` and Go's `URL.Path`: `GET /a+b` has the resource `/a+b`, not `/a b`, and `serve_static()` looks for `a+b`. Query parameters and form bodies still decode `+` as a space, and `util::url::url_decode()` is unchanged.
+- `serve_static()` percent-decodes the path under its prefix: `/static/my%20file.png` serves `my file.png` and UTF-8 names are found. A decoded `%2F` separates directories, and a malformed escape or a decoded NUL gets `400`; a decoded path resolving outside the directory still gets `403`. 0.9.0 looked for the encoded name, so such files got `404` or the fallback. Path parameters of other routes stay raw, as before.
+- Static files (`serve_static()` and `res.send_file()`) with a body over 1 MiB, ranges and precompressed siblings included, are streamed in 64 KiB pieces, each read once the previous one is written, so a response holds about one piece whatever the size of the file and the pace of the client; a client that stops reading is closed by `write_timeout`. 0.9.0 read the whole file into memory on the IO thread for every request, so memory grew with the number of downloads times the size of the file. Bodies up to 1 MiB are read whole, as before. Text files over 4 MiB are no longer compressed on the fly (it needs the whole body): they are sent as they are, without `Vary`, or as their precompressed sibling. See [Static Files](README.md#static-files).
+- `http_request::set_host()` splits a bracketed IPv6 literal after its `]`: `[::1]:8080` gives the host `[::1]` and the port `8080` (0.9.0 split it at the first `:`). The brackets stay in the host, as WHATWG `URL.host` does; a value starting with `[` without a `]` right before its `:` is the host whole.
+- The reverse proxy always sends a `Host` field to the target, empty when it preserves the host of a request that had none (an HTTP/1.0 request may omit it), so the target does not answer `400` for a missing `Host`.
+- The client follows relative redirects. A `Location` without a scheme (`/login`, `login`, `../x`, `?q=1`, `//host:port/path`) is resolved against the URL of the request that got it, as RFC 3986 §5.2 says and as Node's `fetch` and Go's `http.Client` do, with `.` and `..` segments removed (a `..` above the root stops there). It was sent with no host. A `Location` that keeps the host keeps the request's Unix socket, and `Authorization` follows only when the resolved URL has the same origin.
+- A redirect to a `Location` the client cannot parse (another scheme such as `ftp:`, an invalid one, a host it does not support, a URL over the length cap of Security) ends the chain with `boost::asio::error::invalid_argument`, as Go and Node do, with the 3xx response attached so its status and headers stay readable. No further request is sent. A 3xx with an empty `Location` is returned as a response, as one without it already was.
+- The client follows a `303 See Other` with a GET and no body, as RFC 9110 §15.4.4 says and as Node and Go do, and `client_response::is_redirect()` is true for it. It was returned as a final response.
+- A 307 or 308 redirect of a request with a body sends one `Content-Length`. It sent two, which llhttp (Node) rejects with 400.
+- Log lines a peer can trigger at will are logged at debug level, as the listener already logs failed handshakes, with the same text: an invalid request or a header section too large, a request with invalid body framing, a route timeout (`Request timed out`), a congested WebSocket discarding messages, and a WebSocket protocol error. They were errors and warnings any client could write as often as it liked.
+
+### Security
+
+- A client that pipelines requests and never reads the responses can no longer make the server build and hold every response in memory. The server stops reading the next request of a connection while 16 responses are queued on it, or while the write of its front response waits for the socket, and goes on as soon as a response is written out, losing no request (Node pauses its parser the same way; Go reads one request at a time). A paused connection stays bounded by its write deadline, otherwise by its idle deadline, and ends on close, client reset, `stop()` and `shutdown()`. When the client reads, the cost is one branch per request, with no allocation, timer or coroutine.
+- A request body with a `Content-Length` takes memory as its bytes arrive, not when its head arrives: `read_body()` reserves 64 KiB first, then grows geometrically up to the announced length, as Go's `io.ReadAll` does. In 0.9.0 the whole announced length was allocated and zero-filled before any byte arrived, so a head alone announcing 8 MiB committed 8 MiB until the request deadline: 64 such heads now grow the process by under 32 MiB (about 512 MiB before). The limit check still comes before any allocation, and a body under 64 KiB is still one allocation.
+- A `std::regex` no longer runs on a host name or a URL of any length a peer sends: libstdc++'s matcher recurses about once per byte, so one value of some kilobytes could overflow the stack and crash the process.
+  - Server: a `Host` longer than any DNS name (253 bytes, without its port and one trailing dot) is no longer matched against the pattern virtual hosts (`host("*.example.com")`, `:name` hosts and `host_regex()`): it is served by the default host, as any name no virtual host matches. Exact hosts are still found by their name. See [Virtual Hosts](README.md#virtual-hosts).
+  - Client: a URL longer than 8192 bytes is refused before it is matched, in `http_request::set_url` and in `websocket_util::parse_websocket_url`; a hostile server's `Location` can reach 16 KiB. A URL given by the caller is capped too: a request to a longer one fails with no request sent.
+
 ## [0.9.0] - 2026-11-01
 
 Configuration and request lifecycle: the certificate manager and the workers are objects the application owns, one server serves HTTP and HTTPS, the connection settings are per server, a shutdown has one deadline, `stop()` closes what is open, request cancellation is cooperative and opt-in per route, and server connections, event streams and proxy tunnels have deadlines by default. Breaking, with no deprecation wrappers: see [Migrating from 0.8 to 0.9](MIGRATING.md#from-08-to-09) for the changes below in migration order, with code before and after, and the behaviour changes B1–B11 under Changed.
@@ -429,7 +472,8 @@ These changes of the last weeks can be noticed by code written against an earlie
 - Client: connections are kept alive between requests (see the README to tune or disable the pool).
 - The unused `request_handler` interface was removed.
 
-[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/thinger-io/thinger-http/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/thinger-io/thinger-http/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/thinger-io/thinger-http/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/thinger-io/thinger-http/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/thinger-io/thinger-http/compare/v0.7.1...v0.8.0

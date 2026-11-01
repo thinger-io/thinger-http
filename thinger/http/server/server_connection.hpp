@@ -130,6 +130,19 @@ private:
     // Wait until the response of a stream has started, or the connection is closed
     awaitable<void> wait_response(const http_stream& stream);
 
+    // Requests read are bounded by the responses still to write out: no next request is read
+    // while max_queued_responses wait in the queue, or the front one waits for the socket (a
+    // client that does not read). Node pauses its parser so, Go reads one request at a time
+    static constexpr size_t max_queued_responses = 16;
+    bool output_backed_up() const { return writing_ || request_queue_.size() >= max_queued_responses; }
+    // The read loop waits for the output before the next request. A head begun is read to its
+    // end first, within its deadline, which a pause would eat
+    bool reading_paused() const { return output_backed_up() && !reading_head_; }
+    // Wait until the output is no longer backed up, or the connection stops; woken as a response
+    // leaves the queue, or a write that waited completes
+    awaitable<void> wait_output();
+    void output_progressed() { if (output_waited_) [[unlikely]] reader_wake_->set(); }
+
     // The peer watcher: the only reader of the socket while a request is handled, and until
     // its response starts (the read loop reads it otherwise). Once the body of the request
     // was read, it waits for the socket to be readable: data (the next request) stays there,
@@ -232,8 +245,9 @@ private:
     // idle one later (see extend_timeout()), a request holds it (see hold_until())
     asio::watchdog timeout_timer_;
 
-    // Set when a response starts, waking the read loop waiting for it (created by its first wait)
-    std::optional<asio::async_event> response_started_;
+    // Wakes the read loop waiting for a response to start, or for the responses to write out
+    // (see wait_output()); set as it stops too. Created by its first wait
+    std::optional<asio::async_event> reader_wake_;
 
     // Bound to the read loop, which runs the handlers: the scope of the request being handled
     // emits it to interrupt its handler (see http_stream::bind_handler())
@@ -300,6 +314,8 @@ private:
     bool reading_head_{false};
     // A frame waits for the socket, within its write deadline (see write_started())
     bool write_waits_{false};
+    // The read loop waits for the output (see wait_output())
+    bool output_waited_{false};
     stream_id request_id_{0};
 };
 

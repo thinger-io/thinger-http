@@ -1,7 +1,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/response_sink.hpp>
+#include <unistd.h>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <new>
 #include <string>
@@ -87,4 +90,54 @@ TEST_CASE("Allocations of a response with a header set before answering", "[resp
     CHECK(moved == plain);
     CHECK(lvalue == plain + 1);
     CHECK(two == plain + 1);
+}
+
+TEST_CASE("Allocations of a small static file", "[response][allocations][file_server][unit]") {
+    namespace fs = std::filesystem;
+    auto root = fs::temp_directory_path() / ("thinger-file-allocations-" + std::to_string(::getpid()));
+    fs::create_directories(root);
+    // Two files of the same length and with types as short: one compressible, one not
+    for (const char* name : {"a.txt", "a.png"}) {
+        std::ofstream(root / name, std::ios::binary) << std::string(1000, 'x');
+    }
+    auto request = http_request::create_http_request(method::GET, "http://localhost/a");
+
+    auto answer = [&](const char* name, const char* cache_control) {
+        auto path = root / name;
+        auto sink = std::make_shared<keeping_sink>();
+        auto count = allocations_of([&] {
+            response res(sink, request);
+            if (cache_control) res.header("Cache-Control", cache_control);
+            res.send_file(path);
+        });
+        REQUIRE(sink->sent);
+        REQUIRE(sink->sent->get_content().size() == 1000);
+        return count;
+    };
+
+    // The first answer also pays what is made once (the table of types, ...)
+    answer("a.txt", nullptr);
+    answer("a.png", nullptr);
+
+    // One reading of Cache-Control by the compression checks: the list of its values
+    auto reading = [](const char* cache_control) {
+        http_response message;
+        message.add_header("Cache-Control", cache_control ? cache_control : "no-cache");
+        return allocations_of([&] { (void) message.get_headers_with_key("Cache-Control"); });
+    };
+
+    // The default Cache-Control, and a value too long to be kept inline in a string
+    for (const char* cache_control : {static_cast<const char*>(nullptr), "public, max-age=31536000, immutable"}) {
+        auto text = answer("a.txt", cache_control);
+        auto binary = answer("a.png", cache_control);
+        auto read_once = reading(cache_control);
+        INFO("Cache-Control " << (cache_control ? cache_control : "(default)") << ": text " << text
+             << ", binary " << binary << ", one reading of Cache-Control " << read_once);
+        // A text file costs more than a binary one only what deciding to compress it costs:
+        // Cache-Control read twice (whether it forbids transforming the body: for Vary, then to
+        // compress it) and Vary read once. A third reading is the cost a file adds to the
+        // answers that are not files
+        CHECK(text <= binary + 2 * read_once + 1);
+    }
+    fs::remove_all(root);
 }

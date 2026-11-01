@@ -142,6 +142,30 @@ TEST_CASE("url_decode (string variant)", "[url][unit]") {
     }
 }
 
+// The public url_decode() keeps decoding "+" as a space (query and form data); only the path
+// decoding of a request keeps it literal
+TEST_CASE("url_decode keeps decoding plus as a space", "[url][unit]") {
+    REQUIRE(url_decode("a+b") == "a b");
+    std::string out;
+    REQUIRE(url_decode("a+b%2B", out));
+    REQUIRE(out == "a b+");
+}
+
+// "+" is literal in a path: Node's new URL("http://h/a+b").pathname is "/a+b", Go's
+// url.Parse("/a+b").Path is "/a+b"
+TEST_CASE("path_decode keeps plus literal", "[url][unit]") {
+    std::string out;
+    REQUIRE(detail::path_decode("/a+b", out));
+    REQUIRE(out == "/a+b");
+    REQUIRE(detail::path_decode("/a%2Bb%20c", out));
+    REQUIRE(out == "/a+b c");
+    REQUIRE(detail::path_decode("", out));
+    REQUIRE(out.empty());
+    REQUIRE_FALSE(detail::path_decode("/a%2", out));
+    REQUIRE_FALSE(detail::path_decode("/a%", out));
+    REQUIRE_FALSE(detail::path_decode("/a%zz", out));
+}
+
 // ============================================================================
 // url_encode / url_decode roundtrip
 // ============================================================================
