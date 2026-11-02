@@ -4,6 +4,7 @@
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/asio/read_until.hpp>
+#include <fcntl.h>
 
 namespace thinger::asio {
 
@@ -48,7 +49,11 @@ awaitable<boost::system::error_code> unix_socket::connect(const std::string &pat
         close();
         co_return boost::asio::error::timed_out;
     }
-    co_return std::get<0>(*connected);
+    auto connect_ec = std::get<0>(*connected);
+    // Not inherited by the programs the process runs (fork and exec): asio opens sockets
+    // without SOCK_CLOEXEC
+    if (!connect_ec) ::fcntl(socket_.native_handle(), F_SETFD, FD_CLOEXEC);
+    co_return connect_ec;
 }
 
 awaitable<boost::system::error_code> unix_socket::connect(

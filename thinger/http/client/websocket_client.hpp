@@ -17,8 +17,10 @@ namespace thinger::http {
 /**
  * Represents an established WebSocket connection from the client side.
  *
- * This class provides a clean synchronous API for WebSocket operations.
- * Obtained via client.websocket() or async_client.websocket().
+ * Obtained via client.websocket(), async_client.websocket() or executor_client.websocket().
+ * It has a synchronous API, for http::client and threads that do not run the io_context of
+ * the socket (see Synchronous API), a coroutine API, and a message loop with callbacks
+ * (run()), for the callbacks and coroutines of async_client and executor_client.
  *
  * Usage:
  *   http::client client;
@@ -27,6 +29,14 @@ namespace thinger::http {
  *       auto [msg, binary] = ws->receive();
  *       ws->close();
  *   }
+ *
+ *   async_client.websocket("ws://server.com/path", [](auto ws) -> awaitable<void> {
+ *       if (ws) {
+ *           co_await ws->send_text_async("Hello!");
+ *           auto [msg, binary] = co_await ws->receive_async();
+ *           co_await ws->close_async();
+ *       }
+ *   });
  *
  * Keepalive: on by default, as on the server (asio::websocket::start_timeout()): it pings the
  * peer once nothing was received from it for 60 s, and closes the connection once nothing was
@@ -76,11 +86,17 @@ public:
     // ============================================
     // Synchronous API
     //
-    // Each call waits running the io_context of the socket, until its own operation completes
-    // (not until the io_context runs out of work: the keepalive keeps it busy). Called on the
-    // strand the WebSocket was opened from (e.g. from a coroutine of executor_client on a
-    // strand), where it would wait forever, it throws std::logic_error: use the coroutine API
-    // there
+    // For http::client, and for threads that do not run the io_context of the socket. On a
+    // WebSocket of http::client, whose io_context only these calls run, a call waits running
+    // it until its own operation completes (not until it runs out of work: the keepalive keeps
+    // it busy); one thread at a time, as for http::client. On a thread running the io_context
+    // (an async_client worker, so its callbacks; a coroutine of executor_client; a strand of
+    // either) a call throws std::logic_error before starting anything: there it could only
+    // wait for a handler it holds up, or run the handlers of other connections within its
+    // caller. On any other thread it waits for the operation without running the io_context,
+    // so something else must run it (the workers, the threads of the executor_client). In
+    // callbacks and coroutines use the coroutine API below, run() with on_message(), or
+    // stop() to close without waiting
     // ============================================
 
     /**
@@ -137,8 +153,8 @@ public:
      * Keepalive (see above): ping the peer once nothing was received from it for
      * `ping_interval`, close the connection once nothing was received for `idle_timeout`; 0
      * disables each one, (0, 0) the keepalive. Applies from now on, the idle time counted from
-     * now. Called anywhere: off the executor of the WebSocket it waits running its io_context,
-     * as the synchronous calls
+     * now. On the executor of the WebSocket it applies at once; anywhere else it is a
+     * synchronous call (see Synchronous API above)
      */
     void set_keepalive(std::chrono::milliseconds ping_interval, std::chrono::milliseconds idle_timeout);
     // The keepalive in force: 60 s and 120 s unless changed; 0 once released
@@ -180,7 +196,8 @@ public:
 
     /**
      * Start the message receive loop (non-blocking).
-     * Messages are delivered via on_message callback.
+     * Messages are delivered via on_message callback, on the executor of the WebSocket, while
+     * this websocket_client lives (the destructor stops it).
      */
     void run();
 
@@ -214,8 +231,18 @@ public:
     awaitable<void> close_async();
 
 private:
+    friend class http_client_base;
+
+    // As above, on an io_context owned by the client that opened it (see owned_io_context_)
+    websocket_client(std::shared_ptr<asio::websocket> ws, bool owned_io_context);
+
     std::shared_ptr<asio::websocket> websocket_;
     std::atomic<bool> running_{false};
+    // Whether the io_context of the socket belongs to the client that opened it, which runs
+    // it only within its synchronous calls (http::client): the synchronous calls wait running
+    // it. Otherwise something else runs it (the workers of an async_client...), and they wait
+    // without running it
+    bool owned_io_context_{false};
 
     // Callbacks
     message_callback on_message_;

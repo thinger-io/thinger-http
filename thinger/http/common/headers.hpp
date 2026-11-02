@@ -69,12 +69,19 @@ public:
     // The head of a message
     frame_kind kind() const override { return frame_kind::head; }
 
-    // setters
+    // setters. A header whose name is not a token, or whose value has CR, LF, NUL or another
+    // control character but HTAB (RFC 9110, section 5), is refused, without throwing: it is not
+    // stored (a refused set_header leaves the message as it was), and has_refused_header() is
+    // set. So a response is sent without it, and a client request with one fails, unsent. A
+    // header with an empty name is ignored. Writing through get_headers() or process_header()
+    // is not checked: they are for the parsers and the library.
     void add_header(std::string key, std::string value);
     void set_header(std::string key, std::string value);
     void set(std::string key, std::string value) { set_header(std::move(key), std::move(value)); }
     void set_proxy(std::string key, std::string value);
     void add_proxy(std::string key, std::string value);
+    // Whether a setter refused a header (see add_header)
+    bool has_refused_header() const { return refused_header_; }
     bool upgrade() const;
     bool stream() const;
     bool has_header(std::string_view key) const;
@@ -149,6 +156,15 @@ protected:
     // Keep track of the body framing (Content-Length, Transfer-Encoding) of a received header
     void process_framing_header(std::string_view key, std::string_view value);
 
+    // Add, or replace the first `key` header, without checking it: for the parsers, and the
+    // values the library builds itself (constants, digits)
+    void store_header(std::string&& key, std::string&& value);
+    void replace_header(std::string&& key, std::string&& value);
+
+    // Whether a header set by a setter is valid; if not, it is logged and has_refused_header()
+    // is set
+    bool accept_header(std::string_view key, std::string_view value);
+
     // Keep track of the framing headers present, after adding or removing a `key` header
     void on_header_added(std::string_view key);
     void on_header_removed(std::string_view key);
@@ -164,6 +180,7 @@ protected:
     bool transfer_encoding_header_ = false;
     bool chunked_transfer_         = false;
     bool invalid_transfer_encoding_ = false;
+    bool refused_header_          = false;
     uint8_t http_version_major_   = 1;
     uint8_t http_version_minor_   = 1;
 };

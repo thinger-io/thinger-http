@@ -3,11 +3,27 @@
 #include "websocket_connection.hpp"
 #include "connection_tracker.hpp"
 #include <algorithm>
+#include <memory>
 #include <utility>
 #include "../util/utf8.hpp"
 #include "detail/push_queue.hpp"
 
 namespace thinger::http{
+
+    namespace {
+
+        // The read buffer a connection keeps between messages: a larger message gives it up
+        constexpr size_t RETAINED_BUFFER_SIZE = 64 * 1024;
+
+        // A streambuf has no shrink (consume() keeps its capacity) and cannot be moved, so a new
+        // one takes its place, with the same largest message (noexcept: it is never left destroyed)
+        void release_capacity(boost::asio::streambuf& buffer) noexcept {
+            auto max_size = buffer.max_size();
+            std::destroy_at(&buffer);
+            std::construct_at(&buffer, max_size);
+        }
+
+    }
 
     websocket_connection::websocket_connection(std::shared_ptr<asio::websocket> socket,
                                                const websocket_accept_options& options, server_scope scope) :
@@ -152,7 +168,7 @@ namespace thinger::http{
                 // the message goes on in another frame, if not complete: it must fit
                 next_read_size = std::min(DEFAULT_BUFFER_SIZE, buffer_.max_size() - buffer_.size());
                 if(next_read_size == 0){
-                    LOG_ERROR("websocket buffer overflow. closing connection");
+                    LOG_DEBUG("websocket buffer overflow. closing connection");
                     ws_->close(asio::websocket::CLOSE_MESSAGE_TOO_BIG);
                     co_return;
                 }
@@ -160,13 +176,18 @@ namespace thinger::http{
             }else{
                 // check if the buffer is not going to overflow
                 if(buffer_.size() + remaining > buffer_.max_size()){
-                    LOG_ERROR("websocket buffer overflow. closing connection");
+                    LOG_DEBUG("websocket buffer overflow. closing connection");
                     ws_->close(asio::websocket::CLOSE_MESSAGE_TOO_BIG);
                     co_return;
                 }
 
-                // next iteration will prepare enough space for remaining frame data
-                next_read_size = static_cast<size_t>(remaining);
+                // The rest of the frame, but the buffer grows only with what arrives (at most
+                // doubling), never to the size a header announces: what the buffer already has
+                // room for is used as is
+                auto received = buffer_.size();
+                auto room = buffer_.capacity() > received ? buffer_.capacity() - received : 0;
+                next_read_size = static_cast<size_t>(std::min<uint64_t>(remaining,
+                    std::max({DEFAULT_BUFFER_SIZE, received, room})));
             }
         }
     }
@@ -179,7 +200,7 @@ namespace thinger::http{
 
         // check if the message is a valid UTF8 message
         if(!ws_->is_binary() && !utf8::is_valid(data_ptr, data_size)){
-            LOG_ERROR("invalid UTF8 message received!");
+            LOG_DEBUG("invalid UTF8 message received!");
             return false;
         }
 
@@ -190,8 +211,9 @@ namespace thinger::http{
             on_frame_callback_(std::move(data), ws_->is_binary());
         }
 
-        // clear processed buffer
-        buffer_.consume(buffer_.size());
+        // clear processed buffer, giving up what only a large message needed
+        if (data_size > RETAINED_BUFFER_SIZE) release_capacity(buffer_);
+        else buffer_.consume(buffer_.size());
         return true;
     }
 

@@ -218,3 +218,171 @@ TEST_CASE("Encoded traversal never leaves the static directory", "[server][stati
         }
     }
 }
+
+// Dotfiles (static_options::dotfiles), as Express's serve-static: ignored by default (as a
+// path without a file), denied with 403, or allowed; ".well-known" always served; judged
+// on the decoded path under the prefix, never on the configured directory
+namespace {
+
+    constexpr const char* env_content = "API_KEY=secret";
+    constexpr const char* git_content = "[core]";
+    constexpr const char* htpasswd_content = "user:hash";
+    constexpr const char* token_content = "acme token";
+    constexpr const char* well_known_secret = "well-known secret";
+
+    // A folder with dotfiles, served at "/" with `options`
+    struct dotfile_site {
+        fs::path base;
+        fs::path root;
+        http::server server;
+        std::unique_ptr<running_server> running;
+        uint16_t port = 0;
+
+        explicit dotfile_site(http::static_options options, const std::string& prefix = "/",
+                              const fs::path& folder = "www") {
+            static std::atomic<int> sites{0};
+            base = fs::temp_directory_path() /
+                   ("thinger_static_dotfiles_" +
+                    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
+                    std::to_string(sites++));
+            root = base / folder;
+            write_file(root / "index.html", index_page);
+            write_file(root / ".env", env_content);
+            write_file(root / ".git" / "config", git_content);
+            write_file(root / ".git" / "index.html", "git index");
+            write_file(root / ".well-known" / "acme-challenge" / "token", token_content);
+            write_file(root / ".well-known" / ".secret", well_known_secret);
+            write_file(root / "public" / ".htpasswd", htpasswd_content);
+            write_file(root / "public" / "index.html", "public index");
+            write_file(root / "files" / "v1..v2.txt", "range of versions");
+            write_file(root / "a.b" / "c.txt", "dotted dir");
+            server.serve_static(prefix, root.string(), std::move(options));
+            running = std::make_unique<running_server>(server);
+            port = running->port;
+        }
+
+        ~dotfile_site() {
+            running.reset();
+            std::error_code ec;
+            fs::remove_all(base, ec);
+        }
+    };
+
+    // The whole response (closing the connection after it), within 3 s, without its Date
+    std::string raw_without_date(uint16_t port, const std::string& target) {
+        auto result = raw_exchange(port, "GET " + target + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        INFO(target << "\n" << result.data);
+        REQUIRE(result.closed);
+        auto date = result.data.find("\r\nDate: ");
+        if (date != std::string::npos) result.data.erase(date, result.data.find("\r\n", date + 2) - date);
+        return result.data;
+    }
+
+    // No dotfile content in a body
+    void require_no_dotfile(const raw_response& response) {
+        for (const auto* content : {env_content, git_content, htpasswd_content, well_known_secret}) {
+            CHECK(response.body.find(content) == std::string::npos);
+        }
+    }
+
+}
+
+TEST_CASE("Dotfiles are ignored by default", "[server][static][integration]") {
+    SECTION("Without fallback: 404, the same answer as a missing file") {
+        dotfile_site site({.fallback = ""});
+        auto missing = raw_without_date(site.port, "/missing.txt");
+        REQUIRE(missing.substr(0, 12) == "HTTP/1.1 404");
+        for (const auto* target : {"/.env", "/.git/config", "/public/.htpasswd", "/.git/", "/.git", "/.does-not-exist",
+                                   "/..hidden", "/public%2F.htpasswd"}) {
+            INFO(target);
+            REQUIRE(raw_without_date(site.port, target) == missing);
+        }
+    }
+
+    SECTION("With the default fallback: the root index.html, as for a missing file") {
+        dotfile_site site({});
+        auto missing = get(site.port, "/missing.txt");
+        REQUIRE(missing.status == 200);
+        REQUIRE(missing.body == index_page);
+        for (const auto* target : {"/.env", "/.git/config", "/.git/", "/public/.htpasswd"}) {
+            INFO(target);
+            auto response = get(site.port, target);
+            REQUIRE(response.status == 200);
+            REQUIRE(response.body == index_page);
+        }
+    }
+
+    SECTION("Encoded dots are decoded before the check") {
+        dotfile_site site({.fallback = ""});
+        for (const auto* target : {"/%2eenv", "/%2Egit/config", "/public/%2ehtpasswd", "/%2E%67it/config"}) {
+            INFO(target);
+            auto response = get(site.port, target);
+            REQUIRE(response.status == 404);
+            require_no_dotfile(response);
+            auto unparsed = dispatch(site.server, target);
+            REQUIRE(unparsed.status == 404);
+            require_no_dotfile(unparsed);
+        }
+    }
+
+    SECTION("A dot that does not start a segment is served") {
+        dotfile_site site({});
+        REQUIRE(get(site.port, "/index.html").body == index_page);
+        REQUIRE(get(site.port, "/public/").body == "public index");
+        REQUIRE(get(site.port, "/files/v1..v2.txt").body == "range of versions");
+        REQUIRE(get(site.port, "/a.b/c.txt").body == "dotted dir");
+    }
+
+    SECTION("Only the path under the prefix is checked, not the configured directory") {
+        dotfile_site site({.fallback = ""}, "/static", fs::path(".cache") / "www");
+        auto response = get(site.port, "/static/index.html");
+        REQUIRE(response.status == 200);
+        REQUIRE(response.body == index_page);
+        REQUIRE(get(site.port, "/static/.env").status == 404);
+    }
+}
+
+TEST_CASE("Dotfiles can be denied or allowed", "[server][static][integration]") {
+    SECTION("deny: 403, without the fallback, whether or not the file exists") {
+        dotfile_site site({.dotfiles = http::dotfiles_policy::deny});
+        for (const auto* target : {"/.env", "/.git/config", "/public/.htpasswd", "/.does-not-exist", "/%2eenv"}) {
+            INFO(target);
+            auto response = get(site.port, target);
+            REQUIRE(response.status == 403);
+            CHECK(response.body.find(index_page) == std::string::npos);
+            require_no_dotfile(response);
+        }
+        REQUIRE(get(site.port, "/index.html").body == index_page);
+    }
+
+    SECTION("allow: served as any other file") {
+        dotfile_site site({.dotfiles = http::dotfiles_policy::allow});
+        auto env = get(site.port, "/.env");
+        REQUIRE(env.status == 200);
+        REQUIRE(env.body == env_content);
+        auto git = get(site.port, "/.git/config");
+        REQUIRE(git.status == 200);
+        REQUIRE(git.body == git_content);
+        REQUIRE(get(site.port, "/public/.htpasswd").body == htpasswd_content);
+    }
+}
+
+TEST_CASE("\".well-known\" is served whatever the dotfiles policy", "[server][static][integration]") {
+    struct expectation {
+        http::dotfiles_policy policy;
+        int secret_status;
+    };
+    for (auto [policy, secret_status] : {expectation{http::dotfiles_policy::ignore, 404},
+                                         expectation{http::dotfiles_policy::deny, 403},
+                                         expectation{http::dotfiles_policy::allow, 200}}) {
+        INFO("policy " << static_cast<int>(policy));
+        dotfile_site site({.fallback = "", .dotfiles = policy});
+        auto token = get(site.port, "/.well-known/acme-challenge/token");
+        REQUIRE(token.status == 200);
+        REQUIRE(token.body == token_content);
+        // A dotfile segment of its own under it
+        auto secret = get(site.port, "/.well-known/.secret");
+        REQUIRE(secret.status == secret_status);
+        CHECK((secret.body == well_known_secret) == (secret_status == 200));
+    }
+}

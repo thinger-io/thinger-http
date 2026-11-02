@@ -1,6 +1,10 @@
 #include "headers.hpp"
+#include <array>
 #include <charconv>
+#include <cstdint>
+#include <cstring>
 #include <regex>
+#include "syntax.hpp"
 #include "../../util/ascii.hpp"
 #include "../../util/logger.hpp"
 
@@ -40,8 +44,7 @@ namespace thinger::http{
             process_framing_header(key, value);
         }
 
-        on_header_added(key);
-        headers_.emplace_back(std::move(key), std::move(value));
+        store_header(std::move(key), std::move(value));
     }
 
     void headers::process_framing_header(std::string_view key, std::string_view value){
@@ -68,7 +71,11 @@ namespace thinger::http{
     }
 
     void headers::add_header(std::string key, std::string value){
-        if(key.empty()) return;
+        if(key.empty() || !accept_header(key, value)) return;
+        store_header(std::move(key), std::move(value));
+    }
+
+    void headers::store_header(std::string&& key, std::string&& value){
         on_header_added(key);
         headers_.emplace_back(std::move(key), std::move(value));
     }
@@ -90,11 +97,16 @@ namespace thinger::http{
     }
 
     void headers::add_proxy(std::string key, std::string value){
-        if(key.empty()) return;
+        if(key.empty() || !accept_header(key, value)) return;
         proxy_headers_.emplace_back(std::move(key), std::move(value));
     }
 
     void headers::set_header(std::string key, std::string value){
+        if(key.empty() || !accept_header(key, value)) return;
+        replace_header(std::move(key), std::move(value));
+    }
+
+    void headers::replace_header(std::string&& key, std::string&& value){
         for(auto & header : headers_)
         {
             if(is_header(header.first, key)){
@@ -102,10 +114,11 @@ namespace thinger::http{
                 return;
             }
         }
-        add_header(std::move(key), std::move(value));
+        store_header(std::move(key), std::move(value));
     }
 
     void headers::set_proxy(std::string key, std::string value){
+        if(key.empty() || !accept_header(key, value)) return;
         for(auto & header : proxy_headers_)
         {
             if(is_header(header.first, key)){
@@ -113,7 +126,7 @@ namespace thinger::http{
                 return;
             }
         }
-        add_proxy(std::move(key), std::move(value));
+        proxy_headers_.emplace_back(std::move(key), std::move(value));
     }
 
     bool headers::upgrade() const{
@@ -266,6 +279,49 @@ namespace thinger::http{
             }
         }
 
+        // syntax::is_token_char of each byte
+        constexpr auto token_chars = [] {
+            std::array<bool, 256> table{};
+            for (unsigned c = 0; c < table.size(); c++) table[c] = syntax::is_token_char(static_cast<unsigned char>(c));
+            return table;
+        }();
+
+        // syntax::is_token, with a table lookup per byte
+        bool valid_name(std::string_view name) {
+            for (unsigned char c : name) {
+                if (!token_chars[c]) return false;
+            }
+            return !name.empty();
+        }
+
+        // syntax::is_field_value, eight bytes at a time: a word without a byte under 0x20 or
+        // equal to 0x7F is valid (the exact any-byte tests of "Bit Twiddling Hacks"). A value
+        // under eight bytes, or with such a byte (HTAB is one), is checked a byte at a time
+        bool valid_value(std::string_view value) {
+            constexpr uint64_t ones = 0x0101010101010101u, highs = 0x8080808080808080u;
+            auto valid_word = [&value](size_t at) {
+                uint64_t word;
+                std::memcpy(&word, value.data() + at, sizeof word);
+                uint64_t del = word ^ (ones * 0x7f);
+                return ((((word - ones * 0x20) & ~word) | ((del - ones) & ~del)) & highs) == 0;
+            };
+            size_t size = value.size();
+            if (size >= 8) {
+                size_t at = 0;
+                while (at + 8 <= size && valid_word(at)) at += 8;
+                if (at + 8 > size && (at == size || valid_word(size - 8))) return true;
+            }
+            return syntax::is_field_value(value);
+        }
+
+    }
+
+    bool headers::accept_header(std::string_view key, std::string_view value) {
+        if (valid_name(key) && valid_value(value)) [[likely]] return true;
+        // The value is never logged: it may be a credential
+        refused_header_ = true;
+        LOG_DEBUG("Refused header {}: invalid {}", printable(key, 64), syntax::is_token(key) ? "value" : "name");
+        return false;
     }
 
     bool headers::is_sensitive_header(std::string_view name) {
@@ -312,7 +368,7 @@ namespace thinger::http{
 
     void headers::set_keep_alive(bool keep_alive){
 	    keep_alive_ = keep_alive;
-	    set_header(http::header::connection, (keep_alive ? "Keep-Alive" : "Close"));
+	    replace_header(std::string(http::header::connection), keep_alive ? "Keep-Alive" : "Close");
     }
 
     void headers::set_http_version_major(uint8_t http_version_major) {

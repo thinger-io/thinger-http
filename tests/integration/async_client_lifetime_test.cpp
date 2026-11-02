@@ -708,8 +708,8 @@ TEST_CASE("A WebSocket handed out by a client outlives it", "[client][async][lif
     std::lock_guard lock(mutex);
     REQUIRE(websocket);
     CHECK(websocket->is_open());
-    // It still sends and receives on its worker (the coroutine API: the synchronous one runs
-    // the io_context, which the workers run here)
+    // It still sends and receives on its worker (the coroutine API, on the executor of the
+    // WebSocket)
     auto echo = boost::asio::co_spawn(*context, [ws = websocket]() -> awaitable<std::string> {
         if (!co_await ws->send_text_async("still open")) co_return "";
         auto [message, binary] = co_await ws->receive_async();

@@ -81,7 +81,8 @@ bool is_request_target(std::string_view target) {
 }
 
 bool has_valid_headers(const headers& message) {
-    return std::all_of(message.get_headers().begin(), message.get_headers().end(), [](const auto& header) {
+    // a header refused by a setter (e.g. in a hook) is not stored: still an invalid message
+    return !message.has_refused_header() && std::all_of(message.get_headers().begin(), message.get_headers().end(), [](const auto& header) {
         return syntax::is_token(header.first) && syntax::is_field_value(header.second);
     });
 }

@@ -357,6 +357,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/socket_connect_timeout_test.cp
     add_thinger_test(test_integration_socket_connect_timeout integration/socket_connect_timeout_test.cpp)
 endif()
 
+# Integration tests - Listening, accepted and client sockets are not inherited by child processes
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/socket_close_on_exec_test.cpp)
+    add_thinger_test(test_integration_socket_close_on_exec integration/socket_close_on_exec_test.cpp)
+endif()
+
 # Integration tests - Hostile peers (silent, trickle, no-read): every client operation that
 # waits on the peer ends within its deadline
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/hostile_peer_test.cpp)
@@ -466,6 +471,14 @@ endif()
 # Integration tests - Request framing (smuggling, chunked decoding)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/request_framing_test.cpp)
     add_thinger_test(test_integration_request_framing integration/request_framing_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/header_validation_test.cpp)
+    add_thinger_test(test_integration_header_validation integration/header_validation_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/client_header_validation_test.cpp)
+    add_thinger_test(test_integration_client_header_validation integration/client_header_validation_test.cpp)
 endif()
 
 # Integration tests - Expect: 100-continue

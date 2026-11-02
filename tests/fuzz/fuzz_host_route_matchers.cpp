@@ -27,6 +27,9 @@ namespace {
     // Longest host name matched against the pattern hosts (as http_application resolves hosts)
     constexpr size_t max_host_name_size = 253;
 
+    // Longest text a route regex that falls back to std::regex is matched on (as path_matcher)
+    constexpr size_t max_regex_text_size = 2048;
+
     // The handlers answer "<host>\n<route>\n<parameter>" (the parameter last: it may hold any byte)
     void add_routes(virtual_host& host, const std::string& name) {
         auto answer = [name](const std::string& route, const std::string& parameter = {}) {
@@ -104,6 +107,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     http_request->set_method(thinger::http::method::GET);
     http_request->set_uri(target);
     http_request->set_header(thinger::http::header::host, host);
+    // A Host value that a header cannot hold (a control character, NUL included) is refused by the
+    // setter, as the parser refuses it on a connection: the request then has no Host
+    const bool host_refused = http_request->has_refused_header();
 
     auto result = fuzz::run(fixture->app.dispatch(http_request));
     fuzz::check(result != nullptr, "dispatch without a response");
@@ -116,7 +122,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     // Host resolution: exact names first; a name longer than any DNS name never reaches the
     // patterns; otherwise "*.example.com" (the first pattern) takes every label it matches
-    auto name = thinger::http::virtual_host::normalize_host(host.empty() ? http_request->get_host() : host);
+    auto name = thinger::http::virtual_host::normalize_host(host.empty() || host_refused ? http_request->get_host() : host);
     if (name == "api.example.com") {
         fuzz::check(served == "exact", "exact host not found", detail);
     } else if (name.size() > max_host_name_size) {
@@ -143,6 +149,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         fuzz::check(path == "/" + std::string(parameter) + "/raw" && !parameter.empty(), "/:path(.+)/raw mismatch", detail);
     } else if (route == "resource") {
         fuzz::check(parameter == "properties" || parameter == "buckets" || parameter == "logs", "word not in the alternatives", detail);
+    } else if (route == "fallback") {
+        // A segment over the cap is never run through std::regex, and does not match
+        bool pairs = !parameter.empty() && parameter.size() % 2 == 0;
+        for (size_t i = 0; pairs && i < parameter.size(); i += 2) {
+            auto pair = parameter.substr(i, 2);
+            pairs = pair == "ab" || pair == "cd";
+        }
+        fuzz::check(pairs && parameter.size() <= max_regex_text_size && path == "/fallback/" + std::string(parameter),
+                    "(ab|cd)+ parameter mismatch", detail);
+    } else if (route == "word") {
+        // Matched on the whole path: a path over the cap does not match
+        fuzz::check(path.size() <= max_regex_text_size && path == "/words/" + std::string(parameter),
+                    "\\w+\\b route for a path over the regex cap", detail);
     } else if (route == "root") {
         fuzz::check(path == "/", "root route for another path", detail);
     }

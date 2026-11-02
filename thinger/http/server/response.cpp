@@ -331,7 +331,25 @@ void response::redirect(const std::string& url, http::http_response::status redi
     auto response = new_response();
     if (!response) return;
     response->set_status(redirect_type);
-    response->add_header(header::location, url);
+    // The bytes a field value cannot hold are percent-encoded, so the redirect is still sent
+    // (as Express's res.location); spaces, '%' and non-ASCII bytes are kept as they are
+    if (syntax::is_field_value(url)) {
+        response->add_header(header::location, url);
+    } else {
+        static constexpr char hex[] = "0123456789ABCDEF";
+        std::string location;
+        location.reserve(url.size() + 8);
+        for (unsigned char c : url) {
+            if (syntax::is_field_value_char(c)) {
+                location += static_cast<char>(c);
+            } else {
+                location += '%';
+                location += hex[c >> 4];
+                location += hex[c & 0x0F];
+            }
+        }
+        response->add_header(header::location, std::move(location));
+    }
     // Without it, a keep-alive client would read the body until the connection closes
     response->set_content_length(0);
     send_message(std::move(response));
@@ -499,18 +517,14 @@ void response::accept_websocket(const websocket_accept_options& options,
     if (!response) return;
 
     hand_over(std::move(response), [deliver = std::move(deliver), options, protocol](upgraded_connection connection) {
-        // A client must wait for the handshake response before sending frames (RFC 6455)
-        if (!connection.buffered.empty()) {
-            LOG_WARNING("WebSocket client sent data before the handshake completed, closing");
-            connection.socket->close();
-            return;
-        }
-
         // binary, server; on the io_context of the connection, where it is taken over (the
         // default executor). The connection holds the scope: told of a shutdown, counted as a
         // websocket once started
         auto websocket = std::make_shared<asio::websocket>(std::move(connection.socket), true, true);
         websocket->set_protocol(protocol);
+        // Frames the client sent right after its request, without waiting for the response:
+        // read first, once the connection starts reading
+        if (!connection.buffered.empty()) websocket->set_read_ahead(std::move(connection.buffered));
         connection.scope.set_type(connection_type::websocket);
         auto ws_connection = std::make_shared<websocket_connection>(websocket, options, std::move(connection.scope));
 

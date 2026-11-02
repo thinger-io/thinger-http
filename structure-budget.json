@@ -14,7 +14,7 @@
   "H3.detached_allowed": 13,
   "H4.socket_casts": 5,
   "H4.frame_casts": 0,
-  "H6.matrix_cases": 198,
+  "H6.matrix_cases": 205,
   "H6.matrix_suites": 25,
   "H7.using_namespace": 1,
   "H7.logger_includes": 5,
@@ -27,9 +27,9 @@
   "H9.common_up": 3,
   "H9.public_detail": 0,
   "H10.server_connection.cpp": 786,
-  "H10.response.cpp": 780,
+  "H10.response.cpp": 794,
   "H10.websocket_session.cpp": 885,
-  "H10.http_client_base.cpp": 769,
+  "H10.http_client_base.cpp": 779,
   "H10.http_application.cpp": 812,
   "_detached_allow_list": [
     {

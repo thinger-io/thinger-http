@@ -1,6 +1,7 @@
 #include "io_context_of.hpp"
 #include <boost/asio/strand.hpp>
 #include <chrono>
+#include <stdexcept>
 
 namespace thinger::asio {
 
@@ -18,6 +19,7 @@ namespace {
 
 boost::asio::io_context* io_context_of(const boost::asio::any_io_executor& executor) {
     if (auto* io = executor.target<io_executor>()) return &io->context();
+    if (auto* io = executor.target<tracked_io_executor>()) return &io->context();
     if (auto* strand = executor.target<boost::asio::strand<io_executor>>()) {
         return &strand->get_inner_executor().context();
     }
@@ -39,8 +41,7 @@ bool running_in_this_thread(const boost::asio::any_io_executor& executor) {
 
 void run_until(boost::asio::io_context& io_context, const std::function<bool()>& done) {
     if (io_context.get_executor().running_in_this_thread()) {
-        while (!done()) io_context.poll_one();
-        return;
+        throw std::logic_error("run_until() called on a thread running its io_context");
     }
     while (!done()) {
         if (io_context.run_one_for(RUN_SLICE) == 0 && io_context.stopped()) io_context.restart();

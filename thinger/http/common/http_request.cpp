@@ -232,7 +232,7 @@ namespace thinger::http {
 
     void http_request::set_content(std::string content){
         content_ = std::move(content);
-        set_header(http::header::content_length, boost::lexical_cast<std::string>(content_.size()));
+        replace_header(std::string(http::header::content_length), boost::lexical_cast<std::string>(content_.size()));
     }
 
     const std::string& http_request::get_method_string() const{
@@ -244,7 +244,7 @@ namespace thinger::http {
         method_ = method;
         // force methods with a supposed body to force a default content length
         if((method_==http::method::POST || method_==http::method::PUT || method==http::method::PATCH) && !has_header(http::header::content_length)){
-            set_header(http::header::content_length, "0");
+            replace_header(std::string(http::header::content_length), "0");
         }
     }
 
@@ -351,6 +351,10 @@ namespace thinger::http {
     }
 
     void http_request::set_host(std::string host){
+        set_header(http::header::host, parse_host(std::move(host)));
+    }
+
+    std::string http_request::parse_host(std::string host){
         // A bracketed IPv6 literal ("[::1]:8080") keeps its brackets, as WHATWG URL.host does:
         // its port follows the "]". Without a "]" it is the host whole
         auto position = host.find(':');
@@ -369,12 +373,11 @@ namespace thinger::http {
         // use host always in lowercase
         ::thinger::util::ascii::to_lower(host_);
 
-        // update host header
+        // the value of the Host header
         if(get_port()!=https_port && get_port()!=http_port){
-            set_header(http::header::host, host_ + ":" + port_);
-        }else{
-            set_header(http::header::host, host_);
+            return host_ + ":" + port_;
         }
+        return host_;
     }
 
     const std::string& http_request::get_host() const{
@@ -388,7 +391,8 @@ namespace thinger::http {
     void http_request::process_header(std::string key, std::string value){
         // adjust host
         if(::thinger::util::ascii::iequals(key, http::header::host)){
-            set_host(std::move(value));
+            // parsed: already checked
+            replace_header(std::string(http::header::host), parse_host(std::move(value)));
         }else{
             if(::thinger::util::ascii::iequals(key, "Expect")){
                 process_expect_header(value);

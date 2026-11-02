@@ -3,9 +3,11 @@
 #include "../server_connection.hpp"
 #include "../detail/spawn_handler.hpp"
 #include "../../common/http_request.hpp"
+#include "../../common/syntax.hpp"
 #include "../response_compression.hpp"
 #include "../../../asio/sockets/socket.hpp"
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <optional>
 
@@ -47,13 +49,69 @@ namespace {
         }
     }
 
+    // The continuation bytes that follow a UTF-8 lead byte (0 for any other byte)
+    int utf8_continuation_bytes(unsigned char lead) {
+        if (lead >= 0xf0 && lead < 0xf8) return 3;
+        if (lead >= 0xe0 && lead < 0xf0) return 2;
+        if (lead >= 0xc0 && lead < 0xe0) return 1;
+        return 0;
+    }
+
+    // The name as the value of filename* (RFC 8187), after its "UTF-8''"
+    void append_ext_value(std::string& value, std::string_view name) {
+        static constexpr char hex[] = "0123456789ABCDEF";
+        for (unsigned char c : name) {
+            // attr-char: a tchar but '*', '\'' and '%'
+            if (syntax::is_token_char(c) && c != '*' && c != '\'' && c != '%') {
+                value += static_cast<char>(c);
+            } else {
+                value += '%';
+                value += hex[c >> 4];
+                value += hex[c & 0x0F];
+            }
+        }
+    }
+
+    // Content-Disposition of a download named `name`, as Express's content-disposition
+    // package writes it (RFC 6266): an ASCII filename (each other character, or control byte,
+    // as '?'), and the name in UTF-8 as filename* (RFC 8187) when the ASCII one is not it, or
+    // could be read percent-decoded
+    std::string content_disposition(std::string_view name) {
+        auto is_hex = [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; };
+        std::string fallback;
+        bool extended = false;
+        int continuation = 0;  // bytes left of the UTF-8 character written as '?'
+        for (size_t i = 0; i < name.size(); i++) {
+            auto c = static_cast<unsigned char>(name[i]);
+            if (c < 0x20 || c > 0x7e) {
+                extended = true;
+                if (continuation > 0 && (c & 0xc0) == 0x80) {
+                    continuation--;
+                    continue;
+                }
+                continuation = utf8_continuation_bytes(c);
+                fallback += '?';
+                continue;
+            }
+            continuation = 0;
+            if (c == '%' && i + 2 < name.size() && is_hex(name[i + 1]) && is_hex(name[i + 2])) extended = true;
+            if (c == '"' || c == '\\') fallback += '\\';
+            fallback += static_cast<char>(c);
+        }
+        std::string value = "attachment; filename=\"" + fallback + "\"";
+        if (!extended) return value;
+        value += "; filename*=UTF-8''";
+        append_ext_value(value, name);
+        return value;
+    }
+
     void add_content_headers(http_response& message, const representation& file) {
         message.set_status(http_response::status::ok);
         message.set_content_type(file.content_type);
         if (!file.encoding.empty()) message.add_header("Content-Encoding", std::string(file.encoding));
         message.add_header("Accept-Ranges", "bytes");
         if (file.force_download) {
-            message.add_header("Content-Disposition", "attachment; filename=\"" + file.path.filename().string() + "\"");
+            message.add_header("Content-Disposition", content_disposition(file.path.filename().string()));
         }
     }
 

@@ -173,6 +173,9 @@ private:
     std::vector<std::string> ca_pems_;
     expectation expectation_ = expectation::none;
 
+    // Set host_ and port_ from a Host value, returning the Host header to send
+    std::string parse_host(std::string host);
+
     // Keep track of the expectation of a received Expect header
     void process_expect_header(std::string_view value);
 

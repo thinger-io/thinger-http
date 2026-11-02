@@ -13,6 +13,8 @@
 #include <chrono>
 #include <thread>
 #include <future>
+#include <latch>
+#include <vector>
 #include <fstream>
 #include <filesystem>
 #include <sstream>
@@ -516,6 +518,41 @@ TEST_CASE("Server Stop", "[server][control][integration]") {
 
         server.stop();
         t.join();
+        REQUIRE_FALSE(server.is_listening());
+    }
+}
+
+TEST_CASE("Server Stop from several threads at once", "[server][control][integration]") {
+    // Run under ThreadSanitizer too: only one of the calls may run the stop sequence
+    constexpr int rounds = 50;
+    constexpr int stoppers = 8;
+    http::server server;
+
+    for (int round = 0; round < rounds; ++round) {
+        INFO("round " << round);
+        REQUIRE_FALSE(server.listen("0.0.0.0", 0));
+        REQUIRE(server.is_listening());
+
+        std::promise<void> ready;
+        auto waiting = std::async(std::launch::async, [&server, &ready] {
+            ready.set_value();
+            server.wait();
+        });
+        ready.get_future().wait();
+
+        // Released together
+        std::latch start(stoppers);
+        std::vector<std::future<void>> stops;
+        for (int i = 0; i < stoppers; ++i) {
+            stops.push_back(std::async(std::launch::async, [&server, &start] {
+                start.arrive_and_wait();
+                server.stop();
+            }));
+        }
+
+        // Deadline: 5 s for each stop() and for wait()
+        for (auto& stop : stops) REQUIRE(stop.wait_for(5s) == std::future_status::ready);
+        REQUIRE(waiting.wait_for(5s) == std::future_status::ready);
         REQUIRE_FALSE(server.is_listening());
     }
 }
@@ -2741,13 +2778,14 @@ TEST_CASE("Taking over the connection of a client that left", "[server][takeover
     REQUIRE(res.has_responded());
 }
 
-TEST_CASE("WebSocket client sending data before the handshake is closed", "[server][takeover][websocket][integration]") {
+// What follows the upgrade request is read as WebSocket frames, never as another request: here
+// not a valid frame, so the WebSocket closes with 1002 (Protocol Error)
+TEST_CASE("WebSocket client sending a request after the upgrade request is closed", "[server][takeover][websocket][integration]") {
     ServerBaseTestFixture fixture;
     auto& server = fixture.server;
-    std::atomic<bool> opened{false};
 
-    server.get("/ws", [&opened](http::request& req, http::response& res) {
-        res.upgrade_websocket({}, [&opened](std::shared_ptr<http::websocket_connection>) { opened = true; });
+    server.get("/ws", [](http::request& req, http::response& res) {
+        res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection>) {});
     });
 
     fixture.start_server();
@@ -2759,7 +2797,9 @@ TEST_CASE("WebSocket client sending data before the handshake is closed", "[serv
 
     REQUIRE(response.starts_with("HTTP/1.1 101"));
     REQUIRE(response.find("HTTP/1.1 400") == std::string::npos);
-    REQUIRE_FALSE(opened);
+    auto end = response.find("\r\n\r\n");
+    REQUIRE(end != std::string::npos);
+    REQUIRE(response.substr(end + 4) == std::string("\x88\x02\x03\xea", 4));
 }
 
 TEST_CASE("Pipelined request after a chunked body spanning several reads", "[server][chunked-request][pipelining][integration]") {

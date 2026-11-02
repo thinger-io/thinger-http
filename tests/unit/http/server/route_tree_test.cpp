@@ -1,11 +1,16 @@
 #include <catch2/catch_test_macros.hpp>
 #include <thinger/http/server/routing/route_handler.hpp>
+#include <thinger/http/server/http_application.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/util/logger.hpp>
 #include <spdlog/sinks/ringbuffer_sink.h>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/use_future.hpp>
 #include <algorithm>
 #include <random>
+#include <thread>
 
 using namespace thinger;
 using namespace thinger::http;
@@ -25,8 +30,17 @@ namespace {
         const std::string& operator[](const std::string& name) const { return (*req)[name]; }
     };
 
+    // From the target, not a URL: set_url() refuses URLs over 8 KiB, and targets of 16 KiB are tested
+    std::shared_ptr<http_request> make_request(method m, const std::string& target) {
+        auto http_request = std::make_shared<http::http_request>();
+        http_request->set_method(m);
+        http_request->set_uri(target);
+        http_request->set_host("localhost");
+        return http_request;
+    }
+
     lookup find(route_handler& router, const std::string& path, method m = method::GET) {
-        auto http_request = http_request::create_http_request(m, "http://localhost" + path);
+        auto http_request = make_request(m, path);
         auto req = std::make_shared<request>(nullptr, nullptr, http_request);
         auto* matched = router.find_route(req);
         return {matched, req};
@@ -390,6 +404,80 @@ TEST_CASE("Route tree finds the routes the route regexes match", "[route_tree][u
         REQUIRE((result.matched != nullptr) == any);
         if (result.matched) REQUIRE(result.matched->matches(path, m));
     }
+}
+
+TEST_CASE("Regexes run by std::regex only match texts of up to 2048 bytes", "[route_tree][unit]") {
+    route_handler router;
+
+    SECTION("A segment matched by std::regex") {
+        router[method::GET]["/fallback/:code((ab|cd)+)"] = noop;
+        std::string segment;
+        for (int i = 0; i < 1024; ++i) segment += "ab";
+        auto result = find(router, "/fallback/" + segment);
+        REQUIRE(result.pattern() == "/fallback/:code((ab|cd)+)");
+        REQUIRE(result["code"] == segment);
+        REQUIRE(find(router, "/fallback/" + segment + "cd").matched == nullptr);
+    }
+
+    SECTION("A whole path matched by std::regex") {
+        router[method::GET]["/words/:word(\\w+\\b)"] = noop;
+        const std::string prefix = "/words/";
+        auto path = prefix + std::string(2048 - prefix.size(), 'a');
+        REQUIRE(find(router, path)["word"] == path.substr(prefix.size()));
+        REQUIRE(find(router, path + "a").matched == nullptr);
+        REQUIRE(find(router, prefix + std::string(16 * 1024, 'a')).matched == nullptr);
+    }
+
+    SECTION("Routes not matched by std::regex take long paths") {
+        router[method::GET]["/users/:id"] = noop;
+        router[method::GET]["/tags/:tag([a-zA-Z0-9_-]{1,32})"] = noop;
+        router[method::GET]["/:path(.+)/raw"] = noop;
+        router[method::GET]["/static/:path(.*)"] = noop;
+        const std::string id(16 * 1024, 'u');
+        REQUIRE(find(router, "/users/" + id)["id"] == id);
+        REQUIRE(find(router, "/tags/" + std::string(32, 't'))["tag"] == std::string(32, 't'));
+        std::string static_path;
+        while (static_path.size() < 16 * 1024) static_path += "dir/file.css/";
+        REQUIRE(find(router, "/static/" + static_path)["path"] == static_path);
+        REQUIRE(find(router, "/" + static_path + "raw")["path"] == static_path.substr(0, static_path.size() - 1));
+    }
+
+    SECTION("The limit is on the text given to std::regex, not on the path") {
+        router[method::GET]["/x/:a([0-9]+)/:b((ab|cd)+)"] = noop;
+        const std::string digits(16 * 1024, '7');
+        auto result = find(router, "/x/" + digits + "/abcd");
+        REQUIRE(result["a"] == digits);
+        REQUIRE(result["b"] == "abcd");
+    }
+}
+
+TEST_CASE("A long path on a std::regex route goes to the not found handler", "[route_tree][unit]") {
+    http_application app;
+    app.get("/fallback/:code((ab|cd)+)", [](response& res) { res.send("fallback"); });
+    app.set_not_found_handler([](response& res) { res.error(http_response::status::not_found, "not found handler"); });
+
+    std::string segment;
+    while (segment.size() < 16 * 1024) segment += "ab";
+    // Dispatched on a thread with the default stack size
+    auto dispatch = [&](const std::string& target) {
+        auto request = make_request(method::GET, target);
+        REQUIRE(request->get_path() == target);
+        std::shared_ptr<http_response> response;
+        std::thread thread([&] {
+            boost::asio::io_context ioc;
+            auto result = boost::asio::co_spawn(ioc, app.dispatch(request), boost::asio::use_future);
+            ioc.run();
+            response = result.get();
+        });
+        thread.join();
+        REQUIRE(response);
+        return response;
+    };
+
+    REQUIRE(dispatch("/fallback/abcd")->get_content() == "fallback");
+    auto response = dispatch("/fallback/" + segment);
+    REQUIRE(response->get_status() == http_response::status::not_found);
+    REQUIRE(response->get_content() == "not found handler");
 }
 
 TEST_CASE("Invalid route patterns are rejected at registration", "[route_tree][unit]") {

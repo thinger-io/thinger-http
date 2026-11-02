@@ -8,6 +8,7 @@
 #include <boost/asio/use_future.hpp>
 #include <chrono>
 #include <future>
+#include <stdexcept>
 
 namespace thinger::http {
 
@@ -38,9 +39,14 @@ private:
     boost::asio::io_context io_context_;
 
     // Internal helper to run an awaitable synchronously: until it completes (an open
-    // WebSocket keeps the io_context busy with its keepalive)
+    // WebSocket keeps the io_context busy with its keepalive). Refused within a handler of the
+    // io_context (e.g. a stream callback), which would run it re-entrantly
     template<typename T>
     T exec(awaitable<T> coro) {
+        if (io_context_.get_executor().running_in_this_thread()) {
+            throw std::logic_error("http::client: synchronous call made within one of its own callbacks, "
+                                   "where it would run its io_context re-entrantly");
+        }
         auto result = co_spawn(io_context_, std::move(coro), boost::asio::use_future);
         asio::run_until(io_context_, [&] {
             return result.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
@@ -52,6 +58,8 @@ protected:
     boost::asio::io_context& get_io_context() override {
         return io_context_;
     }
+
+    bool owns_io_context() const override { return true; }
 
 public:
     // The io_context runs only during a call, until its operation completes (as the WebSocket

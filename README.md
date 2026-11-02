@@ -43,7 +43,7 @@ To reproduce, see [`benchmark/compare`](benchmark/compare/): `benchmark/compare/
 - **C++20 Coroutines** - Async-first API with sync wrappers
 - **Graceful Shutdown** - Stop listening, finish the requests in flight and tell long-lived connections, until one deadline; connection statistics at no cost per request
 - **Request Cancellation** - Each request knows why it is no longer awaited (client gone, timeout, shutdown); routes opt in to have their handlers interrupted
-- **Lightweight** - Minimal dependencies, suitable for embedded systems
+- **Dependencies** - Boost 1.86+ (Asio, iostreams), OpenSSL and zlib, with a C++20 compiler (see [Requirements](#requirements))
 
 ## Quick Start
 
@@ -117,7 +117,7 @@ include(FetchContent)
 FetchContent_Declare(
     thinger-http
     GIT_REPOSITORY https://github.com/thinger-io/thinger-http.git
-    GIT_TAG v0.9.1
+    GIT_TAG v0.9.2
 )
 FetchContent_MakeAvailable(thinger-http)
 
@@ -204,7 +204,7 @@ server.get("/files/:path(.+)", [](auto& req, auto& res) {
 
 Routes are matched segment by segment (the text between slashes) on a tree, so the cost of finding a route hardly depends on how many there are. Whatever the registration order, a segment is matched first by static text (`/users/me`), then by a constrained parameter (`:id([0-9]+)`, or text mixed with parameters as `:name.:ext`), then by a parameter (`:id`), and last by a parameter that may match slashes (`:path(.+)`), which takes the rest of the path; if the rest of the path does not match below the first option, the next one is tried. Different constraints at the same position are tried in the order they were first registered there, and wildcards in registration order. Registering a route with the same structure as another one (it would never match) logs a warning, and so does adding a constraint (or wildcard) next to another one that may overlap with it (unless they cannot start with the same character), as only that order decides between them. A parameter regex that depends on its surroundings (anchors, word boundaries, lookaheads, back-references) makes its route match the whole path, after every other option.
 
-Paths are matched as received, before percent-decoding (`%2F` is not a slash), and path parameters are raw: `req["name"]` of `/files/my%20file.png` is `my%20file.png`, so a handler decodes it if it needs to (`serve_static()` decodes its own path, see [Static Files](#static-files)). Trailing slashes and empty segments are significant: `/users` does not match `/users/`, nor `/users/:id/devices` match `/users//devices`. Simple regexes (characters, classes, quantifiers, alternative words) are checked without `std::regex`, which is kept for the rest.
+Paths are matched as received, before percent-decoding (`%2F` is not a slash), and path parameters are raw: `req["name"]` of `/files/my%20file.png` is `my%20file.png`, so a handler decodes it if it needs to (`serve_static()` decodes its own path, see [Static Files](#static-files)). Trailing slashes and empty segments are significant: `/users` does not match `/users/`, nor `/users/:id/devices` match `/users//devices`. Simple regexes (characters, classes, quantifiers, alternative words) are checked without `std::regex`, which is kept for the rest and matches at most 2048 bytes of text: a longer segment or path does not match such a regex (libstdc++ recurses about once per byte), so the request goes on to the other routes or the not-found answer.
 
 ### Query Parameters
 
@@ -452,6 +452,18 @@ server.serve_static("/assets", "/var/www/app/assets", {
 `serve_static()` answers `GET` requests, and `HEAD` requests through its `GET` route (so the `GET` routes of the paths it covers, such as an API next to `serve_static("/", ...)`, answer their `HEAD` requests too). The fallback file is served for a directory (its own one), and for the paths without a file (the one of the root directory, as single page applications expect). Paths resolving outside the directory (through symlinks; request targets with a `..` segment in their percent-decoded path, as `/a/../b` or `/%2E%2E/x`, are already rejected with `400`, while `..` elsewhere, as in `/files/v1..v2.txt` or a query, is served) are answered with `403`.
 
 The path under the prefix is percent-decoded before looking for the file, so `/static/my%20file.png` serves `my file.png` and `/static/informe-%C3%B1.pdf` serves `informe-ñ.pdf` (UTF-8 names). `+` is literal (`a+b.txt` is that file, as Node's `send` reads it), a decoded `%2F` separates directories, and a malformed escape or a decoded NUL (`%00`) gets `400`. The decoded path is still checked to resolve inside the directory (`403` otherwise).
+
+Dotfiles (`.env`, `.git/config`, `.htpasswd`) are not served by default, as with Express's `serve-static`: a path is a dotfile path when a segment of its decoded path under the prefix is longer than one character and starts with `.`, other than `..`, which the traversal checks handle (so `/.git/config` and `/%2Eenv` are, `/files/v1..v2.txt` and `/a.b/c.txt` are not). The `dotfiles` option says what to do with them, judging by the path alone, whether or not the file exists:
+
+- `http::dotfiles_policy::ignore` (default): answered as a path without a file, with the root fallback or `404`, so a dotfile cannot be told apart from a missing file.
+- `http::dotfiles_policy::deny`: `403`, without the fallback.
+- `http::dotfiles_policy::allow`: served as any other file.
+
+A segment that is exactly `.well-known` is always served (RFC 8615, for ACME challenges and the like), though dotfiles under it are still checked. The configured directory itself may have dot segments (`/srv/.cache/www`): only the part under the prefix is checked.
+
+```cpp
+server.serve_static("/", "/var/www/app", {.dotfiles = http::dotfiles_policy::deny});
+```
 
 Files are served with validators, so that browsers download them once and only check them afterwards:
 
@@ -1757,6 +1769,8 @@ server.get("/ws", [](auto& req, auto& res) {
 });
 ```
 
+Frames the client sends right after its request, without waiting for the `101` (as Node's `ws` and Go's gorilla/websocket accept), are delivered as messages once the connection starts reading, with the same checks as any other.
+
 ### WebSocket Server with Protocols
 
 ```cpp
@@ -1963,24 +1977,24 @@ if (auto ws = client.request("wss://server.com/ws")
 }
 ```
 
-The synchronous calls (`send_text()`, `send_binary()`, `receive()`, `close()`) wait running the io_context of the socket. On the strand a WebSocket was opened from (e.g. by `executor_client` from a coroutine on a strand), where they would wait forever, they throw `std::logic_error`: use the coroutine API there (`send_text_async()`, `receive_async()`...).
+The synchronous calls (`send_text()`, `send_binary()`, `receive()`, `close()`, and `set_keepalive()` outside the executor of the WebSocket) are for `http::client`, and for threads that do not run the io_context of the WebSocket. With `http::client` they wait running its io_context, until their own operation completes. On a thread running the io_context of the WebSocket (an `async_client` worker, so its callbacks, a coroutine of `executor_client`, a strand of either), where they could only wait for a handler they hold up or run other connections' handlers within their caller, they throw `std::logic_error` before starting anything. On any other thread they wait for the operation without running the io_context, so something else must be running it (the workers of the `async_client`, the threads of the `executor_client`): prefer the coroutine API on workers too, as a worker waiting on another one serves nothing meanwhile, and two waiting on each other never return. Inside callbacks and coroutines use the coroutine API (`send_text_async()`, `receive_async()`, `close_async()`), `run()` with `on_message()`, or `stop()` to close without waiting.
 
 Empty messages are messages, both ways (RFC 6455 allows them): `send_text("")` sends one, and `receive()` returns one as an empty string while `is_open()` stays `true` (an empty string with the connection closed is the end). With `run()`, `on_message()` gets them, and `on_close()` is called only once the connection closed.
 
 ### WebSocket Client (Async Callback)
 
-The `async_client` runs on started [workers](#workers), as in [Async Client](#async-client-async_client).
+The `async_client` runs on started [workers](#workers), as in [Async Client](#async-client-async_client). The callback runs on a worker, where the synchronous calls throw (see [WebSocket Client (Sync)](#websocket-client-sync)): make it a coroutine and use the coroutine API, or use `run()` and `stop()` (see [WebSocket Client (Event-Driven)](#websocket-client-event-driven)).
 
 ```cpp
 thinger::http::async_client client(workers);
 
 // Simple connect
-client.websocket("wss://server.com/ws", [](std::shared_ptr<http::websocket_client> ws) {
+client.websocket("wss://server.com/ws", [](std::shared_ptr<http::websocket_client> ws) -> awaitable<void> {
     if (ws) {
-        ws->send_text("Hello!");
-        auto [msg, _] = ws->receive();
+        co_await ws->send_text_async("Hello!");
+        auto [msg, _] = co_await ws->receive_async();
         std::cout << "Received: " << msg << std::endl;
-        ws->close();
+        co_await ws->close_async();
     }
 });
 
@@ -1990,9 +2004,10 @@ client.wait();
 client.request("wss://server.com/ws")
     .header("Authorization", "Bearer token")
     .protocol("graphql-ws")
-    .websocket([](std::shared_ptr<http::websocket_client> ws) {
+    .websocket([](std::shared_ptr<http::websocket_client> ws) -> awaitable<void> {
         if (ws) {
-            ws->send_text("Hello!");
+            co_await ws->send_text_async("Hello!");
+            co_await ws->close_async();
         }
     });
 
@@ -2036,12 +2051,15 @@ client.wait();
 
 ```cpp
 thinger::http::async_client client(workers);
+std::shared_ptr<http::websocket_client> socket;   // kept while its message loop runs
 
-client.websocket("wss://server.com/ws", [](std::shared_ptr<http::websocket_client> ws) {
-    if (!ws) return;
+client.websocket("wss://server.com/ws", [&socket](std::shared_ptr<http::websocket_client> ws) -> awaitable<void> {
+    if (!ws) co_return;
+    socket = ws;
 
-    ws->on_message([](const std::string& msg, bool binary) {
+    ws->on_message([ws = ws.get()](const std::string& msg, bool binary) {
         std::cout << "Received: " << msg << std::endl;
+        ws->stop();  // Done: close without waiting
     });
 
     ws->on_close([]() {
@@ -2052,12 +2070,14 @@ client.websocket("wss://server.com/ws", [](std::shared_ptr<http::websocket_clien
         std::cerr << "Error: " << error << std::endl;
     });
 
-    ws->send_text("Hello!");
+    co_await ws->send_text_async("Hello!");
     ws->run();  // Start message loop
 });
 
 client.wait();
 ```
+
+`run()` returns at once: the loop reads the messages on the executor of the WebSocket (a worker), calls `on_message()` there for each, and `on_close()` once the connection closed or `stop()` was called. It runs while the `websocket_client` lives (its destructor stops it), so the application keeps the `shared_ptr` the callback got, beyond the callback, which ends the request: `client.wait()` does not wait for the loop.
 
 ## Custom Sockets
 
@@ -2308,7 +2328,7 @@ See the [examples](examples/) directory for complete working examples:
 - `http::client` - Single-threaded, create one per thread or use `async_client`
 - `http::async_client` - Thread-safe, runs on the `asio::workers` it is given
 - `asio::workers` - `next_executor()`, `isolated_executor()`, `in_worker_thread()`, `stop()` and `wait()` from any thread (`stop()` from one of its own threads too); never destroy them from one of their threads
-- `http::websocket_client` - Single connection, thread-safe send operations
+- `http::websocket_client` - Not synchronized, sends included. The coroutine API (`send_text_async()`, `receive_async()`, `close_async()`), `run()`, `stop()` and `set_keepalive()` on the executor of the WebSocket, where `run()` calls its callbacks: the `async_client` callback or coroutine that got it, the `executor_client` coroutine that opened it. The synchronous calls (`send_text()`, `send_binary()`, `receive()`, `close()`) from a thread that does not run its io_context; on one that does they throw `std::logic_error` (see [WebSocket Client (Sync)](#websocket-client-sync)). The synchronous calls of an `http::client` WebSocket are made by one thread at a time, as for `http::client` itself
 - `http::websocket_connection` - Server-side WebSocket, thread-safe send, callbacks on IO thread
 - `http::sse_connection` - Runs on its executor (`get_executor()`, a strand if given one), where its callbacks run: `start()`, the `send*()` methods, `stop()`, `execute()` and the flow control setters from any thread
 - `http::server_scope` - On the thread of the socket it came with

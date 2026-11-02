@@ -18,6 +18,13 @@ namespace thinger::http {
 
 class route_group;
 
+// What serve_static() does with a dotfile path (see static_options::dotfiles)
+enum class dotfiles_policy {
+    ignore, // as a path without a file: the root fallback, or 404
+    allow,  // served as any other file
+    deny    // 403
+};
+
 // How serve_static() serves the files of a directory
 struct static_options {
     // File served for a directory (its own one), and for the paths without a file (the one
@@ -32,6 +39,11 @@ struct static_options {
     // accepts br or gzip (br first at equal quality), with that Content-Encoding and the
     // media type of the file. A build can then serve Brotli without compressing at runtime.
     bool precompressed = true;
+    // Dotfile paths (".env", ".git/config", ".htpasswd"): those with a segment of the decoded
+    // path under the prefix longer than one character that starts with "." (except
+    // ".well-known", always served). Judged by the path alone, whether or not the file
+    // exists. Ignored by default, as Express's serve-static does.
+    dotfiles_policy dotfiles = dotfiles_policy::ignore;
 };
 
 // Set of routes served for a host name (see http_application::host). The application

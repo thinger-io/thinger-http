@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <charconv>
 #include <iostream>
+#include <fcntl.h>
 #include "tcp_socket.hpp"
 #include "../with_timeout.hpp"
 
@@ -92,6 +93,9 @@ awaitable<boost::system::error_code> tcp_socket::connect(
     if (connect_ec) {
         co_return connect_ec;
     }
+    // Not inherited by the programs the process runs (fork and exec): asio opens sockets
+    // without SOCK_CLOEXEC
+    ::fcntl(socket_.native_handle(), F_SETFD, FD_CLOEXEC);
 
     // Run the client handshake if required (for SSL sockets), with the time left: a peer that
     // accepts and stays silent, or trickles its answer, must not hold the call

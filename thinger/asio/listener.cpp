@@ -62,9 +62,8 @@ private:
     int descriptor_;
 };
 
-// An accepted descriptor is not inherited by the programs a handler runs (fork and exec): set
-// before it reaches the executor serving it. The acceptor thread on Linux needs none (see
-// accept_pending())
+// A socket of the listener is not inherited by the programs a handler runs (fork and exec): asio
+// opens it without SOCK_CLOEXEC. The acceptor thread on Linux needs none (see accept_pending())
 void close_on_exec(int descriptor) {
     ::fcntl(descriptor, F_SETFD, FD_CLOEXEC);
 }
@@ -421,6 +420,7 @@ struct listener::state : std::enable_shared_from_this<state> {
         auto acceptor = std::make_unique<Acceptor>(executor);
         boost::system::error_code ec;
         acceptor->open(endpoint.protocol(), ec);
+        if (!ec) close_on_exec(acceptor->native_handle());
         if constexpr (std::is_same_v<Acceptor, tcp::acceptor>) {
             if (!ec) acceptor->set_option(tcp::acceptor::reuse_address(true), ec);
         }
@@ -555,6 +555,7 @@ struct listener::state : std::enable_shared_from_this<state> {
                 return;
             }
         }
+        // set before it reaches the executor serving it
         close_on_exec(peer.native_handle());
         accept_next<Protocol>();
         if (!usable) {
@@ -679,7 +680,7 @@ struct listener::state : std::enable_shared_from_this<state> {
                 (allowed_remotes.empty() || allowed_remotes.contains(remote_ip))) {
                 return true;
             }
-            LOG_WARNING("rejecting connection from: ip: {}, port: {}, secure: {}",
+            LOG_DEBUG("rejecting connection from: ip: {}, port: {}, secure: {}",
                         remote_ip, port.load(), secure);
             return false;
         }
@@ -769,7 +770,7 @@ struct listener::state : std::enable_shared_from_this<state> {
         } else if (ec && self->stopping) {
             sock->close();
         } else if (ec) {
-            LOG_WARNING("error while handling SSL handshake: {}, remote ip: {}", ec.message(), sock->get_remote_ip());
+            LOG_DEBUG("error while handling SSL handshake: {}, remote ip: {}", ec.message(), sock->get_remote_ip());
         } else {
             self->deliver(std::move(sock));
         }

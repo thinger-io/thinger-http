@@ -861,6 +861,41 @@ TEST_CASE("Certificate manager TLS options", "[certificate_manager][tls]") {
 
 }
 
+TEST_CASE("Certificate manager contexts refuse renegotiation", "[certificate_manager][tls]") {
+#ifdef SSL_OP_NO_RENEGOTIATION
+    auto refuses = [](const std::shared_ptr<boost::asio::ssl::context>& ctx) {
+        return (SSL_CTX_get_options(ctx->native_handle()) & SSL_OP_NO_RENEGOTIATION) != 0;
+    };
+    auto mgr = std::make_shared<certificate_manager>();
+    auto [cert, key] = generate_test_certificate("tls.example.com");
+
+    SECTION("Those it creates: from PEM and its self-signed default") {
+        REQUIRE_FALSE(mgr->set_certificate("tls.example.com", cert, key));
+        auto host = mgr->get_certificate("tls.example.com");
+        REQUIRE(host);
+        REQUIRE(refuses(host));
+        auto self_signed = mgr->get_default_certificate();
+        REQUIRE(self_signed);
+        REQUIRE(refuses(self_signed));
+    }
+
+    SECTION("Not one passed in ready-made: it keeps its own options") {
+        auto ready = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
+        ready->use_certificate_chain(boost::asio::buffer(cert));
+        ready->use_private_key(boost::asio::buffer(key), boost::asio::ssl::context::pem);
+        const auto options = SSL_CTX_get_options(ready->native_handle());
+        REQUIRE_FALSE(options & SSL_OP_NO_RENEGOTIATION);
+
+        REQUIRE_FALSE(mgr->set_certificate("tls.example.com", ready));
+        REQUIRE(mgr->get_certificate("tls.example.com") == ready);
+        REQUIRE_FALSE(mgr->set_default_certificate(ready));
+        REQUIRE(SSL_CTX_get_options(ready->native_handle()) == options);
+    }
+#else
+    SKIP("this OpenSSL has no SSL_OP_NO_RENEGOTIATION");
+#endif
+}
+
 TEST_CASE("Certificate manager client certificate modes per host", "[certificate_manager][mtls]") {
     auto manager = std::make_shared<certificate_manager>();
 

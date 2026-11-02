@@ -2,12 +2,12 @@
 // timeouts. The request, its body, the response and the tunnels are in reverse_proxy/.
 #include "reverse_proxy/proxy_exchange.hpp"
 #include "server_connection.hpp"
+#include "../../asio/io_context_of.hpp"
 #include "../../asio/sockets/ssl_socket.hpp"
 #include "../../asio/sockets/tcp_socket.hpp"
 #include "../../asio/sockets/unix_socket.hpp"
 #include "../../util/logger.hpp"
 #include <boost/asio/ssl/error.hpp>
-#include <boost/asio/strand.hpp>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #include <algorithm>
@@ -16,30 +16,11 @@ namespace thinger::http {
 
 namespace proxy_detail {
 
-namespace {
-
-    // The io_context of an executor (of one of its executor or a strand of it), or null
-    boost::asio::io_context* io_context_of(const boost::asio::any_io_executor& executor) {
-        using untracked = boost::asio::io_context::basic_executor_type<std::allocator<void>, 0>;
-        using tracked = boost::asio::io_context::basic_executor_type<std::allocator<void>, 4>;
-        if (auto* inner = executor.target<untracked>()) return &inner->context();
-        if (auto* inner = executor.target<tracked>()) return &inner->context();
-        if (auto* strand = executor.target<boost::asio::strand<boost::asio::any_io_executor>>()) {
-            return io_context_of(strand->get_inner_executor());
-        }
-        if (auto* strand = executor.target<boost::asio::strand<untracked>>()) {
-            return &strand->get_inner_executor().context();
-        }
-        return nullptr;
-    }
-
-}
-
 boost::asio::io_context* proxy_exchange::io_context() {
     if (auto* io = req_.source_ ? req_.source_->io_context() : nullptr) return io;
     // A request dispatched in memory: the context running the handler, if it is an
     // io_context (null otherwise: the sockets need one)
-    return io_context_of(executor_);
+    return asio::io_context_of(executor_);
 }
 
 std::string proxy_exchange::describe() const {

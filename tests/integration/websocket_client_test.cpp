@@ -9,9 +9,13 @@
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/websocket_connection.hpp>
+#include <algorithm>
 #include <thread>
 #include <chrono>
 #include <future>
+#include <mutex>
+#include <set>
+#include <stdexcept>
 #include <thinger/util/base64.hpp>
 #include <thinger/util/sha1.hpp>
 #include "../fixtures/hostile_peer.hpp"
@@ -297,7 +301,7 @@ TEST_CASE("Async Client WebSocket Integration", "[websocket][client][integration
             callback_called = true;
             if (ws && ws->is_open()) {
                 connected = true;
-                ws->close();
+                ws->stop();   // the close of a callback, which cannot wait
             }
         });
 
@@ -313,12 +317,13 @@ TEST_CASE("Async Client WebSocket Integration", "[websocket][client][integration
         std::string received_message;
         std::atomic<bool> done{false};
 
-        client.websocket(fixture.ws_url + "/ws/echo", [&](std::shared_ptr<http::websocket_client> ws) {
+        // a coroutine callback: the coroutine API, as the synchronous one cannot wait there
+        client.websocket(fixture.ws_url + "/ws/echo", [&](std::shared_ptr<http::websocket_client> ws) -> awaitable<void> {
             if (ws && ws->is_open()) {
-                ws->send_text("Hello async!");
-                auto [msg, _] = ws->receive();
+                co_await ws->send_text_async("Hello async!");
+                auto [msg, _] = co_await ws->receive_async();
                 received_message = msg;
-                ws->close();
+                co_await ws->close_async();
             }
             done = true;
         });
@@ -460,7 +465,7 @@ TEST_CASE("Client WebSocket keepalive: the default and the setter", "[websocket]
         std::atomic<bool> checked{false};
         client.websocket(url, [&](std::shared_ptr<http::websocket_client> ws) {
             if (ws && ws->get_ping_interval() == PING && ws->get_idle_timeout() == IDLE) checked = true;
-            if (ws) ws->close();
+            if (ws) ws->stop();
         });
         client.wait();
         CHECK(checked);
@@ -505,8 +510,11 @@ TEST_CASE("Client WebSocket keepalive: set and turned off against a silent peer"
     auto ws = open_on(ioc, client, peer.websocket_url("/ws"));
     ws.on_close([&] { closed = true; });
 
-    ws.set_keepalive(PING_INTERVAL, IDLE_TIMEOUT);
-    if (!on) ws.set_keepalive(0ms, 0ms);
+    // on the io_context, which runs only below
+    boost::asio::post(ioc, [&] {
+        ws.set_keepalive(PING_INTERVAL, IDLE_TIMEOUT);
+        if (!on) ws.set_keepalive(0ms, 0ms);
+    });
     ws.run();
     ioc.run_for(IDLE_TIMEOUT + 500ms);
     CHECK(ws.is_open() == !on);
@@ -524,7 +532,8 @@ TEST_CASE("Client WebSocket keepalive: a responsive peer stays connected", "[web
         http::executor_client client(ioc);
         std::atomic<bool> closed{false};
         auto ws = open_on(ioc, client, fixture.ws_url + "/ws/echo");
-        ws.set_keepalive(PING_INTERVAL, IDLE_TIMEOUT);
+        // on the io_context, which runs only below
+        boost::asio::post(ioc, [&] { ws.set_keepalive(PING_INTERVAL, IDLE_TIMEOUT); });
         ws.on_close([&] { closed = true; });
         ws.run();
         // nothing sent nor received but the pings and pongs
@@ -627,4 +636,188 @@ TEST_CASE("Client WebSocket keepalive: the blocking calls return once their oper
     ws->close();
     CHECK_FALSE(ws->is_open());
     CHECK(elapsed_since(start) < PROMPT);
+}
+
+// A synchronous call cannot wait on a thread running the io_context of its WebSocket: it would
+// hold up the handler it waits for, or run the handlers of other connections within its caller.
+// It throws there at once, before starting anything, and the connection stays usable
+TEST_CASE("The synchronous calls of a WebSocket fail on a thread running its io_context", "[websocket][client][integration]") {
+    WebSocketServerFixture fixture;
+    const auto url = fixture.ws_url + "/ws/echo";
+    constexpr auto AT_ONCE = 100ms;
+
+    SECTION("In a plain callback of async_client, on its worker") {
+        thinger::http::test::running_workers workers;
+        http::async_client client(workers);
+        bool opened = false;
+        int thrown = 0;
+        auto slowest = 0ms;
+        std::string message;
+        std::string echoed;
+        client.websocket(url, [&](std::shared_ptr<http::websocket_client> ws) {
+            if (!ws) return;
+            opened = true;
+            auto refused = [&](auto&& call) {
+                auto start = clock_type::now();
+                try {
+                    call();
+                } catch (const std::logic_error& error) {
+                    ++thrown;
+                    if (message.empty()) message = error.what();
+                }
+                slowest = std::max(slowest, elapsed_since(start));
+            };
+            refused([&] { ws->send_text("x"); });
+            refused([&] { ws->send_binary(std::string_view("x")); });
+            refused([&] { ws->receive(); });
+            refused([&] { ws->close(); });
+
+            // the coroutine API, on the connection still open
+            client.run([ws, &echoed]() -> awaitable<void> {
+                if (co_await ws->send_text_async("hello")) echoed = (co_await ws->receive_async()).first;
+                co_await ws->close_async();
+            });
+        });
+        REQUIRE(client.wait_for(10s));
+
+        REQUIRE(opened);
+        CHECK(thrown == 4);
+        CHECK(slowest < AT_ONCE);
+        INFO(message);
+        CHECK(message.find("send_text()") != std::string::npos);
+        CHECK(message.find("send_text_async()") != std::string::npos);
+        CHECK(message.find("stop()") != std::string::npos);
+        CHECK(echoed == "hello");
+    }
+
+    SECTION("In a coroutine of executor_client on the io_context, without polling it") {
+        boost::asio::io_context context;
+        bool opened = false;
+        bool thrown = false;
+        bool probe_ran = false;
+        bool polled = true;
+        auto took = 0ms;
+        std::string echoed;
+        co_spawn(context, [&]() -> awaitable<void> {
+            auto client = co_await http::executor_client::for_current_coroutine();
+            auto ws = co_await client->websocket(url);
+            if (!ws) co_return;
+            opened = true;
+            // a handler ready to run: a call polling the io_context would run it
+            boost::asio::post(context, [&] { probe_ran = true; });
+            auto start = clock_type::now();
+            try { ws->send_text("lost"); } catch (const std::logic_error&) { thrown = true; }
+            took = elapsed_since(start);
+            polled = probe_ran;
+
+            if (co_await ws->send_text_async("hello")) echoed = (co_await ws->receive_async()).first;
+            co_await ws->close_async();
+        }, detached);
+        context.run_for(10s);
+
+        REQUIRE(opened);
+        CHECK(thrown);
+        CHECK(took < AT_ONCE);
+        CHECK_FALSE(polled);
+        CHECK(probe_ran);
+        CHECK(echoed == "hello");
+    }
+}
+
+// From a thread that does not run the io_context of the WebSocket, a synchronous call waits for
+// its operation, which runs on the worker: the caller runs nothing of that io_context meanwhile
+TEST_CASE("The synchronous calls of an async_client WebSocket wait on another thread without running its io_context",
+          "[websocket][client][integration]") {
+    thinger::http::test::running_workers workers(1);
+    WebSocketServerFixture fixture;
+    http::async_client client(workers);
+
+    struct handed_websocket {
+        std::shared_ptr<http::websocket_client> ws;
+        boost::asio::io_context* context = nullptr;
+        std::thread::id worker;
+    };
+    std::promise<handed_websocket> handed;
+    client.websocket(fixture.ws_url + "/ws/echo", [&](std::shared_ptr<http::websocket_client> ws) {
+        handed.set_value({std::move(ws), &workers.get_thread_io_context(), std::this_thread::get_id()});
+    });
+    auto future = handed.get_future();
+    REQUIRE(future.wait_for(5s) == std::future_status::ready);
+    auto websocket = future.get();
+    auto& ws = websocket.ws;
+    auto* context = websocket.context;
+    const auto worker = websocket.worker;
+    REQUIRE(ws);
+    REQUIRE(ws->is_open());
+    REQUIRE(worker != std::this_thread::get_id());
+
+    // The thread of every handler of the io_context run during the calls: before each call, the
+    // worker is held up a while with probe handlers queued behind it, which a second thread
+    // running the io_context would run meanwhile. They run before the operation of the call,
+    // queued after them
+    std::mutex mutex;
+    std::set<std::thread::id> ran_on;
+    int probes = 0;
+    auto probed = [&](auto&& call) {
+        boost::asio::post(*context, [] { std::this_thread::sleep_for(50ms); });
+        for (int i = 0; i < 5; ++i) {
+            boost::asio::post(*context, [&] {
+                std::lock_guard lock(mutex);
+                ran_on.insert(std::this_thread::get_id());
+                ++probes;
+            });
+        }
+        auto start = clock_type::now();
+        call();
+        CHECK(elapsed_since(start) < 2s);
+    };
+
+    probed([&] { CHECK(ws->send_text("hello")); });
+    probed([&] {
+        auto [message, binary] = ws->receive();
+        CHECK(message == "hello");
+        CHECK_FALSE(binary);
+    });
+    probed([&] { ws->set_keepalive(PING_INTERVAL, IDLE_TIMEOUT); });
+    CHECK(ws->get_ping_interval() == PING_INTERVAL);
+    CHECK(ws->get_idle_timeout() == IDLE_TIMEOUT);
+    probed([&] { ws->close(); });
+    CHECK_FALSE(ws->is_open());
+
+    std::lock_guard lock(mutex);
+    CHECK(probes == 20);
+    CHECK(ran_on == std::set<std::thread::id>{worker});
+    ws.reset();
+}
+
+// http::client runs its io_context only within its synchronous calls: from whichever thread
+// makes them, one at a time, but not from within one of its own callbacks
+TEST_CASE("The synchronous calls of http::client within its own callbacks fail", "[websocket][client][integration]") {
+    WebSocketServerFixture fixture;
+    const auto hello = "http://127.0.0.1:" + std::to_string(fixture.port) + "/hello";
+    http::client client;
+    auto ws = client.websocket(fixture.ws_url + "/ws/echo");
+    REQUIRE(ws.has_value());
+
+    int calls = 0;
+    int thrown = 0;
+    auto result = client.send_streaming(http::http_request::create_http_request(http::method::GET, hello),
+        [&](const http::stream_info&) {
+            if (calls++ > 0) return true;
+            try { client.get(hello); } catch (const std::logic_error&) { ++thrown; }
+            try { ws->send_text("lost"); } catch (const std::logic_error&) { ++thrown; }
+            return true;
+        });
+    CHECK(result.ok());
+    CHECK(calls > 0);
+    CHECK(thrown == 2);
+
+    // Both still work, the WebSocket also from another thread (while no other uses the client)
+    CHECK(client.get(hello).body() == "hello");
+    REQUIRE(ws->send_text("from another thread"));
+    auto received = std::async(std::launch::async, [&] { return ws->receive(); });
+    REQUIRE(received.wait_for(2s) == std::future_status::ready);
+    CHECK(received.get().first == "from another thread");
+    ws->close();
+    CHECK_FALSE(ws->is_open());
 }

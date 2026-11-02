@@ -325,12 +325,16 @@ namespace {
     http::websocket_client open_websocket(boost::asio::io_context& ioc, http::executor_client& client,
                                           const hostile_peer& peer) {
         const auto url = peer.websocket_url("/ws");
-        auto result = run_bounded(ioc, client.websocket(url));
+        // the keepalive set on the io_context, which runs only within run_bounded()
+        auto connect = [&]() -> awaitable<std::optional<http::websocket_client>> {
+            auto websocket = co_await client.websocket(url);
+            if (websocket) websocket->set_keepalive(PING_INTERVAL, IDLE_TIMEOUT);
+            co_return std::move(websocket);
+        };
+        auto result = run_bounded(ioc, connect());
         REQUIRE(result.value);
         REQUIRE(result.value->has_value());
-        auto websocket = std::move(**result.value);
-        websocket.set_keepalive(PING_INTERVAL, IDLE_TIMEOUT);
-        return websocket;
+        return std::move(**result.value);
     }
 
     // The documented outcome of a connection closed for being idle

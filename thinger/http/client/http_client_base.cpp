@@ -406,6 +406,12 @@ std::shared_ptr<client_connection> http_client_base::make_connection(const conne
 
 connection_pool::lease http_client_base::get_connection(const std::shared_ptr<http_request>& request,
                                                         boost::system::error_code& ec, bool reuse) {
+    // A request on which a setter refused a header is not sent, as Go's client does: it fails
+    // as an unparseable URL does, before any connection is opened or reused
+    if (request->has_refused_header()) {
+        ec = boost::asio::error::invalid_argument;
+        return {};
+    }
     ec = {};
     const std::string& socket_path = request->get_unix_socket();
 
@@ -722,6 +728,10 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
     }
     auto key = set_upgrade_headers(*request, *url, subprotocol);
     apply_default_headers(request);
+    if (request->has_refused_header()) {
+        LOG_ERROR("WebSocket upgrade not sent: the request has an invalid header");
+        co_return std::nullopt;
+    }
 
     // A connection of its own, never pooled: it becomes the WebSocket. Over the Unix socket of
     // the request or of the client, as the other requests; otherwise through a proxy it is a
@@ -763,7 +773,7 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
     ws->start_timeout();
 
     LOG_INFO("WebSocket connected to {}", request->get_url());
-    co_return websocket_client(std::move(ws));
+    co_return websocket_client(std::move(ws), owns_io_context());
 }
 
 } // namespace thinger::http

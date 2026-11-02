@@ -59,6 +59,10 @@ protected:
         return executor;
     }
 
+    // Whether the io_context is the client's own, run only within its synchronous calls: the
+    // synchronous calls of its WebSockets then wait running it (see websocket_client)
+    virtual bool owns_io_context() const { return false; }
+
     void apply_default_headers(const std::shared_ptr<http_request>& request);
 
     // A connection for a request: an idle one of the pool if `reuse` and there is one, or a

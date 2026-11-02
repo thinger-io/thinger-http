@@ -1,3 +1,4 @@
+#include <future>
 #include <iostream>
 #include <thinger/http_client.hpp>
 
@@ -24,30 +25,33 @@ int main(int argc, char* argv[]) {
     std::cout << "=== Callback API ===\n" << std::endl;
     std::cout << "Connecting to " << url << "..." << std::endl;
 
-    client.websocket(url, [](std::shared_ptr<http::websocket_client> ws) {
+    // The callback runs on a worker, which runs the io_context of the WebSocket: there the
+    // synchronous calls (send_text(), receive(), close()) throw, so it is a coroutine using
+    // the coroutine API
+    client.websocket(url, [](std::shared_ptr<http::websocket_client> ws) -> awaitable<void> {
         if (!ws) {
             std::cerr << "Failed to connect to WebSocket server" << std::endl;
-            return;
+            co_return;
         }
 
         std::cout << "Connected!" << std::endl;
 
-        // Send and receive (sync methods work inside callback)
+        // Send and receive
         std::cout << "Sending: Hello from async_client!" << std::endl;
-        ws->send_text("Hello from async_client!");
+        co_await ws->send_text_async("Hello from async_client!");
 
-        auto [response, is_binary] = ws->receive();
+        auto [response, is_binary] = co_await ws->receive_async();
         std::cout << "Received: " << response << std::endl;
 
         // Send multiple messages
         for (int i = 1; i <= 3; ++i) {
             std::string msg = "Message #" + std::to_string(i);
-            ws->send_text(msg);
-            auto [reply, binary] = ws->receive();
+            co_await ws->send_text_async(msg);
+            auto [reply, binary] = co_await ws->receive_async();
             std::cout << "Echo " << i << ": " << reply << std::endl;
         }
 
-        ws->close();
+        co_await ws->close_async();
         std::cout << "Connection closed\n" << std::endl;
     });
 
@@ -86,21 +90,33 @@ int main(int argc, char* argv[]) {
     std::cout << "=== Event-Driven API ===\n" << std::endl;
     std::cout << "Connecting to " << url << "..." << std::endl;
 
-    client.websocket(url, [](std::shared_ptr<http::websocket_client> ws) {
+    // The message loop runs while the websocket_client lives: the application keeps it beyond
+    // the callback, and learns from on_close() when the loop ended
+    std::shared_ptr<http::websocket_client> socket;
+    std::promise<void> closed;
+    auto loop_ended = closed.get_future();
+    const std::string greeting = "Hello, event-driven!";
+
+    client.websocket(url, [&socket, &closed, &greeting](std::shared_ptr<http::websocket_client> ws) -> awaitable<void> {
         if (!ws) {
             std::cerr << "Failed to connect" << std::endl;
-            return;
+            closed.set_value();
+            co_return;
         }
 
         std::cout << "Connected!" << std::endl;
+        socket = ws;
 
-        // Set up handlers
-        ws->on_message([](const std::string& msg, bool binary) {
+        // Set up handlers: they run on the worker of the WebSocket
+        ws->on_message([ws = ws.get(), &greeting](const std::string& msg, bool binary) {
             std::cout << "Received: " << msg << std::endl;
+            // Done once the echo arrived: close without waiting
+            if (msg == greeting) ws->stop();
         });
 
-        ws->on_close([]() {
-            std::cout << "Connection closed by server" << std::endl;
+        ws->on_close([&closed]() {
+            std::cout << "Connection closed" << std::endl;
+            closed.set_value();
         });
 
         ws->on_error([](const std::string& error) {
@@ -108,19 +124,23 @@ int main(int argc, char* argv[]) {
         });
 
         // Send a message
-        ws->send_text("Hello, event-driven!");
+        if (!co_await ws->send_text_async(greeting)) {
+            std::cerr << "Failed to send" << std::endl;
+            closed.set_value();
+            co_return;
+        }
 
         // Start message loop (receives messages via callbacks)
         ws->run();
-
-        // Keep connection alive briefly
-        std::this_thread::sleep_for(std::chrono::seconds(1));
     });
 
     client.wait();
+    loop_ended.wait();
 
     std::cout << "\nAll examples completed!" << std::endl;
 
     workers.stop();
+    // Once no worker runs it anymore (its message loop may still be ending on one above)
+    socket.reset();
     return 0;
 }

@@ -366,14 +366,20 @@ public:
      * Connect to a WebSocket server (callback version).
      *
      * Usage:
-     *   client.websocket("ws://server.com/path", [](auto ws) {
+     *   client.websocket("ws://server.com/path", [](auto ws) -> awaitable<void> {
      *       if (ws) {
-     *           ws->send_text("Hello!");
-     *           ws->run();  // Start message loop
+     *           co_await ws->send_text_async("Hello!");
+     *           auto [msg, binary] = co_await ws->receive_async();
+     *           co_await ws->close_async();
      *       }
      *   });
      *
-     * The callback receives a shared_ptr to maintain ownership.
+     * The callback receives a shared_ptr to maintain ownership (null if the connection
+     * failed). It runs on a worker, which runs the io_context of the WebSocket: there the
+     * synchronous calls of websocket_client (send_text(), receive(), close()...) throw
+     * std::logic_error. Use its coroutine API, as above (the callback may be a coroutine),
+     * run() with on_message() (the loop runs while the websocket_client lives: keep the
+     * shared_ptr), or stop() to close without waiting.
      */
     template<typename Callback>
         requires std::invocable<Callback&, std::shared_ptr<websocket_client>>   // not a subprotocol

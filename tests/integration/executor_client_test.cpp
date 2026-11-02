@@ -7,6 +7,8 @@
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
 #include <boost/asio/bind_cancellation_slot.hpp>
+#include <boost/asio/execution.hpp>
+#include <boost/asio/require.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/thread_pool.hpp>
@@ -129,6 +131,12 @@ TEST_CASE("io_context_of finds the io_context behind an executor", "[client][exe
     CHECK(asio::io_context_of(boost::asio::make_strand(io)) == &context);
     CHECK(asio::io_context_of(boost::asio::make_strand(boost::asio::any_io_executor(boost::asio::make_strand(io)))) ==
           &context);
+    // a work-tracked executor (it keeps the io_context running), and a strand of it
+    boost::asio::any_io_executor tracked =
+        boost::asio::require(context.get_executor(), boost::asio::execution::outstanding_work.tracked);
+    CHECK(asio::io_context_of(tracked) == &context);
+    CHECK(asio::io_context_of(boost::asio::make_strand(tracked)) == &context);
+    tracked = {};
 
     boost::asio::thread_pool pool(1);
     CHECK(asio::io_context_of(pool.get_executor()) == nullptr);

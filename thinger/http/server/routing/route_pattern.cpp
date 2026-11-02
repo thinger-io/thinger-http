@@ -223,6 +223,26 @@ namespace {
         return true;
     }
 
+    // A text matched against a regex the matcher could not compile, with the groups to capture.
+    // A text longer than this does not match, and is not run through std::regex: libstdc++
+    // matches recursively, about one frame per byte, so a request target of up to 16 KiB could
+    // overflow the stack (as the Host name, capped before host patterns). 2 KiB leaves a wide
+    // margin on default thread stacks and is the URL length long held as portable. Every other
+    // matcher still takes the whole target, within the 8000 octets RFC 9110 section 4.1
+    // recommends for a URI
+    bool match_regex(const std::regex& regex, const std::vector<size_t>& groups, std::string_view text,
+                     route_captures& captures) {
+        constexpr size_t max_regex_text_size = 2048;
+        if (text.size() > max_regex_text_size) return false;
+        std::cmatch matches;
+        if (!std::regex_match(text.data(), text.data() + text.size(), matches, regex)) return false;
+        for (size_t group : groups) {
+            const auto& capture = matches[group];
+            captures.push_back(capture.matched ? std::string_view(capture.first, capture.length()) : std::string_view{});
+        }
+        return true;
+    }
+
 } // namespace
 
 std::vector<pattern_token> parse_route_pattern(std::string_view pattern) {
@@ -424,15 +444,7 @@ bool path_matcher::match(std::string_view text, route_captures& captures) const 
         return true;
     }
 
-    if (regex_) {
-        std::cmatch matches;
-        if (!std::regex_match(text.data(), text.data() + text.size(), matches, *regex_)) return false;
-        for (size_t group : regex_groups_) {
-            const auto& capture = matches[group];
-            captures.push_back(capture.matched ? std::string_view(capture.first, capture.length()) : std::string_view{});
-        }
-        return true;
-    }
+    if (regex_) return match_regex(*regex_, regex_groups_, text, captures);
 
     // A single atom, as a parameter with a character class: check length and characters
     if (atoms_.size() == 1) {

@@ -87,7 +87,10 @@ public:
     void status(http::http_response::status s);
 
     // Add a header to the response sent, whatever answer sends it (not thread-safe). The key
-    // and value are moved into the response: pass an rvalue (e.g. std::move()) to save a copy
+    // and value are moved into the response: pass an rvalue (e.g. std::move()) to save a copy.
+    // An invalid header (a name that is not a token, or a value with CR, LF, NUL or another
+    // control character but HTAB) is dropped, logged at debug level: the response is sent
+    // without it
     void header(std::string key, std::string value);
 
     // Send raw http_response object (for advanced use cases). Its content is sent whole,
@@ -155,7 +158,8 @@ public:
     // compressed on the fly for the client; files over 4 MiB are never compressed on the fly.
     void send_file(const std::filesystem::path& path, bool force_download = false);
 
-    // Redirect response
+    // Redirect response. Each byte of `url` not allowed in a header value (CR, LF, NUL and the
+    // other control characters but HTAB) is percent-encoded in Location; the rest is kept
     void redirect(const std::string& url, http::http_response::status redirect_type = http::http_response::status::moved_temporarily);
     
     // Chunked response: start_chunked() sends the headers (false if another answer was sent

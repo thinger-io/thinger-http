@@ -208,7 +208,8 @@ private:
     /// Messages not written yet, against the write limits, and their writer
     std::unique_ptr<detail::push_queue<out_message>> queue_;
 
-    /// Incoming data
+    /// Incoming data: the message being received, grown as its bytes arrive (never to the size
+    /// a frame header announces), up to max_message_size; given up after a message above 64 KiB
     boost::asio::streambuf buffer_{MAX_BUFFER_SIZE};
 
     sync_callback<void(std::string, bool)> on_frame_callback_;

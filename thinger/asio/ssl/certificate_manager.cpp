@@ -390,6 +390,11 @@ void certificate_manager::prepare_context(boost::asio::ssl::context& context) {
 std::shared_ptr<boost::asio::ssl::context> certificate_manager::create_base_ssl_context(const tls_options& options) {
     auto context = std::make_shared<boost::asio::ssl::context>(boost::asio::ssl::context::tls_server);
     context->set_options(boost::asio::ssl::context::single_dh_use);
+#ifdef SSL_OP_NO_RENEGOTIATION
+    // No TLS 1.2 renegotiation (OpenSSL 1.1.1 allows it), as Go's servers: contexts passed in
+    // ready-made keep their own options
+    SSL_CTX_set_options(context->native_handle(), SSL_OP_NO_RENEGOTIATION);
+#endif
     prepare_context(*context);
     // Validated when set (see set_tls_options()), so this fails only if OpenSSL changed its mind
     if (!apply_tls_options(*context, options)) {
@@ -585,7 +590,7 @@ bool tls_handshake_record::misdirected(std::string_view host) const {
     bool chosen = manager.owner_before(none) || none.owner_before(manager);
     auto owner = manager.lock();
     if (owner ? !owner->misdirected(*this, host) : !chosen) return false;
-    // At info level, as nginx: any client can send it
+    // At debug level: any client can send it
     LOG_DEBUG("misdirected request (421): host '{}' on a TLS connection for '{}'", host, has_name ? name : "(no SNI)");
     return true;
 }

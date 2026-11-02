@@ -7,7 +7,9 @@
 #include "../response_compression.hpp"
 #include "../virtual_host.hpp"
 #include "../../util/url.hpp"
+#include <algorithm>
 #include <optional>
+#include <string_view>
 
 namespace thinger::http::file_server {
 
@@ -93,6 +95,39 @@ namespace {
         send(res, {file, *original, content_type});
     }
 
+    // Whether a decoded path has a dotfile segment (as Node's send): longer than one
+    // character and starting with ".", other than ".well-known" (RFC 8615) and ".." (left to
+    // the containment check, as send refuses it before). Segments are split as
+    // std::filesystem splits them.
+    bool is_dotfile_path(std::string_view path) {
+#ifdef _WIN32
+        constexpr std::string_view separators = "/\\";
+#else
+        constexpr std::string_view separators = "/";
+#endif
+        size_t start = 0;
+        while (start < path.size()) {
+            auto end = std::min(path.find_first_of(separators, start), path.size());
+            auto segment = path.substr(start, end - start);
+            if (segment.size() > 1 && segment[0] == '.' && segment != ".." && segment != ".well-known") return true;
+            start = end + 1;
+        }
+        return false;
+    }
+
+    // Percent-decodes a raw path parameter in place, with "+" literal: false for a bad escape
+    // or a decoded NUL
+    bool decode_path(std::string& path) {
+        if (path.find('%') == std::string::npos) return true;
+        std::string escaped;
+        escaped.reserve(path.size());
+        for (char c : path) {
+            if (c == '+') escaped.append("%2B");
+            else escaped.push_back(c);
+        }
+        return util::url::url_decode(escaped, path) && path.find('\0') == std::string::npos;
+    }
+
     // The fallback file of a directory, if it has one
     std::optional<fs::path> fallback_of(const fs::path& directory, const std::string& fallback) {
         if (fallback.empty()) return std::nullopt;
@@ -108,17 +143,16 @@ void serve(request& req, response& res, const fs::path& directory, const static_
     // send does), so escaped first for url_decode, which reads it as a form space. A decoded "/"
     // separates directories; a NUL could not name a file
     std::string path = req["path"];
-    if (path.find('%') != std::string::npos) {
-        std::string escaped;
-        escaped.reserve(path.size());
-        for (char c : path) {
-            if (c == '+') escaped.append("%2B");
-            else escaped.push_back(c);
-        }
-        if (!util::url::url_decode(escaped, path) || path.find('\0') != std::string::npos) {
-            res.error(http_response::status::bad_request, "Invalid path");
-            return;
-        }
+    if (!decode_path(path)) {
+        res.error(http_response::status::bad_request, "Invalid path");
+        return;
+    }
+    // Dotfiles (".env", ".git/"), judged by the path alone: denied, or ignored as a path
+    // without a file, unless allowed
+    bool dotfile = options.dotfiles != dotfiles_policy::allow && is_dotfile_path(path);
+    if (dotfile && options.dotfiles == dotfiles_policy::deny) {
+        res.error(http_response::status::forbidden, "Access denied");
+        return;
     }
     auto root = fs::canonical(directory);
     auto send = [&](const fs::path& file) {
@@ -127,7 +161,7 @@ void serve(request& req, response& res, const fs::path& directory, const static_
     };
 
     // An empty path is the root: its fallback, if any
-    if (!path.empty()) {
+    if (!path.empty() && !dotfile) {
         auto file = fs::weakly_canonical(directory / path);
         if (!is_within(file, root)) {
             res.error(http_response::status::forbidden, "Access denied");

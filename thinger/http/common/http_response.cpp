@@ -460,7 +460,7 @@ namespace thinger::http{
 
     void http_response::set_content_length(size_t content_length){
         content_length_ = content_length;
-        set_header(http::header::content_length, boost::lexical_cast<std::string>(content_length));
+        replace_header(std::string(http::header::content_length), boost::lexical_cast<std::string>(content_length));
     }
 
     void http_response::set_content_type(std::string&& content_type){

@@ -2,6 +2,7 @@
 #include "../fixtures/hostile_peer.hpp"
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
+#include <thinger/http/server/websocket_connection.hpp>
 #include "../fixtures/awaited_shutdown.hpp"
 #include <algorithm>
 #include <array>
@@ -125,6 +126,130 @@ TEST_CASE("Heads announcing large bodies take memory only for what arrives",
     // The heads alone: a request each, and the first piece of its body (64 KiB)
     CHECK(growth(connected, after) < 16 * MiB);
     CHECK(server.stats().http_connections == static_cast<uint64_t>(connections));
+}
+
+namespace {
+
+    std::string websocket_upgrade(const std::string& path) {
+        return "GET " + path + " HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+               "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    }
+
+    // The head of a binary frame from a client announcing `size` bytes: masked with a zero key,
+    // so the payload bytes after it go as they are
+    std::string frame_header_announcing(uint64_t size) {
+        std::string header{char(0x82), char(0x80 | 127)};
+        for (int i = 7; i >= 0; --i) header.push_back(char((size >> (i * 8)) & 0xFF));
+        return header.append(4, '\0');
+    }
+
+}
+
+// Many WebSocket frame headers announcing the largest message allowed, followed by one byte of
+// it or by none: the server takes memory for the bytes that arrive, not for those announced
+// (v0.9.1 reserved each message whole once a byte of it arrived, 1 GiB here), and every
+// connection waits for the rest
+TEST_CASE("WebSocket frame headers announcing large messages take memory only for what arrives",
+          "[server][websocket][hostile_peer][memory][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    bool with_byte = GENERATE(true, false);
+    INFO((with_byte ? "one byte of the payload" : "no byte of the payload"));
+    constexpr int connections = 64;
+    constexpr uint64_t announced = 16 * MiB - 1;   // within the default max_message_size
+
+    http::server server;
+    std::atomic<int> opened{0};
+    std::atomic<int> received{0};
+    server.get("/ws", [&](http::request&, http::response& res) {
+        res.upgrade_websocket({}, [&](std::shared_ptr<http::websocket_connection> ws) {
+            ws->on_message([&](std::string, bool) { ++received; });
+            ++opened;
+        });
+    });
+    running_server running(server, kind);
+
+    size_t before = 0;
+    bool measured = allocated_bytes(before);
+
+    // Upgraded first (over TLS, the handshakes take memory of their own on both ends)
+    std::vector<std::unique_ptr<hostile_client>> clients;
+    for (int i = 0; i < connections; ++i) {
+        clients.push_back(std::make_unique<hostile_client>(running.endpoint()));
+        REQUIRE(clients.back()->upgrade(websocket_upgrade("/ws"), 5s).answered_with("HTTP/1.1 101"));
+    }
+    REQUIRE(eventually([&] { return opened == connections; }, 10s));
+    REQUIRE(eventually([&] { return server.stats().websocket_connections == static_cast<uint64_t>(connections); }, 10s));
+    size_t connected = 0;
+    measured = measured && allocated_bytes(connected);
+
+    auto frame = frame_header_announcing(announced) + (with_byte ? "x" : "");
+    for (auto& client : clients) REQUIRE(client->send_without_reading(frame));
+    // Each connection read its frame header, and waits for the rest of the payload
+    std::this_thread::sleep_for(300ms);
+
+    size_t after = 0;
+    if (!measured || !allocated_bytes(after)) {
+        SKIP("the allocator does not tell what it allocated here");
+    }
+    auto growth = [](size_t from, size_t to) { return to > from ? to - from : 0; };
+    INFO("allocated " << growth(before, after) / 1024 << " KiB more, " << growth(connected, after) / 1024
+                      << " KiB for the " << connections << " frames announcing " << announced << " bytes each");
+    CHECK(growth(connected, after) < 16 * MiB);
+    CHECK(received == 0);
+    CHECK(server.stats().websocket_connections == static_cast<uint64_t>(connections));
+}
+
+// Many connections that each received one large message: once delivered, the connections give
+// its buffer up (v0.9.1 kept each at its peak until the connection closed, 256 MiB here)
+TEST_CASE("WebSocket connections give up the buffer of a large message once delivered",
+          "[server][websocket][memory][integration][matrix]") {
+    MATRIX_TRANSPORT(kind);
+    constexpr int connections = 64;
+    constexpr size_t message_size = 4 * MiB;
+
+    http::server server;
+    std::atomic<int> opened{0};
+    std::atomic<int> received{0};
+    std::atomic<int> wrong{0};
+    server.get("/ws", [&](http::request&, http::response& res) {
+        res.upgrade_websocket({}, [&](std::shared_ptr<http::websocket_connection> ws) {
+            ws->on_message([&](std::string message, bool) {
+                if (message.size() != message_size) ++wrong;
+                ++received;
+            });
+            ++opened;
+        });
+    });
+    running_server running(server, kind);
+
+    std::vector<std::unique_ptr<hostile_client>> clients;
+    for (int i = 0; i < connections; ++i) {
+        clients.push_back(std::make_unique<hostile_client>(running.endpoint()));
+        REQUIRE(clients.back()->upgrade(websocket_upgrade("/ws"), 5s).answered_with("HTTP/1.1 101"));
+    }
+    REQUIRE(eventually([&] { return opened == connections; }, 10s));
+    REQUIRE(eventually([&] { return server.stats().websocket_connections == static_cast<uint64_t>(connections); }, 10s));
+    size_t connected = 0;
+    bool measured = allocated_bytes(connected);
+
+    {   // (the frame the clients send is not counted)
+        auto frame = frame_header_announcing(message_size) + std::string(message_size, 'x');
+        for (auto& client : clients) REQUIRE(client->send_without_reading(frame));   // 10 s each
+    }
+    REQUIRE(eventually([&] { return received == connections; }, 30s));
+    CHECK(wrong == 0);
+    // (each connection gives its buffer up right after its on_message() returns)
+    std::this_thread::sleep_for(200ms);
+
+    size_t after = 0;
+    if (!measured || !allocated_bytes(after)) {
+        SKIP("the allocator does not tell what it allocated here");
+    }
+    size_t growth = after > connected ? after - connected : 0;
+    INFO("allocated " << growth / 1024 << " KiB more after " << connections << " messages of "
+                      << message_size << " bytes");
+    CHECK(growth < 8 * MiB);
+    CHECK(server.stats().websocket_connections == static_cast<uint64_t>(connections));
 }
 
 namespace {

@@ -281,7 +281,11 @@ host not found; a name over 253 bytes served by a pattern host (they are never r
 pattern's regex, whose libstdc++ matcher recurses about once per byte, see
 [Virtual Hosts](../../README.md#virtual-hosts)); a name served by `*.example.com` that is not one
 label followed by `.example.com`, or such a name served by another host; a parameter that is not
-the part of the path its route matches. A stack overflow is reported by AddressSanitizer as a
+the part of the path its route matches; the `(ab|cd)+` route answered with a parameter that is
+not the segment after `/fallback/`, made of `ab`/`cd` pairs, of at most 2048 bytes, or the
+`\w+\b` route answered for a path over 2048 bytes (the text a fallback regex is matched on is
+capped, see [Basic Routing](../../README.md#basic-routing)). The seeds `fallback_2048.txt`,
+`fallback_2050.txt`, `words_2048.txt` and `words_2049.txt` sit on both sides of that cap. A stack overflow is reported by AddressSanitizer as a
 crash, and a matcher that backtracks too much as a timeout (`-timeout`, 1200 s by default: use
 `-timeout=10` or so).
 

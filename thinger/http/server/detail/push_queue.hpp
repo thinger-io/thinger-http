@@ -23,8 +23,8 @@ enum class push_failure {
     write_error     // write_item() failed: the error it returned
 };
 
-// The queue, flow control and single writer that websocket_connection and sse_connection compose
-// (target design §4.7). Not public: only those two classes use it, from their .cpp files.
+// The queue, flow control and single writer that websocket_connection and sse_connection compose.
+// Not public: only those two classes use it, from their .cpp files.
 //
 // Items are written one at a time, in order, by one writer coroutine, started when the queue
 // gets an item and ended once it is empty or closed. A unit is what drop_oldest drops whole: the

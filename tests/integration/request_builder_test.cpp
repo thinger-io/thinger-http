@@ -645,12 +645,12 @@ TEST_CASE("Request Builder WebSocket with async client", "[http][client][request
 
         client.request(fixture.ws_url + "/ws/echo")
             .header("X-Test", "callback")
-            .websocket([&promise](std::shared_ptr<http::websocket_client> ws) {
+            .websocket([&promise](std::shared_ptr<http::websocket_client> ws) -> awaitable<void> {
                 if (ws) {
-                    ws->send_text("callback hello");
-                    auto [msg, binary] = ws->receive();
+                    co_await ws->send_text_async("callback hello");
+                    auto [msg, binary] = co_await ws->receive_async();
                     promise.set_value(msg == "echo: callback hello");
-                    ws->close();
+                    co_await ws->close_async();
                 } else {
                     promise.set_value(false);
                 }
@@ -667,12 +667,12 @@ TEST_CASE("Request Builder WebSocket with async client", "[http][client][request
 
         client.request(fixture.ws_url + "/ws/echo-with-protocol")
             .protocol("json")
-            .websocket([&promise](std::shared_ptr<http::websocket_client> ws) {
+            .websocket([&promise](std::shared_ptr<http::websocket_client> ws) -> awaitable<void> {
                 if (ws) {
-                    ws->send_text("protocol callback test");
-                    auto [msg, binary] = ws->receive();
+                    co_await ws->send_text_async("protocol callback test");
+                    auto [msg, binary] = co_await ws->receive_async();
                     promise.set_value(msg == "echo: protocol callback test");
-                    ws->close();
+                    co_await ws->close_async();
                 } else {
                     promise.set_value(false);
                 }

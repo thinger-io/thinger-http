@@ -62,13 +62,13 @@ void server::stop() {
 }
 
 void server::stop_running() {
-    if (!running_) {
+    // One exchange, so of the stop() calls made at once only one goes on
+    if (!running_.exchange(false)) {
         return;
     }
-    
+
     LOG_DEBUG("Stopping standalone HTTP server");
-    running_ = false;
-    
+
     // Stop accepting new connections first (this is always safe to call)
     server_base::stop();
     
