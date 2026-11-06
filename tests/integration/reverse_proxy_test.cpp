@@ -12,9 +12,6 @@
 #include <nlohmann/json.hpp>
 #include <boost/asio.hpp>
 #include <boost/asio/use_future.hpp>
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/x509v3.h>
 #include <unistd.h>
 #include "../../examples/http_server/device_proxy_policy.hpp"
 #include "../fixtures/transport_matrix.hpp"
@@ -377,49 +374,6 @@ namespace {
 
     std::string get(const std::string& path, const std::string& extra_headers = "") {
         return "GET " + path + " HTTP/1.1\r\nHost: front.example\r\n" + extra_headers + "\r\n";
-    }
-
-    // A self-signed certificate for `name`, valid as its own CA
-    std::pair<std::string, std::string> make_certificate(const std::string& name) {
-        EVP_PKEY* key = EVP_EC_gen("P-256");
-        X509* certificate = X509_new();
-        X509_set_version(certificate, 2);
-        ASN1_INTEGER_set(X509_get_serialNumber(certificate), static_cast<long>(std::time(nullptr)));
-        X509_gmtime_adj(X509_getm_notBefore(certificate), -3600);
-        X509_gmtime_adj(X509_getm_notAfter(certificate), 24 * 3600);
-        X509_set_pubkey(certificate, key);
-        X509_NAME* subject = X509_get_subject_name(certificate);
-        X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
-                                   reinterpret_cast<const unsigned char*>(name.c_str()), -1, -1, 0);
-        X509_set_issuer_name(certificate, subject);
-
-        X509V3_CTX context;
-        X509V3_set_ctx_nodb(&context);
-        X509V3_set_ctx(&context, certificate, certificate, nullptr, nullptr, 0);
-        std::string san = "DNS:" + name;
-        for (auto [nid, value] : {std::pair{NID_subject_alt_name, san.c_str()},
-                                  std::pair{NID_basic_constraints, "critical,CA:TRUE"},
-                                  std::pair{NID_key_usage, "critical,digitalSignature,keyCertSign"}}) {
-            X509_EXTENSION* extension = X509V3_EXT_conf_nid(nullptr, &context, nid, value);
-            X509_add_ext(certificate, extension, -1);
-            X509_EXTENSION_free(extension);
-        }
-        X509_sign(certificate, key, EVP_sha256());
-
-        auto to_pem = [](auto write) {
-            BIO* bio = BIO_new(BIO_s_mem());
-            write(bio);
-            char* data = nullptr;
-            long size = BIO_get_mem_data(bio, &data);
-            std::string pem(data, static_cast<size_t>(size));
-            BIO_free(bio);
-            return pem;
-        };
-        auto certificate_pem = to_pem([&](BIO* bio) { PEM_write_bio_X509(bio, certificate); });
-        auto key_pem = to_pem([&](BIO* bio) { PEM_write_bio_PrivateKey(bio, key, nullptr, nullptr, 0, nullptr, nullptr); });
-        X509_free(certificate);
-        EVP_PKEY_free(key);
-        return {certificate_pem, key_pem};
     }
 
     awaitable<void> echo_session(std::shared_ptr<asio::socket> socket, std::string buffered) {
@@ -799,7 +753,8 @@ TEST_CASE("Reverse proxy forwards to Unix socket targets", "[proxy][unix][integr
 }
 
 TEST_CASE("Reverse proxy verifies TLS targets", "[proxy][tls][integration]") {
-    auto [certificate, key] = make_certificate("backend.test");
+    http::test::test_ca ca;
+    auto [certificate, key] = ca.issue("backend.test");
     auto certificates = std::make_shared<asio::certificate_manager>();
     // As the default: the proxy sends the address of the target as Host, which an entry of its
     // own for backend.test (its SNI) would answer with 421
@@ -826,7 +781,7 @@ TEST_CASE("Reverse proxy verifies TLS targets", "[proxy][tls][integration]") {
     }
 
     SECTION("A private CA is trusted when configured") {
-        destination.tls.ca_pem = certificate;
+        destination.tls.ca_pem = ca.pem();
         proxy.start();
         auto res = raw_request(proxy.port, get("/secure"));
         REQUIRE(res.status == 200);
@@ -835,7 +790,7 @@ TEST_CASE("Reverse proxy verifies TLS targets", "[proxy][tls][integration]") {
     }
 
     SECTION("The certificate must be issued for the name of the target") {
-        destination.tls.ca_pem = certificate;
+        destination.tls.ca_pem = ca.pem();
         destination.tls.server_name = "other.test";
         proxy.start();
         REQUIRE(raw_request(proxy.port, get("/secure")).status == 502);

@@ -18,7 +18,7 @@ namespace thinger::http {
 // Collects the response of a request dispatched in memory (see http_application::dispatch).
 // It is shared by every copy of the response object, so a handler may keep a copy and
 // answer later, from any thread.
-class memory_response : public response_sink {
+class memory_response : public response_sink, public std::enable_shared_from_this<memory_response> {
 public:
     explicit memory_response(const boost::asio::any_io_executor& executor) : done_(executor, 1) {}
 
@@ -83,11 +83,32 @@ public:
         return complete_;
     }
 
-    // Wait until the response is complete; null if it does not complete within `timeout`
+    // The application is gone before the response completed (a response in parts included):
+    // there will be none. Wakes wait(), and whatever is sent later is dropped. The observer is
+    // not told: it reports the response as aborted when released, once the request ends too
+    void abandon() {
+        std::lock_guard lock(mutex_);
+        if (complete_) return;
+        response_.reset();
+        finish_locked();
+    }
+
+    bool abandoned() const {
+        std::lock_guard lock(mutex_);
+        return complete_ && !response_;
+    }
+
+    // Wait until the response is complete; null if it does not complete within `timeout`, or it
+    // was abandoned. The timer wakes the same wait: the caller may run on an executor of several
+    // threads, where the two branches of an `||` finishing at once would race on the cancellation
+    // signal of each other
     awaitable<std::shared_ptr<http_response>> wait(std::chrono::milliseconds timeout) {
         if (!is_complete()) {
             boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, timeout);
-            co_await (done_.async_receive(use_nothrow_awaitable) || timer.async_wait(use_nothrow_awaitable));
+            timer.async_wait([self = shared_from_this()](const boost::system::error_code& ec) {
+                if (!ec) self->done_.try_send(boost::system::error_code{});
+            });
+            co_await done_.async_receive(use_nothrow_awaitable);
         }
         std::lock_guard lock(mutex_);
         co_return complete_ ? response_ : nullptr;

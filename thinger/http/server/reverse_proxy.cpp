@@ -36,7 +36,8 @@ std::string proxy_exchange::describe() const {
             where = "http://" + target_.authority();
             break;
     }
-    return get_method(incoming_->get_method()) + " " + incoming_->get_uri() + " -> " + where;
+    // Without the query, as the other logs of a request being handled: it may have secrets
+    return get_method(incoming_->get_method()) + " " + incoming_->get_path() + " -> " + where;
 }
 
 void proxy_exchange::fail(http_response::status status, const std::string& message, const std::string& detail) {

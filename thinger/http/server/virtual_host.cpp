@@ -128,11 +128,21 @@ void virtual_host::serve_static(const std::string& url_prefix,
     if (!route.empty() && route.back() == '/') route.pop_back();
     route += "/:path(.*)";
 
-    auto handler = [directory = fs::path(directory), options = std::move(options)](request& req, response& res) {
-        file_server::serve(req, res, directory, options);
-    };
     // HEAD requests reach it too, unless a HEAD route matches them
-    get(route, std::move(handler)).hidden();
+    if (!options.fallthrough) {
+        get(route, [directory = fs::path(directory), options = std::move(options)](request& req, response& res) {
+            file_server::serve(req, res, directory, req["path"], options);
+        }).hidden();
+        return;
+    }
+    // A coroutine only to wait for the not-found handler. The router outlives it: it owns the route
+    get(route, [router = &settings_->router, directory = fs::path(directory), options = std::move(options)](
+                   request& req, response& res) -> thinger::awaitable<void> {
+        if (file_server::serve(req, res, directory, req["path"], options)) co_return;
+        // As if no route had matched it (the middlewares ran once, and do not run again)
+        req.set_matched_route(nullptr);
+        co_await router->handle_unmatched(req, res);
+    }).hidden();
 }
 
 } // namespace thinger::http

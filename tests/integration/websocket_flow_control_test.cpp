@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
@@ -524,6 +525,7 @@ TEST_CASE("WebSocket drop_oldest falls back to drop_newest", "[websocket][flow][
     static constexpr size_t big = 16 * 1024 * 1024;
     http::server server;
     std::promise<size_t> queued;
+    std::atomic<uint64_t> dropped{0};
     server.get("/ws", [&](http::request&, http::response& res) {
         res.upgrade_websocket({}, [&](ws_ptr ws) -> awaitable<void> {
             ws->set_write_limits({.max_messages = 3, .policy = http::overflow_policy::drop_oldest});
@@ -536,6 +538,7 @@ TEST_CASE("WebSocket drop_oldest falls back to drop_newest", "[websocket][flow][
             // the three are queued (started now, or before this resumes)
             co_await boost::asio::post(executor, use_awaitable);
             ws->send_binary(indexed(3, 10));
+            dropped = ws->dropped_messages();
             queued.set_value(ws->queued_messages());
         });
     });
@@ -543,6 +546,8 @@ TEST_CASE("WebSocket drop_oldest falls back to drop_newest", "[websocket][flow][
     raw_ws_client client(running.port);
     REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
     REQUIRE(queued.get_future().get() == 3);
+    // only the new message was dropped: it counts one
+    REQUIRE(dropped == 1);
     REQUIRE(read_indexes(client, 5s) == range(0, 3));
 }
 
@@ -696,5 +701,250 @@ TEST_CASE("WebSocket close codes of messages not delivered", "[websocket][flow][
         REQUIRE(close);
         REQUIRE(close->opcode == OP_CLOSE);
         REQUIRE(close->close_code() == 1009);
+    }
+}
+
+TEST_CASE("WebSocket dropped_messages counts what the overflow policy dropped", "[websocket][flow][dropped][integration]") {
+    http::server server;
+    std::promise<ws_ptr> created;
+    std::function<void(const ws_ptr&)> setup;
+    server.get("/ws", [&](http::request&, http::response& res) {
+        res.upgrade_websocket({}, [&](ws_ptr ws) {
+            setup(ws);
+            created.set_value(ws);
+        });
+    });
+    running_server running(server);
+    raw_ws_client client(running.port);
+    // What is sent in `setup`, on the thread of the websocket, while the client does not read yet.
+    // The counter is read from this thread, once `setup` ended
+    auto dropped_after = [&](std::function<void(const ws_ptr&)> sending) {
+        setup = std::move(sending);
+        REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
+        return created.get_future().get()->dropped_messages();
+    };
+    // All the client gets: `count` messages and nothing else
+    auto read_exactly = [&](uint64_t count) {
+        auto received = read_indexes(client, 5s, count);
+        REQUIRE(received.size() == count);
+        REQUIRE_FALSE(client.read_frame(100ms));
+        return received;
+    };
+
+    SECTION("A new connection: none") {
+        uint64_t at_first = 1;
+        REQUIRE(dropped_after([&](const ws_ptr& ws) { at_first = ws->dropped_messages(); }) == 0);
+        REQUIRE(at_first == 0);
+    }
+
+    SECTION("Without an overflow: none") {
+        auto dropped = dropped_after([](const ws_ptr& ws) {
+            ws->set_write_limits({.max_messages = 10, .policy = http::overflow_policy::drop_oldest});
+            for (uint32_t i = 0; i < 10; ++i) ws->send_binary(indexed(i, 100));
+        });
+        REQUIRE(dropped == 0);
+        REQUIRE(read_exactly(10) == range(0, 10));
+    }
+
+    SECTION("drop_newest: the new one") {
+        auto dropped = dropped_after([](const ws_ptr& ws) {
+            ws->set_write_limits({.max_messages = 10, .policy = http::overflow_policy::drop_newest});
+            for (uint32_t i = 0; i < 30; ++i) ws->send_binary(indexed(i, 100));
+        });
+        REQUIRE(dropped == 20);
+        REQUIRE(read_exactly(10) == range(0, 10));
+    }
+
+    SECTION("drop_oldest: what the client does not get") {
+        auto dropped = dropped_after([](const ws_ptr& ws) {
+            ws->set_write_limits({.max_messages = 10, .policy = http::overflow_policy::drop_oldest});
+            for (uint32_t i = 0; i < 30; ++i) ws->send_binary(indexed(i, 100));
+        });
+        REQUIRE(dropped > 0);
+        REQUIRE(read_exactly(30 - dropped).back() == 29);
+    }
+
+    SECTION("drop_oldest over a byte limit: all the older ones it made room with") {
+        auto dropped = dropped_after([](const ws_ptr& ws) {
+            ws->set_write_limits({.max_messages = 0, .max_bytes = 1000, .policy = http::overflow_policy::drop_oldest});
+            for (uint32_t i = 0; i < 3; ++i) ws->send_binary(indexed(i, 300));
+            // room for it takes two of them, the first one being written or not
+            ws->send_binary(indexed(3, 650));
+        });
+        REQUIRE(dropped == 2);
+        REQUIRE(read_exactly(2).back() == 3);
+    }
+}
+
+TEST_CASE("WebSocket dropped_messages with senders on many threads", "[websocket][flow][dropped][integration]") {
+    static constexpr uint32_t threads = 8;
+    static constexpr uint32_t each = 1000;
+    static constexpr int rounds = 50;
+    // all of them, 128 MiB, are more than the socket buffers hold: the queue overflows
+    static constexpr size_t size = 16 * 1024;
+    const auto policy = GENERATE(http::overflow_policy::drop_newest, http::overflow_policy::drop_oldest);
+
+    http::server server;
+    std::mutex mutex;
+    ws_ptr accepted;
+    server.get("/ws", [&](http::request&, http::response& res) {
+        res.upgrade_websocket({}, [&](ws_ptr ws) {
+            ws->set_write_limits({.max_messages = 10, .policy = policy});
+            std::scoped_lock lock(mutex);
+            accepted = std::move(ws);
+        });
+    });
+    running_server running(server);
+
+    for (int round = 0; round < rounds; ++round) {
+        INFO("round " << round);
+        raw_ws_client client(running.port);
+        REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
+        ws_ptr ws;
+        REQUIRE(eventually([&] {
+            std::scoped_lock lock(mutex);
+            ws = std::exchange(accepted, nullptr);
+            return ws != nullptr;
+        }));
+
+        // The client does not read until they all ended
+        auto seen = server_test::send_concurrently(threads, each, [&](uint32_t index) {
+            if (index % 2) ws->send_binary(indexed(index, size));
+            else ws->send_text(indexed(index, size));
+        }, [&] { return ws->dropped_messages(); });
+        REQUIRE(seen.reads > 0);
+        REQUIRE_FALSE(seen.decreased);
+        REQUIRE_FALSE(seen.above_sent);
+
+        // After what they sent, on the thread of the websocket: all of it was taken. A message
+        // awaited is never dropped, so it tells when the client got everything
+        on_ws_thread(ws, [] { return true; });
+        auto dropped = ws->dropped_messages();
+        co_spawn(ws->get_executor(), ws->send_text_async("end"), detached);
+
+        uint64_t received = 0;
+        for (;;) {
+            auto frame = client.read_frame(10s);
+            REQUIRE(frame);
+            REQUIRE(frame->opcode != OP_CLOSE);
+            if (frame->opcode == OP_PING) continue;
+            if (frame->payload == "end") break;
+            ++received;
+        }
+        REQUIRE(dropped > 0);
+        REQUIRE(received + dropped == threads * each);
+        REQUIRE(ws->dropped_messages() == dropped);
+    }
+}
+
+TEST_CASE("WebSocket dropped_messages does not count what the policy did not drop", "[websocket][flow][dropped][integration]") {
+    // More than the socket buffers hold: being written while the client does not read
+    static constexpr size_t big = 16 * 1024 * 1024;
+
+    http::server server;
+    std::promise<ws_ptr> created;
+    std::function<void(const ws_ptr&)> setup;
+    auto closed = std::make_shared<std::atomic<int>>(0);
+    server.get("/ws", [&, closed](http::request&, http::response& res) {
+        res.upgrade_websocket({}, [&, closed](ws_ptr ws) {
+            ws->on_close([closed](const http::websocket_close&) { ++*closed; });
+            setup(ws);
+            created.set_value(ws);
+        });
+    });
+    running_server running(server);
+    raw_ws_client client(running.port);
+
+    // A queue full with the client not reading: another message would overflow it
+    std::atomic<bool> filled{false};
+    const auto fill = [&](const ws_ptr& ws) {
+        ws->set_write_limits({.max_messages = 3, .policy = http::overflow_policy::drop_newest});
+        ws->send_binary(indexed(0, big));
+        ws->send_binary(indexed(1, 10));
+        ws->send_binary(indexed(2, 10));
+        filled = ws->queue_full();
+    };
+    // Messages that would overflow it, once closed: on its thread, and all taken on return
+    const auto send_once_closed = [](const ws_ptr& ws) {
+        REQUIRE(eventually([&] { return ws->queued_messages() == 0; }));
+        for (uint32_t i = 0; i < 20; ++i) ws->send_binary(indexed(i, 10));
+        on_ws_thread(ws, [] { return true; });
+    };
+
+    SECTION("Messages awaited, whatever the policy") {
+        const auto policy = GENERATE(http::overflow_policy::drop_newest, http::overflow_policy::drop_oldest,
+                                     http::overflow_policy::close);
+        auto written = std::make_shared<std::atomic<int>>(0);
+        setup = [&, written](const ws_ptr& ws) {
+            ws->set_write_limits({.max_messages = 2, .policy = policy});
+            for (uint32_t i = 0; i < 6; ++i) {
+                co_spawn(ws->get_executor(), ws->send_binary_async(indexed(i, 100)), [written](std::exception_ptr, bool done) {
+                    if (done) ++*written;
+                });
+            }
+        };
+        REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
+        auto ws = created.get_future().get();
+        REQUIRE(read_indexes(client, 5s, 6) == range(0, 6));
+        REQUIRE(eventually([&] { return *written == 6; }));
+        REQUIRE(ws->dropped_messages() == 0);
+    }
+
+    SECTION("Sent while closing, or once closed, and what was queued when it closed") {
+        std::atomic<uint64_t> dropped_closing{1};
+        setup = [&](const ws_ptr& ws) {
+            fill(ws);
+            ws->stop(1008, "x");
+            for (uint32_t i = 0; i < 20; ++i) ws->send_binary(indexed(i, 10));
+            dropped_closing = ws->dropped_messages();
+        };
+        REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
+        auto ws = created.get_future().get();
+        REQUIRE(filled);
+        REQUIRE(dropped_closing == 0);
+
+        std::optional<ws_frame> frame;
+        do { frame = client.read_frame(10s); } while (frame && frame->opcode != OP_CLOSE);
+        REQUIRE(frame);
+        REQUIRE(frame->close_code() == 1008);
+        client.send_frame(OP_CLOSE, close_payload(1008));
+        REQUIRE(eventually([&] { return *closed == 1; }));
+
+        send_once_closed(ws);
+        REQUIRE(ws->dropped_messages() == 0);
+    }
+
+    SECTION("The client closed with the queue full") {
+        setup = fill;
+        REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
+        auto ws = created.get_future().get();
+        REQUIRE(filled);
+        client.send_frame(OP_CLOSE, close_payload(1000));
+        REQUIRE(eventually([&] { return *closed == 1; }));
+
+        send_once_closed(ws);
+        REQUIRE(ws->dropped_messages() == 0);
+    }
+
+    SECTION("An overflow with overflow_policy::close") {
+        std::atomic<uint64_t> dropped_overflow{1};
+        setup = [&](const ws_ptr& ws) {
+            ws->set_write_limits({.max_messages = 3, .policy = http::overflow_policy::close});
+            for (uint32_t i = 0; i < 20; ++i) ws->send_binary(indexed(i, 10));
+            dropped_overflow = ws->dropped_messages();
+        };
+        REQUIRE(client.handshake("/ws").starts_with("HTTP/1.1 101"));
+        auto ws = created.get_future().get();
+        REQUIRE(dropped_overflow == 0);
+
+        std::optional<ws_frame> frame;
+        do { frame = client.read_frame(5s); } while (frame && frame->opcode != OP_CLOSE);
+        REQUIRE(frame);
+        REQUIRE(frame->close_code() == 1013);
+        client.send_frame(OP_CLOSE, close_payload(1013));
+        REQUIRE(eventually([&] { return *closed == 1; }));
+
+        send_once_closed(ws);
+        REQUIRE(ws->dropped_messages() == 0);
     }
 }

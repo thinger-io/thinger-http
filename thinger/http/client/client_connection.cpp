@@ -368,9 +368,11 @@ awaitable<std::shared_ptr<http_response>> client_connection::read_after_failed_w
     request_unsent_ = bytes == 0;
     // The server may have answered before taking the whole request, and closed the
     // connection (e.g. 413 for a body over its limit): its answer may be there to read,
-    // as curl does. The connection is never reused then
+    // as curl does. The connection is never reused then. A Unix socket whose peer closed fails
+    // the write with not_connected on macOS
     if (bytes == 0 || (write_ec != boost::asio::error::broken_pipe &&
-                       write_ec != boost::asio::error::connection_reset)) {
+                       write_ec != boost::asio::error::connection_reset &&
+                       write_ec != boost::asio::error::not_connected)) {
         co_return nullptr;
     }
     auto response = co_await read_response(request);

@@ -10,6 +10,11 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <libproc.h>
+#include <sys/proc_info.h>
+#include <sys/socket.h>
+#endif
 #include "../fixtures/transport_matrix.hpp"
 
 // The sockets of the library are not inherited by the programs its process runs (fork and
@@ -35,6 +40,13 @@ namespace {
         for (int descriptor = 0; descriptor < 1024; ++descriptor) {
             struct stat status{};
             if (::fstat(descriptor, &status) != 0 || !S_ISSOCK(status.st_mode)) continue;
+#if defined(__APPLE__)
+            // Not a socket of the library: getaddrinfo opens one to the kernel (com.apple.netsrc),
+            // inherited by the children of any process that resolves a name
+            socket_fdinfo info{};
+            if (::proc_pidfdinfo(::getpid(), descriptor, PROC_PIDFDSOCKETINFO, &info, sizeof(info)) > 0 &&
+                info.psi.soi_family == AF_SYSTEM) continue;
+#endif
             ++found.sockets;
             if (!(::fcntl(descriptor, F_GETFD) & FD_CLOEXEC)) found.inherited.push_back(descriptor);
         }

@@ -227,7 +227,10 @@ TEST_CASE("The executor client runs its requests on the caller's thread", "[clie
         http::test::running_workers workers(2);
         http::async_client pooled(workers);
         std::promise<bool> ok;
+        std::atomic<bool> on_its_worker{false};
         pooled.run([&]() -> awaitable<void> {
+            // Its executor is the plain one of the io_context of its worker
+            on_its_worker = asio::io_context_of(co_await boost::asio::this_coro::executor) == &workers.get_thread_io_context();
             auto worker = std::this_thread::get_id();
             auto client = co_await http::executor_client::for_current_coroutine();
             auto response = co_await client->get(origins.url_a + "/get");
@@ -236,6 +239,7 @@ TEST_CASE("The executor client runs its requests on the caller's thread", "[clie
         auto result = ok.get_future();
         REQUIRE(result.wait_for(10s) == std::future_status::ready);
         CHECK(result.get());
+        CHECK(on_its_worker);
     }
 
     SECTION("A coroutine of an executor without io_context cannot have one") {

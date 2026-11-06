@@ -38,11 +38,13 @@ std::pair<std::string, std::string> generate_test_certificate(const std::string&
     X509_set_pubkey(x509, pkey);
     
     // Set subject
-    X509_NAME* name = X509_get_subject_name(x509);
+    X509_NAME* name = X509_NAME_new();
     X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC, (unsigned char*)"US", -1, -1, 0);
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char*)common_name.c_str(), -1, -1, 0);
-    
+
+    X509_set_subject_name(x509, name);
     X509_set_issuer_name(x509, name);
+    X509_NAME_free(name);
     X509_sign(x509, pkey, EVP_sha256());
     
     // Convert to PEM
@@ -200,7 +202,7 @@ std::string get_certificate_cn(const std::shared_ptr<boost::asio::ssl::context>&
     X509* cert = SSL_CTX_get0_certificate(ssl_ctx);
     if (!cert) return "";
     
-    X509_NAME* subject = X509_get_subject_name(cert);
+    const X509_NAME* subject = X509_get_subject_name(cert);
     char cn[256];
     if (X509_NAME_get_text_by_NID(subject, NID_commonName, cn, sizeof(cn)) > 0) {
         return {cn};

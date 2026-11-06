@@ -305,6 +305,10 @@ namespace thinger::http {
         return queue_->queued_messages();
     }
 
+    uint64_t sse_connection::dropped_messages() const{
+        return queue_->dropped_messages();
+    }
+
     void sse_connection::on_high_watermark(sync_callback<void()> callback){
         queue_->on_high_watermark(std::move(callback));
     }

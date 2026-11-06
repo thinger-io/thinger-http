@@ -240,7 +240,7 @@ bool proxy_exchange::check_outgoing(const http_request& outgoing) {
         return false;
     }
     if (!is_request_target(outgoing.get_uri())) {
-        fail(http_response::status::internal_server_error, "", "invalid path for the target: " + outgoing.get_uri());
+        fail(http_response::status::internal_server_error, "", "invalid path for the target: " + outgoing.get_path());
         return false;
     }
     if (!has_valid_headers(outgoing)) {

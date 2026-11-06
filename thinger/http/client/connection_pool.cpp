@@ -5,6 +5,16 @@
 
 namespace thinger::http {
 
+namespace {
+
+    // A key for the logs, without its last field: the credentials of a proxy, if it has one
+    // (see proxy_endpoint::key())
+    [[maybe_unused]] std::string_view loggable(std::string_view key) {
+        return key.substr(0, key.rfind('|'));
+    }
+
+}
+
 struct connection_pool::state : std::enable_shared_from_this<state> {
     struct idle_entry {
         std::string key;
@@ -146,7 +156,7 @@ struct connection_pool::state : std::enable_shared_from_this<state> {
             connection = remove(*entry);
             prune(key);
         }
-        LOG_DEBUG("closing a connection idle for too long ({})", key);
+        LOG_DEBUG("closing a connection idle for too long ({})", loggable(key));
         connection->close();
     }
 };
@@ -232,7 +242,7 @@ connection_pool::lease connection_pool::acquire(const std::string& key) {
             }
         }
     }
-    if (!closing.empty()) LOG_DEBUG("closing {} idle connections closed or expired ({})", closing.size(), key);
+    if (!closing.empty()) LOG_DEBUG("closing {} idle connections closed or expired ({})", closing.size(), loggable(key));
     for (auto& connection : closing) connection->close();
     if (!found) return {};
     return lease(state_, key, std::move(found));

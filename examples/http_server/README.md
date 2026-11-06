@@ -105,22 +105,43 @@ Basic HTTP authentication.
 
 ### server_cors_example
 
-Cross-Origin Resource Sharing configuration.
+Cross-origin requests from a browser, with a list of origins and credentials. The server listens on two ports: open the test page on the second (`port + 1`), which is the origin allowed, and it calls the API on the first. It sends a cookie, which needs the credentials, and `Authorization` and JSON, which need the preflights the server answers.
 
 ```bash
 ./server_cors_example [port]
+curl -i -H "Origin: http://localhost:8092" localhost:8091/api/data
+curl -i -X OPTIONS -H "Origin: http://localhost:8092" -H "Access-Control-Request-Method: PUT" localhost:8091/api/data
 ```
 
 ```cpp
-server.enable_cors();  // Allow all origins
+// The defaults, those of cors() in Express: any origin, without credentials
+server.enable_cors();
 
-// Or configure specific origins
-server.enable_cors({
-    .origins = {"https://example.com"},
-    .methods = {"GET", "POST"},
-    .headers = {"Content-Type", "Authorization"}
-});
+// A list of origins with credentials: the origin of the request, if listed, is reflected.
+// Returns invalid_argument for options that cannot be applied, e.g. credentials with "*"
+if (auto ec = server.enable_cors({
+        .origins = {"http://localhost:8092", "https://console.example.com"},
+        .allowed_headers = std::vector<std::string>{"Content-Type", "Authorization"},
+        .exposed_headers = {"X-Total-Count"},
+        .max_age = std::chrono::minutes(10),
+        .credentials = true,
+    })) {
+    return 1;
+}
 ```
+
+| `http::cors_options` | Default |
+|---|---|
+| `origins` | `{"*"}`: any origin, or a list of exact origins |
+| `origin_filter` | none: a function that decides instead of the list |
+| `methods` | `GET, HEAD, PUT, PATCH, POST, DELETE` |
+| `allowed_headers` | no value: reflect what a preflight asks for |
+| `exposed_headers` | empty |
+| `max_age` | no value: `Access-Control-Max-Age` is not sent |
+| `credentials` | `false` |
+| `preflight_continue` | `false`: the library answers preflights itself |
+
+A preflight (`OPTIONS` with `Access-Control-Request-Method`) is answered with `204` on any path, without running the middlewares; with `.preflight_continue = true` it goes through routing and the middlewares as any request. See [CORS](../../README.md#cors) in the main README.
 
 ### server_shutdown_example
 

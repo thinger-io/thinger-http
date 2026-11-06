@@ -7,17 +7,50 @@
 #include "../../util/base64.hpp"
 #include "../../util/ascii.hpp"
 #include <boost/algorithm/string.hpp>
+#include <boost/intrusive/list.hpp>
+#include <atomic>
 #include <mutex>
 #include <optional>
+#include <utility>
+#include <vector>
 
 namespace thinger::http {
 
 // What serving a request reads: the hosts and their routes, the middlewares and the settings of
-// the application. Its connections keep it (see connection_handler()), so the requests still
-// running when a server is destroyed find it. It never refers to the application
+// the application. Its connections and its dispatches in memory keep it (see connection_handler()
+// and dispatch()), so the requests still running when the application is destroyed find it. It
+// never refers to the application
 class http_application::state : public std::enable_shared_from_this<state> {
 public:
     explicit state(std::unique_ptr<virtual_host> default_host) : default_host_(std::move(default_host)) {}
+
+    // The source of a request dispatched in memory, which is also how close() reaches it: it
+    // lives as the request does, as long as a handler outliving its answer may run. The request
+    // owns it, and it does not own the request, nor what reaches it through a response hook
+    // (the response is only weakly held)
+    struct tracked_source : detail::memory_source, boost::intrusive::list_base_hook<> {
+        tracked_source(std::string body, std::string peer_ip, std::shared_ptr<state> owner,
+                       std::shared_ptr<http_stream> stream, std::weak_ptr<memory_response> memory)
+            : detail::memory_source(std::move(body), std::move(peer_ip)), owner(std::move(owner)),
+              stream(std::move(stream)), memory(std::move(memory)) {}
+        ~tracked_source() override;
+
+        std::shared_ptr<state> owner;
+        std::shared_ptr<http_stream> stream;
+        std::weak_ptr<memory_response> memory;
+    };
+
+    // In-memory dispatch, on a frame keeping this state instead of the application. Static: a
+    // member coroutine would only keep a raw pointer to it
+    static awaitable<std::shared_ptr<http_response>> dispatch(std::shared_ptr<state> self,
+                                                              std::shared_ptr<http_request> http_request,
+                                                              dispatch_options options);
+    // Track an in-memory dispatch; false if the application is gone already
+    bool track(tracked_source& source);
+    // The application is being destroyed: from now on no request starts, and the dispatches in
+    // flight are ended and their handlers interrupted, without waiting for them
+    void close();
+    bool closed() const { return closed_.load(std::memory_order_acquire); }
 
     // handle(), telling `created` the response once created (for in-memory dispatch, which
     // answers its timeout)
@@ -35,6 +68,14 @@ public:
                                        http_response::status status);
     awaitable<bool> run_middlewares(request& req, response& res);
     awaitable<void> discard_unread_body(request& req);
+    // What CORS means for the request, set on its response before anything may answer it, and
+    // what comes next
+    enum class cors_step { go_on, answer_preflight, fail };
+    cors_step decide_cors(const http_request& head, response& res) const;
+    // Answers a request that CORS alone settles: a preflight, or an origin it could not decide
+    awaitable<void> answer_cors(request& req, response& res, cors_step step);
+    // Whether a handler can start, marking it as started if so
+    bool start_handler(http_stream* stream) const;
 
     // The application as the default host: its settings, shared with the application
     std::unique_ptr<virtual_host> default_host_;
@@ -43,7 +84,9 @@ public:
     body_settings body_settings_;
     openapi_generator openapi_{default_host_->router(), &body_settings_};
     std::vector<async_middleware_function> middlewares_;
-    bool cors_enabled_{false};
+
+    // Cross-origin requests (off if null)
+    std::shared_ptr<const detail::cors_policy> cors_;
 
     // Maximum allowed request body size
     size_t max_body_size_{default_max_body_size};
@@ -60,10 +103,47 @@ public:
 
     // Called with every response (none if null)
     std::shared_ptr<const response_hook> response_hook_;
+
+    // The dispatches in flight (see close()). Written under the mutex, closed_ is read without it
+    std::mutex dispatches_mutex_;
+    boost::intrusive::list<tracked_source> dispatches_;
+    std::atomic<bool> closed_{false};
 };
 
 http_application::http_application()
     : state_(std::make_shared<state>(std::unique_ptr<virtual_host>(new virtual_host(settings_)))) {}
+
+http_application::~http_application() {
+    state_->close();
+}
+
+bool http_application::state::track(tracked_source& source) {
+    std::scoped_lock lock(dispatches_mutex_);
+    if (closed_.load(std::memory_order_relaxed)) return false;
+    dispatches_.push_back(source);
+    return true;
+}
+
+http_application::state::tracked_source::~tracked_source() {
+    std::scoped_lock lock(owner->dispatches_mutex_);
+    if (is_linked()) owner->dispatches_.erase(owner->dispatches_.iterator_to(*this));
+}
+
+void http_application::state::close() {
+    std::vector<std::pair<std::shared_ptr<http_stream>, std::weak_ptr<memory_response>>> in_flight;
+    {
+        std::scoped_lock lock(dispatches_mutex_);
+        closed_.store(true, std::memory_order_release);
+        in_flight.reserve(dispatches_.size());
+        for (const auto& source : dispatches_) in_flight.emplace_back(source.stream, source.memory);
+    }
+    for (const auto& [stream, memory] : in_flight) {
+        // First the response, so what an interrupted handler answers is dropped; one already
+        // complete is delivered
+        if (auto response = memory.lock()) response->abandon();
+        stream->cancel(cancel_reason::shutdown);
+    }
+}
 
 std::function<awaitable<void>(std::shared_ptr<request>)> http_application::connection_handler() const {
     return [state = state_](std::shared_ptr<request> req) {
@@ -287,8 +367,15 @@ openapi_generator& http_application::openapi() {
 }
 
 // Configuration
-void http_application::enable_cors(bool enabled) {
-    state_->cors_enabled_ = enabled;
+boost::system::error_code http_application::enable_cors(cors_options options) {
+    auto policy = detail::make_cors_policy(std::move(options));
+    if (!policy) return make_error_code(boost::system::errc::invalid_argument);
+    state_->cors_ = std::move(policy);
+    return {};
+}
+
+void http_application::disable_cors() {
+    state_->cors_.reset();
 }
 
 void http_application::set_max_body_size(size_t size) {
@@ -484,6 +571,37 @@ namespace {
 
 }
 
+http_application::state::cors_step http_application::state::decide_cors(const http_request& head, response& res) const {
+    detail::cors_decision decision;
+    auto step = cors_step::go_on;
+    try {
+        decision = detail::decide_cors(*cors_, head);
+        if (decision.answer_preflight) step = cors_step::answer_preflight;
+    } catch (...) {
+        LOG_ERROR("Exception in the CORS origin filter: {}", describe(std::current_exception()));
+        step = cors_step::fail;
+    }
+    res.set_cors(cors_, std::move(decision));
+    return step;
+}
+
+awaitable<void> http_application::state::answer_cors(request& req, response& res, cors_step step) {
+    if (step == cors_step::answer_preflight) {
+        // For every host and path, with no route whose limits apply, and no middleware (a
+        // preflight never has credentials). Any body it has is dropped, not taken as the
+        // next request
+        auto no_content = std::make_shared<http_response>();
+        no_content->set_status(http_response::status::no_content);
+        res.send_response(no_content);
+        if (req.has_pending_body()) co_await discard_unread_body(req);
+    } else {
+        // Nothing of the application runs on a request whose origin could not be decided; its
+        // body, sent or not, is not read: the connection is not reused then
+        if (req.has_pending_body()) must_close(req, detail::close_reason::body_unread);
+        res.error(http_response::status::internal_server_error);
+    }
+}
+
 awaitable<void> http_application::handle(std::shared_ptr<request> req, std::shared_ptr<response_sink> sink) {
     // Its coroutine, not one more around it
     return state_->handle(std::move(req), std::move(sink), nullptr);
@@ -498,11 +616,12 @@ awaitable<void> http_application::state::handle(std::shared_ptr<request> req, st
         sink->observe(handled.observer);
     }
 
-    response res(std::move(sink), req->get_http_request(), cors_enabled_);
+    response res(std::move(sink), req->get_http_request());
     auto http_request = req->get_http_request();
 
     // Server settings the request and its response depend on
     res.set_error_formatter(error_formatter_);
+    auto cors_next = cors_ ? decide_cors(*http_request, res) : cors_step::go_on;
     if (created) created(res);
     req->set_trusted_proxies(trusted_proxies_);
     req->set_max_body_size(max_body_size_);
@@ -519,6 +638,11 @@ awaitable<void> http_application::state::handle(std::shared_ptr<request> req, st
     }
 
     if (refused_before_routing(*req, *http_request, res)) [[unlikely]] co_return;
+
+    if (cors_next != cors_step::go_on) [[unlikely]] {
+        co_await answer_cors(*req, res, cors_next);
+        co_return;
+    }
 
     // Match the virtual host (by the Host header), then the route among its routes, whose
     // limits apply from here
@@ -548,6 +672,19 @@ awaitable<void> http_application::state::handle(std::shared_ptr<request> req, st
     co_await serve(std::move(req), res, *host, matched_route);
 }
 
+bool http_application::state::start_handler(http_stream* stream) const {
+    // Nothing starts once the application is gone. Checked in the step marking the handler
+    // as started: close() cancels its scope later, on this executor, or this sees it closed.
+    // Left unanswered: the request has no one to answer to (see close())
+    if (closed()) [[unlikely]] {
+        if (stream) stream->handler_ended();
+        return false;
+    }
+    // The signals of the scope are emitted only while the handler runs (on this executor)
+    if (stream) stream->handler_started();
+    return true;
+}
+
 awaitable<void> http_application::state::serve(std::shared_ptr<request> req, response& res, virtual_host& host,
                                                const route* matched_route) {
     // The handler runs within the cancellation scope of its stream, on a coroutine bound to it
@@ -560,14 +697,14 @@ awaitable<void> http_application::state::serve(std::shared_ptr<request> req, res
         failure = co_await serve_on_own_coroutine(*stream, serve(req, res, host, matched_route));
         if (!failure) co_return;
     } else {
-        // The signals of the scope are emitted only while the handler runs (on this executor)
-        if (stream) stream->handler_started();
+        if (!start_handler(stream.get())) [[unlikely]] co_return;
         // Any exception is answered below with 500 unless the scope interrupted the handler
         try {
             if (!middlewares_.empty() && !co_await run_middlewares(*req, res)) {
-                // STOPPED by a middleware, which answered (before reading the body)
+                // STOPPED by a middleware, which answered (before reading the body), or the
+                // application is gone
             } else if (auto how = dispatch_of(*req, res, matched_route); how == dispatch_kind::unmatched) {
-                co_await host.router().handle_unmatched(req, res);
+                co_await host.router().handle_unmatched(*req, res);
             } else if (how == dispatch_kind::handle ||
                        (how == dispatch_kind::read_then_handle && co_await req->read_body())) {
                 co_await matched_route->handle_request_coro(*req, res);
@@ -677,9 +814,15 @@ awaitable<void> http_application::state::serve_with_timeout(std::shared_ptr<requ
 // In-memory dispatch
 awaitable<std::shared_ptr<http_response>> http_application::dispatch(std::shared_ptr<http_request> http_request,
                                                                      dispatch_options options) {
-    if (!http_request) co_return state_->make_error_response(http_response::status::bad_request, "Missing request");
+    return state::dispatch(state_, std::move(http_request), std::move(options));
+}
+
+awaitable<std::shared_ptr<http_response>> http_application::state::dispatch(std::shared_ptr<state> self,
+                                                                            std::shared_ptr<http_request> http_request,
+                                                                            dispatch_options options) {
+    if (!http_request) co_return self->make_error_response(http_response::status::bad_request, "Missing request");
     if (http_request->is_chunked_transfer()) {
-        co_return state_->make_error_response(http_response::status::bad_request, "Chunked requests cannot be dispatched in memory");
+        co_return self->make_error_response(http_response::status::bad_request, "Chunked requests cannot be dispatched in memory");
     }
 
     // The body comes from memory (see detail::memory_source): handlers read it like on a
@@ -698,8 +841,10 @@ awaitable<std::shared_ptr<http_response>> http_application::dispatch(std::shared
     // of the response. handle() answers whatever the middlewares, body reading or handler throw.
     auto strand = boost::asio::make_strand(executor);
     auto stream = std::make_shared<http_stream>(1, *http_request, strand);
-    auto req = std::make_shared<request>(
-        std::make_unique<detail::memory_source>(std::move(body), std::move(options.remote_ip)), stream, http_request);
+    auto source = std::make_unique<tracked_source>(std::move(body), std::move(options.remote_ip), self, stream, memory);
+    // The application is gone: nothing starts, and the caller gets what cancelling it gets
+    if (!self->track(*source)) throw boost::system::system_error(boost::asio::error::operation_aborted);
+    auto req = std::make_shared<request>(std::move(source), stream, http_request);
     req->context() = std::move(options.context);
     // The response, once created on the strand, to answer the timeout through it
     struct created_response {
@@ -708,15 +853,17 @@ awaitable<std::shared_ptr<http_response>> http_application::dispatch(std::shared
     };
     auto created = std::make_shared<created_response>();
     co_spawn(strand,
-        [state = state_, req, memory, created]() -> awaitable<void> {
-            co_await state->handle(req, memory, [created](const response& res) {
+        [self, req, memory, created]() -> awaitable<void> {
+            // The application went first: the request never reached it, nor its response hook
+            if (self->closed()) co_return;
+            co_await self->handle(req, memory, [created](const response& res) {
                 std::scoped_lock lock(created->mutex);
                 created->res.emplace(res);
             });
         },
         // What handle() itself throws is a 500, at once (unless the response is complete)
-        [state = state_, memory](const std::exception_ptr& error) {
-            if (error) memory->send(state->make_error_response(http_response::status::internal_server_error, ""));
+        [self, memory](const std::exception_ptr& error) {
+            if (error) memory->send(self->make_error_response(http_response::status::internal_server_error, ""));
         });
 
     auto result = co_await memory->wait(options.timeout);
@@ -727,7 +874,7 @@ awaitable<std::shared_ptr<http_response>> http_application::dispatch(std::shared
         stream->cancel(cancel_reason::client_gone);
         throw boost::system::system_error(boost::asio::error::operation_aborted);
     }
-    if (!result) {
+    if (!result && !memory->abandoned()) {
         // Answered with the timeout as a route timeout does (a later answer is dropped, and
         // logged as late), without the headers the handler may still be setting on the strand;
         // unless an answer started first. Before the response exists, the 504 is collected alone
@@ -739,15 +886,19 @@ awaitable<std::shared_ptr<http_response>> http_application::dispatch(std::shared
         if (res) {
             res->answer_timeout(http_response::status::gateway_timeout, false);
         } else {
-            memory->send(state_->make_error_response(http_response::status::gateway_timeout, "No response within the timeout"));
+            memory->send(self->make_error_response(http_response::status::gateway_timeout, "No response within the timeout"));
         }
         // Then the scope of the request is cancelled, on the strand: its handler goes on unless
         // its route declared the timeout (see route::cancel_on)
         stream->cancel(cancel_reason::timeout);
         result = co_await memory->wait(std::chrono::milliseconds(0));
         // An answer that started first and is not complete
-        if (!result) result = state_->make_error_response(http_response::status::gateway_timeout, "No response within the timeout");
+        if (!result && !memory->abandoned()) {
+            result = self->make_error_response(http_response::status::gateway_timeout, "No response within the timeout");
+        }
     }
+    // The application was destroyed without a complete response (see close())
+    if (!result) throw boost::system::system_error(boost::asio::error::operation_aborted);
     co_return result;
 }
 
@@ -755,9 +906,13 @@ void http_application::dispatch(const boost::asio::any_io_executor& executor,
                                 std::shared_ptr<http_request> request,
                                 sync_callback<void(std::shared_ptr<http_response>)> callback,
                                 dispatch_options options) {
-    co_spawn(executor, dispatch(std::move(request), std::move(options)),
+    co_spawn(executor, state::dispatch(state_, std::move(request), std::move(options)),
         [state = state_, callback = std::move(callback)](std::exception_ptr error, std::shared_ptr<http_response> result) {
-            if (error || !result) {
+            if (error && state->closed()) {
+                // The application was destroyed: no error to report to a callback, so a status
+                // saying what happened (RFC 9110 section 15.6.4)
+                result = state->make_error_response(http_response::status::service_unavailable, "Service Unavailable");
+            } else if (error || !result) {
                 result = state->make_error_response(http_response::status::internal_server_error, "");
             }
             callback(std::move(result));
@@ -776,6 +931,10 @@ awaitable<bool> http_application::state::run_middlewares(request& req, response&
         }
 
         if (res.has_responded()) co_return false;
+
+        // A middleware may suspend: nothing else starts if the application went meanwhile, whose
+        // cancellation may still be queued behind this step (left unanswered, see serve())
+        if (closed()) [[unlikely]] co_return false;
 
         if (!next) {
             // stopped without responding: answer anyway so the stream is not left pending

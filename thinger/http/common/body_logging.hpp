@@ -2,6 +2,7 @@
 #define THINGER_HTTP_BODY_LOGGING_HPP
 
 #include <cstddef>
+#include "../util/url.hpp"
 
 namespace thinger::http {
 
@@ -17,6 +18,10 @@ namespace thinger::http {
 
         bool enabled = false;
         size_t max_length = default_max_length;
+        // The query parameters hidden from the URIs logged, whether `enabled` or not: the
+        // request line and, if `enabled`, the values of Location, Content-Location and Referer.
+        // Assigning the two fields above with {true, 512} sets this back to the defaults
+        util::url::redacted_parameters redact = util::url::redacted_parameters::defaults();
     };
 
 }

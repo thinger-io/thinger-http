@@ -258,17 +258,7 @@ public:
     template<typename Callback>
         requires requires { std::declval<Client>().run(std::declval<std::function<awaitable<void>()>>()); }
     void websocket(Callback&& callback) {
-        auto req = request_;
-        auto proto = protocol_;
-        client_->run([client = client_, req, proto, cb = std::forward<Callback>(callback)]() mutable -> awaitable<void> {
-            auto result = co_await client->http_client_base::upgrade_websocket(std::move(req), proto);
-            if (result) {
-                auto ws = std::make_shared<websocket_client>(std::move(*result));
-                co_await call_and_await(cb, ws);
-            } else {
-                co_await call_and_await(cb, std::shared_ptr<websocket_client>{});
-            }
-        });
+        client_->websocket_with_callback(request_, protocol_, std::forward<Callback>(callback));
     }
 
 private:
@@ -300,11 +290,8 @@ private:
         if (!body_content_.empty()) {
             request_->set_content(std::move(body_content_), std::move(body_content_type_));
         }
-        auto req = request_;
-        client_->run([client = client_, req, cb = std::forward<Callback>(callback)]() mutable -> awaitable<void> {
-            auto response = co_await client->http_client_base::send(std::move(req));
-            co_await call_and_await(cb, response);
-        });
+        client_->run_with_callback([req = request_](auto c) mutable { return c.client.send(std::move(req)); },
+                                   std::forward<Callback>(callback));
     }
 };
 

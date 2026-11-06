@@ -14,6 +14,7 @@ asio/listener.hpp
 asio/watchdog.hpp
 http/common/syntax.hpp
 http/server/body_decoders.hpp
+http/server/file_server/static_files.hpp
 http/server/upgrade.hpp
 http/util/url.hpp
 http/util/utf8.hpp

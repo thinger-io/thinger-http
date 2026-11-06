@@ -1,16 +1,22 @@
 #include <catch2/catch_test_macros.hpp>
+#include <thinger/http/client/async_client.hpp>
 #include <thinger/http/client/client.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
+#include <thinger/http/server/reverse_proxy.hpp>
 #include <thinger/http/server/server_standalone.hpp>
 #include <thinger/http/server/websocket_connection.hpp>
 #include <thinger/util/logger.hpp>
 #include <spdlog/sinks/ringbuffer_sink.h>
+#include <boost/asio.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include "../fixtures/running_workers.hpp"
 #include "server_test_helpers.hpp"
 
 // The logs of the HTTP messages never show what may be a credential: bodies, WebSocket
@@ -19,6 +25,7 @@
 
 using namespace thinger;
 using server_test::running_server;
+using thinger::http::util::url::redacted_parameters;
 
 namespace {
 
@@ -90,6 +97,55 @@ namespace {
             REQUIRE(line.find(request_cookie) == std::string::npos);
             REQUIRE(line.find(response_cookie) == std::string::npos);
         }
+    }
+
+    redacted_parameters defaults_and(std::string_view name) {
+        auto names = redacted_parameters::defaults();
+        names.add(name);
+        return names;
+    }
+
+    void answer_ok(http::server& server) {
+        for (const char* path : {"/x", "/join"}) {
+            server.get(path, [](http::request&, http::response& res) { res.send("ok"); });
+        }
+    }
+
+    void redact_on(http::server& server, const redacted_parameters& names) {
+        http::connection_options options;
+        options.logging.redact = names;
+        server.set_connection_options(options);
+    }
+
+    // The request line of a server redacting `names`, for a request for `target`
+    void require_server_line(const redacted_parameters& names, const std::string& target, const std::string& line) {
+        http::server server;
+        answer_ok(server);
+        redact_on(server, names);
+        // The logger set before the server thread logs, and restored after it ends
+        log_capture logs;
+        running_server running(server);
+
+        http::client client;
+        REQUIRE(client.get(running.url(target)).status() == 200);
+
+        INFO("captured logs:\n" << logs.dump());
+        REQUIRE(logs.contains("[SERVER REQUEST] " + line));
+    }
+
+    // The request line of a client redacting `names`, for a request for `target`
+    void require_client_line(const redacted_parameters& names, const std::string& target, const std::string& line) {
+        http::server server;
+        answer_ok(server);
+        log_capture logs;
+        running_server running(server);
+
+        http::client client;
+        client.redact_parameters(names);
+        REQUIRE(client.get(running.url(target)).status() == 200);
+
+        INFO("captured logs:\n" << logs.dump());
+        REQUIRE(logs.contains("[CLIENT->] " + line));
     }
 
 }
@@ -196,9 +252,9 @@ TEST_CASE("Two servers of one process log each as configured", "[logging][connec
     for (auto* server : {&logging_server, &quiet_server}) {
         server->post("/reply", [](http::request& req, http::response& res) { res.send("reply-to-" + req.body()); });
     }
+    log_capture logs;
     running_server logging_running(logging_server);
     running_server quiet_running(quiet_server);
-    log_capture logs;
 
     http::client client;
     auto post = [&](uint16_t port, const std::string& name) {
@@ -256,4 +312,524 @@ TEST_CASE("Credentials in the query string are redacted from the request lines",
     require_no_secret(logs);
     REQUIRE(logs.contains("[CLIENT->] GET /data?authorization=[redacted]&count=10"));
     REQUIRE(logs.contains("[SERVER REQUEST] GET /data?authorization=[redacted]&count=10"));
+}
+
+TEST_CASE("One-time codes in the query string are redacted by default", "[logging][integration]") {
+    http::server server;
+    server.get("/cb", [](http::request&, http::response& res) { res.send("ok"); });
+    // The logger set before the server thread logs, and restored after it ends
+    log_capture logs;
+    running_server running(server);
+
+    http::client client;
+    auto res = client.get("http://127.0.0.1:" + std::to_string(running.port) + "/cb?code=abc&state=s");
+    REQUIRE(res.status() == 200);
+
+    INFO("captured logs:\n" << logs.dump());
+    REQUIRE(logs.contains("[SERVER REQUEST] GET /cb?code=[redacted]&state=s"));
+    REQUIRE(logs.contains("[CLIENT->] GET /cb?code=[redacted]&state=s"));
+    REQUIRE_FALSE(logs.contains("abc"));
+}
+
+TEST_CASE("No request line is logged with the info level off", "[logging][integration]") {
+    http::server server;
+    server.get("/cb", [](http::request&, http::response& res) { res.send("ok"); });
+    // The logger set before the server thread logs, and restored after it ends
+    log_capture logs;
+    logging::get_logger()->set_level(spdlog::level::warn);
+    running_server running(server);
+
+    http::client client;
+    auto res = client.get("http://127.0.0.1:" + std::to_string(running.port) + "/cb?code=abc&state=s");
+    REQUIRE(res.status() == 200);
+
+    INFO("captured logs:\n" << logs.dump());
+    REQUIRE_FALSE(logs.contains("[SERVER REQUEST]"));
+    REQUIRE_FALSE(logs.contains("[CLIENT->]"));
+}
+
+TEST_CASE("Connection options and clients start from the default set of names", "[logging][integration]") {
+    http::connection_options options;
+    REQUIRE(options.logging.redact.contains("code"));
+    REQUIRE(options.logging.redact.size() == redacted_parameters::defaults().size());
+
+    // The two fields of the opt-in are set as before, which also goes back to the defaults
+    options.logging.redact = {"invite"};
+    options.logging = {true, 512};
+    REQUIRE(options.logging.enabled);
+    REQUIRE(options.logging.max_length == 512);
+    REQUIRE(options.logging.redact.contains("code"));
+    REQUIRE_FALSE(options.logging.redact.contains("invite"));
+
+    http::client client;
+    REQUIRE(client.get_body_logging().redact.contains("code"));
+}
+
+TEST_CASE("A server redacts the names of its connection options", "[logging][connection_options][integration]") {
+    SECTION("the defaults and one more") {
+        require_server_line(defaults_and("invite"), "/join?invite=xyz&code=abc&page=2",
+                            "GET /join?invite=[redacted]&code=[redacted]&page=2");
+    }
+    SECTION("the defaults but one") {
+        auto names = redacted_parameters::defaults();
+        names.remove("key");
+        require_server_line(names, "/x?key=visible&token=t", "GET /x?key=visible&token=[redacted]");
+    }
+    SECTION("a set of its own, which replaces the defaults") {
+        require_server_line({"invite"}, "/x?invite=a&code=b", "GET /x?invite=[redacted]&code=b");
+    }
+    SECTION("no name at all") {
+        require_server_line({}, "/x?code=b&token=t", "GET /x?code=b&token=t");
+    }
+    SECTION("without case, on both sides") {
+        require_server_line({"Invite"}, "/x?INVITE=a", "GET /x?INVITE=[redacted]");
+    }
+    SECTION("whether it logs the header values and the bodies or not") {
+        http::server server;
+        answer_ok(server);
+        http::connection_options options;
+        options.logging.enabled = true;
+        options.logging.redact = {"invite"};
+        server.set_connection_options(options);
+        log_capture logs;
+        running_server running(server);
+
+        http::client client;
+        REQUIRE(client.get(running.url("/x?invite=a&code=b")).status() == 200);
+
+        INFO("captured logs:\n" << logs.dump());
+        REQUIRE(logs.contains("[SERVER REQUEST] GET /x?invite=[redacted]&code=b"));
+    }
+}
+
+TEST_CASE("A client redacts the names set on it", "[logging][integration]") {
+    SECTION("the defaults and one more") {
+        require_client_line(defaults_and("invite"), "/join?invite=xyz", "GET /join?invite=[redacted]");
+    }
+    SECTION("a set of its own, which replaces the defaults") {
+        require_client_line({"invite"}, "/x?invite=a&code=b", "GET /x?invite=[redacted]&code=b");
+    }
+    SECTION("no name at all") {
+        require_client_line({}, "/x?code=b", "GET /x?code=b");
+    }
+    SECTION("without case, on both sides") {
+        require_client_line({"Invite"}, "/x?INVITE=a", "GET /x?INVITE=[redacted]");
+    }
+}
+
+TEST_CASE("An async_client redacts the names set on it", "[logging][integration]") {
+    http::server server;
+    answer_ok(server);
+    log_capture logs;
+    running_server running(server);
+    http::test::running_workers workers;
+
+    http::async_client client(workers);
+    client.redact_parameters(defaults_and("invite"));
+    std::atomic<int> status{0};
+    client.get(running.url("/join?invite=xyz"), [&](http::client_response& res) { status = res.status(); });
+    client.wait();
+    REQUIRE(status == 200);
+
+    INFO("captured logs:\n" << logs.dump());
+    REQUIRE(logs.contains("[CLIENT->] GET /join?invite=[redacted]"));
+    // Its own set: the server, with the defaults, shows it
+    REQUIRE(logs.contains("[SERVER REQUEST] GET /join?invite=xyz"));
+    REQUIRE_FALSE(logs.contains("[CLIENT->] GET /join?invite=xyz"));
+}
+
+TEST_CASE("log_bodies() keeps the names of a client", "[logging][integration]") {
+    http::server server;
+    answer_ok(server);
+    log_capture logs;
+    running_server running(server);
+
+    http::client client;
+    client.redact_parameters({"invite"}).log_bodies(true, 64);
+    REQUIRE(client.get_body_logging().enabled);
+    REQUIRE(client.get_body_logging().max_length == 64);
+    REQUIRE(client.get(running.url("/x?invite=a&code=b")).status() == 200);
+    client.log_bodies(false);
+    REQUIRE_FALSE(client.get_body_logging().enabled);
+    REQUIRE(client.get(running.url("/x?invite=c&code=d")).status() == 200);
+
+    INFO("captured logs:\n" << logs.dump());
+    REQUIRE(logs.contains("[CLIENT->] GET /x?invite=[redacted]&code=b"));
+    REQUIRE(logs.contains("[CLIENT->] GET /x?invite=[redacted]&code=d"));
+}
+
+TEST_CASE("A new set of a client applies from its next request, on a pooled connection too", "[logging][integration]") {
+    http::server server;
+    answer_ok(server);
+    log_capture logs;
+    running_server running(server);
+
+    http::client client;
+    client.redact_parameters({});
+    REQUIRE(client.get(running.url("/x?invite=first")).status() == 200);
+    client.redact_parameters({"invite"});
+    REQUIRE(client.get(running.url("/x?invite=second")).status() == 200);
+
+    INFO("captured logs:\n" << logs.dump());
+    REQUIRE(logs.contains("Reusing connection from pool"));
+    REQUIRE(logs.contains("[CLIENT->] GET /x?invite=first"));
+    REQUIRE(logs.contains("[CLIENT->] GET /x?invite=[redacted]"));
+    REQUIRE_FALSE(logs.contains("[CLIENT->] GET /x?invite=second"));
+}
+
+TEST_CASE("Two servers of one process redact each its own names", "[logging][connection_options][integration]") {
+    http::server plain;
+    http::server custom;
+    answer_ok(plain);
+    answer_ok(custom);
+    redact_on(custom, defaults_and("invite"));
+    log_capture logs;
+    running_server plain_running(plain);
+    running_server custom_running(custom);
+
+    // The `via` tells the servers apart in the log
+    http::client client;
+    REQUIRE(client.get(plain_running.url("/x?invite=a&via=plain")).status() == 200);
+    REQUIRE(client.get(custom_running.url("/x?invite=a&via=custom")).status() == 200);
+
+    INFO("captured logs:\n" << logs.dump());
+    REQUIRE(logs.contains("[SERVER REQUEST] GET /x?invite=a&via=plain"));
+    REQUIRE(logs.contains("[SERVER REQUEST] GET /x?invite=[redacted]&via=custom"));
+    REQUIRE_FALSE(logs.contains("[SERVER REQUEST] GET /x?invite=[redacted]&via=plain"));
+    REQUIRE_FALSE(logs.contains("[SERVER REQUEST] GET /x?invite=a&via=custom"));
+}
+
+TEST_CASE("A set changed after listen() applies to new connections alone", "[logging][connection_options][integration]") {
+    http::server server;
+    answer_ok(server);
+    log_capture logs;
+    running_server running(server);
+
+    http::client open;
+    REQUIRE(open.get(running.url("/x?invite=before")).status() == 200);
+
+    redact_on(server, {"invite"});
+
+    // The connection already open keeps the set it was accepted with
+    REQUIRE(open.get(running.url("/x?invite=open")).status() == 200);
+    // A new one takes the new set
+    http::client fresh;
+    REQUIRE(fresh.get(running.url("/x?invite=fresh")).status() == 200);
+
+    INFO("captured logs:\n" << logs.dump());
+    REQUIRE(logs.contains("Reusing connection from pool"));
+    REQUIRE(logs.contains("[SERVER REQUEST] GET /x?invite=before"));
+    REQUIRE(logs.contains("[SERVER REQUEST] GET /x?invite=open"));
+    REQUIRE(logs.contains("[SERVER REQUEST] GET /x?invite=[redacted]"));
+    REQUIRE_FALSE(logs.contains("[SERVER REQUEST] GET /x?invite=fresh"));
+}
+
+namespace {
+
+    // A WebSocket endpoint, for the logs of opening it
+    void answer_websocket(http::server& server) {
+        server.get("/ws", [](http::request&, http::response& res) {
+            res.upgrade_websocket({}, [](std::shared_ptr<http::websocket_connection>) {});
+        });
+    }
+
+    // Answers with `location` as its Location and Content-Location
+    void answer_location(http::server& server, const std::string& location) {
+        server.get("/moved", [location](http::request&, http::response& res) {
+            res.status(http::http_response::status::moved_temporarily);
+            res.header("Location", location);
+            res.header("Content-Location", location);
+            res.send("moved");
+        });
+    }
+
+    http::client_response get_moved(http::client& client, const running_server& running, const std::string& referer) {
+        client.follow_redirects(false);
+        return client.request(running.url("/moved")).header("Referer", referer).get();
+    }
+
+    void require_no_line_with(const log_capture& logs, const std::string& text) {
+        INFO("captured logs:\n" << logs.dump());
+        REQUIRE_FALSE(logs.contains(text));
+    }
+
+}
+
+TEST_CASE("Opening a WebSocket logs its URL redacted", "[logging][websocket][integration]") {
+    http::server server;
+    answer_websocket(server);
+    log_capture logs;
+    running_server running(server);
+    const std::string host = "ws://127.0.0.1:" + std::to_string(running.port);
+
+    SECTION("with the defaults") {
+        http::client client;
+        REQUIRE(client.websocket(host + "/ws?token=t0k3n&room=1"));
+        INFO("captured logs:\n" << logs.dump());
+        REQUIRE(logs.contains("WebSocket connected to " + host + "/ws?token=[redacted]&room=1"));
+        require_no_line_with(logs, "t0k3n");
+    }
+    SECTION("with the set of the client") {
+        http::client client;
+        client.redact_parameters(defaults_and("invite"));
+        REQUIRE(client.websocket(host + "/ws?invite=x-v4lue"));
+        INFO("captured logs:\n" << logs.dump());
+        REQUIRE(logs.contains("WebSocket connected to " + host + "/ws?invite=[redacted]"));
+        REQUIRE(logs.contains("[CLIENT->] GET /ws?invite=[redacted]"));
+        REQUIRE_FALSE(logs.contains("WebSocket connected to " + host + "/ws?invite=x-v4lue"));
+        REQUIRE_FALSE(logs.contains("[CLIENT->] GET /ws?invite=x-v4lue"));
+    }
+    SECTION("with a URL given as http://") {
+        http::client client;
+        REQUIRE(client.websocket("http://127.0.0.1:" + std::to_string(running.port) + "/ws?code=abc"));
+        INFO("captured logs:\n" << logs.dump());
+        REQUIRE(logs.contains("WebSocket connected to " + host + "/ws?code=[redacted]"));
+        require_no_line_with(logs, "abc");
+    }
+}
+
+TEST_CASE("Opening a WebSocket over a Unix socket logs with the set of the client", "[logging][websocket][unix][integration]") {
+    http::server server;
+    answer_websocket(server);
+    log_capture logs;
+    running_server running(server, server_test::transport::unix);
+
+    http::client client;
+    client.redact_parameters({"invite"}).unix_socket(running.listener.endpoint().unix_path);
+    REQUIRE(client.websocket("ws://localhost/ws?invite=x-v4lue&code=b"));
+
+    INFO("captured logs:\n" << logs.dump());
+    REQUIRE(logs.contains("[CLIENT->] GET /ws?invite=[redacted]&code=b"));
+    REQUIRE(logs.contains("WebSocket connected to ws://localhost:80/ws?invite=[redacted]&code=b"));
+    REQUIRE_FALSE(logs.contains("[CLIENT->] GET /ws?invite=x-v4lue"));
+}
+
+TEST_CASE("An invalid WebSocket URL is logged with the set of the client", "[logging][websocket][integration]") {
+    log_capture logs;
+    http::client client;
+    client.redact_parameters({"invite"});
+
+    auto request = std::make_shared<http::http_request>();
+    request->set_host("127.0.0.1");
+    request->set_port("not-a-port");
+    request->set_uri("/ws?invite=x-v4lue&code=b");
+    REQUIRE_FALSE(client.websocket(request));
+
+    INFO("captured logs:\n" << logs.dump());
+    REQUIRE(logs.contains("Invalid WebSocket URL: http://127.0.0.1:not-a-port/ws?invite=[redacted]&code=b"));
+    require_no_line_with(logs, "x-v4lue");
+}
+
+TEST_CASE("An unusable proxy logs the URL with the set of the client", "[logging][proxy][integration]") {
+    log_capture logs;
+    http::client client;
+    client.redact_parameters({"invite"}).proxy("socks5://127.0.0.1:1080");
+
+    // A loopback host would not use the proxy
+    REQUIRE(client.get("http://origin.test:1/x?invite=x-v4lue&code=b").error_code() == http::client_error::invalid_proxy);
+
+    INFO("captured logs:\n" << logs.dump());
+    REQUIRE(logs.contains("cannot use the proxy for http://origin.test:1/x?invite=[redacted]&code=b"));
+    require_no_line_with(logs, "x-v4lue");
+}
+
+TEST_CASE("Following a redirect logs its Location redacted", "[logging][redirect][integration]") {
+    http::server server;
+    answer_ok(server);
+    server.get("/moved", [](http::request&, http::response& res) {
+        res.status(http::http_response::status::moved_temporarily);
+        res.header("Location", "/x?code=abc&invite=x-v4lue&state=s");
+        res.send("moved");
+    });
+    log_capture logs;
+    running_server running(server);
+
+    http::client client;
+    client.follow_redirects(true);
+
+    SECTION("with the defaults") {
+        REQUIRE(client.get(running.url("/moved")).status() == 200);
+        INFO("captured logs:\n" << logs.dump());
+        REQUIRE(logs.contains("Following redirect #1 to: /x?code=[redacted]&invite=x-v4lue&state=s"));
+        require_no_line_with(logs, "abc");
+    }
+    SECTION("with the set of the client") {
+        client.redact_parameters({"invite"});
+        REQUIRE(client.get(running.url("/moved")).status() == 200);
+        INFO("captured logs:\n" << logs.dump());
+        REQUIRE(logs.contains("Following redirect #1 to: /x?code=abc&invite=[redacted]&state=s"));
+    }
+    SECTION("with the debug level off, not logged") {
+        logging::get_logger()->set_level(spdlog::level::info);
+        REQUIRE(client.get(running.url("/moved")).status() == 200);
+        require_no_line_with(logs, "Following redirect");
+    }
+}
+
+TEST_CASE("The values logged of the headers holding a URI are redacted", "[logging][integration]") {
+    const std::string location = "https://app.example/cb?code=abc&token=t0k3n&state=s";
+    const std::string shown = "https://app.example/cb?code=[redacted]&token=[redacted]&state=s";
+    http::server server;
+    answer_location(server, location);
+
+    auto require_values = [&](const log_capture& logs) {
+        INFO("captured logs:\n" << logs.dump());
+        REQUIRE(logs.contains("  Location: " + shown));
+        REQUIRE(logs.contains("  Content-Location: " + shown));
+        REQUIRE(logs.contains("  Referer: " + shown));
+        REQUIRE_FALSE(logs.contains("abc"));
+        REQUIRE_FALSE(logs.contains("t0k3n"));
+    };
+
+    SECTION("in the server") {
+        http::connection_options options;
+        options.logging.enabled = true;
+        server.set_connection_options(options);
+        log_capture logs;
+        running_server running(server);
+
+        http::client client;
+        REQUIRE(get_moved(client, running, location).status() == 302);
+        require_values(logs);
+    }
+    SECTION("in the client") {
+        log_capture logs;
+        running_server running(server);
+
+        http::client client;
+        client.log_bodies(true);
+        REQUIRE(get_moved(client, running, location).status() == 302);
+        require_values(logs);
+    }
+    SECTION("only with the log of the values on") {
+        log_capture logs;
+        running_server running(server);
+
+        http::client client;
+        REQUIRE(get_moved(client, running, location).status() == 302);
+        INFO("captured logs:\n" << logs.dump());
+        REQUIRE(logs.contains("  Location"));
+        REQUIRE_FALSE(logs.contains("app.example"));
+    }
+}
+
+TEST_CASE("The headers holding a URI are redacted with the set of the server or the client", "[logging][connection_options][integration]") {
+    const std::string location = "/next?invite=x-v4lue&code=b";
+    const std::string shown = "/next?invite=[redacted]&code=b";
+    http::server server;
+    answer_location(server, location);
+
+    auto require_values = [&](const log_capture& logs) {
+        INFO("captured logs:\n" << logs.dump());
+        REQUIRE(logs.contains("  Location: " + shown));
+        REQUIRE(logs.contains("  Content-Location: " + shown));
+        REQUIRE(logs.contains("  Referer: " + shown));
+        REQUIRE_FALSE(logs.contains("  Location: " + location));
+    };
+
+    SECTION("the server") {
+        http::connection_options options;
+        options.logging.enabled = true;
+        options.logging.redact = {"invite"};
+        server.set_connection_options(options);
+        log_capture logs;
+        running_server running(server);
+
+        http::client client;
+        REQUIRE(get_moved(client, running, location).status() == 302);
+        require_values(logs);
+    }
+    SECTION("the client") {
+        log_capture logs;
+        running_server running(server);
+
+        http::client client;
+        client.log_bodies(true).redact_parameters({"invite"});
+        REQUIRE(get_moved(client, running, location).status() == 302);
+        require_values(logs);
+    }
+}
+
+TEST_CASE("The headers holding a URI are redacted before they are truncated", "[logging][integration]") {
+    // Cut inside the value of the parameter: only its marker may be shown, in part
+    constexpr size_t max_length = 12;
+    http::server server;
+    answer_location(server, "/cb?code=abcdefghijklmnop");
+    http::connection_options options;
+    options.logging = {true, max_length};
+    server.set_connection_options(options);
+    log_capture logs;
+    running_server running(server);
+
+    http::client client;
+    REQUIRE(get_moved(client, running, "/from").status() == 302);
+
+    INFO("captured logs:\n" << logs.dump());
+    REQUIRE(logs.contains("  Location: /cb?code=[re... ("));
+    REQUIRE_FALSE(logs.contains("abc"));
+}
+
+TEST_CASE("The password of a URI in a header is always redacted", "[logging][integration]") {
+    http::server server;
+    answer_location(server, "http://user:pa55word@app.example/x?invite=a");
+    http::connection_options options;
+    options.logging.enabled = true;
+    options.logging.redact = {};
+    server.set_connection_options(options);
+    log_capture logs;
+    running_server running(server);
+
+    http::client client;
+    REQUIRE(get_moved(client, running, "/from").status() == 302);
+
+    INFO("captured logs:\n" << logs.dump());
+    REQUIRE(logs.contains("  Location: http://user:[redacted]@app.example/x?invite=a"));
+    REQUIRE_FALSE(logs.contains("pa55word"));
+}
+
+TEST_CASE("A reverse proxy logs its failures without the query of the request", "[logging][proxy][integration]") {
+    http::reverse_proxy reverse_proxy;
+    std::string target;
+    {
+        // A port nothing listens on
+        boost::asio::io_context io;
+        boost::asio::ip::tcp::acceptor acceptor(io, {boost::asio::ip::make_address("127.0.0.1"), 0});
+        target = "http://127.0.0.1:" + std::to_string(acceptor.local_endpoint().port());
+    }
+    http::server server;
+    server.set_not_found_handler([&](http::request& req, http::response& res) -> awaitable<void> {
+        co_await reverse_proxy.forward(req, res, *http::proxy_target::from_url(target));
+    });
+    log_capture logs;
+    running_server running(server);
+
+    http::client client;
+    REQUIRE(client.get(running.url("/app/page?invite=x-v4lue&code=abc")).status() == 502);
+
+    INFO("captured logs:\n" << logs.dump());
+    REQUIRE(logs.contains("reverse proxy GET /app/page -> " + target));
+    // The request line is that of the server, with its set
+    REQUIRE(logs.contains("[SERVER REQUEST] GET /app/page?invite=x-v4lue&code=[redacted]"));
+    REQUIRE_FALSE(logs.contains("abc"));
+}
+
+TEST_CASE("A reverse proxy logs a path invalid for its target without the query", "[logging][proxy][integration]") {
+    http::reverse_proxy reverse_proxy;
+    http::server server;
+    server.set_not_found_handler([&](http::request& req, http::response& res) -> awaitable<void> {
+        http::proxy_options options;
+        options.on_request = [](http::request&, http::http_request& outgoing) {
+            outgoing.set_uri("no-leading-slash?code=abc");
+        };
+        co_await reverse_proxy.forward(req, res, *http::proxy_target::from_url("http://127.0.0.1:1"), options);
+    });
+    log_capture logs;
+    running_server running(server);
+
+    http::client client;
+    REQUIRE(client.get(running.url("/app")).status() == 500);
+
+    INFO("captured logs:\n" << logs.dump());
+    REQUIRE(logs.contains("invalid path for the target: no-leading-slash"));
+    REQUIRE_FALSE(logs.contains("abc"));
 }

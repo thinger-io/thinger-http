@@ -23,9 +23,11 @@ struct websocket_close {
     // Status code of the closing handshake (RFC 6455, 7.4), as websocket::get_close_code():
     // the one of the peer's close frame (1005 if it had none, 1002 if it was not valid), else
     // the one this end closed with; 1006 (websocket::CLOSE_ABNORMAL) if no close frame was
-    // exchanged, e.g. when the connection was lost
+    // exchanged, e.g. when the connection was lost, or the one of close_graceful() was not
+    // written whole by its deadline
     uint16_t code = 1006;
-    // Reason of the peer's close frame, if any (not validated as UTF-8)
+    // Reason of the peer's close frame, if any (not validated as UTF-8), never the one this end
+    // sent
     std::string reason;
     // Whether the peer closed first (sent its close frame before this end did)
     bool remote = false;
@@ -55,7 +57,8 @@ struct websocket_close {
 //   frame being written, a close frame (code 1000), and the connection closed once the peer
 //   answers or after CLOSE_TIMEOUT. Called anywhere else (e.g. by a synchronous client, while
 //   nothing runs its io_context), it closes the connection at once instead. close(code) does
-//   the same with another status code. close_graceful() does the handshake, waiting. A
+//   the same with another status code. close_graceful() does the handshake, waiting, with a
+//   status code and a reason if given, within CLOSE_TIMEOUT whatever the peer does. A
 //   websocket destroyed open on its executor closes with 1001. An executor that is neither an
 //   io_context executor nor a strand cannot be told to be running (see
 //   asio::running_in_this_thread()): close() then closes at once, without the handshake.
@@ -78,6 +81,7 @@ class websocket : public socket, public std::enable_shared_from_this<websocket> 
 public:
 
     static constexpr auto CONNECTION_TIMEOUT_SECONDS = std::chrono::seconds{60};
+    // What the closing handshake may take, from the call that starts it to the socket closed
     static constexpr auto CLOSE_TIMEOUT = std::chrono::seconds{5};
     static constexpr int MASK_SIZE_BYTES = 4;
     static std::atomic<unsigned long> connections;
@@ -94,6 +98,12 @@ public:
     static constexpr uint16_t CLOSE_INTERNAL_ERROR = 1011;
     // IANA registry: the server sheds a client (e.g. one that does not keep up); it may retry
     static constexpr uint16_t CLOSE_TRY_AGAIN_LATER = 1013;
+
+    // Whether a close frame may carry `code` (RFC 6455, 7.4, and the IANA registry up to 1014, as
+    // Node ws and Go accept): 1000-1014 but 1004, 1005 and 1006, and 3000-4999
+    static bool valid_close_code(uint16_t code);
+    // Largest reason of a close frame, in bytes: a control frame carries 125 (RFC 6455, 5.5.1)
+    static constexpr size_t MAX_CLOSE_REASON_SIZE = 123;
 
     // `binary`: frames written are binary (otherwise text); `server`: the server role (frames
     // received must be masked, frames sent are not); `executor`: where its user runs it (e.g. a
@@ -113,9 +123,15 @@ public:
     // any operation. A code that may not be sent (RFC 6455, 7.4: e.g. 1005, 1006 or 1015) is
     // sent as 1000
     void close(uint16_t code, bool expect_reply = true);
-    // Send a close frame (waiting for a pending write), wait for the close frame of the peer
-    // (up to CLOSE_TIMEOUT), and close. A code that may not be sent is sent as 1000
-    awaitable<void> close_graceful(uint16_t code = CLOSE_NORMAL);
+    // Send a close frame with `code` and `reason` (waiting for a pending write), wait for the
+    // close frame of the peer, and close; the keepalive stops at once. All of it within
+    // CLOSE_TIMEOUT of the first call, its wait for the turn to write included: at the deadline
+    // the socket is closed without the handshake, whatever is pending on it, and on_close() told
+    // (see get_close_code()). While that frame waits for its turn, it is what any other close
+    // sends, and another close_graceful() only waits for the same handshake. A code that may not
+    // be sent is sent as 1000, a reason above MAX_CLOSE_REASON_SIZE is left out; the reason is
+    // not validated as UTF-8 here
+    awaitable<void> close_graceful(uint16_t code = CLOSE_NORMAL, std::string reason = {});
     // The pending read and writes end with boost::asio::error::operation_aborted; the
     // websocket stays usable. A read that received data meanwhile may return it instead, but
     // never reads on: e.g. after a control frame received just before
@@ -155,7 +171,8 @@ public:
 
     // Closing handshake: the status code of the close frame received from the peer
     // (CLOSE_NO_STATUS if it had none, CLOSE_PROTOCOL_ERROR if it was not valid), else of the
-    // one this end sent; CLOSE_ABNORMAL if neither was, e.g. when the connection was lost
+    // one this end sent; CLOSE_ABNORMAL if neither was, e.g. when the connection was lost, or
+    // the frame of close_graceful() was not written whole by its deadline
     uint16_t get_close_code() const;
     // The reason of the close frame received, if any (not validated as UTF-8)
     const std::string& get_close_reason() const { return close_reason_; }
@@ -163,10 +180,11 @@ public:
     bool closed_by_peer() const { return closed_by_peer_; }
 
     // Called once the connection closed, with how (see websocket_close): close() (by its user,
-    // the keepalive, a protocol error, or the close frame of the peer answered), or the
-    // connection lost (an error reading or writing other than a cancellation, the end of the
-    // stream without a close frame, or the socket closed under it, e.g. by a server at the end
-    // of its shutdown): then with 1006 unless close frames were exchanged. Once, posted to the
+    // the keepalive, a protocol error, or the close frame of the peer answered), the deadline of
+    // close_graceful(), or the connection lost (an error reading or writing other than a
+    // cancellation, the end of the stream without a close frame, or the socket closed under it,
+    // e.g. by a server at the end of its shutdown): then with 1006 unless a close frame was
+    // sent or received. Once, posted to the
     // executor (never from within the call that closed it), what it throws logged; set once
     // closed, it is posted at once. A websocket destroyed open does not call it. The connection
     // is noticed lost by the operations running on it (a pending read, the keepalive). Unlike
@@ -203,7 +221,8 @@ public:
     // Keepalive: ping the peer once nothing was received from it for `ping_interval`, and
     // close the connection (1001) once nothing was received for `idle_timeout` (pongs
     // included). 0 disables each one; calling it again replaces the previous settings, and
-    // counts the idle time from then. Requires the websocket to be owned by a std::shared_ptr.
+    // counts the idle time from then; it does not start once close_graceful() was called.
+    // Requires the websocket to be owned by a std::shared_ptr.
     // In the client role, for a user that does not read all the time (e.g. a synchronous
     // client between its calls): bytes that reached the socket while nothing read count as
     // received, once its check sees them; and, with a ping interval under the idle timeout, a
@@ -271,7 +290,10 @@ private:
     // one leaves if interrupted. In slices with a `progress` (see write_message())
     awaitable<boost::system::error_code> write_frame(uint8_t opcode, const std::vector<boost::asio::const_buffer>& payload,
                                                      const sync_callback<void()>* progress = nullptr);
-    awaitable<boost::system::error_code> send_close(uint16_t code);
+    // The close frame close_graceful() asked for, waiting for the turn
+    awaitable<boost::system::error_code> send_close();
+    // Payload of the close frame sent: its code and reason
+    std::vector<uint8_t> close_payload() const;
     // Queue a pong (answering the last ping) or a ping, sent without waiting for it
     void queue_control();
     // Send the control frames queued, holding the turn
@@ -280,12 +302,20 @@ private:
     // keepalive for the next check
     void check_keepalive();
 
+    // Closed for its user: pending operations told, timers and control frames dropped
+    void mark_closed();
+    // The handshake of close_graceful() ends within CLOSE_TIMEOUT: at the deadline the socket is
+    // closed without it, whatever is pending on it
+    void start_close_deadline();
+    void close_expired();
+
     void start_linger();
     // The rest of a frame and a close frame, the bytes still buffered and the payload
     // remaining of the frame being received: what the closing handshake needs once this
-    // websocket is closed
+    // websocket is closed, and when it ends at the latest
     static awaitable<void> linger(std::shared_ptr<socket> socket, std::vector<uint8_t> output,
-                                  std::string input, uint64_t skip, bool expect_reply);
+                                  std::string input, uint64_t skip, bool expect_reply,
+                                  std::chrono::steady_clock::time_point deadline);
 
     std::shared_ptr<socket> socket_;
     boost::asio::any_io_executor executor_;
@@ -336,10 +366,16 @@ private:
     bool closed_ = false;
     bool close_received_ = false;
     bool close_sent_ = false;
+    // The close frame being written by close_graceful() is not written whole (yet): it counts as
+    // not sent for get_close_code()
+    bool close_unwritten_ = false;
     // Closing handshake to start once the write in progress ends
     bool linger_pending_ = false;
     bool linger_expect_reply_ = true;
     uint16_t close_code_ = CLOSE_NORMAL;
+    // Asked for by close_graceful(): that code and this reason are the ones of the close frame
+    bool close_requested_ = false;
+    std::string close_reason_sent_;
     // Close frame received: its code and reason, and whether it came first
     uint16_t received_close_code_ = CLOSE_NO_STATUS;
     std::string close_reason_;

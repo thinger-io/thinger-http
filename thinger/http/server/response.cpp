@@ -1,4 +1,5 @@
 #include "response.hpp"
+#include "http_application.hpp"
 #include "request.hpp"
 #include "mime_types.hpp"
 #include "body_decoders.hpp"
@@ -33,7 +34,8 @@ struct response::state {
     std::optional<http_response> draft;                         // status and headers set so far
     std::shared_ptr<const error_formatter> formatter;           // default format if null
     std::atomic<bool> responded{false};
-    bool cors_enabled = false;
+    std::shared_ptr<const detail::cors_policy> cors;            // off if null
+    detail::cors_decision cors_decision;                        // what it means for this request
 
     // Request timeout: called once the response starts, and whether it was answered by it
     std::function<void()> on_start;
@@ -51,30 +53,21 @@ struct response::state {
     size_t stream_remaining = 0;
 };
 
-namespace {
-
-    void add_cors_headers(http_response& response) {
-        response.add_header("Access-Control-Allow-Origin", "*");
-        response.add_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH");
-        response.add_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-        response.add_header("Access-Control-Allow-Credentials", "true");
-    }
-
-}
-
 response::response(const std::shared_ptr<server_connection>& connection,
                    const std::shared_ptr<http_stream>& stream,
-                   const std::shared_ptr<http::http_request>& http_request,
-                   bool cors_enabled)
-    : response(std::make_shared<connection_sink>(connection, stream), http_request, cors_enabled) {}
+                   const std::shared_ptr<http::http_request>& http_request)
+    : response(std::make_shared<connection_sink>(connection, stream), http_request) {}
 
 response::response(std::shared_ptr<response_sink> sink,
-                   const std::shared_ptr<http::http_request>& http_request,
-                   bool cors_enabled)
+                   const std::shared_ptr<http::http_request>& http_request)
     : state_(std::make_shared<state>()) {
     state_->sink = std::move(sink);
     state_->request = http_request;
-    state_->cors_enabled = cors_enabled;
+}
+
+void response::set_cors(std::shared_ptr<const detail::cors_policy> policy, detail::cors_decision decision) {
+    state_->cors = std::move(policy);
+    state_->cors_decision = std::move(decision);
 }
 
 void response::log_late_answer(const char* message) const {
@@ -139,15 +132,13 @@ std::shared_ptr<http_response> response::take_draft(bool with_draft) {
     bool drafted = with_draft && state_->draft;
     auto message = drafted ? std::make_shared<http_response>(std::move(*state_->draft))
                            : std::make_shared<http_response>();
-    if (!drafted && state_->cors_enabled) add_cors_headers(*message);
+    // Once the headers set so far are there, which it does not replace
+    if (state_->cors) detail::apply_cors(*state_->cors, state_->cors_decision, *message);
     return message;
 }
 
 http_response& response::draft() {
-    if (!state_->draft) {
-        state_->draft.emplace();
-        if (state_->cors_enabled) add_cors_headers(*state_->draft);
-    }
+    if (!state_->draft) state_->draft.emplace();
     return *state_->draft;
 }
 
@@ -260,7 +251,7 @@ void response::encode(const nlohmann::json& data, http::http_response::status st
     if (!message) return;
     message->set_status(status);
     message->set_content(std::move(body), encoding.media_type);
-    message->add_header("Vary", "Accept");
+    compression::add_vary(*message, "Accept");
     send_message(std::move(message));
 }
 
@@ -298,7 +289,6 @@ void response::header(std::string key, std::string value) {
 
 void response::send_response(const std::shared_ptr<http_response>& response) {
     if (!ensure_not_responded()) return;
-    if (state_->cors_enabled) add_cors_headers(*response);
     // A message built by hand may carry the framing of another one (e.g. copied from a
     // response whose body was decoded): its content is its body, sent whole (a response
     // to HEAD keeps the length it tells)
@@ -307,6 +297,7 @@ void response::send_response(const std::shared_ptr<http_response>& response) {
         response->remove_headers(header::content_length);
     }
     if (!mark_responded()) return;
+    if (state_->cors) detail::apply_cors(*state_->cors, state_->cors_decision, *response);
     send_message(response);
 }
 
@@ -684,15 +675,24 @@ namespace {
     }
 
     // Status and headers of the head of a streamed response: those of `head` replace the ones
-    // with the same name set before (e.g. CORS); the framing is the response's own
+    // with the same name set before (e.g. CORS), except Vary, which adds up: the response
+    // depends on the fields of both, and a cache must know. The framing is the response's own
     void apply_head(http_response& message, const http_response& head) {
         message.set_status(head.get_status());
         message.set_reason_phrase(head.get_reason());
         for (const auto& [key, value] : head.get_headers()) {
-            if (!is_framing_header(key)) message.remove_headers(key);
+            if (!is_framing_header(key) && !headers::is_header(key, "Vary")) message.remove_headers(key);
         }
+        // Credentials granted by CORS mean nothing next to an origin "*", and browsers reject them
+        if (head.get_header("Access-Control-Allow-Origin") == "*") message.remove_headers("Access-Control-Allow-Credentials");
+        const bool merge_vary = message.has_header("Vary");
         for (const auto& [key, value] : head.get_headers()) {
-            if (!is_framing_header(key)) message.add_header(key, value);
+            if (is_framing_header(key)) continue;
+            if (merge_vary && headers::is_header(key, "Vary")) {
+                syntax::for_each_element(value, [&message](std::string_view field) { compression::add_vary(message, field); });
+            } else {
+                message.add_header(key, value);
+            }
         }
         // headers set before (header()) may carry framing too
         message.remove_headers(header::content_length);

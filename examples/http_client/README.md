@@ -114,12 +114,14 @@ asio::workers workers;
 workers.start();
 http::async_client client(workers);
 
-client.websocket("wss://echo.websocket.org", [](std::shared_ptr<http::websocket_client> ws) {
+// The callback runs on a worker, where the synchronous calls of a WebSocket throw: it is a
+// coroutine and uses their async versions
+client.websocket("wss://echo.websocket.org", [](std::shared_ptr<http::websocket_client> ws) -> awaitable<void> {
     if (ws) {
-        ws->send_text("Hello from callback!");
-        auto [msg, _] = ws->receive();
+        co_await ws->send_text_async("Hello from callback!");
+        auto [msg, _] = co_await ws->receive_async();
         std::cout << "Received: " << msg << std::endl;
-        ws->close();
+        co_await ws->close_async();
     }
 });
 

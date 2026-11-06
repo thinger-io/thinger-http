@@ -2,6 +2,7 @@
 #define SSE_CONNECTION_HPP
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -44,15 +45,15 @@ struct sse_event {
  * websocket_connection (see write_limits), counted in what was sent: each field (send_event(),
  * send_id(), send_retry(), send_data()), each sse_event and each comment counts one.
  * drop_oldest drops whole events, never one being written nor one sent with send_async();
- * close closes, and EventSource reconnects.
+ * close closes, and EventSource reconnects. dropped_messages() counts what the policy drops.
  *
  * The connection reads what the client sends, only to learn when it leaves (it sends nothing
  * after its request; anything it sends is discarded): on_close() tells it.
  *
  * Threads. It runs on its executor (see get_executor()), which may be a strand. From any
  * thread: start(), send*(), stop(), execute(), set_keepalive(), wait_writable(),
- * set_write_limits(), on_high_watermark(), on_low_watermark(), queued_bytes() and
- * queued_messages(). On its executor only (e.g. from execute()): get_write_limits().
+ * set_write_limits(), on_high_watermark(), on_low_watermark(), queued_bytes(), queued_messages()
+ * and dropped_messages(). On its executor only (e.g. from execute()): get_write_limits().
  * on_shutdown() and on_close() are set in the handler that accepts it.
  */
 class sse_connection : public std::enable_shared_from_this<sse_connection>, public boost::noncopyable{
@@ -144,6 +145,14 @@ public:
     /// Bytes, and what was sent (see the class), not written yet (the one being written included)
     size_t queued_bytes() const;
     size_t queued_messages() const;
+
+    /// What was sent without waiting (see the class: an event sent field by field counts each
+    /// field) that the overflow policy dropped since the connection was created. Not what is
+    /// awaited, sent once closed, or queued when it closed, nor an overflow with
+    /// overflow_policy::close, nor the keep-alive comments, never queued. It never decreases, and
+    /// a send from another thread counts once the executor took it: once all were taken (e.g.
+    /// after execute()), written + queued + dropped is what was sent while open
+    uint64_t dropped_messages() const;
 
     /// The watermarks crossed (see write_limits); not told once the connection is closed
     void on_high_watermark(sync_callback<void()> callback);

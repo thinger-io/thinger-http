@@ -283,10 +283,15 @@ TEST_CASE("A route timeout longer than the request deadline does not delay it", 
 // A slow client that keeps reading takes its whole response, however long it lasts: the write
 // deadline bounds a stall, not the length of a response, and a response being written is no idle
 // connection. Over a Unix socket, whose buffers (about 200 KB) keep the response waiting for the
-// client: 3 MiB taken 64 KiB per 100 ms, about 5 s, past both deadlines
+// client: 3 MiB taken 64 KiB per 100 ms, about 5 s, past both deadlines. On macOS those buffers
+// hold 8 KiB, and so does each read: 512 KiB last about 6 s
 TEST_CASE("A slow client that keeps reading is cut neither by the write deadline nor as idle",
           "[server][deadline][integration]") {
+#if defined(__APPLE__)
+    constexpr size_t size = 512 << 10;
+#else
     constexpr size_t size = 3 << 20;
+#endif
     http::server server;
     http::connection_options options;
     options.write_timeout = 1s;

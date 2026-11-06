@@ -458,13 +458,13 @@ struct listener::state : std::enable_shared_from_this<state> {
             }
         }
         if (acceptor) {
-            // Stopped while opening: its acceptor goes before its thread, and its socket file
-            // with it (stop() removes it once open only)
-            acceptor.reset();
+            // Stopped while opening: its socket file goes first, as in close() (stop() removes it
+            // once open only), and its acceptor before its thread
             if constexpr (std::is_same_v<Protocol, local>) {
                 std::error_code removed;
                 std::filesystem::remove(std::get<unix_endpoint>(options.endpoint).path, removed);
             }
+            acceptor.reset();
             return boost::asio::error::operation_aborted;
         }
         LOG_DEBUG("listening on {}", url_for(bound));
@@ -541,6 +541,13 @@ struct listener::state : std::enable_shared_from_this<state> {
     template<typename Protocol>
     void on_accepted(const boost::system::error_code& e, typename Protocol::socket peer, bool usable) {
         auto accepted_at = steady::now();
+        // Where asio sets SO_NOSIGPIPE on the socket it accepted, this is a client already gone
+        // (EINVAL by then): nothing wrong with the acceptor, and nothing to wait for
+#if defined(SO_NOSIGPIPE)
+        bool client_gone = e == boost::asio::error::invalid_argument;
+#else
+        bool client_gone = false;
+#endif
         {
             // Stopped meanwhile (from any thread): its acceptor is gone
             std::scoped_lock lock(mutex);
@@ -549,11 +556,15 @@ struct listener::state : std::enable_shared_from_this<state> {
                 LOG_DEBUG("stop accepting connections");
                 return;
             }
-            if (e) {
+            if (e && !client_gone) {
                 LOG_ERROR("cannot accept more connections: {}", e.message());
                 retry_accept<Protocol>();
                 return;
             }
+        }
+        if (client_gone) {
+            accept_next<Protocol>();
+            return;
         }
         // set before it reaches the executor serving it
         close_on_exec(peer.native_handle());
@@ -889,8 +900,10 @@ struct listener::state : std::enable_shared_from_this<state> {
         }
     }
 
-    // Close the acceptor, once its thread (if any) is not using it, and the Unix socket file.
-    // The accept handlers still to run do nothing, as the listener is stopping
+    // Close the acceptor, once its thread (if any) is not using it. The Unix socket file goes
+    // first, as in libuv and Go: a server binding its path as soon as a client cannot connect
+    // does not lose its new file to this one. The accept handlers still to run do nothing, as
+    // the listener is stopping
     void close(acceptor_thread_ptr thread) {
         if (thread) thread->stop();
         std::unique_ptr<tcp::acceptor> tcp_closed;
@@ -902,14 +915,14 @@ struct listener::state : std::enable_shared_from_this<state> {
             unix_closed = std::move(unix_acceptor);
             was_open = opened;
         }
-        close_acceptor(tcp_closed);
-        close_acceptor(unix_closed);
-        port = 0;
         if (const auto* unix = std::get_if<unix_endpoint>(&options.endpoint); unix && was_open) {
             std::error_code ec;
             std::filesystem::remove(unix->path, ec);
             if (ec) LOG_WARNING("cannot remove Unix socket file {}: {}", unix->path, ec.message());
         }
+        close_acceptor(tcp_closed);
+        close_acceptor(unix_closed);
+        port = 0;
         // The thread goes after its acceptor, with the handlers it never ran
         tcp_closed.reset();
         unix_closed.reset();

@@ -7,10 +7,13 @@
 #include <boost/asio.hpp>
 #include <boost/asio/use_future.hpp>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <thread>
+#include <vector>
 
 // Helpers for server tests: a server running on its own thread (on any transport of the matrix),
 // raw exchanges that never block longer than a timeout, and in-memory dispatch
@@ -21,6 +24,48 @@ namespace server_test {
     using thinger::http::test::exchange_result;
     using thinger::http::test::transport;
     using thinger::http::test::transport_endpoint;
+
+    // What a reader of dropped_messages() saw while others were sending
+    struct dropped_reads {
+        uint64_t reads = 0;
+        bool decreased = false;
+        bool above_sent = false;
+    };
+
+    // `threads` threads calling send(index) `each` times (each index once), while another reads
+    // dropped(), which only goes up and never above what was sent so far. They ended on return
+    template<typename Send, typename Dropped>
+    dropped_reads send_concurrently(uint32_t threads, uint32_t each, Send send, Dropped dropped) {
+        std::atomic<uint64_t> sent{0};
+        std::atomic<bool> done{false};
+        dropped_reads seen;
+        std::thread reader([&] {
+            uint64_t last = 0;
+            do {
+                // in this order: what was sent includes whatever led to the value read
+                auto value = dropped();
+                auto so_far = sent.load();
+                if (value < last) seen.decreased = true;
+                if (value > so_far) seen.above_sent = true;
+                last = value;
+                ++seen.reads;
+                std::this_thread::yield();
+            } while (!done);
+        });
+        std::vector<std::thread> senders;
+        for (uint32_t thread = 0; thread < threads; ++thread) {
+            senders.emplace_back([&, thread] {
+                for (uint32_t i = 0; i < each; ++i) {
+                    ++sent;
+                    send(thread * each + i);
+                }
+            });
+        }
+        for (auto& sender : senders) sender.join();
+        done = true;
+        reader.join();
+        return seen;
+    }
 
     // Runs `server` (routes registered beforehand) until destroyed, on an ephemeral port of
     // 127.0.0.1 (TCP, TLS) or on a socket in a temporary directory (Unix)

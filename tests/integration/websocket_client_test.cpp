@@ -21,6 +21,7 @@
 #include "../fixtures/hostile_peer.hpp"
 #include "../fixtures/running_workers.hpp"
 #include "../fixtures/server_listen.hpp"
+#include "../fixtures/time_scale.hpp"
 
 using namespace thinger;
 using namespace std::chrono_literals;
@@ -644,7 +645,9 @@ TEST_CASE("Client WebSocket keepalive: the blocking calls return once their oper
 TEST_CASE("The synchronous calls of a WebSocket fail on a thread running its io_context", "[websocket][client][integration]") {
     WebSocketServerFixture fixture;
     const auto url = fixture.ws_url + "/ws/echo";
-    constexpr auto AT_ONCE = 100ms;
+    // A call waiting on its own thread would not return at all, and the sections give up at 10 s
+    constexpr auto AT_ONCE = thinger::http::test::scaled(100ms);
+    static_assert(AT_ONCE < 10s);
 
     SECTION("In a plain callback of async_client, on its worker") {
         thinger::http::test::running_workers workers;

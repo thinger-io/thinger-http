@@ -665,7 +665,7 @@ void server_connection::shutdown_drain() {
 
 void server_connection::shutdown_cancel() {
     // The handlers still running: that of the request being read, and those of the requests
-    // waiting for their responses (cancelled once, see http_stream::cancel())
+    // waiting for their responses (interrupted once, see http_stream::cancel())
     if (in_progress_ && in_progress_->handler_running()) in_progress_->cancel(cancel_reason::shutdown);
     for (const auto& stream : request_queue_) {
         if (stream->handler_running()) stream->cancel(cancel_reason::shutdown);

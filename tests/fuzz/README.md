@@ -156,7 +156,7 @@ fields included but for the first case below...) are not listed.
 
 | Case | Ours | Beast | llhttp |
 |---|---|---|---|
-| HTAB after `chunked` (`Transfer-Encoding: chunked\t`) | chunked: the whitespace around a value is not part of it (RFC 9110 section 5.5) | chunked | another coding, which a request must not have: rejected, **normalized** (HTAB made SP) |
+| HTAB after `chunked` (`Transfer-Encoding: chunked\t`) | chunked: the whitespace around a value is not part of it (RFC 9110 section 5.5) | chunked | another coding, which a request must not have: rejected, or with `Connection: upgrade` and `Upgrade` an upgrade with no body, which ends at the headers; **normalized** (HTAB made SP) |
 | Obsolete line folding, in headers or trailers | rejected | unfolded | rejected |
 | Whitespace before the first header line or a field name | rejected | accepted | rejected |
 | `Content-Length: 5, 5` | rejected | accepted (same values) | rejected |

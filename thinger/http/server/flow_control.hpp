@@ -35,13 +35,15 @@ namespace thinger::http {
         size_t low_watermark = 0;
         /// For messages sent without waiting. drop_oldest never drops the message being
         /// written, one a sender waits for, nor the rest of an SSE event being written; when
-        /// that is not enough, the new message is dropped, so the limits hold
+        /// that is not enough, the new message is dropped, so the limits hold. What is dropped
+        /// is counted by dropped_messages() of the connection
         overflow_policy policy = overflow_policy::drop_newest;
         /// A write that makes no progress for this long (no byte taken by the socket, nor by the
         /// peer from it, watched for a quarter of it more: see set_send_backlog()) closes
         /// the connection (a WebSocket with 1013), as a client that stopped reading; awaited sends and wait_writable() then return false. A stall, not the time to
         /// write a message: a slow client that keeps reading is never cut. 60 s, nginx's
-        /// send_timeout; 0 disables it
+        /// send_timeout; 0 disables it. A WebSocket closing with stop() does not wait for it: its
+        /// closing handshake has its own deadline, asio::websocket::CLOSE_TIMEOUT
         std::chrono::milliseconds write_timeout{60000};
     };
 

@@ -268,12 +268,22 @@ namespace thinger::http{
             return out;
         }
 
+        // The headers whose value is a URI, which may have secrets in its query
+        [[maybe_unused]] bool holds_uri(std::string_view name) {
+            return headers::is_header(name, "Location") || headers::is_header(name, "Content-Location") ||
+                   headers::is_header(name, "Referer");
+        }
+
         [[maybe_unused]] void log_header(std::string_view label, const std::string& name, const std::string& value,
                         const body_logging& options) {
             if (!options.enabled) {
                 LOG_DEBUG("  {}{}", label, printable(name, name.size()));
             } else if (headers::is_sensitive_header(name)) {
                 LOG_DEBUG("  {}{}: {}", label, printable(name, name.size()), redacted);
+            } else if (holds_uri(name)) {
+                // Redacted first: truncating it may leave a part of the secret unrecognized
+                LOG_DEBUG("  {}{}: {}", label, printable(name, name.size()),
+                          printable(util::url::loggable_uri(value, options.redact), options.max_length));
             } else {
                 LOG_DEBUG("  {}{}: {}", label, printable(name, name.size()), printable(value, options.max_length));
             }

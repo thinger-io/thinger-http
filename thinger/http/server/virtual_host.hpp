@@ -4,6 +4,7 @@
 #include "routing/route_handler.hpp"
 #include "routing/route.hpp"
 #include "routing/route_registrar.hpp"
+#include "file_server/static_files.hpp"
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -17,34 +18,6 @@
 namespace thinger::http {
 
 class route_group;
-
-// What serve_static() does with a dotfile path (see static_options::dotfiles)
-enum class dotfiles_policy {
-    ignore, // as a path without a file: the root fallback, or 404
-    allow,  // served as any other file
-    deny    // 403
-};
-
-// How serve_static() serves the files of a directory
-struct static_options {
-    // File served for a directory (its own one), and for the paths without a file (the one
-    // of the root directory, for single page applications); empty: 404 for both
-    std::string fallback = "index.html";
-    // Cache-Control of the files. By default, caches keep them but revalidate them on every
-    // use: answered with 304 Not Modified (no body) while they do not change. Assets with a
-    // hash in their names can be reused without asking: "public, max-age=31536000, immutable".
-    std::string cache_control = "no-cache";
-    // Precompressed files (as nginx gzip_static and brotli_static): a file is sent as its
-    // "<file>.br" or "<file>.gz" sibling, if there is one not older than it and the client
-    // accepts br or gzip (br first at equal quality), with that Content-Encoding and the
-    // media type of the file. A build can then serve Brotli without compressing at runtime.
-    bool precompressed = true;
-    // Dotfile paths (".env", ".git/config", ".htpasswd"): those with a segment of the decoded
-    // path under the prefix longer than one character that starts with "." (except
-    // ".well-known", always served). Judged by the path alone, whether or not the file
-    // exists. Ignored by default, as Express's serve-static does.
-    dotfiles_policy dotfiles = dotfiles_policy::ignore;
-};
 
 // Set of routes served for a host name (see http_application::host). The application
 // itself is the default virtual host: its routes answer the requests for hosts not registered.
@@ -80,7 +53,8 @@ public:
     // response::send_file does: with ETag and Last-Modified, answering conditional requests
     // with 304 and single byte ranges with 206, or their precompressed siblings (see
     // static_options). Paths resolving outside the directory (through symlinks) are
-    // answered with 403.
+    // answered with 403. A route is chosen once per request, so with static_options::fallthrough
+    // a path without a file goes to the not-found handler, not to another serve_static().
     void serve_static(const std::string& url_prefix,
                       const std::string& directory,
                       const std::string& fallback = "index.html");

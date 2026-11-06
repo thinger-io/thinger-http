@@ -8,6 +8,7 @@
 #include <thinger/http/server/server_connection.hpp>
 #include <thinger/http/server/response_sink.hpp>
 
+#include <algorithm>
 #include <mutex>
 
 #include "server_test_helpers.hpp"
@@ -60,6 +61,17 @@ namespace {
         }
     };
 
+    // An exact read after read_until(), which may have read past its delimiter, as
+    // boost::asio::async_read_until does: first what `held` keeps of that, then the socket
+    awaitable<io_result> read_after_until(asio::socket& socket, boost::asio::streambuf& held,
+                                          uint8_t* buffer, size_t size) {
+        size_t taken = boost::asio::buffer_copy(boost::asio::buffer(buffer, size), held.data());
+        held.consume(taken);
+        if (taken == size) co_return io_result{boost::system::error_code{}, taken};
+        auto [ec, bytes] = co_await socket.read(buffer + taken, size - taken);
+        co_return io_result{ec, taken + bytes};
+    }
+
 }
 
 TEST_CASE("Custom socket: reads and writes built on read_some() and write()", "[socket][custom][integration]") {
@@ -67,9 +79,17 @@ TEST_CASE("Custom socket: reads and writes built on read_some() and write()", "[
     std::string written;
     auto socket = std::make_shared<memory_socket>(ioc, [&](std::string data) { written += data; });
 
-    // data arriving from another thread, in pieces
-    std::thread producer([socket] {
-        for (auto piece : {"GET / HT", "TP/1.1\r\nHost: x\r", "\n\r\n", "0123", "456789", "tail"}) {
+    std::vector<std::string> pieces;
+    SECTION("Data arriving in pieces") {
+        pieces = {"GET / HT", "TP/1.1\r\nHost: x\r", "\n\r\n", "0123", "456789", "tail"};
+    }
+    SECTION("Data arriving at once: read_until() reads past its delimiter") {
+        pieces = {"GET / HTTP/1.1\r\nHost: x\r\n\r\n0123456789tail"};
+    }
+
+    // from another thread: however these pieces get together on the way, the results are the same
+    std::thread producer([socket, pieces] {
+        for (const auto& piece : pieces) {
             socket->push(piece);
             std::this_thread::sleep_for(5ms);
         }
@@ -84,16 +104,18 @@ TEST_CASE("Custom socket: reads and writes built on read_some() and write()", "[
         buffer.consume(bytes);
 
         uint8_t exact[4];
-        auto [read_ec, read_bytes] = co_await socket->read(exact, sizeof(exact));
+        auto [read_ec, read_bytes] = co_await read_after_until(*socket, buffer, exact, sizeof(exact));
         results.push_back(read_ec ? read_ec.message() : std::string(reinterpret_cast<char*>(exact), read_bytes));
 
-        auto [buffer_ec, buffer_bytes] = co_await socket->read(buffer, 6);
-        results.push_back(buffer_ec ? buffer_ec.message() : std::string(static_cast<const char*>(buffer.data().data()), buffer.size()));
-        buffer.consume(buffer.size());
+        // into the streambuf: it reads what `buffer` still lacks of the 6 bytes
+        size_t missing = 6 - std::min<size_t>(6, buffer.size());
+        auto [buffer_ec, buffer_bytes] = co_await socket->read(buffer, missing);
+        results.push_back(buffer_ec ? buffer_ec.message() : std::string(static_cast<const char*>(buffer.data().data()), 6));
+        buffer.consume(6);
 
         // the end of the stream ends an exact read too, with what was read
         uint8_t rest[16];
-        auto [end_ec, end_bytes] = co_await socket->read(rest, sizeof(rest));
+        auto [end_ec, end_bytes] = co_await read_after_until(*socket, buffer, rest, sizeof(rest));
         results.push_back(std::string(reinterpret_cast<char*>(rest), end_bytes) + "|" +
                           (end_ec == boost::asio::error::eof ? "eof" : end_ec.message()));
 

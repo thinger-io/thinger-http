@@ -34,9 +34,18 @@ namespace thinger::http {
           cancelled_(cancel_reason::none) {}
 
     void http_stream::cancel(cancel_reason reason) {
+        if (reason == cancel_reason::none) return;
         // The first reason wins, whatever thread gives it
         auto none = cancel_reason::none;
-        if (reason == cancel_reason::none || !cancelled_.compare_exchange_strong(none, reason, std::memory_order_acq_rel)) {
+        if (!cancelled_.compare_exchange_strong(none, reason, std::memory_order_acq_rel)) {
+            // The scope stays as it is, but a shutdown still interrupts a handler that the first
+            // reason let go on (once: what it does about an interruption is up to it)
+            if (reason != cancel_reason::shutdown) return;
+            boost::asio::dispatch(executor_, [self = shared_from_this()] {
+                if (!self->handler_running_ || self->handler_interrupted_) return;
+                self->observer_signal_.emit(boost::asio::cancellation_type::terminal);
+                self->interrupt_handler();
+            });
             return;
         }
         boost::asio::dispatch(executor_, [self = shared_from_this(), reason] {
@@ -45,11 +54,15 @@ namespace thinger::http {
             self->observer_signal_.emit(boost::asio::cancellation_type::terminal);
             // A drain deadline interrupts every handler; another reason, those declaring it
             if (reason == cancel_reason::shutdown || (self->cancel_on_ & (1u << static_cast<unsigned>(reason)))) {
-                self->handler_interrupted_ = true;
-                auto& signal = self->bound_signal_ ? *self->bound_signal_ : self->handler_signal_;
-                signal.emit(boost::asio::cancellation_type::terminal);
+                self->interrupt_handler();
             }
         });
+    }
+
+    void http_stream::interrupt_handler() {
+        handler_interrupted_ = true;
+        auto& signal = bound_signal_ ? *bound_signal_ : handler_signal_;
+        signal.emit(boost::asio::cancellation_type::terminal);
     }
 
     void http_stream::end_input(bool follows) {

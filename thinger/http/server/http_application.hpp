@@ -10,12 +10,14 @@
 #include "response_observer.hpp"
 #include "request_context.hpp"
 #include "../../util/types.hpp"
+#include <boost/system/error_code.hpp>
 #include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace thinger::http {
@@ -45,6 +47,66 @@ struct dispatch_options {
     request_context context;
 };
 
+// Cross-origin requests (see http_application::enable_cors). The defaults are those of cors()
+// in Express: any origin, without credentials, reflecting the headers a preflight asks for.
+struct cors_options {
+    // Origins allowed. {"*"} alone (the default) is any origin: every response says
+    // "Access-Control-Allow-Origin: *", also to a request without Origin. Otherwise, the exact
+    // origins allowed (ASCII case-insensitive; empty for none, "null" for that origin): the one
+    // of a request listed is reflected as it came, and every response says "Vary: Origin",
+    // allowed or not. "*" next to other origins is invalid.
+    std::vector<std::string> origins{"*"};
+
+    // Whether an origin is allowed, instead of the list, which is ignored then: reflected as
+    // above if it returns true. Called once for each request with an Origin (repeated ones come
+    // joined by ", "), on the thread of the request and before its middlewares, so it must not
+    // block. If it throws, the request is answered 500, with no origin allowed.
+    std::function<bool(std::string_view origin, const http_request& request)> origin_filter{};
+
+    // Access-Control-Allow-Methods of a preflight
+    std::vector<std::string> methods{"GET", "HEAD", "PUT", "PATCH", "POST", "DELETE"};
+
+    // Access-Control-Allow-Headers of a preflight: without a value (the default), what its
+    // Access-Control-Request-Headers asks for, with "Vary: Access-Control-Request-Headers";
+    // with a value, that list, whatever it asks for (not sent if empty). Being optional, it is
+    // set as std::vector<std::string>{"Content-Type", "Authorization"}.
+    std::optional<std::vector<std::string>> allowed_headers{};
+
+    // Access-Control-Expose-Headers, on the responses to an origin allowed (not sent if empty)
+    std::vector<std::string> exposed_headers{};
+
+    // Access-Control-Max-Age of a preflight: not sent without a value (the default), and sent
+    // when 0. Not negative.
+    std::optional<std::chrono::seconds> max_age{};
+
+    // Send "Access-Control-Allow-Credentials: true" to an origin allowed (cookies or
+    // Authorization in a browser). Invalid with any origin ("*"), which browsers reject: use a
+    // list or a filter.
+    bool credentials = false;
+
+    // Let a preflight go on as any request (route matching, middlewares and the OPTIONS route of
+    // the application, or 404/405), with the preflight headers already on its response. By
+    // default the application answers it with 204, before route matching and the middlewares.
+    bool preflight_continue = false;
+};
+
+namespace detail {
+    // What http_application and response share of CORS (cors.cpp): the options once checked and
+    // computed (null, and logged, if invalid); what they mean for a request, which runs the
+    // filter of the options and throws what it throws; and its headers, added to a message about
+    // to be sent, unless the message has them
+    struct cors_policy;
+    struct cors_decision {
+        std::string origin;             // granted: "*", as it came, or empty for none
+        bool preflight = false;         // its response says what a preflight is told
+        bool answer_preflight = false;  // the application answers it, not its routes
+        std::string requested_headers;  // Access-Control-Request-Headers of a preflight, to reflect
+    };
+    std::shared_ptr<const cors_policy> make_cors_policy(cors_options options);
+    cors_decision decide_cors(const cors_policy& policy, const http_request& request);
+    void apply_cors(const cors_policy& policy, const cors_decision& decision, http_response& message);
+}
+
 // Middlewares run after route matching (request::get_matched_route() is set, or null
 // if no route matched) and before the request body is read, so they cannot see it.
 // They share the response object with the route handler.
@@ -71,6 +133,10 @@ class http_application : public virtual_host {
 public:
     http_application();
 
+    // Ends the requests dispatched in memory that are still in flight (see dispatch()), without
+    // waiting for their handlers. It may be called from any thread, or from one of those handlers
+    ~http_application();
+
     // Virtual hosts: the routes registered on the application itself answer any host,
     // unless the Host header (case-insensitive, port ignored) matches a host registered
     // here: exact names first, then patterns in registration order. Register before serving
@@ -95,10 +161,22 @@ public:
     // and the same 404/405 handling. Useful for tests, internal calls and gateways.
     // The body is taken from the request content (set_content); chunked requests are not
     // supported. WebSocket, SSE and connection takeover answer 501.
+    //
+    // A dispatch shares only the serving state with the application, never the application
+    // itself, so destroying it (from any thread, or from a handler) ends the dispatches in
+    // flight without waiting for them. One without a complete response ends at once, and this
+    // throws boost::system::system_error(operation_aborted); a complete one is delivered. One
+    // not started yet (this awaitable, awaited later) runs no middleware or handler. A handler
+    // running is interrupted as at the shutdown of a server: its next cancellable await ends
+    // with operation_aborted, whatever its route declared and even if its scope was cancelled
+    // already (request::cancelled() keeps the first reason, cancel_reason::shutdown if none).
+    // Its current step, and the awaits it isolated from cancellation, end on their own, and what
+    // it sends afterwards is dropped. What it captured itself is the caller's to keep alive.
     awaitable<std::shared_ptr<http_response>> dispatch(std::shared_ptr<http_request> request,
                                                        dispatch_options options = {});
 
-    // Same, calling `callback` with the response; runs on `executor`
+    // Same, calling `callback` once with the response; runs on `executor`. With no error to
+    // report, a dispatch ended by destroying the application gets 503 Service Unavailable
     void dispatch(const boost::asio::any_io_executor& executor,
                   std::shared_ptr<http_request> request,
                   sync_callback<void(std::shared_ptr<http_response>)> callback,
@@ -131,8 +209,20 @@ public:
                         const std::string& realm,
                         const std::map<std::string, std::string>& users);
 
-    // Add CORS headers to every response
-    void enable_cors(bool enabled = true);
+    // Serve cross-origin requests from browsers (see cors_options; off by default). Its headers
+    // go on every response of the application, whoever answers it (the handler, a middleware,
+    // or the server itself: 400, 404, 405, 413, 415, 500, a route timeout...), on a connection or
+    // dispatched in memory; a header set by the handler or a middleware stays instead. It is not
+    // access control: a request from an origin not allowed still runs, only without the headers
+    // a browser needs to read its response. A preflight (OPTIONS with a non-empty
+    // Access-Control-Request-Method) is answered 204 by the application, without running the
+    // middlewares, unless cors_options::preflight_continue. Returns `invalid_argument` for
+    // options that cannot be applied, the reason in the log: nothing changes then. Set it before
+    // serving (listen()): it is read without locks.
+    boost::system::error_code enable_cors(cors_options options = {});
+
+    // Back to no CORS headers, and OPTIONS routed as any other method
+    void disable_cors();
 
     // Maximum request body size (8 MB by default), for the routes that do not set their own
     // (route::max_body_size) and the requests matching no route: every read of a body is

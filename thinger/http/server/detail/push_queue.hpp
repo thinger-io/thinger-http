@@ -1,6 +1,8 @@
 #ifndef THINGER_HTTP_SERVER_DETAIL_PUSH_QUEUE_HPP
 #define THINGER_HTTP_SERVER_DETAIL_PUSH_QUEUE_HPP
 
+#include <atomic>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <iterator>
@@ -32,8 +34,8 @@ enum class push_failure {
 // event up to its data. The queue never closes its owner's connection: it stops writing, closes
 // (the producers waiting are told false) and tells its owner, through on_failure, which closes.
 //
-// On its owner's executor, except queued_bytes(), queued_messages() and the calls said to be
-// from any thread, which keep the owner alive while they hop to it
+// On its owner's executor, except queued_bytes(), queued_messages(), dropped_messages() and the
+// calls said to be from any thread, which keep the owner alive while they hop to it
 template<typename Item>
 class push_queue {
 public:
@@ -78,6 +80,7 @@ public:
                 enqueue(entry{std::move(item), nullptr});
                 break;
             case admission::drop:
+                count_dropped(1);
                 break;
             case admission::close:
                 fail(push_failure::overflow, {});
@@ -119,6 +122,11 @@ public:
     // Bytes, and items, not written yet (the one being written included); from any thread
     size_t queued_bytes() const { return flow_.queued_bytes(); }
     size_t queued_messages() const { return flow_.queued_messages(); }
+
+    // Items sent without waiting that the overflow policy dropped so far: the new one, or the older
+    // ones it made room with. Not what close() empties, nor what is pushed once closed. From any
+    // thread: it never decreases, and acquires what led to the value (e.g. what was sent)
+    uint64_t dropped_messages() const { return dropped_.load(std::memory_order_acquire); }
 
     // Nothing else is written: the watermark callbacks are released, producers waiting (and
     // those of the items queued) are told false, the queue is emptied. Once; an item being
@@ -229,6 +237,11 @@ private:
         writing_ = false;
     }
 
+    // Only ever written here, on the executor, so no read-modify-write; nothing per item queued
+    void count_dropped(uint64_t items){
+        dropped_.store(dropped_.load(std::memory_order_relaxed) + items, std::memory_order_release);
+    }
+
     // Stop writing for good, and tell the owner (once)
     void fail(push_failure failure, boost::system::error_code ec){
         if(closed_) return;
@@ -270,6 +283,7 @@ private:
         }
         // accounted for once the queue is consistent
         flow_.remove(bytes, items);
+        count_dropped(items);
         return !flow_.overflows(size);
     }
 
@@ -285,6 +299,8 @@ private:
     // The last item taken for writing did not end its unit: the items up to its end belong to it
     bool unit_open_ = false;
     bool closed_ = false;
+    // See dropped_messages()
+    std::atomic<uint64_t> dropped_{0};
 };
 
 }

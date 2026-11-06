@@ -118,6 +118,11 @@ namespace compression {
 
     void add_vary(http_response& message, std::string_view field) {
         if (has_list_token(message, "Vary", field) || has_list_token(message, "Vary", "*")) return;
+        if (field == "*") {
+            message.remove_headers("Vary");
+            message.add_header("Vary", "*");
+            return;
+        }
         const auto& vary = message.get_header("Vary");
         if (vary.empty()) {
             message.add_header("Vary", std::string(field));

@@ -26,13 +26,6 @@ constexpr uint8_t OPCODE_PONG = 0xA;
 
 constexpr size_t MAX_CONTROL_PAYLOAD = 125;
 
-// Close codes that may be sent back (RFC 6455, 7.4, and the IANA registry up to 1014, as Node
-// ws and Go accept)
-bool valid_close_code(uint16_t code) {
-    if (code >= 3000 && code <= 4999) return true;
-    return code >= 1000 && code <= 1014 && code != 1004 && code != 1005 && code != 1006;
-}
-
 // Mask keys must be unpredictable (RFC 6455, 5.3): taken from the CSPRNG of OpenSSL (a few
 // bytes per frame sent by a client), or from std::random_device without it
 void random_mask(uint8_t mask[websocket::MASK_SIZE_BYTES]) {
@@ -46,7 +39,7 @@ void random_mask(uint8_t mask[websocket::MASK_SIZE_BYTES]) {
 
 // The code to send in a close frame: 1000 for one that may not be sent
 uint16_t sendable_close_code(uint16_t code) {
-    if (valid_close_code(code)) return code;
+    if (websocket::valid_close_code(code)) return code;
     LOG_WARNING("websocket close code {} may not be sent, closing with 1000", code);
     return websocket::CLOSE_NORMAL;
 }
@@ -58,6 +51,11 @@ boost::system::error_code protocol_error() {
 }
 
 std::atomic<unsigned long> websocket::connections{0};
+
+bool websocket::valid_close_code(uint16_t code) {
+    if (code >= 3000 && code <= 4999) return true;
+    return code >= 1000 && code <= 1014 && code != 1004 && code != 1005 && code != 1006;
+}
 
 websocket::websocket(std::shared_ptr<socket> sock, bool binary, bool server, boost::asio::any_io_executor executor)
     : socket("websocket", sock->get_io_context())
@@ -474,7 +472,10 @@ awaitable<boost::system::error_code> websocket::write_frame(uint8_t opcode,
             co_return ec;
         }
     }
-    if (opcode == OPCODE_CLOSE) close_sent_ = true;
+    if (opcode == OPCODE_CLOSE) {
+        close_sent_ = true;
+        close_unwritten_ = true;
+    }
 
     size_t size = boost::asio::buffer_size(payload);
     uint8_t header[14];
@@ -507,6 +508,8 @@ awaitable<boost::system::error_code> websocket::write_frame(uint8_t opcode,
             tail_.resize(boost::asio::buffer_size(output));
             boost::asio::buffer_copy(boost::asio::buffer(tail_), output);
         }
+    } else if (opcode == OPCODE_CLOSE) {
+        close_unwritten_ = false;
     }
     co_return ec;
 }
@@ -536,12 +539,17 @@ awaitable<io_result> websocket::send_frame(uint8_t opcode, const std::vector<boo
     co_return io_result{ec, ec ? 0 : boost::asio::buffer_size(payload)};
 }
 
-awaitable<boost::system::error_code> websocket::send_close(uint16_t code) {
-    LOG_DEBUG("sending close frame: {}", code);
-    close_code_ = code;
-    uint8_t payload[2] = {uint8_t(code >> 8), uint8_t(code & 0xFF)};
+awaitable<boost::system::error_code> websocket::send_close() {
+    LOG_DEBUG("sending close frame: {}", close_code_);
+    auto payload = close_payload();
     auto [ec, bytes] = co_await send_frame(OPCODE_CLOSE, {boost::asio::buffer(payload)}, true);
     co_return ec;
+}
+
+std::vector<uint8_t> websocket::close_payload() const {
+    std::vector<uint8_t> payload{uint8_t(close_code_ >> 8), uint8_t(close_code_ & 0xFF)};
+    payload.insert(payload.end(), close_reason_sent_.begin(), close_reason_sent_.end());
+    return payload;
 }
 
 awaitable<void> websocket::send_ping(uint8_t buffer[], size_t size) {
@@ -590,12 +598,7 @@ void websocket::close() {
 void websocket::close(uint16_t code, bool expect_reply) {
     if (closed_) return;
     code = sendable_close_code(code);
-    closed_ = true;
-    keepalive_.cancel();
-    close_timer_->cancel();
-    wake_writers();
-    pending_pong_.reset();
-    pending_ping_ = false;
+    mark_closed();
 
     // The closing handshake runs on the executor: called anywhere else (e.g. by a synchronous
     // client between its calls, while nothing runs its io_context) the connection is closed now
@@ -605,7 +608,8 @@ void websocket::close(uint16_t code, bool expect_reply) {
         return;
     }
     close_sent_ = true;
-    close_code_ = code;
+    // (a close frame asked for and waiting for its turn is the one sent)
+    if (!close_requested_) close_code_ = code;
     linger_expect_reply_ = expect_reply;
 
     // Pending operations end now. A write in progress leaves the rest of its frame, sent
@@ -619,30 +623,61 @@ void websocket::close(uint16_t code, bool expect_reply) {
     on_close_.notify(close_status());
 }
 
+void websocket::mark_closed() {
+    closed_ = true;
+    keepalive_.cancel();
+    close_timer_->cancel();
+    wake_writers();
+    pending_pong_.reset();
+    pending_ping_ = false;
+}
+
+void websocket::start_close_deadline() {
+    close_timer_->expires_after(CLOSE_TIMEOUT);
+    // (a websocket not owned by a std::shared_ptr is closed by close_graceful(), once the socket
+    // ends what it waits for)
+    close_timer_->async_wait([weak = weak_from_this(), socket = socket_](const boost::system::error_code& ec) {
+        if (ec) return;
+        if (auto self = weak.lock()) self->close_expired();
+        else socket->close();
+    });
+}
+
+void websocket::close_expired() {
+    if (closed_) return;
+    LOG_DEBUG("websocket closing handshake timed out");
+    mark_closed();
+    socket_->close();
+    on_close_.notify(close_status());
+}
+
 void websocket::start_linger() {
     linger_pending_ = false;
     std::vector<uint8_t> output = std::move(tail_);
     tail_.clear();
     uint8_t header[14];
     uint8_t mask[MASK_SIZE_BYTES];
-    size_t header_size = build_header(OPCODE_CLOSE, 2, header, mask);
+    auto payload = close_payload();
+    size_t header_size = build_header(OPCODE_CLOSE, payload.size(), header, mask);
     output.insert(output.end(), header, header + header_size);
-    uint8_t payload[2] = {uint8_t(close_code_ >> 8), uint8_t(close_code_ & 0xFF)};
-    if (!server_role_) apply_mask(payload, sizeof(payload), mask, 0);
-    output.insert(output.end(), payload, payload + sizeof(payload));
+    if (!server_role_) apply_mask(payload.data(), payload.size(), mask, 0);
+    output.insert(output.end(), payload.begin(), payload.end());
 
     // The closing handshake goes on without this websocket, on its socket, with what was
     // received but not read yet
     std::string input(reinterpret_cast<const char*>(in_.data() + in_begin_), buffered());
-    co_spawn(executor_, linger(socket_, std::move(output), std::move(input), frame_remaining_, linger_expect_reply_),
+    // (asked for by close_graceful(), the time it has left)
+    auto deadline = close_requested_ ? close_timer_->expiry() : std::chrono::steady_clock::now() + CLOSE_TIMEOUT;
+    co_spawn(executor_, linger(socket_, std::move(output), std::move(input), frame_remaining_, linger_expect_reply_, deadline),
              detached);
 }
 
 awaitable<void> websocket::linger(std::shared_ptr<socket> socket, std::vector<uint8_t> output,
-                                  std::string input, uint64_t skip, bool expect_reply) {
-    // Close the socket after the timeout, whatever is pending on it: on the executor of the
+                                  std::string input, uint64_t skip, bool expect_reply,
+                                  std::chrono::steady_clock::time_point deadline) {
+    // Close the socket at the deadline, whatever is pending on it: on the executor of the
     // websocket, as the operations it ends
-    auto timer = std::make_shared<boost::asio::steady_timer>(co_await boost::asio::this_coro::executor, CLOSE_TIMEOUT);
+    auto timer = std::make_shared<boost::asio::steady_timer>(co_await boost::asio::this_coro::executor, deadline);
     timer->async_wait([socket](const boost::system::error_code& ec) {
         if (!ec) socket->close();
     });
@@ -673,18 +708,29 @@ awaitable<void> websocket::linger(std::shared_ptr<socket> socket, std::vector<ui
     socket->close();
 }
 
-awaitable<void> websocket::close_graceful(uint16_t code) {
+awaitable<void> websocket::close_graceful(uint16_t code, std::string reason) {
     if (closed_) co_return;
     code = sendable_close_code(code);
-    if (!close_sent_ && !close_received_) {
-        if (co_await send_close(code)) {
+    // Nothing else is sent after the close frame
+    keepalive_.cancel();
+    pending_ping_ = false;
+    if (!close_requested_) {
+        if (reason.size() > MAX_CLOSE_REASON_SIZE) {
+            LOG_WARNING("websocket close reason of {} bytes does not fit in a close frame, closing without it", reason.size());
+            reason.clear();
+        }
+        close_requested_ = true;
+        close_code_ = code;
+        close_reason_sent_ = std::move(reason);
+        // One deadline for the whole handshake, its turn to write included
+        start_close_deadline();
+        if (co_await send_close()) {
             close(code);
             co_return;
         }
     }
     if (closed_) co_return;
     if (!close_received_) {
-        close_timer_->expires_after(CLOSE_TIMEOUT);
         if (reading_) {
             // The reader gets the close frame of the peer, and closes (which ends this wait)
             co_await close_timer_->async_wait(use_nothrow_awaitable);
@@ -717,7 +763,7 @@ void websocket::set_keepalive(std::chrono::milliseconds ping_interval, std::chro
     ping_interval_ = ping_interval;
     idle_timeout_ = idle_timeout;
     keepalive_.cancel();
-    if (closed_ || (ping_interval.count() <= 0 && idle_timeout.count() <= 0)) return;
+    if (closed_ || close_requested_ || (ping_interval.count() <= 0 && idle_timeout.count() <= 0)) return;
     if (weak_from_this().expired()) {
         LOG_ERROR("websocket keepalive requires the websocket to be owned by a std::shared_ptr");
         return;
@@ -836,7 +882,7 @@ awaitable<boost::system::error_code> websocket::handshake(const std::string& hos
 
 uint16_t websocket::get_close_code() const {
     if (close_received_) return received_close_code_;
-    if (close_sent_) return close_code_;
+    if (close_sent_ && !close_unwritten_) return close_code_;
     return CLOSE_ABNORMAL;
 }
 

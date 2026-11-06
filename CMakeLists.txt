@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.14)
 project(thinger_http 
-    VERSION 0.9.2
+    VERSION 0.10.0
     DESCRIPTION "Thinger HTTP Library - ASIO, HTTP and utilities"
     LANGUAGES CXX C
 )
@@ -77,16 +77,27 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(json)
 
 if(THINGER_HTTP_ENABLE_LOGGING)
-    find_package(spdlog QUIET)
-    if(NOT spdlog_FOUND)
-        message(STATUS "spdlog not found, fetching from GitHub...")
-        FetchContent_Declare(
-            spdlog
-            GIT_REPOSITORY https://github.com/gabime/spdlog.git
-            GIT_TAG        v1.12.0
-            GIT_SHALLOW    TRUE
-        )
-        FetchContent_MakeAvailable(spdlog)
+    # 1.15.1 is the oldest spdlog whose bundled fmt (11.1) compiles with clang 20 or later. A
+    # spdlog::spdlog the parent project already defined is its choice, and it stays
+    if(NOT TARGET spdlog::spdlog)
+        # Global, so a parent project sees the installed spdlog::spdlog as it sees the fetched one
+        set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL ON)
+        find_package(spdlog 1.15.1 QUIET)
+        unset(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL)
+        if(NOT spdlog_FOUND)
+            message(STATUS "spdlog >= 1.15.1 not found, fetching from GitHub...")
+            FetchContent_Declare(
+                spdlog
+                GIT_REPOSITORY https://github.com/gabime/spdlog.git
+                GIT_TAG        v1.15.1
+                GIT_SHALLOW    TRUE
+            )
+            # A static library that ends up inside the shared one
+            if(THINGER_HTTP_BUILD_SHARED)
+                set(SPDLOG_BUILD_PIC ON)
+            endif()
+            FetchContent_MakeAvailable(spdlog)
+        endif()
     endif()
 endif()
 

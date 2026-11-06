@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -313,6 +314,35 @@ TEST_CASE("listener accepts Unix domain socket connections", "[listener][unix][i
             REQUIRE_FALSE(std::filesystem::exists(path));
         }
     }
+}
+
+TEST_CASE("listener stops whatever happened to its Unix socket file", "[listener][unix][stop][integration]") {
+    auto path = unix_path("file_gone");
+    io_thread io;
+    auto server = make_listener(unix_options(path), io, accept_mode::provider);
+    REQUIRE_FALSE(server->open());
+    // Never accepted: it sees the acceptor closing
+    boost::asio::io_context client_context;
+    local::socket client(client_context);
+    client.connect(local::endpoint(path));
+    REQUIRE(std::filesystem::remove(path));
+    log_capture logs;
+
+    SECTION("Another removed it") {
+        server->stop();
+        REQUIRE(logs.count("warning", "cannot remove Unix socket file") == 0);
+    }
+
+    SECTION("It cannot be removed") {
+        // (a directory with something in it: not even root removes it)
+        std::filesystem::create_directories(std::filesystem::path(path) / "child");
+        server->stop();
+        std::filesystem::remove_all(path);
+        REQUIRE(logs.count("warning", "cannot remove Unix socket file") == 1);
+    }
+
+    pollfd closing{client.native_handle(), POLLIN, 0};
+    REQUIRE(::poll(&closing, 1, 2000) == 1);
 }
 
 TEST_CASE("listener replaces a stale Unix socket file", "[listener][unix][integration]") {
@@ -632,6 +662,36 @@ TEST_CASE("Unix listener stops from another thread while accepting", "[listener]
         DYNAMIC_SECTION(name(mode)) {
             stop_while_connecting<local>([&] { return unix_options(path); }, mode,
                                          [&](const listener&) { return local::endpoint(path); });
+        }
+    }
+}
+
+// A client that left before its connection was accepted does not stop the listener accepting. On
+// macOS accepting it fails: asio sets SO_NOSIGPIPE on its socket, EINVAL by then
+TEST_CASE("A client gone before its accept holds up nobody", "[listener][unix][integration]") {
+    for (auto mode : {accept_mode::provider, accept_mode::acceptor_thread}) {
+        DYNAMIC_SECTION(name(mode)) {
+            log_capture logs;
+            auto path = unix_path("gone");
+            io_thread io;
+            auto server = make_listener(unix_options(path), io, mode);
+            REQUIRE_FALSE(server->open());
+
+            // In the backlog when the listener starts accepting
+            boost::asio::io_context clients;
+            local::socket gone(clients);
+            gone.connect(local::endpoint(path));
+            gone.close();
+
+            server->start([](std::shared_ptr<thinger::asio::socket> sock) { sock->close(); });
+
+            // The next client is served: the handler closes its connection
+            local::socket next(clients);
+            next.connect(local::endpoint(path));
+            pollfd closed{next.native_handle(), POLLIN, 0};
+            CHECK(::poll(&closed, 1, 5000) == 1);
+            CHECK(logs.count("error", "cannot accept more connections") == 0);
+            server->stop();
         }
     }
 }

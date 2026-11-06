@@ -6,3 +6,10 @@
 # sigaction() and kill() as the synchronization they are: it reports the read as a race
 # (workers::wait() tests, which raise the signal they wait for)
 race:boost_asio_signal_handler
+
+# asio's shared executors (any_io_executor holding a strand) count their references with a release
+# decrement and, on the last one, an acquire fence before deleting (detail::ref_count_down). That
+# is correct, but TSan does not model atomic_thread_fence: it reports the delete as a race with
+# the decrement of another thread (an in-memory dispatch whose stream is released on the thread
+# destroying the application, while the strand finishes on a thread of a pool)
+race:boost::asio::detail::ref_count_down

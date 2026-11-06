@@ -49,7 +49,7 @@ namespace compression {
     bool compressible(const http_response& message);
 
     // Add `field` to the Vary header (as the vary module of Express): appended to the one
-    // there, unless it has it or is "*"
+    // there, unless it has it or is "*"; a `field` "*" replaces all the others
     void add_vary(http_response& message, std::string_view field);
 
     // Compress a compressible message if the client accepts it, adding "Vary: Accept-Encoding"

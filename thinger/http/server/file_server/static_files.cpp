@@ -5,11 +5,11 @@
 #include "../request.hpp"
 #include "../response.hpp"
 #include "../response_compression.hpp"
-#include "../virtual_host.hpp"
 #include "../../util/url.hpp"
 #include <algorithm>
 #include <optional>
 #include <string_view>
+#include <system_error>
 
 namespace thinger::http::file_server {
 
@@ -136,56 +136,77 @@ namespace {
         return file;
     }
 
+    void send_file(request& req, response& res, const fs::path& file, const fs::path& root,
+                   const static_options& options) {
+        if (!options.cache_control.empty()) res.header(header::cache_control, options.cache_control);
+        send_static_file(req, res, file, root, options.precompressed);
+    }
+
+    // Answers with the file a decoded path names, or the index of the directory it names: false
+    // if the path has no file, leaving the request unanswered
+    bool serve_path(request& req, response& res, const fs::path& directory, const std::string& path,
+                    const fs::path& root, const static_options& options) {
+        std::error_code error;
+        auto file = fs::weakly_canonical(directory / path, error);
+        if (error) {
+            // A name too long to exist is a path without a file (as in Node's send); any other
+            // failure of the file system is one of the server
+            if (options.fallthrough && error == std::errc::filename_too_long) return false;
+            throw fs::filesystem_error("weakly_canonical", directory / path, error);
+        }
+        if (!is_within(file, root)) {
+            res.error(http_response::status::forbidden, "Access denied");
+            return true;
+        }
+        auto status = fs::status(file);
+        if (fs::is_regular_file(status)) {
+            send_file(req, res, file, root, options);
+            return true;
+        }
+        if (fs::is_directory(status)) {
+            if (auto index = fallback_of(file, options.fallback)) {
+                send_file(req, res, *index, root, options);
+                return true;
+            }
+        }
+        return false;
+    }
+
 }
 
-void serve(request& req, response& res, const fs::path& directory, const static_options& options) {
-    // The path parameter is raw: percent-decoded here as a path, where "+" is literal (as Node's
-    // send does), so escaped first for url_decode, which reads it as a form space. A decoded "/"
-    // separates directories; a NUL could not name a file
-    std::string path = req["path"];
+bool serve(request& req, response& res, const fs::path& directory, std::string_view raw_path,
+           const static_options& options) {
+    // The path is raw: percent-decoded here as a path, where "+" is literal (as Node's send does),
+    // so escaped first for url_decode, which reads it as a form space. A decoded "/" separates
+    // directories; a NUL could not name a file
+    std::string path(raw_path);
     if (!decode_path(path)) {
         res.error(http_response::status::bad_request, "Invalid path");
-        return;
+        return true;
     }
     // Dotfiles (".env", ".git/"), judged by the path alone: denied, or ignored as a path
     // without a file, unless allowed
     bool dotfile = options.dotfiles != dotfiles_policy::allow && is_dotfile_path(path);
     if (dotfile && options.dotfiles == dotfiles_policy::deny) {
         res.error(http_response::status::forbidden, "Access denied");
-        return;
+        return true;
     }
     auto root = fs::canonical(directory);
-    auto send = [&](const fs::path& file) {
-        if (!options.cache_control.empty()) res.header(header::cache_control, options.cache_control);
-        send_static_file(req, res, file, root, options.precompressed);
-    };
 
     // An empty path is the root: its fallback, if any
-    if (!path.empty() && !dotfile) {
-        auto file = fs::weakly_canonical(directory / path);
-        if (!is_within(file, root)) {
-            res.error(http_response::status::forbidden, "Access denied");
-            return;
-        }
-        auto status = fs::status(file);
-        if (fs::is_regular_file(status)) {
-            send(file);
-            return;
-        }
-        if (fs::is_directory(status)) {
-            if (auto index = fallback_of(file, options.fallback)) {
-                send(*index);
-                return;
-            }
-        }
-    }
+    if (!path.empty() && !dotfile && serve_path(req, res, directory, path, root, options)) return true;
 
-    // The fallback of the root for the paths without a file (single page applications)
-    if (auto index = fallback_of(root, options.fallback)) {
-        send(*index);
-        return;
+    // The fallback of the root for the paths without a file (single page applications), which
+    // with fallthrough are for the caller: there it is only the index of the root
+    if (!options.fallthrough || path.empty()) {
+        if (auto index = fallback_of(root, options.fallback)) {
+            send_file(req, res, *index, root, options);
+            return true;
+        }
     }
+    if (options.fallthrough) return false;
     res.error(http_response::status::not_found, "Not found");
+    return true;
 }
 
 } // namespace thinger::http::file_server

@@ -27,7 +27,10 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     container:
       image: thinger/compiler:mold-latest
-      options: --memory=36g --memory-swap=36g
+      # /tmp in memory: unlinking a Unix socket at shutdown must not wait for a disk busy with other
+      # builds. The compiler and the tests write under 1 GiB there at any moment; the size makes a
+      # runaway fail with ENOSPC, not with an OOM kill. Nothing runs from /tmp (noexec by default)
+      options: --memory=36g --memory-swap=36g --tmpfs /tmp:size=8g
 
     steps:
       - uses: actions/checkout@v4

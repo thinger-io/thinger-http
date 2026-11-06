@@ -1,5 +1,5 @@
 #include "url.hpp"
-#include <array>
+#include "../../util/ascii.hpp"
 
 namespace thinger::http::util::url{
 
@@ -144,17 +144,6 @@ namespace thinger::http::util::url{
 
         constexpr std::string_view redacted = "[redacted]";
 
-        bool is_credential_parameter(std::string_view name) {
-            static constexpr std::array<std::string_view, 8> names{
-                "access_token", "authorization", "token", "api_key", "apikey", "key", "password", "client_secret"};
-            return std::any_of(names.begin(), names.end(), [&](std::string_view candidate) {
-                return candidate.size() == name.size() &&
-                       std::equal(candidate.begin(), candidate.end(), name.begin(), [](char a, char b) {
-                           return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
-                       });
-            });
-        }
-
         // "scheme://user:password@host...": the password redacted
         std::string redact_user_info(std::string_view uri) {
             auto scheme_end = uri.find("://");
@@ -175,7 +164,47 @@ namespace thinger::http::util::url{
 
     }
 
+    redacted_parameters::redacted_parameters(std::initializer_list<std::string_view> names) {
+        for (auto name : names) add(name);
+    }
+
+    const redacted_parameters& redacted_parameters::defaults() {
+        static const redacted_parameters names{
+            "access_token", "api_key", "apikey", "authorization", "client_secret", "code",
+            "id_token", "key", "password", "refresh_token", "secret", "sig", "signature", "token",
+            "x-amz-security-token", "x-amz-signature", "x-goog-signature"};
+        return names;
+    }
+
+    // The names are shared with the copies of this set: both change a copy of them
+    redacted_parameters& redacted_parameters::add(std::string_view name) {
+        if (name.empty() || contains(name)) return *this;
+        auto names = names_ ? std::make_shared<std::vector<std::string>>(*names_)
+                            : std::make_shared<std::vector<std::string>>();
+        names->emplace_back(name);
+        names_ = std::move(names);
+        return *this;
+    }
+
+    redacted_parameters& redacted_parameters::remove(std::string_view name) {
+        if (!contains(name)) return *this;
+        auto names = std::make_shared<std::vector<std::string>>(*names_);
+        std::erase_if(*names, [&](const std::string& candidate) { return thinger::util::ascii::iequals(candidate, name); });
+        names_ = std::move(names);
+        return *this;
+    }
+
+    bool redacted_parameters::contains(std::string_view name) const {
+        return names_ && std::any_of(names_->begin(), names_->end(), [&](const std::string& candidate) {
+            return thinger::util::ascii::iequals(candidate, name);
+        });
+    }
+
     std::string loggable_uri(std::string_view uri) {
+        return loggable_uri(uri, redacted_parameters::defaults());
+    }
+
+    std::string loggable_uri(std::string_view uri, const redacted_parameters& names) {
         auto query = uri.find('?');
         if (query == std::string_view::npos) return redact_user_info(uri);
         auto fragment = uri.find('#', query);
@@ -188,7 +217,7 @@ namespace thinger::http::util::url{
             auto end = (amp == std::string_view::npos || amp > query_end) ? query_end : amp;
             auto pair = uri.substr(pos, end - pos);
             auto eq = pair.find('=');
-            if (eq != std::string_view::npos && is_credential_parameter(url_decode(std::string(pair.substr(0, eq))))) {
+            if (eq != std::string_view::npos && names.contains(url_decode(std::string(pair.substr(0, eq))))) {
                 out += pair.substr(0, eq + 1);
                 out += redacted;
             } else {

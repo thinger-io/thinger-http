@@ -16,6 +16,7 @@
 #include "../fixtures/running_workers.hpp"
 #include "../fixtures/stream_test_helpers.hpp"
 #include "../fixtures/transport_matrix.hpp"
+#include "../fixtures/watchdog.hpp"
 
 #include <boost/asio/bind_cancellation_slot.hpp>
 #include <boost/asio/cancellation_signal.hpp>
@@ -24,12 +25,8 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <cstdio>
-#include <cstdlib>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -38,53 +35,13 @@ using namespace thinger;
 using namespace std::chrono_literals;
 using shutdown_test::eventually;
 using shutdown_test::raw_client;
+using http::test::timed;
+using http::test::watchdog;
 using clock_type = std::chrono::steady_clock;
 
 namespace {
 
-// Ends the test program if the test is still running after `limit`: a deadlock fails the test
-// instead of hanging it
-class watchdog {
-public:
-    explicit watchdog(std::chrono::seconds limit) {
-        thread_ = std::thread([this, limit] {
-            std::unique_lock lock(mutex_);
-            if (!done_.wait_for(lock, limit, [this] { return disarmed_; })) {
-                std::fprintf(stderr, "watchdog: the test is still running after %llds, aborting\n",
-                             static_cast<long long>(limit.count()));
-                std::abort();
-            }
-        });
-    }
-
-    ~watchdog() {
-        {
-            std::lock_guard lock(mutex_);
-            disarmed_ = true;
-        }
-        done_.notify_all();
-        thread_.join();
-    }
-
-    watchdog(const watchdog&) = delete;
-    watchdog& operator=(const watchdog&) = delete;
-
-private:
-    std::mutex mutex_;
-    std::condition_variable done_;
-    bool disarmed_ = false;
-    std::thread thread_;
-};
-
 const std::string second_request = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
-
-// How long `action` took
-template<typename Action>
-std::chrono::milliseconds timed(Action&& action) {
-    auto begin = clock_type::now();
-    action();
-    return std::chrono::duration_cast<std::chrono::milliseconds>(clock_type::now() - begin);
-}
 
 // A client of `endpoint` with a keep-alive GET / answered: an idle keep-alive connection
 std::unique_ptr<raw_client> idle_client(const http::test::transport_endpoint& endpoint) {
@@ -240,8 +197,8 @@ TEST_CASE("Destroying a pool server with a route timeout pending, or expired wit
         CHECK(probe.reason == http::cancel_reason::shutdown);
         CHECK(rest.data.empty());
     }
-    // After the timeout, its scope was cancelled already (with a reason its route did not
-    // declare): the handler runs its wait to the end, against the serving state it keeps
+    // After the timeout, its 504 was written and the connection no longer follows the request:
+    // the handler runs its wait to the end, against the serving state it keeps
 }
 
 TEST_CASE("Destroying a pool server after a shutdown left a handler running", "[server][lifetime][matrix]") {

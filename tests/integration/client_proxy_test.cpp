@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "../fixtures/listener_helpers.hpp"
 #include "../fixtures/test_ca.hpp"
 #include "../fixtures/running_workers.hpp"
 #include "../fixtures/server_listen.hpp"
@@ -710,6 +711,29 @@ TEST_CASE("HTTP client never shares a connection between direct and proxied requ
     REQUIRE(direct != proxied);
     REQUIRE(direct_again == direct);
     REQUIRE(proxy.received_requests().size() == 1);
+}
+
+TEST_CASE("HTTP client hides the credentials of its proxy in the logs of its pool", "[http][client][proxy][pool][logging][integration]") {
+    // Before the servers, to outlive their threads: replacing the logger while one logs is a data race
+    http::test::log_capture logs;
+    http::test::test_ca ca;
+    auto certificates = std::make_shared<asio::certificate_manager>();
+    http::test::server_certificate certificate(certificates, "origin.test", ca.issue("origin.test"));
+    test_proxy proxy("user:secret");
+    origin_server origin(true, certificates);
+
+    http::client client;
+    client.timeout(5s).proxy(proxy.url("user:secret")).add_ca_pem(ca.pem());
+    client.idle_timeout(1ms);
+    REQUIRE(client.get(origin.url("origin.test")).ok());
+    // Expired by now: the next request closes it, or its timer did
+    std::this_thread::sleep_for(20ms);
+    REQUIRE(client.get(origin.url("origin.test")).ok());
+
+    // The key of the connection, up to the proxy: its credentials are what followed
+    REQUIRE(logs.count("debug", "idle") > 0);
+    REQUIRE(logs.count("debug", "|connect:127.0.0.1|" + std::to_string(proxy.port()) + ")") > 0);
+    REQUIRE(logs.count("debug", util::base64::encode("user:secret")) == 0);
 }
 
 TEST_CASE("HTTP client streams chunked responses through the proxy", "[http][client][proxy][streaming][integration]") {

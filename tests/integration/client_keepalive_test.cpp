@@ -424,7 +424,8 @@ TEST_CASE("HTTP client reuses a TLS connection", "[http][client][pool][ssl][inte
     REQUIRE(client.pool_stats().reused == 9);
 
     SECTION("Different CAs trusted, different connections") {
-        http::test::test_ca other;
+        // Another name: without an authority key identifier, the issuer is chosen by its name
+        http::test::test_ca other("Other Test CA");
         auto res = client.request(server.url()).ca_pem(other.pem()).get();
         REQUIRE(res.ok());
         REQUIRE_FALSE(ports.contains(res.body()));

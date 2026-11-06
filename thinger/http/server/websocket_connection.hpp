@@ -2,7 +2,9 @@
 #define THINGER_WEBSOCKET_CONNECTION_HPP
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <boost/asio/streambuf.hpp>
 #include "../../asio/async_event.hpp"
 #include "../../asio/io_context_of.hpp"
@@ -26,12 +28,14 @@ namespace detail {
 /// How a server WebSocket closed (see websocket_connection::on_close() and
 /// asio::websocket_close). The status code (RFC 6455, 7.4) is the one of the peer's close frame
 /// (1005 if it had none, 1002 if it was not valid); else the one this end closed with, as 1000
-/// (stop()), 1001 (server shutdown, or idle), 1007 or 1009 (a message not valid, or too large),
-/// 1011 (on_message() threw) or 1013 (it did not keep up, see write_limits); 1006 if no close
-/// frame was exchanged: the connection was lost, or closed by the server at the end of a
-/// shutdown's grace period. When this end closed first and the peer answered while the
+/// (stop(), or the code given to stop(code, reason)), 1001 (server shutdown, or idle), 1007 or
+/// 1009 (a message not valid, or too large), 1011 (on_message() threw) or 1013 (it did not keep
+/// up, see write_limits); 1006 if no close frame was exchanged: the connection was lost, closed
+/// by the server at the end of a shutdown's grace period, or the close frame of stop() not
+/// written whole by its deadline. When this end closed first and the peer answered while the
 /// websocket was still reading (stop(), the shutdown), it is the code of the peer's answer, its
-/// echo, as Node's ws reports it
+/// echo, as Node's ws reports it; if the peer did not answer, the one sent. The reason is always
+/// the one of the peer's close frame, not the one given to stop()
 using websocket_close = asio::websocket_close;
 
 /**
@@ -40,13 +44,18 @@ using websocket_close = asio::websocket_close;
  * (waiting until written, so a producer goes at the pace of the peer).
  *
  * Flow control: the queue holds 100 messages and drops the newest sent to a full queue, unless
- * set_write_limits() says otherwise (see write_limits in flow_control.hpp). pause_reading()
- * lets TCP backpressure reach the peer.
+ * set_write_limits() says otherwise (see write_limits in flow_control.hpp), and
+ * dropped_messages() counts what the policy drops. pause_reading() lets TCP backpressure reach
+ * the peer.
+ *
+ * Closing: stop() closes with 1000, stop(code, reason) with a code and a reason of the
+ * application. Both do the closing handshake and end within asio::websocket::CLOSE_TIMEOUT,
+ * whatever the peer does, and on_close() tells how it ended.
  *
  * Threads. Callbacks run on the websocket thread. From any thread: send_*(), wait_writable(),
  * set_write_limits(), on_high_watermark(), on_low_watermark(), pause_reading(),
- * resume_reading(), stop(), execute(), queued_bytes() and queued_messages(). On the websocket
- * thread only (e.g. from its callbacks, or execute()): get_write_limits(), queue_full(),
+ * resume_reading(), stop(), execute(), queued_bytes(), queued_messages() and dropped_messages().
+ * On the websocket thread only (e.g. from its callbacks, or execute()): get_write_limits(), queue_full(),
  * is_reading_paused() and release_socket(). on_message() and on_shutdown() are set before
  * start(), in the handler that accepts it; on_close() too, or later on the websocket thread.
  */
@@ -85,7 +94,8 @@ public:
     /// within the call closing it (e.g. a send from a loop over the connections, which may then
     /// remove this one); what it throws is logged. Set once the WebSocket closed, it is posted
     /// at once. Not called once released (release_socket()), nor if the io_context is stopped
-    /// and destroyed with it open
+    /// and destroyed with it open. See websocket_close for the code it gets; after stop(), it is
+    /// called within asio::websocket::CLOSE_TIMEOUT of the call
     void on_close(sync_callback<void(const websocket_close&)> callback);
 
     /// The executor of the websocket (its thread, or strand): the one of its socket
@@ -107,8 +117,30 @@ public:
     /// Start reading, and the keepalive: the connection lives while it is open
     void start();
 
-    /// Close with 1000 (Normal Closure)
+    /// Close with 1000 (Normal Closure) and no reason, as stop(code, reason). It never throws
     void stop();
+
+    /**
+     * Close with `code` and `reason`, as ws.close(code, reason) in Node: the closing handshake
+     * (the frame goes after the message being written, ahead of those still queued, which are
+     * not sent; then the peer answers), the queue closed and the producers waiting told false,
+     * the keepalive stopped, and on_close() called once.
+     *
+     * It ends within asio::websocket::CLOSE_TIMEOUT (5 s) of the call, whatever the peer does
+     * (it does not answer, it does not read, it reads a few bytes at a time): at the deadline the
+     * socket is closed without the handshake, even with a message being written, which also
+     * bounds a slow peer that keeps reading: to get a large message out first, await its send.
+     * write_limits::write_timeout is not waited for, and does not turn it into a 1013. on_close()
+     * gets the code of the peer's answer; `code` if the peer did not answer; 1006 if the close
+     * frame was not written whole.
+     *
+     * Throws std::invalid_argument, in the calling thread and without closing, if a close frame
+     * may not carry them: `code` is not 1000-1014 (but 1004, 1005 and 1006) nor 3000-4999, or
+     * `reason` is above 123 bytes or not valid UTF-8, whatever the state of the connection. Once
+     * closing or closed it does nothing else: the first code decides, the close of a server
+     * shutdown included
+     */
+    void stop(uint16_t code, std::string reason = {});
 
     /// Whether the next message sent without waiting overflows the queue (not the watermarks)
     bool queue_full() const;
@@ -129,6 +161,14 @@ public:
     size_t queued_bytes() const;
     size_t queued_messages() const;
 
+    /// Messages sent without waiting that the overflow policy dropped since the connection was
+    /// created: the new one (drop_newest, or drop_oldest with no room to make), or the older ones
+    /// (drop_oldest). Not those awaited, those sent once closing or closed, those queued when it
+    /// closed, nor an overflow with overflow_policy::close. It never decreases, and a send from
+    /// another thread counts once the websocket thread took it: once all were taken (e.g. after
+    /// execute()), written + queued + dropped is what was sent while open
+    uint64_t dropped_messages() const;
+
     /// The watermarks crossed (see write_limits); not told once the websocket is closing
     void on_high_watermark(sync_callback<void()> callback);
     void on_low_watermark(sync_callback<void()> callback);
@@ -147,12 +187,14 @@ public:
      */
     void pause_reading();
 
-    /// Read again, in order and from where reading stopped; the keepalive is restarted
+    /// Read again, in order and from where reading stopped; the keepalive is restarted. Nothing
+    /// once closing: the closing handshake reads the socket
     void resume_reading();
 
     bool is_reading_paused() const;
 
-    /// Release the socket for another handler: no other call may be made to this instance
+    /// Release the socket for another handler: no other call may be made to this instance, and
+    /// on_close() is not called. To close with a code of your own, stop(code, reason)
     std::shared_ptr<asio::socket> release_socket();
 
 private:
@@ -177,8 +219,9 @@ private:
     void suspend_keepalive();
     void restore_keepalive();
 
-    /// Start the closing handshake with `code`, and end the read loop once closed if paused
-    void start_close(uint16_t code);
+    /// Start the closing handshake with `code` and `reason`, unless closing already, and end the
+    /// read loop once closed if paused
+    void start_close(uint16_t code, std::string reason = {});
 
     /// A message to write
     struct out_message {
@@ -227,8 +270,12 @@ private:
     bool started_ = false;
     bool released_ = false;
 
-    /// The connection was lost: a read failed while the websocket was open
+    /// The connection was lost: a read failed while the websocket was open, with no close frame
+    /// out
     bool lost_ = false;
+
+    /// The closing handshake started (see start_close())
+    bool closing_ = false;
 
     /// Keepalive started by start(), and its settings while suspended
     std::chrono::milliseconds ping_interval_;

@@ -19,7 +19,7 @@ int main(int argc, char* argv[]) {
     auto* router = &server.router();
     
     // Enable CORS
-    router->enable_cors(true);
+    server.enable_cors();
     
     // Define routes using the elegant syntax with multiple signatures
     // 

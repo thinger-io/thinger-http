@@ -226,6 +226,8 @@ namespace thinger::http {
         bool handler_running_ = false;
         // The handler signal was emitted
         bool handler_interrupted_ = false;
+        // Emit it, on the executor of the stream
+        void interrupt_handler();
 
     public:
         /**
@@ -420,11 +422,13 @@ namespace thinger::http {
         // --- Cancellation scope (see route::cancel_on, request::cancelled()) ---
 
         /**
-         * Cancel the scope for `reason`, from any thread, once: the first reason stays and
-         * later calls do nothing. On the executor of the stream, it then sets the event
-         * client_gone() waits for and, while the handler runs, emits terminal on the observer
-         * signal, and on the handler signal if the route declared the reason or it is
-         * shutdown. For a stream owned by a shared_ptr (it stays alive until then)
+         * Cancel the scope for `reason`, from any thread, once: the first reason stays. On the
+         * executor of the stream, it then sets the event client_gone() waits for and, while the
+         * handler runs, emits terminal on the observer signal, and on the handler signal if the
+         * route declared the reason or it is shutdown. Later calls do nothing, except a shutdown
+         * while the handler runs not interrupted yet: it emits both signals, and neither
+         * cancelled() nor wait_cancelled() see it. For a stream owned by a shared_ptr (it stays
+         * alive until then)
          */
         void cancel(cancel_reason reason);
 

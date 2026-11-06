@@ -44,6 +44,18 @@ namespace thinger::http::test {
 
     inline std::ostream& operator<<(std::ostream& out, transport kind) { return out << to_string(kind); }
 
+    // Stopping a Unix listener unlinks its socket file, synchronously and on the way to the wait
+    // of a shutdown. On a disk that other builds are writing to, that alone can stall for hundreds
+    // of milliseconds, so a test timing a window that includes it allows this much more, on that
+    // transport only. It is the margin of the test and changes nothing in the library; the sockets
+    // of these tests are in memory where they can be (temporary_directory), which is what removes
+    // the stall on Linux
+    inline constexpr auto unix_unlink_margin = 100ms;
+
+    constexpr std::chrono::milliseconds stop_margin(transport kind) {
+        return kind == transport::unix ? unix_unlink_margin : 0ms;
+    }
+
     // The CA that issues the certificates of the TLS listeners, one per process
     inline const test_ca& matrix_ca() {
         static const test_ca ca{"Thinger Matrix CA"};
@@ -93,11 +105,21 @@ namespace thinger::http::test {
         return manager;
     }
 
-    // A directory of its own under the temporary directory, removed with everything in it when
-    // destroyed. Its name is short: a socket path must fit in sun_path (104 bytes on macOS)
+    // A directory of its own, removed with everything in it when destroyed. On Linux it is in
+    // /dev/shm if that can be written, so unlinking a socket at shutdown never waits for a busy
+    // disk (keep large files out: /dev/shm is 64 MiB in a container). Otherwise it is under the
+    // temporary directory, with a short name: a socket path must fit in sun_path (104 bytes on
+    // macOS)
     class temporary_directory {
     public:
         temporary_directory() {
+#if defined(__linux__)
+            std::string in_memory = "/dev/shm/thttp-XXXXXX";
+            if (::mkdtemp(in_memory.data()) != nullptr) {
+                path_ = in_memory;
+                return;
+            }
+#endif
             auto base = std::filesystem::temp_directory_path();
             if (base.string().size() > 60) base = "/tmp";
             std::string pattern = (base / "thttp-XXXXXX").string();

@@ -32,11 +32,8 @@ public:
     // Handle an unmatched request through the response: the fallback handler, else 404 for
     // a method with routes (HEAD has those of GET), or 405 for a method without any, with the
     // methods of the routes matching the path in its Allow header (HEAD wherever GET)
-    thinger::awaitable<void> handle_unmatched(std::shared_ptr<request> req, response& res);
+    thinger::awaitable<void> handle_unmatched(request& req, response& res);
 
-    // Enable CORS support: answer preflight OPTIONS requests on any path
-    void enable_cors(bool enabled = true);
-    
     // Add a catch-all handler for unmatched routes, taking (request&, response&) or
     // (response&), synchronous or coroutine. An empty one (nullptr, or an empty
     // std::function) removes it: unmatched requests are answered 404/405 again.

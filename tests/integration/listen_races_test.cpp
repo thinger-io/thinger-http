@@ -11,6 +11,7 @@
 #include <boost/asio/error.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/local/stream_protocol.hpp>
 #include <boost/asio/post.hpp>
 #include <algorithm>
 #include <atomic>
@@ -43,6 +44,8 @@
 // while a shutdown is in progress, and works again once it ended. Two listen() on the same
 // endpoint open one listener at most.
 //
+// A server taking over the Unix socket path of another that stops never loses its socket file.
+//
 // And the shutdown racing what stops under it: the workers of a pool server stopping
 // (workers.stop()) never make it throw nor hang, and a subclass being destroyed as the shutdown
 // ends on a worker never has its stop() override called
@@ -64,6 +67,11 @@ namespace {
     // Iterations of each race: their overlap shifts a little in each (see race())
     constexpr int race_iterations = 200;
     constexpr int same_endpoint_iterations = 100;
+    // Rounds of the relay of two servers on a Unix socket path, and relays at once in each. The
+    // old order of a listener stopping (close, then remove the file) fails only if something
+    // delays it between both: the relays at once do, within a few rounds, and far fewer hardly ever
+    constexpr int relay_rounds = 40;
+    constexpr int relays_at_once = 32;
 
     // Run `first` and `second` on two threads released at once, `second` delayed by a few
     // microseconds that change with `iteration` (on either side), so that the races cover the
@@ -203,6 +211,43 @@ namespace {
         client.get("/hello");
         return client.read_until("hi");
     }
+
+    // Whether a client cannot connect to the Unix socket at `path`: no file there, or nothing
+    // listening on it. Any other failure (out of descriptors, say) tells nothing
+    bool connection_refused(boost::asio::io_context& ioc, const std::string& path) {
+        boost::asio::local::stream_protocol::socket sock(ioc);
+        boost::system::error_code ec;
+        sock.connect(boost::asio::local::stream_protocol::endpoint(path), ec);
+        return ec == boost::asio::error::connection_refused || ec == boost::system::errc::no_such_file_or_directory;
+    }
+
+    // Two servers on the same Unix socket path: `next` takes over from `first`
+    struct path_relay {
+        temporary_directory directory;
+        std::string path = (directory.path() / "s.sock").string();
+        http::pool_server first;
+        http::pool_server next;
+        boost::system::error_code next_listened;
+
+        explicit path_relay(asio::workers& workers) : first(workers), next(workers) {
+            next.get("/hello", [](http::response& res) { res.send("hi"); });
+        }
+
+        // Once `go` is set: as soon as a client cannot connect any more, `next` listens. Its
+        // clients are created on `ioc`, which need not run
+        void take_over(const std::atomic<bool>& go, boost::asio::io_context& ioc) {
+            while (!go) std::this_thread::yield();
+            while (!connection_refused(ioc, path)) {
+#if defined(__APPLE__)
+                // (there a backlog full refuses a client too: leave the listener time to go on)
+                std::this_thread::sleep_for(100us);
+#endif
+            }
+            auto options = unix_listen_options(path);
+            options.max_listening_attempts = 1;
+            next_listened = next.listen(std::move(options));
+        }
+    };
 
     // co_await server.shutdown(by) on an io_context of the caller's, out of the server's
     // workers: its result, or what it threw
@@ -395,6 +440,45 @@ TEST_CASE("Two listen() on the same endpoint at once open one listener at most",
             }
             server.stop_listening();
             REQUIRE_FALSE(can_connect(client));
+        }
+    }
+}
+
+TEST_CASE("A server taking over a Unix socket path as soon as another stops keeps its socket file",
+          "[server][listeners][unix][race][integration]") {
+    http::test::running_workers workers;
+    boost::asio::io_context clients;
+    std::vector<std::unique_ptr<path_relay>> relays;
+    for (int i = 0; i < relays_at_once; ++i) relays.push_back(std::make_unique<path_relay>(workers));
+
+    for (int round = 0; round < relay_rounds; ++round) {
+        INFO("round " << round);
+        for (auto& relay : relays) REQUIRE_FALSE(relay->first.listen(unix_listen_options(relay->path)));
+
+        std::atomic<bool> go{false};
+        std::vector<std::thread> threads;
+        for (size_t i = 0; i < relays.size(); ++i) {
+            auto& relay = relays[i];
+            // Spread out, for the servers stopping to overlap those starting
+            threads.emplace_back([&go, &relay = *relay, delay = i * 10us] {
+                while (!go) std::this_thread::yield();
+                auto until = clock::now() + delay;
+                while (clock::now() < until) {}
+                relay.first.stop_listening();
+            });
+            threads.emplace_back([&go, &clients, &relay = *relay] { relay.take_over(go, clients); });
+        }
+        go = true;
+        for (auto& thread : threads) thread.join();
+
+        for (auto& relay : relays) {
+            INFO("listen(): " << relay->next_listened.message());
+            REQUIRE_FALSE(relay->next_listened);
+            // The first server, gone from the path, took nothing from the next one
+            REQUIRE(std::filesystem::is_socket(relay->path));
+            REQUIRE(answers(unix_at(relay->path)));
+            relay->next.stop_listening();
+            REQUIRE_FALSE(std::filesystem::exists(relay->path));
         }
     }
 }

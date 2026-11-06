@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
@@ -606,5 +607,281 @@ TEST_CASE("SSE drop_oldest keeps whole events", "[sse][flow][integration]") {
         for (size_t i = 0; i < 30; i += 5) CHECK(std::count(received.begin(), received.end(), i) == 1);
         CHECK(received.size() < 30);
         CHECK(std::set<size_t>(received.begin(), received.end()).size() == received.size());
+    }
+}
+
+namespace {
+
+    // The events in a stream: their empty lines
+    size_t events_in(const std::string& stream) {
+        size_t events = 0;
+        for (auto pos = stream.find("\n\n"); pos != std::string::npos; pos = stream.find("\n\n", pos + 2)) ++events;
+        return events;
+    }
+
+}
+
+TEST_CASE("SSE dropped_messages counts what the overflow policy dropped", "[sse][flow][dropped][integration]") {
+    http::server server;
+    std::function<void(const sse_ptr&)> setup;
+    std::promise<sse_ptr> created;
+    server.get("/events", [&](http::request&, http::response& res) {
+        res.start_sse([&](sse_ptr sse) {
+            setup(sse);
+            created.set_value(sse);
+        });
+    });
+    running_server running(server);
+    // In each section, the client connects once `setup` is set, and reads once it sent everything
+
+    SECTION("A new connection: none") {
+        uint64_t at_first = 1;
+        setup = [&](const sse_ptr& sse) { at_first = sse->dropped_messages(); };
+        sse_client client(running.port);
+        auto sse = created.get_future().get();
+        REQUIRE(at_first == 0);
+        REQUIRE(sse->dropped_messages() == 0);
+    }
+
+    SECTION("drop_newest: the new field") {
+        setup = [](const sse_ptr& sse) {
+            sse->set_write_limits({.max_messages = 10, .policy = http::overflow_policy::drop_newest});
+            for (size_t i = 0; i < 30; ++i) sse->send_data(std::to_string(i));
+        };
+        sse_client client(running.port);
+        auto sse = created.get_future().get();
+        REQUIRE(sse->dropped_messages() == 20);
+        REQUIRE(client.read_events(10) == data_events(0, 10));
+    }
+
+    SECTION("drop_oldest: each field of the events dropped") {
+        setup = [](const sse_ptr& sse) {
+            // two fields each: five events
+            sse->set_write_limits({.max_messages = 10, .policy = http::overflow_policy::drop_oldest});
+            for (size_t i = 0; i < 30; ++i) {
+                sse->send_event("e" + std::to_string(i));
+                sse->send_data(std::to_string(i));
+            }
+        };
+        sse_client client(running.port);
+        auto sse = created.get_future().get();
+        REQUIRE(sse->dropped_messages() == 60 - 2 * events_in(client.read_events(5)));
+        REQUIRE(sse->dropped_messages() == 50);
+    }
+
+    SECTION("drop_oldest: a comment counts as the field it is") {
+        setup = [](const sse_ptr& sse) {
+            // four fields each: three events
+            sse->set_write_limits({.max_messages = 12, .policy = http::overflow_policy::drop_oldest});
+            for (size_t i = 0; i < 30; ++i) {
+                auto event = multiline_event(i);
+                sse->send_comment("c" + std::to_string(i));
+                sse->send_event(*event.event);
+                sse->send_id(*event.id);
+                sse->send_data(event.data);
+            }
+        };
+        sse_client client(running.port);
+        auto sse = created.get_future().get();
+        REQUIRE(sse->dropped_messages() == 120 - 4 * events_in(client.read_events(3)));
+    }
+
+    SECTION("drop_oldest: an event sent whole counts one, whatever its fields and lines") {
+        setup = [](const sse_ptr& sse) {
+            sse->set_write_limits({.max_messages = 10, .policy = http::overflow_policy::drop_oldest});
+            for (size_t i = 0; i < 30; ++i) sse->send(multiline_event(i));
+        };
+        sse_client client(running.port);
+        auto sse = created.get_future().get();
+        REQUIRE(sse->dropped_messages() == 20);
+    }
+
+    SECTION("drop_oldest with no room to make: the new field") {
+        setup = [](const sse_ptr& sse) {
+            sse->set_write_limits({.max_messages = 3, .policy = http::overflow_policy::drop_oldest});
+            // an event not ended yet, which is never dropped
+            for (size_t i = 0; i < 5; ++i) sse->send_id(std::to_string(i));
+        };
+        sse_client client(running.port);
+        auto sse = created.get_future().get();
+        REQUIRE(sse->dropped_messages() == 2);
+    }
+
+    SECTION("Keep-alive comments are not counted, written or not") {
+        // Quiet, or with more than the socket buffers hold being written
+        const bool quiet = GENERATE(true, false);
+        setup = [quiet](const sse_ptr& sse) {
+            sse->set_write_limits({.max_messages = 2, .policy = http::overflow_policy::drop_newest});
+            sse->set_keepalive(5ms);
+            if (quiet) return;
+            sse->send_data(std::string(16 * 1024 * 1024, 'x'));
+            sse->send_data("queued");
+        };
+        sse_client client(running.port);
+        auto sse = created.get_future().get();
+        if (quiet) {
+            REQUIRE(client.read_events(1, 200ms).find(": keep-alive\n: keep-alive\n") != std::string::npos);
+        } else {
+            // none written, as something is being written: the client does not read
+            std::this_thread::sleep_for(100ms);
+            REQUIRE(sse->queued_messages() == 2);
+        }
+        REQUIRE(sse->dropped_messages() == 0);
+    }
+}
+
+TEST_CASE("SSE dropped_messages does not count what the policy did not drop", "[sse][flow][dropped][integration]") {
+    http::server server;
+    std::function<void(const sse_ptr&)> setup;
+    std::promise<sse_ptr> created;
+    auto closed = std::make_shared<std::atomic<int>>(0);
+    server.get("/events", [&, closed](http::request&, http::response& res) {
+        res.start_sse([&, closed](sse_ptr sse) {
+            sse->on_close([closed] { ++*closed; });
+            setup(sse);
+            created.set_value(sse);
+        });
+    });
+    running_server running(server);
+
+    // A queue full with the client not reading: more than the socket buffers hold being written
+    const auto fill = [](const sse_ptr& sse) {
+        sse->set_write_limits({.max_messages = 3, .policy = http::overflow_policy::drop_newest});
+        sse->send_data(std::string(16 * 1024 * 1024, 'x'));
+        sse->send_data("1");
+        sse->send_data("2");
+    };
+    // What would overflow it, once closed: taken by the executor on return
+    const auto send_once_closed = [](const sse_ptr& sse) {
+        for (size_t i = 0; i < 20; ++i) sse->send_data(std::to_string(i));
+        std::promise<void> taken;
+        sse->execute([&] { taken.set_value(); });
+        taken.get_future().get();
+    };
+
+    SECTION("Events awaited, whatever the policy") {
+        const auto policy = GENERATE(http::overflow_policy::drop_newest, http::overflow_policy::drop_oldest,
+                                     http::overflow_policy::close);
+        auto written = std::make_shared<std::atomic<int>>(0);
+        setup = [policy, written](const sse_ptr& sse) {
+            sse->set_write_limits({.max_messages = 2, .policy = policy});
+            for (size_t i = 0; i < 6; ++i) {
+                co_spawn(sse->get_executor(), sse->send_async(http::sse_event{.data = std::to_string(i)}),
+                         [written](std::exception_ptr, bool done) {
+                    if (done) ++*written;
+                });
+            }
+        };
+        sse_client client(running.port);
+        auto sse = created.get_future().get();
+        REQUIRE(client.read_events(6, 5s) == data_events(0, 6));
+        REQUIRE(eventually([&] { return *written == 6; }));
+        REQUIRE(sse->dropped_messages() == 0);
+    }
+
+    SECTION("Sent once closed, and what was queued when it closed") {
+        std::atomic<uint64_t> dropped_closed{1};
+        setup = [&](const sse_ptr& sse) {
+            fill(sse);
+            sse->stop();
+            for (size_t i = 0; i < 20; ++i) sse->send_data(std::to_string(i));
+            dropped_closed = sse->dropped_messages();
+        };
+        sse_client client(running.port);
+        auto sse = created.get_future().get();
+        REQUIRE(dropped_closed == 0);
+        REQUIRE(eventually([&] { return *closed == 1; }));
+        send_once_closed(sse);
+        REQUIRE(sse->dropped_messages() == 0);
+        REQUIRE(sse->queued_messages() == 0);
+    }
+
+    SECTION("The client left with the queue full") {
+        setup = fill;
+        auto client = std::make_unique<sse_client>(running.port);
+        auto sse = created.get_future().get();
+        REQUIRE(sse->queued_messages() == 3);
+        client.reset();
+        REQUIRE(eventually([&] { return *closed == 1; }));
+        send_once_closed(sse);
+        REQUIRE(sse->dropped_messages() == 0);
+    }
+
+    SECTION("An overflow with overflow_policy::close") {
+        std::atomic<uint64_t> dropped_overflow{1};
+        setup = [&](const sse_ptr& sse) {
+            sse->set_write_limits({.max_messages = 3, .policy = http::overflow_policy::close});
+            for (size_t i = 0; i < 20; ++i) sse->send_data(std::to_string(i));
+            dropped_overflow = sse->dropped_messages();
+        };
+        sse_client client(running.port);
+        auto sse = created.get_future().get();
+        REQUIRE(dropped_overflow == 0);
+        REQUIRE(eventually([&] { return *closed == 1; }));
+        send_once_closed(sse);
+        REQUIRE(sse->dropped_messages() == 0);
+    }
+}
+
+TEST_CASE("SSE dropped_messages with senders on many threads", "[sse][flow][dropped][integration]") {
+    static constexpr uint32_t threads = 8;
+#ifdef THINGER_HTTP_TEST_COVERAGE
+    // Looking for line breaks in each byte of an event, with the counters of coverage shared by
+    // these threads, makes the 128 MiB below take minutes each time. This still overflows the queue
+    static constexpr uint32_t each = 250;
+    static constexpr int rounds = 1;
+#else
+    static constexpr uint32_t each = 1000;
+    static constexpr int rounds = 10;
+#endif
+    // all of them, 128 MiB (32 MiB with coverage), are more than the socket buffers hold: the queue overflows
+    static constexpr size_t size = 16 * 1024;
+    const auto policy = GENERATE(http::overflow_policy::drop_newest, http::overflow_policy::drop_oldest);
+
+    http::server server;
+    std::mutex mutex;
+    sse_ptr accepted;
+    server.get("/events", [&](http::request&, http::response& res) {
+        res.start_sse([&](sse_ptr sse) {
+            sse->set_write_limits({.max_messages = 10, .policy = policy});
+            std::scoped_lock lock(mutex);
+            accepted = std::move(sse);
+        });
+    });
+    running_server running(server);
+
+    for (int round = 0; round < rounds; ++round) {
+        INFO("round " << round);
+        sse_client client(running.port);
+        sse_ptr sse;
+        REQUIRE(eventually([&] {
+            std::scoped_lock lock(mutex);
+            sse = std::exchange(accepted, nullptr);
+            return sse != nullptr;
+        }));
+
+        // The client does not read until they all ended
+        auto seen = server_test::send_concurrently(threads, each, [&](uint32_t index) {
+            sse->send(http::sse_event{.data = payload(index, size)});
+        }, [&] { return sse->dropped_messages(); });
+        REQUIRE(seen.reads > 0);
+        REQUIRE_FALSE(seen.decreased);
+        REQUIRE_FALSE(seen.above_sent);
+
+        // After what they sent, on the executor: all of it was taken. An event awaited is never
+        // dropped, so once written everything else was, and the connection closes
+        std::promise<void> taken;
+        sse->execute([&] { taken.set_value(); });
+        taken.get_future().get();
+        auto dropped = sse->dropped_messages();
+        co_spawn(sse->get_executor(), sse->send_async(http::sse_event{.data = "end"}),
+                 [sse](std::exception_ptr, bool) { sse->stop(); });
+
+        auto stream = client.read_events(SIZE_MAX, 15s);
+        REQUIRE(client.closed());
+        REQUIRE(stream.ends_with("data: end\n\n"));
+        REQUIRE(dropped > 0);
+        REQUIRE(events_in(stream) - 1 + dropped == threads * each);
+        REQUIRE(sse->dropped_messages() == dropped);
     }
 }

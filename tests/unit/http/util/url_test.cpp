@@ -1,6 +1,11 @@
 #include <catch2/catch_test_macros.hpp>
 #include <thinger/http/util/url.hpp>
 
+#include <algorithm>
+#include <cctype>
+#include <string>
+#include <vector>
+
 using namespace thinger::http::util::url;
 
 // ============================================================================
@@ -327,7 +332,7 @@ TEST_CASE("loggable_uri redacts credentials in query parameters and user info", 
     SECTION("Credential parameters are redacted, the others kept, in order") {
         REQUIRE(loggable_uri("/v1/data?authorization=eyJhbGciOi.x.y&count=10") ==
                 "/v1/data?authorization=[redacted]&count=10");
-        REQUIRE(loggable_uri("/cb?code=abc&access_token=t0k3n&state=s") == "/cb?code=abc&access_token=[redacted]&state=s");
+        REQUIRE(loggable_uri("/cb?code=abc&access_token=t0k3n&state=s") == "/cb?code=[redacted]&access_token=[redacted]&state=s");
         REQUIRE(loggable_uri("/x?a=1&TOKEN=secret") == "/x?a=1&TOKEN=[redacted]");
         REQUIRE(loggable_uri("/x?api%5Fkey=secret") == "/x?api%5Fkey=[redacted]");
         REQUIRE(loggable_uri("/x?password=p&client_secret=c&apikey=k&key=k2") ==
@@ -336,6 +341,7 @@ TEST_CASE("loggable_uri redacts credentials in query parameters and user info", 
 
     SECTION("Names that only contain a credential name are kept") {
         REQUIRE(loggable_uri("/x?tokens=3&keyboard=1&mytoken=2") == "/x?tokens=3&keyboard=1&mytoken=2");
+        REQUIRE(loggable_uri("/x?codec=1&zipcode=2&tokens=3&mytoken=4") == "/x?codec=1&zipcode=2&tokens=3&mytoken=4");
     }
 
     SECTION("Parameters without a value, empty pairs and the fragment are kept") {
@@ -343,6 +349,19 @@ TEST_CASE("loggable_uri redacts credentials in query parameters and user info", 
         REQUIRE(loggable_uri("/x?a=1&&token=s#frag") == "/x?a=1&&token=[redacted]#frag");
         REQUIRE(loggable_uri("/x?") == "/x?");
         REQUIRE(loggable_uri("/x#token=s") == "/x#token=s");
+        REQUIRE(loggable_uri("/x?code&a=1") == "/x?code&a=1");
+        REQUIRE(loggable_uri("/x?a=1&&code=s#frag") == "/x?a=1&&code=[redacted]#frag");
+        REQUIRE(loggable_uri("/x#code=s") == "/x#code=s");
+    }
+
+    SECTION("An empty value is redacted, and every occurrence of a repeated name") {
+        REQUIRE(loggable_uri("/x?code=&a=1") == "/x?code=[redacted]&a=1");
+        REQUIRE(loggable_uri("/x?code=a&b=1&code=b") == "/x?code=[redacted]&b=1&code=[redacted]");
+    }
+
+    SECTION("The name is compared decoded, and logged as it came") {
+        REQUIRE(loggable_uri("/x?co%64e=abc") == "/x?co%64e=[redacted]");
+        REQUIRE(loggable_uri("/x?CO%64E=abc") == "/x?CO%64E=[redacted]");
     }
 
     SECTION("The password of the user info is redacted, the user kept") {
@@ -350,5 +369,96 @@ TEST_CASE("loggable_uri redacts credentials in query parameters and user info", 
                 "http://user:[redacted]@proxy:3128/path?token=[redacted]");
         REQUIRE(loggable_uri("wss://user@host/ws") == "wss://user@host/ws");
         REQUIRE(loggable_uri("http://host/p?q=a@b:c") == "http://host/p?q=a@b:c");
+    }
+}
+
+TEST_CASE("loggable_uri redacts each default name, in any case, and keeps the rest", "[url][unit][logging]") {
+    const std::vector<std::string> names{
+        "access_token", "api_key", "apikey", "authorization", "client_secret", "code",
+        "id_token", "key", "password", "refresh_token", "secret", "sig", "signature", "token",
+        "x-amz-security-token", "x-amz-signature", "x-goog-signature"};
+    REQUIRE(redacted_parameters::defaults().size() == names.size());
+
+    for (const auto& name : names) {
+        INFO(name);
+        std::string upper = name;
+        std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return std::toupper(c); });
+        REQUIRE(redacted_parameters::defaults().contains(name));
+        REQUIRE(loggable_uri("/x?a=1&&" + name + "=s3cret&b=2#frag") == "/x?a=1&&" + name + "=[redacted]&b=2#frag");
+        REQUIRE(loggable_uri("/x?a=1&&" + upper + "=s3cret&b=2#frag") == "/x?a=1&&" + upper + "=[redacted]&b=2#frag");
+    }
+}
+
+TEST_CASE("loggable_uri redacts with the set it is given", "[url][unit][logging]") {
+
+    SECTION("Added to the defaults") {
+        auto names = redacted_parameters::defaults();
+        names.add("invite");
+        REQUIRE(loggable_uri("/join?invite=xyz&code=abc&page=2", names) == "/join?invite=[redacted]&code=[redacted]&page=2");
+    }
+
+    SECTION("Removed from the defaults, whatever its case") {
+        auto names = redacted_parameters::defaults();
+        names.remove("KEY");
+        REQUIRE(loggable_uri("/x?key=visible&token=t", names) == "/x?key=visible&token=[redacted]");
+    }
+
+    SECTION("A copy changed leaves the defaults and the other copies as they were") {
+        auto size = redacted_parameters::defaults().size();
+        auto first = redacted_parameters::defaults();
+        auto second = first;
+        second.add("invite").remove("code");
+        REQUIRE(first.contains("code"));
+        REQUIRE_FALSE(first.contains("invite"));
+        REQUIRE(second.contains("invite"));
+        REQUIRE_FALSE(second.contains("code"));
+        REQUIRE(redacted_parameters::defaults().size() == size);
+        REQUIRE(redacted_parameters::defaults().contains("code"));
+        REQUIRE_FALSE(redacted_parameters::defaults().contains("invite"));
+    }
+
+    SECTION("A set of its own replaces the defaults") {
+        redacted_parameters names{"invite"};
+        REQUIRE(loggable_uri("/x?invite=a&code=b", names) == "/x?invite=[redacted]&code=b");
+    }
+
+    SECTION("The case does not matter in the set or in the URI") {
+        redacted_parameters names{"Invite"};
+        REQUIRE(names.contains("INVITE"));
+        REQUIRE(loggable_uri("/x?INVITE=a&invite=b&InViTe=c", names) == "/x?INVITE=[redacted]&invite=[redacted]&InViTe=[redacted]");
+    }
+
+    SECTION("A name is added once") {
+        redacted_parameters names{"invite", "INVITE"};
+        names.add("Invite");
+        REQUIRE(names.size() == 1);
+    }
+
+    SECTION("An empty set redacts no parameter, but the password of the user info") {
+        const redacted_parameters names{};
+        REQUIRE(names.size() == 0);
+        REQUIRE(loggable_uri("http://user:pa55@host/p?token=t&code=c", names) == "http://user:[redacted]@host/p?token=t&code=c");
+        REQUIRE(loggable_uri("/x?token=t", {}) == "/x?token=t");
+    }
+
+    SECTION("Removing every name leaves the set empty, and a missing name changes nothing") {
+        redacted_parameters names{"invite"};
+        names.remove("other");
+        REQUIRE(names.size() == 1);
+        names.remove("invite");
+        REQUIRE(names.size() == 0);
+        REQUIRE(loggable_uri("/x?invite=a", names) == "/x?invite=a");
+    }
+
+    SECTION("An empty name is ignored: parameters without a name stay as they are") {
+        redacted_parameters names{"", "invite"};
+        names.add("");
+        REQUIRE(names.size() == 1);
+        REQUIRE(loggable_uri("/x?=a&invite=b", names) == "/x?=a&invite=[redacted]");
+    }
+
+    SECTION("A name decoded is compared with the set") {
+        redacted_parameters names{"my invite"};
+        REQUIRE(loggable_uri("/x?my%20invite=a&my+invite=b", names) == "/x?my%20invite=[redacted]&my+invite=[redacted]");
     }
 }

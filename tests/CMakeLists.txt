@@ -14,6 +14,12 @@ FetchContent_MakeAvailable(Catch2)
 include(CTest)
 include(Catch)
 
+# Every test built here learns of coverage from this definition, as the compiler has no macro for
+# it (fixtures/time_scale.hpp)
+if(THINGER_HTTP_ENABLE_COVERAGE)
+    add_compile_definitions(THINGER_HTTP_TEST_COVERAGE)
+endif()
+
 # Create a test main library with logging initialization
 add_library(test_main STATIC test_main.cpp)
 target_link_libraries(test_main PUBLIC Catch2::Catch2 thinger::http spdlog::spdlog)
@@ -288,6 +294,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_flow_control_test.cp
     add_thinger_test(test_integration_websocket_flow_control integration/websocket_flow_control_test.cpp)
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_close_test.cpp)
+    add_thinger_test(test_integration_websocket_close integration/websocket_close_test.cpp)
+endif()
+
 # Integration tests - WebSockets on the executor of their creator (strands of a multi-threaded io_context)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/websocket_executor_test.cpp)
     add_thinger_test(test_integration_websocket_executor integration/websocket_executor_test.cpp)
@@ -316,6 +326,10 @@ endif()
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/memory_dispatch_test.cpp)
     add_thinger_test(test_integration_memory_dispatch integration/memory_dispatch_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/dispatch_lifetime_test.cpp)
+    add_thinger_test(test_integration_dispatch_lifetime integration/dispatch_lifetime_test.cpp)
 endif()
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/request_context_test.cpp)
@@ -432,6 +446,10 @@ endif()
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/response_hook_test.cpp)
     add_thinger_test(test_integration_response_hook integration/response_hook_test.cpp)
+endif()
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/cors_test.cpp)
+    add_thinger_test(test_integration_cors integration/cors_test.cpp)
 endif()
 
 # Integration tests - Schema validation

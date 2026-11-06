@@ -10,25 +10,6 @@ route_builder route_handler::operator[](method http_method) {
     return route_builder(http_method, routes_[http_method], trees_[http_method], &schema_components_);
 }
 
-void route_handler::enable_cors(bool enabled) {
-    if (enabled) {
-        // Add OPTIONS handler for all routes
-        (*this)[method::OPTIONS][":path(.*)"] = [](request& req, response& res) {
-            auto response = std::make_shared<http_response>();
-            response->set_status(http_response::status::no_content);
-            
-            // Add CORS headers
-            response->add_header("Access-Control-Allow-Origin", "*");
-            response->add_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH");
-            response->add_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-            response->add_header("Access-Control-Max-Age", "86400");
-            
-            res.send_response(response);
-        };
-        routes_[method::OPTIONS].back().hidden();
-    }
-}
-
 const route* route_handler::find_route(std::shared_ptr<request> req) {
     auto http_request = req->get_http_request();
     const auto& request_method = http_request->get_method();
@@ -62,14 +43,14 @@ const route* route_handler::find_route(std::shared_ptr<request> req) {
     return found->target;
 }
 
-thinger::awaitable<void> route_handler::handle_unmatched(std::shared_ptr<request> req, response& res) {
+thinger::awaitable<void> route_handler::handle_unmatched(request& req, response& res) {
     if (fallback_handler_) {
-        co_await fallback_handler_(*req, res);
+        co_await fallback_handler_(req, res);
         co_return;
     }
 
     // A method with routes (HEAD has those of GET too) → 404
-    auto http_request = req->get_http_request();
+    auto http_request = req.get_http_request();
     const auto& request_method = http_request->get_method();
     if (routes_.contains(request_method) || (request_method == method::HEAD && routes_.contains(method::GET))) {
         res.error(http_response::status::not_found);

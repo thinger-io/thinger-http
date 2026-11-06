@@ -88,7 +88,7 @@ TEST_CASE("Concurrent answers from copies of a response send only the first one"
 
     for (int i = 0; i < 300; ++i) {
         auto sink = std::make_shared<recording_sink>();
-        response res(sink, make_request(), true);
+        response res(sink, make_request());
         res.header("X-Common", "set before answering");
 
         response json_copy = res, error_copy = res, text_copy = res, redirect_copy = res, chunked_copy = res;
@@ -111,7 +111,6 @@ TEST_CASE("Concurrent answers from copies of a response send only the first one"
         auto message = sink->response();
         REQUIRE(message);
         REQUIRE(message->get_header("X-Common") == "set before answering");
-        REQUIRE(message->get_header("Access-Control-Allow-Origin") == "*");
         std::set<std::string> keys;
         for (const auto& [key, value] : message->get_headers()) {
             REQUIRE(keys.insert(key).second);   // headers of a single answer, not repeated

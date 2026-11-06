@@ -137,6 +137,12 @@ namespace stream_test {
             return data;
         }
 
+        // Read at most `most` bytes, what arrives within the timeout, for the next frames: how
+        // many (a peer that reads at its own pace)
+        size_t read_at_most(size_t most, std::chrono::milliseconds timeout) {
+            return connection_.read_some(buffer_, timeout, most);
+        }
+
         // Whether the server closes the connection before the timeout (anything else received
         // is dropped)
         bool closed_within(std::chrono::milliseconds timeout) {

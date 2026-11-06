@@ -277,7 +277,12 @@ Other suites on `connection_options`, per server:
   server; two servers of one process, one with linger 0 and one with the default, close as
   each is configured (transport matrix).
 - `integration/body_logging_test.cpp` (`[logging]`): two servers of one process, one logging
-  and one not, log as each is configured.
+  and one not, log as each is configured; the query parameters each server and client redact
+  (`logging.redact`, `redact_parameters()`): added, removed, replaced or none, two servers with
+  different sets, and a set changed after `listen()`, which only new connections take; the same
+  redaction in the other lines with a URI: opening a WebSocket (TCP and Unix socket), an invalid
+  WebSocket URL, an unusable proxy, a redirect followed, the values of `Location`,
+  `Content-Location` and `Referer` (redacted before truncated), and a reverse proxy failing.
 - `integration/server_base_test.cpp` (`[server]`, built into `all_integration_tests` only:
   `./all_integration_tests "-#" "[#server_base_test]"`): the application served by `server_base`,
   the idle timeout set through `connection_options`.

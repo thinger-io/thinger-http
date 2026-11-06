@@ -7,6 +7,7 @@
 #include "server_test_helpers.hpp"
 #include "../fixtures/awaited_shutdown.hpp"
 #include "../fixtures/handler_probe.hpp"
+#include "../fixtures/time_scale.hpp"
 
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
@@ -40,8 +41,10 @@ namespace {
 
     using clock = std::chrono::steady_clock;
 
-    // How long after its reason a handler that declared it sees operation_aborted, at most
-    constexpr auto interruption_bound = 50ms;
+    // How long after its reason a handler that declared it sees operation_aborted, at most. Far
+    // below the 10 s these handlers wait when nothing interrupts them, margin included
+    constexpr auto interruption_bound = http::test::scaled(50ms);
+    static_assert(interruption_bound + http::test::unix_unlink_margin < 10s);
 
     std::string get(const std::string& path) {
         return "GET " + path + " HTTP/1.1\r\nHost: localhost\r\n\r\n";
@@ -144,7 +147,8 @@ TEST_CASE("A cancel_on route interrupts its handler within 50 ms of the shutdown
     CHECK(probe.interrupted);
     CHECK(probe.reason == cancel_reason::shutdown);
     CHECK(probe.end_time() >= by);
-    CHECK(probe.ended_after(by) <= interruption_bound);
+    // This window includes stopping the listener: over Unix, unlinking its file (unix_unlink_margin)
+    CHECK(probe.ended_after(by) <= interruption_bound + http::test::stop_margin(kind));
 
     // Then its connection is closed
     CHECK(client.read_until_closed(2s).closed);
@@ -441,6 +445,11 @@ TEST_CASE("A TLS client sending its close_notify after a complete request gets i
     client.read_some(tickets, 100ms);
     REQUIRE(tickets.empty());
     REQUIRE(client.write(get("/declared")));
+#if defined(__APPLE__)
+    // Once its handler started: on macOS a close_notify arriving along with the request may be
+    // read with it, from the socket, and the server cannot tell before the response starts
+    REQUIRE(probe.wait_started());
+#endif
     client.close_notify();
 
     auto response = client.read_until_closed(3s);
@@ -497,12 +506,19 @@ TEST_CASE("A client ending its connection in the middle of the body is gone", "[
     bool declared = GENERATE(false, true);
     INFO((declared ? "cancel_on(client_gone)" : "default route"));
 
-    // 1 MiB announced, half of it sent
+    // 1 MiB announced, part of it sent: half. On macOS 64 KiB: a reset right after a write larger
+    // than its socket buffers often does not arrive, and the reader hears nothing for seconds
+    // (plain sockets too, on the loopback)
+#if defined(__APPLE__)
+    constexpr size_t sent = 64 * 1024;
+#else
+    constexpr size_t sent = 512 * 1024;
+#endif
     raw_connection client(running.endpoint());
     REQUIRE(client.write(std::string("POST ") + (declared ? "/declared" : "/default") +
                          " HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048576\r\n\r\n"));
     REQUIRE(probe.wait_started());
-    REQUIRE(client.write(std::string(512 * 1024, 'a')));
+    REQUIRE(client.write(std::string(sent, 'a')));
     if (reset) {
         client.reset();
     } else {

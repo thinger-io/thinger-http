@@ -31,6 +31,11 @@ class virtual_host;
 class response;
 struct file_info;
 
+namespace detail {
+    struct cors_policy;
+    struct cors_decision;
+}
+
 namespace file_server {
     struct representation;
     void send(response& res, const representation& file);
@@ -49,13 +54,11 @@ class response {
 public:
     response(const std::shared_ptr<server_connection>& connection,
              const std::shared_ptr<http_stream>& stream,
-             const std::shared_ptr<http::http_request>& http_request,
-             bool cors_enabled = false);
+             const std::shared_ptr<http::http_request>& http_request);
 
     // Response written to `sink`, e.g. a memory_response for requests dispatched in memory
     response(std::shared_ptr<response_sink> sink,
-             const std::shared_ptr<http::http_request>& http_request,
-             bool cors_enabled = false);
+             const std::shared_ptr<http::http_request>& http_request);
 
     // JSON response
     void json(const nlohmann::json& data, http::http_response::status status = http::http_response::status::ok);
@@ -174,7 +177,8 @@ public:
 
     // Streamed response, with flow control (e.g. to relay a body as it arrives from
     // elsewhere). start_stream() sends the head: the headers set so far (header()) and those
-    // of `head`, with the status of `head`. Its framing is set here (Content-Length,
+    // of `head`, which replace the ones with the same name except Vary, whose fields add up,
+    // with the status of `head`. Its framing is set here (Content-Length,
     // Transfer-Encoding and Connection headers in `head` are ignored): with `content_length`
     // the body has that length; without it, it is chunked, or, for HTTP/1.0 clients, ended
     // by closing the connection. Responses to HEAD requests, and with status 1xx, 204 or
@@ -209,6 +213,11 @@ private:
     // The request answered, and the formatter of its errors (null for the default one)
     const http_request& request_message() const;
     const error_formatter* formatter() const;
+
+    // The CORS policy of the application and what it means for this request, set before the
+    // response is handed to the handler. Every answer applies them to its message, reading
+    // nothing that may change: it may run on any thread
+    void set_cors(std::shared_ptr<const detail::cors_policy> policy, detail::cors_decision decision);
 
     // Call `hook` once the response starts (the first answer), from the thread answering.
     // Set before the response is handed to the handler.

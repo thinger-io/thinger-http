@@ -364,7 +364,8 @@ http_client_base::connection_plan http_client_base::plan_connection(const http_r
 
     auto choice = select_proxy(request);
     if (!choice.error.empty()) {
-        LOG_ERROR("cannot use the proxy for {}: {}", util::url::loggable_uri(request.get_url()), choice.error);
+        LOG_ERROR("cannot use the proxy for {}: {}", util::url::loggable_uri(request.get_url(), body_logging_.redact),
+                  choice.error);
         ec = client_error::invalid_proxy;
         return plan;
     }
@@ -662,7 +663,10 @@ awaitable<client_response> http_client_base::send_with_redirects(std::shared_ptr
             co_return client_response(boost::system::error_code{}, response);
         }
         std::string location = response->get_header("Location");
-        LOG_DEBUG("Following redirect #{} to: {}", redirect_count + 1, location);
+        if (LOG_DEBUG_ENABLED()) {
+            LOG_DEBUG("Following redirect #{} to: {}", redirect_count + 1,
+                      util::url::loggable_uri(location, body_logging_.redact));
+        }
         request = redirect_request(*request, *response, location);
         // A Location that is not a URL the client can reach ends the chain, with the redirect
         if (!request) co_return client_response(boost::asio::error::invalid_argument, response);
@@ -723,7 +727,7 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
     std::shared_ptr<http_request> request, const std::string& subprotocol) {
     auto url = parse_websocket_url(request->get_url());
     if (!url) {
-        LOG_ERROR("Invalid WebSocket URL: {}", util::url::loggable_uri(request->get_url()));
+        LOG_ERROR("Invalid WebSocket URL: {}", util::url::loggable_uri(request->get_url(), body_logging_.redact));
         co_return std::nullopt;
     }
     auto key = set_upgrade_headers(*request, *url, subprotocol);
@@ -741,6 +745,7 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
     if (!request->get_unix_socket().empty()) {
         auto sock = std::make_shared<thinger::asio::unix_socket>("http_client", get_io_context());
         connection = std::make_shared<client_connection>(sock, request->get_unix_socket(), timeout_);
+        connection->set_body_logging(body_logging_);
     } else {
         boost::system::error_code ec;
         auto plan = plan_connection(*request, ec);
@@ -765,14 +770,15 @@ awaitable<std::optional<websocket_client>> http_client_base::upgrade_websocket(
     // Used, and running its keepalive and closing handshake, where the caller runs: on its
     // strand, never at the same time as the caller on an io_context run by several threads
     auto ws = std::make_shared<asio::websocket>(connection->release_socket(), false, false,
-                                                websocket_executor(co_await boost::asio::this_coro::executor));
+                                                co_await boost::asio::this_coro::executor);
     ws->set_protocol(response->get_header("Sec-WebSocket-Protocol"));
     // Frames the server sent right after its response, read along with it
     ws->set_read_ahead(connection->take_buffered());
     // Every network wait has a deadline: the keepalive of the server, 60 s and 120 s
     ws->start_timeout();
 
-    LOG_INFO("WebSocket connected to {}", request->get_url());
+    LOG_INFO("WebSocket connected to {}",
+             util::url::loggable_uri(url->scheme + "://" + url->host + ":" + url->port + url->path, body_logging_.redact));
     co_return websocket_client(std::move(ws), owns_io_context());
 }
 

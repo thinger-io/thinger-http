@@ -1,7 +1,10 @@
 // An async_client stopped or destroyed with requests in flight, while its workers run: from the
 // application's thread (US1), from inside one of its own completions (US2), and in the less
-// common states (US3 and the edge cases). Nothing of the client runs once stop() or the
-// destructor returned: no callback, no coroutine of run()
+// common states (US3 and the edge cases). No callback of the client runs once stop() or the
+// destructor returned. No coroutine of run() does either when they were called from the
+// application's thread; from a worker, those may resume afterwards, and see their requests fail
+// with operation_aborted or a response that completed before the cancellation reached them, so
+// they hold what they use by shared_ptr, the client included
 #include <catch2/catch_test_macros.hpp>
 #include <thinger/http/client/async_client.hpp>
 #include <thinger/http/client/websocket_client.hpp>
@@ -17,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <iterator>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -44,7 +48,6 @@ struct silent_server {
     const bool answer;
     // Touched only on the server's thread
     std::list<tcp::socket> peers;
-    std::array<char, 4096> discard{};
     std::thread thread;
 
     explicit silent_server(bool answer = false) : answer(answer) {
@@ -75,19 +78,88 @@ private:
         });
     }
 
-    // Read the requests (small ones, read whole), answering them or not, until the client
-    // closes the connection
+    // Read the requests, answering them or not, until the client closes the connection. The end
+    // of a request has to arrive within one read, which holds for these small ones, written at
+    // once. Each read has its own buffer: the read of another connection could overwrite a shared
+    // one before this handler runs, and the request would never be answered
     void read(tcp::socket& peer) {
-        peer.async_read_some(boost::asio::buffer(discard), [this, &peer](boost::system::error_code ec, size_t size) {
+        auto own = std::make_shared<std::array<char, 4096>>();
+        peer.async_read_some(boost::asio::buffer(*own), [this, &peer, own](boost::system::error_code ec, size_t size) {
             if (ec) {
                 ++closed;
                 return;
             }
-            if (answer && std::string_view(discard.data(), size).find("\r\n\r\n") != std::string_view::npos) {
+            if (answer && std::string_view(own->data(), size).find("\r\n\r\n") != std::string_view::npos) {
                 static constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
                 boost::asio::async_write(peer, boost::asio::buffer(response), [](boost::system::error_code, size_t) {});
             }
             read(peer);
+        });
+    }
+};
+
+// A server answering every request with a chunked body that never ends, written as fast as the
+// client reads it: several chunks reach the client in a single read. It counts the connections
+// accepted, and those the client closed
+struct endless_stream_server {
+    boost::asio::io_context context;
+    tcp::acceptor acceptor{context, {boost::asio::ip::make_address("127.0.0.1"), 0}};
+    std::atomic<int> accepted{0};
+    std::atomic<int> closed{0};
+    std::thread thread;
+
+    endless_stream_server() {
+        accept();
+        thread = std::thread([this] { context.run(); });
+    }
+
+    ~endless_stream_server() {
+        boost::asio::post(context, [this] { context.stop(); });
+        thread.join();
+    }
+
+    std::string url() const { return "http://127.0.0.1:" + std::to_string(acceptor.local_endpoint().port()) + "/"; }
+
+private:
+    // Touched only on the server's thread
+    std::array<char, 4096> discard{};
+
+    static const std::string& chunks() {
+        static const std::string burst = [] {
+            std::string result;
+            for (int i = 0; i < 64; ++i) result += "4\r\ndata\r\n";
+            return result;
+        }();
+        return burst;
+    }
+
+    void accept() {
+        acceptor.async_accept([this](boost::system::error_code ec, tcp::socket socket) {
+            if (ec) return;
+            ++accepted;
+            auto peer = std::make_shared<tcp::socket>(std::move(socket));
+            // The request (a small one, read whole), then the head with the first chunks
+            peer->async_read_some(boost::asio::buffer(discard), [this, peer](boost::system::error_code ec, size_t) {
+                if (ec) {
+                    ++closed;
+                    return;
+                }
+                auto head = std::make_shared<std::string>("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + chunks());
+                boost::asio::async_write(*peer, boost::asio::buffer(*head), [this, peer, head](boost::system::error_code ec, size_t) {
+                    write(peer, ec);
+                });
+            });
+            accept();
+        });
+    }
+
+    void write(const std::shared_ptr<tcp::socket>& peer, boost::system::error_code ec) {
+        if (ec) {
+            ++closed;
+            return;
+        }
+        boost::asio::async_write(*peer, boost::asio::buffer(chunks()), [this, peer](boost::system::error_code ec, size_t) {
+            write(peer, ec);
         });
     }
 };
@@ -441,6 +513,324 @@ TEST_CASE("A callback stops its client, then the application destroys it", "[cli
     CHECK(log.after_done == 0);
 }
 
+TEST_CASE("A callback destroys its client, and a coroutine of run() on its worker resumes afterwards",
+          "[client][async][lifetime]") {
+    constexpr size_t threads = 1;
+    running_workers workers(threads);
+    http::test::TestServerFixture fixture;
+    silent_server silent;
+
+    // What the coroutine uses: it may outlive the client, so it holds it
+    struct seen_by_coroutine {
+        std::atomic<bool> client_done{false};
+        std::atomic<int> resumed{0};
+        std::atomic<int> resumed_after_done{0};
+        std::atomic<int> not_aborted{0};
+    };
+    auto seen = std::make_shared<seen_by_coroutine>();
+
+    auto client = std::make_unique<http::async_client>(workers);
+    client->run([seen, raw = client.get(), url = silent.url("/coroutine")]() -> awaitable<void> {
+        auto response = co_await raw->get(url);
+        ++seen->resumed;
+        if (seen->client_done) ++seen->resumed_after_done;
+        if (response.ok() || response.error_code() != boost::asio::error::operation_aborted) ++seen->not_aborted;
+    });
+    REQUIRE(eventually([&] { return silent.accepted == 1; }, 2s));
+
+    // The callback holds the only worker while this thread queues a request and a coroutine on
+    // it, which cannot start before the destructor, and then destroys the client
+    callback_log log(1);
+    std::atomic<bool> entered{false};
+    std::atomic<bool> queued{false};
+    std::atomic<bool> done{false};
+    std::atomic<bool> resumed_in_destructor{false};
+    std::atomic<int> not_started_coroutines{0};
+    client->get(fixture.base_url + "/get", [&](http::client_response&) {
+        entered = true;
+        eventually([&] { return queued.load(); }, 5s);
+        client.reset();
+        resumed_in_destructor = seen->resumed > 0;
+        seen->client_done = true;
+        log.client_done = true;
+        done = true;
+    });
+    REQUIRE(eventually([&] { return entered.load(); }, 5s));
+    client->get(silent.url("/not-started"), log.callback(0));
+    client->run([&]() -> awaitable<void> {
+        ++not_started_coroutines;
+        co_return;
+    });
+    queued = true;
+
+    REQUIRE(eventually([&] { return done.load(); }, 5s));
+    // It resumes on its worker once the callback returns, with the client gone, and only sees its
+    // request fail; the connection closes
+    REQUIRE(eventually([&] { return seen->resumed == 1; }, 5s));
+    CHECK_FALSE(resumed_in_destructor);
+    CHECK(seen->resumed_after_done == 1);
+    CHECK(seen->not_aborted == 0);
+    CHECK(eventually([&] { return silent.all_closed(); }, 2s));
+    REQUIRE(drain(workers, threads));
+    // What had not started yet does not run: no connection, no callback, no coroutine
+    CHECK(silent.accepted == 1);
+    CHECK(log.total_calls() == 0);
+    CHECK(not_started_coroutines == 0);
+}
+
+TEST_CASE("A callback destroys its client while a callback of another worker runs", "[client][async][lifetime]") {
+    constexpr size_t threads = 2;
+    running_workers workers(threads);
+    http::test::TestServerFixture fixture;
+    std::atomic<bool> sleeping{false};
+    std::atomic<bool> destroying{false};
+    std::atomic<bool> slept{false};
+    std::atomic<bool> slept_at_return{false};
+    std::atomic<bool> done{false};
+    // Each one written by its callback, and read once `done` is set
+    std::thread::id sleeper;
+    std::thread::id destroyer;
+
+    auto client = std::make_unique<http::async_client>(workers);
+    // One request from each worker, so that it runs there
+    std::atomic<int> started{0};
+    REQUIRE(start_on_every_worker(workers, threads, [&] {
+        if (started++ == 0) {
+            client->get(fixture.base_url + "/get", [&](http::client_response&) {
+                sleeper = std::this_thread::get_id();
+                sleeping = true;
+                // Asleep for sure when the destructor starts
+                eventually([&] { return destroying.load(); }, 5s);
+                std::this_thread::sleep_for(300ms);
+                slept = true;
+            });
+        } else {
+            client->get(fixture.base_url + "/get", [&](http::client_response&) {
+                destroyer = std::this_thread::get_id();
+                eventually([&] { return sleeping.load(); }, 5s);
+                destroying = true;
+                client.reset();
+                slept_at_return = slept.load();
+                done = true;
+            });
+        }
+    }));
+
+    REQUIRE(eventually([&] { return done.load(); }, 5s));
+    CHECK(sleeping);
+    CHECK(sleeper != destroyer);
+    CHECK(slept_at_return);
+    REQUIRE(drain(workers, threads));
+}
+
+TEST_CASE("A callback stops its client, and the destructor waits for the coroutines cancelled",
+          "[client][async][lifetime]") {
+    constexpr size_t threads = 1;
+    running_workers workers(threads);
+    http::test::TestServerFixture fixture;
+    silent_server silent;
+    std::atomic<bool> stopped{false};
+    std::atomic<bool> destroying{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<int> resumed{0};
+    std::atomic<int> resumed_after_done{0};
+    std::atomic<int> not_aborted{0};
+
+    auto client = std::make_unique<http::async_client>(workers);
+    client->run([&, raw = client.get()]() -> awaitable<void> {
+        auto response = co_await raw->get(silent.url("/coroutine"));
+        ++resumed;
+        if (client_done) ++resumed_after_done;
+        if (response.ok() || response.error_code() != boost::asio::error::operation_aborted) ++not_aborted;
+    });
+    REQUIRE(eventually([&] { return silent.accepted == 1; }, 2s));
+
+    // stop() does not wait on the worker; the callback then holds it, so the coroutine cancelled
+    // cannot end before the destructor starts
+    client->get(fixture.base_url + "/get", [&](http::client_response&) {
+        client->stop();
+        stopped = true;
+        eventually([&] { return destroying.load(); }, 5s);
+        std::this_thread::sleep_for(100ms);
+    });
+    REQUIRE(eventually([&] { return stopped.load(); }, 5s));
+    CHECK(resumed == 0);
+
+    destroying = true;
+    auto start = std::chrono::steady_clock::now();
+    client.reset();
+    client_done = true;
+    CHECK(std::chrono::steady_clock::now() - start < 2s);
+    // It ended before the return, having seen its request fail
+    CHECK(resumed == 1);
+    CHECK(not_aborted == 0);
+
+    CHECK(eventually([&] { return silent.all_closed(); }, 2s));
+    REQUIRE(drain(workers, threads));
+    CHECK(resumed_after_done == 0);
+}
+
+namespace {
+
+// What the coroutines of the next cases see, which hold it and the client by shared_ptr: they may
+// outlive the call that stops it
+struct seen_by_holders {
+    std::atomic<bool> client_done{false};
+    std::atomic<int> ended{0};
+    std::atomic<int> responses_after_done{0};
+    std::atomic<int> aborted_after_done{0};
+    std::atomic<int> other_errors{0};
+    std::atomic<int> cancelled_callbacks{0};
+
+    void failed(boost::system::error_code error) {
+        if (error != boost::asio::error::operation_aborted) ++other_errors;
+        else if (client_done) ++aborted_after_done;
+    }
+};
+
+// A coroutine holding its client: it makes requests until one is aborted, reported or thrown
+awaitable<void> request_until_aborted(std::shared_ptr<seen_by_holders> seen, std::shared_ptr<http::async_client> client,
+                                      std::string url) {
+    try {
+        for (;;) {
+            auto response = co_await client->get(url);
+            if (!response.ok()) {
+                seen->failed(response.error_code());
+                break;
+            }
+            if (seen->client_done) ++seen->responses_after_done;
+        }
+    } catch (const boost::system::system_error& error) {
+        seen->failed(error.code());
+    }
+    ++seen->ended;
+}
+
+} // namespace
+
+// The worker B is held while a callback on the worker A stops the client, so the cancellation
+// reaches the coroutine of B only after stop() returned there
+TEST_CASE("A callback stops a client its coroutines hold, and one of another worker resumes afterwards",
+          "[client][async][lifetime]") {
+    constexpr size_t threads = 3;
+    running_workers workers(threads);
+    http::test::TestServerFixture fixture;
+    silent_server silent;
+    auto seen = std::make_shared<seen_by_holders>();
+
+    std::set<boost::asio::io_context*> contexts;
+    for (size_t i = 0; contexts.size() < threads && i < threads * 16; ++i) {
+        contexts.insert(&workers.get_next_io_context());
+    }
+    REQUIRE(contexts.size() == threads);
+    auto& worker_a = **contexts.begin();
+    auto& worker_b = **std::next(contexts.begin());
+
+    auto client = std::make_shared<http::async_client>(workers);
+    std::weak_ptr<http::async_client> handle = client;
+    boost::asio::post(worker_b, [seen, client, url = silent.url("/coroutine")] {
+        client->run(request_until_aborted(seen, client, url));
+    });
+    REQUIRE(eventually([&] { return silent.accepted == 1; }, 5s));
+
+    std::atomic<bool> held{false};
+    std::atomic<bool> release{false};
+    boost::asio::post(worker_b, [&] {
+        held = true;
+        eventually([&] { return release.load(); }, 5s);
+    });
+    REQUIRE(eventually([&] { return held.load(); }, 5s));
+
+    boost::asio::post(worker_a, [&, seen, client, url = fixture.base_url + "/get"] {
+        client->get(url, [&, seen, client](http::client_response&) {
+            client->stop();
+            seen->client_done = true;
+            release = true;
+        });
+    });
+    client.reset();
+
+    // It resumes once stop() returned, and the client goes with the coroutine, on its worker
+    REQUIRE(eventually([&] { return seen->ended == 1; }, 5s));
+    CHECK(seen->aborted_after_done == 1);
+    CHECK(seen->responses_after_done == 0);
+    CHECK(seen->other_errors == 0);
+    CHECK(eventually([&] { return handle.expired(); }, 2s));
+    CHECK(eventually([&] { return silent.all_closed(); }, 2s));
+    REQUIRE(drain(workers, threads));
+}
+
+// Racing with responses: the coroutines of the other workers may see correct ones after stop()
+// returned, or operation_aborted, and nothing else; no callback of a request cancelled is called.
+// Under the sanitizers, they use the client until the end
+TEST_CASE("A callback stops a client its coroutines hold, while they get responses on every worker",
+          "[client][async][lifetime]") {
+    constexpr size_t threads = 3;
+    constexpr int per_worker = 4;
+    constexpr int iterations = 30;
+    running_workers workers(threads);
+    silent_server answering(true);
+    silent_server silent;
+    int responses_after_done = 0;
+    int aborted_after_done = 0;
+
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        auto seen = std::make_shared<seen_by_holders>();
+        auto client = std::make_shared<http::async_client>(workers);
+        std::weak_ptr<http::async_client> handle = client;
+        REQUIRE(start_on_every_worker(workers, threads, [seen, client, url = answering.url(), silent_url = silent.url()] {
+            for (int i = 0; i < per_worker; ++i) {
+                client->run(request_until_aborted(seen, client, url));
+            }
+            client->get(silent_url, [seen, client](http::client_response&) { ++seen->cancelled_callbacks; });
+        }));
+        client->get(answering.url(), [seen, client](http::client_response&) {
+            client->stop();
+            seen->client_done = true;
+        });
+        client.reset();
+
+        REQUIRE(eventually([&] { return seen->ended == static_cast<int>(threads) * per_worker; }, 5s));
+        REQUIRE(eventually([&] { return handle.expired(); }, 5s));
+        CHECK(seen->other_errors == 0);
+        CHECK(seen->cancelled_callbacks == 0);
+        CHECK(seen->client_done);
+        responses_after_done += seen->responses_after_done;
+        aborted_after_done += seen->aborted_after_done;
+    }
+    INFO("after stop(): " << responses_after_done << " responses, " << aborted_after_done << " aborted");
+    CHECK(eventually([&] { return answering.all_closed() && silent.all_closed(); }, 5s));
+    REQUIRE(drain(workers, threads));
+}
+
+TEST_CASE("A coroutine holds the last reference to its client", "[client][async][lifetime]") {
+    constexpr size_t threads = 3;
+    running_workers workers(threads);
+    silent_server answering(true);
+    auto ended = std::make_shared<std::atomic<int>>(0);
+    auto responses = std::make_shared<std::atomic<int>>(0);
+
+    auto client = std::make_shared<http::async_client>(workers);
+    std::weak_ptr<http::async_client> handle = client;
+    REQUIRE(start_on_every_worker(workers, threads, [ended, responses, client, url = answering.url()] {
+        client->run([ended, responses, client, url]() -> awaitable<void> {
+            for (int i = 0; i < 3; ++i) {
+                auto response = co_await client->get(url);
+                if (response.ok()) ++*responses;
+            }
+            ++*ended;
+        });
+    }));
+    client.reset();
+
+    // The last one ending destroys it on its worker, within its own frame
+    REQUIRE(eventually([&] { return ended->load() == static_cast<int>(threads); }, 5s));
+    CHECK(responses->load() == static_cast<int>(threads) * 3);
+    CHECK(eventually([&] { return handle.expired(); }, 2s));
+    CHECK(eventually([&] { return answering.all_closed(); }, 2s));
+    REQUIRE(drain(workers, threads));
+}
+
 // --- Less common states (US3) ---
 
 TEST_CASE("Destroying a client with a request waiting in its TLS handshake", "[client][async][lifetime]") {
@@ -561,6 +951,164 @@ TEST_CASE("A callback starts a request while the client stops or is destroyed", 
     CHECK(silent.accepted == 0);
     CHECK(late_calls == 0);
     CHECK(late_coroutines == 0);
+}
+
+TEST_CASE("What is queued on a worker when the application destroys the client does not start",
+          "[client][async][lifetime]") {
+    constexpr size_t threads = 1;
+    running_workers workers(threads);
+    http::test::TestServerFixture fixture;
+    silent_server silent;
+    std::atomic<bool> entered{false};
+    std::atomic<bool> queued{false};
+    std::atomic<int> started_coroutines{0};
+    callback_log log(1);
+
+    // The callback holds the only worker until the destructor marked what is queued as cancelled,
+    // so that it finds the mark when it starts, before the cancellation reaches it
+    auto client = std::make_unique<http::async_client>(workers);
+    client->get(fixture.base_url + "/get", [&, raw = client.get()](http::client_response&) {
+        entered = true;
+        eventually([&] { return queued.load() && !raw->is_running(); }, 5s);
+        std::this_thread::sleep_for(100ms);
+    });
+    REQUIRE(eventually([&] { return entered.load(); }, 5s));
+    client->get(silent.url("/queued"), log.callback(0));
+    client->run([&]() -> awaitable<void> {
+        ++started_coroutines;
+        co_return;
+    });
+    queued = true;
+
+    client.reset();
+    log.client_done = true;
+    REQUIRE(drain(workers, threads));
+    CHECK(started_coroutines == 0);
+    CHECK(silent.accepted == 0);
+    CHECK(log.total_calls() == 0);
+}
+
+TEST_CASE("A chunk of a streamed body does not reach its callback once the client is gone",
+          "[client][async][lifetime]") {
+    constexpr size_t threads = 1;
+    running_workers workers(threads);
+    http::test::TestServerFixture fixture;
+    endless_stream_server server;
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> destroy_in_chunk{false};
+    std::atomic<int> chunks{0};
+    std::atomic<int> chunks_after_done{0};
+    std::atomic<int> results{0};
+
+    auto client = std::make_unique<http::async_client>(workers);
+    auto start_stream = [&] {
+        client->get_streaming(server.url(), [&](const http::stream_info&) {
+            ++chunks;
+            if (client_done) ++chunks_after_done;
+            if (destroy_in_chunk) {
+                destroy_in_chunk = false;
+                client.reset();
+                client_done = true;
+            }
+            return true;
+        }, [&](http::stream_result&) { ++results; });
+    };
+
+    SECTION("destroyed from the application's thread") {
+        start_stream();
+        REQUIRE(eventually([&] { return chunks > 0; }, 5s));
+        client.reset();
+        client_done = true;
+    }
+
+    SECTION("destroyed by a chunk callback, with more chunks read") {
+        destroy_in_chunk = true;
+        start_stream();
+    }
+
+    SECTION("destroyed by a callback on the same worker, with a read completed") {
+        start_stream();
+        REQUIRE(eventually([&] { return chunks > 0; }, 5s));
+        client->get(fixture.base_url + "/get", [&](http::client_response&) {
+            client.reset();
+            client_done = true;
+        });
+    }
+
+    REQUIRE(eventually([&] { return client_done.load(); }, 5s));
+    CHECK(eventually([&] { return server.closed == server.accepted; }, 2s));
+    REQUIRE(drain(workers, threads));
+    CHECK(chunks > 0);
+    CHECK(chunks_after_done == 0);
+    CHECK(results == 0);
+}
+
+TEST_CASE("The callbacks of the request builder go through the same entry as the others",
+          "[client][async][lifetime]") {
+    constexpr size_t threads = 1;
+    running_workers workers(threads);
+    http::test::TestServerFixture fixture;
+    silent_server silent;
+    callback_log log(2);
+    std::atomic<int> websocket_calls{0};
+    std::atomic<int> websocket_after_done{0};
+
+    auto client = std::make_unique<http::async_client>(workers);
+    auto websocket_callback = [&](std::shared_ptr<http::websocket_client>) {
+        ++websocket_calls;
+        if (log.client_done) ++websocket_after_done;
+    };
+
+    SECTION("Cancelled in flight, they are not called once the client is gone") {
+        client->request(silent.url("/plain")).get(log.callback(0));
+        client->request(silent.url("/socket", "ws")).websocket(websocket_callback);
+        REQUIRE(eventually([&] { return silent.accepted == 2; }, 2s));
+        client.reset();
+        log.client_done = true;
+        CHECK(eventually([&] { return silent.all_closed(); }, 2s));
+    }
+
+    SECTION("Running, the destructor waits for them") {
+        std::atomic<bool> entered{false};
+        std::atomic<bool> returned{false};
+        client->request(fixture.base_url + "/get").get([&](http::client_response&) {
+            entered = true;
+            std::this_thread::sleep_for(300ms);
+            returned = true;
+        });
+        REQUIRE(eventually([&] { return entered.load(); }, 5s));
+        client.reset();
+        CHECK(returned);
+        log.client_done = true;
+    }
+
+    SECTION("Not started when a callback destroys the client, they never run") {
+        std::atomic<bool> entered{false};
+        std::atomic<bool> queued{false};
+        client->get(fixture.base_url + "/get", [&](http::client_response&) {
+            entered = true;
+            eventually([&] { return queued.load(); }, 5s);
+            client.reset();
+            log.client_done = true;
+        });
+        REQUIRE(eventually([&] { return entered.load(); }, 5s));
+        // Queued on the worker while the callback holds it
+        client->request(silent.url("/plain")).get(log.callback(0));
+        client->request(silent.url("/socket", "ws")).websocket(websocket_callback);
+        queued = true;
+        REQUIRE(eventually([&] { return log.client_done.load(); }, 5s));
+        REQUIRE(drain(workers, threads));
+        CHECK(silent.accepted == 0);
+        CHECK(log.total_calls() == 0);
+        CHECK(websocket_calls == 0);
+    }
+
+    REQUIRE(drain(workers, threads));
+    CHECK(log.after_done == 0);
+    CHECK(log.each_at_most_once());
+    CHECK(log.not_aborted == 0);
+    CHECK(websocket_after_done == 0);
+    CHECK(websocket_calls <= 1);
 }
 
 // --- Edge cases ---

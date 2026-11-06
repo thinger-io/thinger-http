@@ -73,10 +73,10 @@ TEMPLATE_TEST_CASE("HTTP Server configuration", "[http][server][unit]",
     }
     
     SECTION("CORS configuration") {
-        server.enable_cors(true);
-        server.enable_cors(false);
-        
-        REQUIRE(true);
+        REQUIRE_FALSE(server.enable_cors());
+        REQUIRE_FALSE(server.enable_cors({.origins = {"https://a.example"}, .credentials = true}));
+        REQUIRE(server.enable_cors({.credentials = true}) == boost::system::errc::invalid_argument);
+        server.disable_cors();
     }
 }
 

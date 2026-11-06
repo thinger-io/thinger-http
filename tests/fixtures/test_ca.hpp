@@ -128,10 +128,13 @@ private:
         X509_gmtime_adj(X509_getm_notBefore(certificate), -3600);
         X509_gmtime_adj(X509_getm_notAfter(certificate), 24 * 3600);
         X509_set_pubkey(certificate, key);
-        X509_NAME* subject = X509_get_subject_name(certificate);
+        X509_NAME* subject = X509_NAME_new();
         X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
                                    reinterpret_cast<const unsigned char*>(name.c_str()), -1, -1, 0);
-        X509_set_issuer_name(certificate, issuer ? X509_get_subject_name(issuer) : subject);
+        X509_set_subject_name(certificate, subject);
+        const X509_NAME* issuer_name = issuer ? X509_get_subject_name(issuer) : subject;
+        X509_set_issuer_name(certificate, issuer_name);
+        X509_NAME_free(subject);
 
         X509V3_CTX context;
         X509V3_set_ctx_nodb(&context);

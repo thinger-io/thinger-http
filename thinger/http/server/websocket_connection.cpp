@@ -4,6 +4,8 @@
 #include "connection_tracker.hpp"
 #include <algorithm>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include "../util/utf8.hpp"
 #include "detail/push_queue.hpp"
@@ -66,9 +68,12 @@ namespace thinger::http{
         start_close(asio::websocket::CLOSE_GOING_AWAY);
     }
 
-    void websocket_connection::start_close(uint16_t code){
+    void websocket_connection::start_close(uint16_t code, std::string reason){
+        // One close frame: the first close decides
+        if(closing_) return;
+        closing_ = true;
         // The connection is told when the handshake ends (closed, or failed), as it may be paused
-        co_spawn(ws_->get_executor(), ws_->close_graceful(code),
+        co_spawn(ws_->get_executor(), ws_->close_graceful(code, std::move(reason)),
             [self = shared_from_this()](const std::exception_ptr&){
                 LOG_LEVEL(1, "websocket closed");
                 self->wake_reader();
@@ -140,10 +145,11 @@ namespace thinger::http{
                 static_cast<uint8_t*>(buf.data()), buf.size());
 
             if (ec) {
-                // The connection is lost (reset, or ended without a close frame): closed
+                // The connection is lost (reset, or ended without a close frame): closed. Not lost
+                // for how it closed if the close frame was out: the peer just did not answer it
                 if (!released_ && ws_->is_open()) {
                     LOG_LEVEL(1, "websocket connection lost: {}", ec.message());
-                    lost_ = true;
+                    lost_ = ws_->get_close_code() == asio::websocket::CLOSE_ABNORMAL;
                     ws_->close();
                 }
                 break;
@@ -251,7 +257,8 @@ namespace thinger::http{
 
     void websocket_connection::resume_reading(){
         execute([this]{
-            if(!paused_) return;
+            // (once closing, the handshake is what reads the socket, until it closes)
+            if(!paused_ || closing_) return;
             paused_ = false;
             if(started_ && !released_) restore_keepalive();
             wake_reader();
@@ -286,6 +293,8 @@ namespace thinger::http{
                 close_congested("its write timed out");
                 return;
             case detail::push_failure::write_error:
+                // closing: nothing more goes after the close frame, and the handshake goes on
+                if(closing_) return;
                 // a websocket that cannot write is broken: closed, which ends reading too (not
                 // the socket released: its write was cancelled)
                 LOG_LEVEL(1, "websocket write failed: {}", ec.message());
@@ -297,7 +306,8 @@ namespace thinger::http{
 
     void websocket_connection::close_congested(const char* reason)
     {
-        if(!ws_->is_open()) return;
+        // (once closing, the closing handshake has its own deadline, and the first code decides)
+        if(closing_ || !ws_->is_open()) return;
         LOG_WARNING("closing websocket: {}", reason);
         ws_->close(asio::websocket::CLOSE_TRY_AGAIN_LATER);
         wake_reader();
@@ -337,9 +347,22 @@ namespace thinger::http{
     }
 
     void websocket_connection::stop(){
-        execute([this, self = shared_from_this()]{
-            LOG_LEVEL(1, "closing websocket");
-            start_close(asio::websocket::CLOSE_NORMAL);
+        stop(asio::websocket::CLOSE_NORMAL);
+    }
+
+    void websocket_connection::stop(uint16_t code, std::string reason){
+        if(!asio::websocket::valid_close_code(code)){
+            throw std::invalid_argument("websocket close code may not be sent: " + std::to_string(code));
+        }
+        if(reason.size() > asio::websocket::MAX_CLOSE_REASON_SIZE){
+            throw std::invalid_argument("websocket close reason above 123 bytes: " + std::to_string(reason.size()));
+        }
+        if(!utf8::is_valid(reason)){
+            throw std::invalid_argument("websocket close reason is not valid UTF-8");
+        }
+        execute([this, self = shared_from_this(), code, reason = std::move(reason)]() mutable {
+            LOG_LEVEL(1, "closing websocket: {}", code);
+            start_close(code, std::move(reason));
         });
     }
 
@@ -360,7 +383,10 @@ namespace thinger::http{
     }
 
     void websocket_connection::push_message(std::string data, bool binary){
-        // (once closed, nothing is sent: not a congestion)
+        // (nothing goes after the close frame, nor once closed, even if the read loop did not end
+        // yet and the queue is still open: not a congestion)
+        if(closing_ || !ws_->is_open()) return;
+        // (a queue closed drops it too: not a congestion either)
         if(queue_->push(out_message{std::move(data), binary}) == detail::push_queue<out_message>::admission::drop && !queue_->closed()){
             LOG_DEBUG("websocket is congested. discarding packets!");
         }
@@ -396,6 +422,10 @@ namespace thinger::http{
 
     size_t websocket_connection::queued_messages() const{
         return queue_->queued_messages();
+    }
+
+    uint64_t websocket_connection::dropped_messages() const{
+        return queue_->dropped_messages();
     }
 
     void websocket_connection::on_high_watermark(sync_callback<void()> callback){

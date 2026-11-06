@@ -104,11 +104,12 @@ int main() {
 
 ### Requirements
 
-- C++20 compiler (GCC 11+, Clang 14+, MSVC 2022+)
+- C++20 compiler. Tested with GCC 13, Clang 20 and Apple Clang 17 (see [macOS](#macos)), with no compiler flag or fmt macro of your own. GCC 11+, Clang 14+ and MSVC 2022+ have what the code needs, but are not tested
 - CMake 3.14+
 - Boost 1.86+ (ASIO with coroutines, iostreams)
 - ZLIB (HTTP compression via Boost.Iostreams)
 - OpenSSL (for HTTPS/WSS)
+- spdlog 1.15.1+, unless `THINGER_HTTP_ENABLE_LOGGING` is off. CMake downloads `v1.15.1`, which brings fmt 11.1, when no spdlog is installed or the one installed is older, and linking `thinger::http` gives you its includes and library. A `spdlog::spdlog` target your project already defined stays, whatever its version
 
 ### CMake Integration
 
@@ -117,7 +118,7 @@ include(FetchContent)
 FetchContent_Declare(
     thinger-http
     GIT_REPOSITORY https://github.com/thinger-io/thinger-http.git
-    GIT_TAG v0.9.2
+    GIT_TAG v0.10.0
 )
 FetchContent_MakeAvailable(thinger-http)
 
@@ -133,7 +134,7 @@ Releases are tagged `vMAJOR.MINOR.PATCH` and follow [Semantic Versioning](https:
 
 From 1.0.0 on, only a major version changes the API in an incompatible way.
 
-[MIGRATING.md](MIGRATING.md) walks through each minor version's breaking changes in migration order, with code before and after: see [from 0.8 to 0.9](MIGRATING.md#from-08-to-09).
+[MIGRATING.md](MIGRATING.md) walks through each minor version's breaking changes in migration order, with code before and after: see [from 0.9 to 0.10](MIGRATING.md#from-09-to-010) and [from 0.8 to 0.9](MIGRATING.md#from-08-to-09).
 
 ### Build from Source
 
@@ -144,6 +145,19 @@ mkdir build && cd build
 cmake -DTHINGER_HTTP_BUILD_EXAMPLES=ON ..
 cmake --build .
 ```
+
+### macOS
+
+macOS is a secondary platform: CI does not run on it. The library and its test suite build and pass on arm64 with Apple Clang 17, and Boost and OpenSSL 3 from Homebrew. The tests take about 40 minutes:
+
+```bash
+brew install cmake boost openssl@3
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
+cmake --build build -j6
+ctest --test-dir build --output-on-failure --timeout 120
+```
+
+`OPENSSL_ROOT_DIR` selects OpenSSL 3 when `openssl@4` is installed too: without it CMake may take OpenSSL 4, with which the whole test suite has not been run.
 
 ### Run an Example
 
@@ -447,6 +461,9 @@ server.serve_static("/assets", "/var/www/app/assets", {
     .fallback = "",
     .cache_control = "public, max-age=31536000, immutable"
 });
+
+// Paths without a file go to the not-found handler (see Fallthrough)
+server.serve_static("/", "/var/www/app", {.fallthrough = true});
 ```
 
 `serve_static()` answers `GET` requests, and `HEAD` requests through its `GET` route (so the `GET` routes of the paths it covers, such as an API next to `serve_static("/", ...)`, answer their `HEAD` requests too). The fallback file is served for a directory (its own one), and for the paths without a file (the one of the root directory, as single page applications expect). Paths resolving outside the directory (through symlinks; request targets with a `..` segment in their percent-decoded path, as `/a/../b` or `/%2E%2E/x`, are already rejected with `400`, while `..` elsewhere, as in `/files/v1..v2.txt` or a query, is served) are answered with `403`.
@@ -455,7 +472,7 @@ The path under the prefix is percent-decoded before looking for the file, so `/s
 
 Dotfiles (`.env`, `.git/config`, `.htpasswd`) are not served by default, as with Express's `serve-static`: a path is a dotfile path when a segment of its decoded path under the prefix is longer than one character and starts with `.`, other than `..`, which the traversal checks handle (so `/.git/config` and `/%2Eenv` are, `/files/v1..v2.txt` and `/a.b/c.txt` are not). The `dotfiles` option says what to do with them, judging by the path alone, whether or not the file exists:
 
-- `http::dotfiles_policy::ignore` (default): answered as a path without a file, with the root fallback or `404`, so a dotfile cannot be told apart from a missing file.
+- `http::dotfiles_policy::ignore` (default): answered as a path without a file, with the root fallback or `404` (with [`fallthrough`](#fallthrough), it passes), so a dotfile cannot be told apart from a missing file.
 - `http::dotfiles_policy::deny`: `403`, without the fallback.
 - `http::dotfiles_policy::allow`: served as any other file.
 
@@ -498,6 +515,75 @@ server.get("/report", [](http::response& res) {
     res.send_file("/data/report.pdf");   // 304 while it does not change
 });
 ```
+
+#### Fallthrough
+
+By default `serve_static()` answers every path it gets, with the root fallback or its own `404`, so the application has no say on the paths without a file. With `.fallthrough = true`, those paths go to the not-found handler of the host instead, for rules such as an `index.html` under some prefixes only, or a `404` of its own:
+
+```cpp
+server.serve_static("/", "/var/www/app", {.fallthrough = true});
+
+// index.html under /console/ only, and a 404 without body elsewhere
+server.set_not_found_handler([](http::request& req, http::response& res) {
+    auto method = req.get_http_request()->get_method();
+    if ((method == http::method::GET || method == http::method::HEAD) &&
+        req.get_http_request()->get_path().starts_with("/console/")) {
+        res.send_file("/var/www/app/index.html");
+        return;
+    }
+    res.error(http::http_response::status::not_found);
+});
+```
+
+The not-found handler gets every method without a route, not only the `GET` and `HEAD` of `serve_static()`: hence the check.
+
+- **What passes:** a `GET` or `HEAD` for a path without a file to serve: it does not exist (a name too long to exist included), it is a directory without its fallback file, it is neither a file nor a directory (a FIFO, a socket), or it is a dotfile with the policy `ignore`. Conditional and range requests for it pass as a plain `GET`, without a `304`, `206` or `416`. The response reaches the handler untouched (no validators, `Cache-Control` or `Accept-Ranges`), the handler runs once, the middlewares do not run again, and `get_matched_route()` is null, as in a request without a route. The parameter `path` of the route is still in the request (`req["path"]`), so take the path from `req.get_http_request()->get_path()`, as above.
+- **What does not pass:** a path resolving outside the directory (`403`), a dotfile with the policy `deny` (`403`), a malformed escape or a decoded NUL (`400`) and a `..` segment (`400`, from the request parser). A not-found handler that serves an `index.html` or works as a proxy never sees them. A failure of the file system (no permission, the directory does not exist) is still a `500`.
+- **The fallback** is only the index of a directory, the root included: `/` and `/docs` serve their `index.html`, and `/missing` passes. Without a fallback (`.fallback = ""`), those directories pass too.
+- **Where it goes:** to the not-found handler of the host where `serve_static()` was registered or, if it has none, to the answer that host gives to a `GET` without a route. It does not go to another `serve_static()`: the router chooses one route per request and has no `next()`, so with `"/"` and `"/assets"` on a host, a path without a file under `/assets` is not looked for in the one of `"/"`.
+- **Against `fallthrough` in Express's `serve-static`:** it is off by default, where Express has it on, as a single page application relying on the root fallback would stop working. And the `400` and `403` are answered, where Express lets every error under `500` pass. A directory gets its index without a redirect, with or without the option, where `serve-static` redirects `/docs` to `/docs/`.
+
+#### Serving Files from a Handler
+
+`http::file_server::serve()` does what `serve_static()` does from a handler of your own, for what a route of its own needs: another parameter name, or rules of the not-found handler. It is declared, with `http::static_options`, in `<thinger/http/server/file_server/static_files.hpp>`:
+
+```cpp
+bool serve(http::request& req, http::response& res, const std::filesystem::path& directory,
+           std::string_view path, const http::static_options& options);
+```
+
+```cpp
+#include <thinger/http/server/file_server/static_files.hpp>
+
+// A route with a parameter of another name; without fallthrough, it always answers
+server.get("/files/:rest(.*)", [](http::request& req, http::response& res) {
+    http::file_server::serve(req, res, "/var/www/files", req["rest"], {});
+});
+
+// A not-found handler: files under /app/, then the rules of the application
+server.set_not_found_handler([](http::request& req, http::response& res) {
+    auto method = req.get_http_request()->get_method();
+    auto path = req.get_http_request()->get_path();
+    if ((method == http::method::GET || method == http::method::HEAD) && path.starts_with("/app/")) {
+        if (http::file_server::serve(req, res, "/var/www/app", std::string_view(path).substr(5),
+                                     {.fallthrough = true})) {
+            return;  // answered: a file, a 304, a 403...
+        }
+        if (path.starts_with("/app/console/")) {
+            res.send_file("/var/www/app/index.html");
+            return;
+        }
+    }
+    res.error(http::http_response::status::not_found);
+});
+```
+
+- **The path** is the file relative to `directory`, raw as it comes in the URI and without the query: what `req.get_http_request()->get_path()` gives after your prefix, or a route parameter, which is captured raw. The function percent-decodes it as above, so do not decode it first. Empty, it is the directory itself. Remove the `/` after your prefix too: a path starting with `/` is absolute, not relative to `directory`, and gets `403` outside it. No route parameter is read, so a route does not need one called `path`.
+- **What it guarantees:** the same as `serve_static()`, with the same `static_options`: decoding, containment, dotfiles, validators and `304`, byte ranges, precompressed siblings and `Cache-Control`.
+- **Whether it answered:** the result, so there is no need to look at the file system. It is `false` only with `fallthrough`, for a path without a file (as listed in [Fallthrough](#fallthrough)), with the response untouched for the caller to answer it. It is `true` otherwise, for a rejected path too (`400`, `403`). Without `fallthrough` it always answers, as `serve_static()` does: a file, the root fallback, or a `404`.
+- **What it leaves to the caller:** the method, which it does not look at, so a not-found handler must check it. And a failure of the file system is thrown, which the server answers with `500`.
+
+Over a connection, a malformed escape (`%zz`) in the target is rejected with `400` by the request parser, before any handler. The function rejects it for what does not come from there, such as a request dispatched in memory.
 
 ### JSON Schema Validation
 
@@ -814,9 +900,9 @@ Each request has a cancellation scope, which the server cancels once, for the fi
 
 - `client_gone`: the client reset the connection, a read or write on it failed (a reset or a broken pipe as the response is written), or the connection ended in the middle of the request body. A client that only closes its sending side after a complete request (a TCP FIN, as simple HTTP stacks do; over TLS a `close_notify`, or a FIN without one) has **not** left: its response is written, with `Connection: close`, and the connection closes after it. So a client that closes cleanly while its handler runs is noticed later, at the first write of its response or at the route timeout: a long poll declares `timeout` too.
 - `timeout`: the [timeout of the route](#limits-and-timeouts-per-route) expired, right after its `504`, or that of an [in-memory dispatch](#in-memory-dispatch).
-- `shutdown`: the [shutdown](#shutdown) reached its deadline with the request in progress.
+- `shutdown`: the [shutdown](#shutdown) reached its deadline with the request in progress, the server was [stopped or destroyed](#server-lifecycle), or the application was destroyed with an [in-memory dispatch](#in-memory-dispatch) in flight.
 
-Cancellation is cooperative. The server interrupts a handler only on a route that declares the reason with `.cancel_on(reasons)`, and every handler at the shutdown deadline. On any other route the handler goes on, and looks at the scope where it chooses:
+Cancellation is cooperative. The server interrupts a handler only on a route that declares the reason with `.cancel_on(reasons)`, and at the shutdown deadline, on `stop()` and on its destruction, every handler of a request it still follows (see below). On any other route the handler goes on, and looks at the scope where it chooses:
 
 ```cpp
 using http::cancel_reason;
@@ -838,7 +924,7 @@ server.get("/v1/report", [](http::request& req, http::response& res) -> thinger:
 
 - `req.cancelled()` returns the reason, `none` until the scope is cancelled, from any thread.
 - `co_await req.client_gone()` completes once the scope is cancelled, whatever the reason, and returns it (with `||`, alongside other work); `none` if the wait itself is cancelled. It never completes for a scope never cancelled.
-- `req.cancellation_slot()` is cancelled (terminal) with the scope while the handler runs: bind it with `boost::asio::bind_cancellation_slot` to the awaits the handler can abandon, one pending await at a time (asio's rule).
+- `req.cancellation_slot()` is cancelled (terminal) with the scope while the handler runs, and once more by a later `shutdown`: bind it with `boost::asio::bind_cancellation_slot` to the awaits the handler can abandon, one pending await at a time (asio's rule).
 - On a `cancel_on` route, asio cancels the handler coroutine: its pending await, or its next one, ends with `operation_aborted` (thrown, or returned with `as_tuple`), and so do those of the coroutines it awaits. Code that does not await is not interrupted. An interrupted handler is not a failure: no `500` (the timeout already answered, the client is gone, or the connection closes), its exception logged at debug level; a response it had started closes the connection after it. `cancel_on()` is set on each route (groups and hosts do not carry it), and `cancel_on({})` keeps the default.
 
 Work that must not be interrupted on such a route (a write and what follows it) runs outside the cancellation state of the handler, either for the rest of the handler or for that work only:
@@ -855,7 +941,7 @@ co_await co_spawn(co_await boost::asio::this_coro::executor, store.save(record),
                   boost::asio::bind_cancellation_slot(boost::asio::cancellation_slot{}, thinger::use_awaitable));
 ```
 
-The scope is cancelled once: a handler that disabled its cancellation checks `req.cancelled()` afterwards. The scope is cancelled on the thread of the connection (the strand of an in-memory dispatch), where the handler runs. An in-memory dispatch follows the same rules: its timeout is `timeout`, and a caller cancelling it is `client_gone`. The [reverse proxy](#reverse-proxy) stops the exchange with its target when the scope is cancelled.
+The scope is cancelled once: a handler that disabled its cancellation checks `req.cancelled()` afterwards. A `shutdown` still interrupts a handler that an earlier reason let go on, once, and `req.cancelled()` keeps the first reason. The scope is cancelled on the thread of the connection (the strand of an in-memory dispatch), where the handler runs. An in-memory dispatch follows the same rules: its timeout is `timeout`, a caller cancelling it is `client_gone`, and destroying the application is `shutdown`. A connection follows a request until its response is written: a handler still running after that, such as one going on after the `504` of its route timeout was written, is not interrupted by the server stopping, and runs on against what it shares with the server. A dispatch has no such limit: destroying the application reaches its handler until it ends. The [reverse proxy](#reverse-proxy) stops the exchange with its target when the scope is cancelled.
 
 This is Go's model, where the context of the request is cancelled and the handler decides when to look; Node does not cancel handlers.
 
@@ -917,6 +1003,14 @@ response = co_await server.dispatch(request, options);
 
 The server does not need to be listening. Chunked responses are collected whole. A `HEAD` request gets the response it gets on a connection: no content, with the `Content-Length` of the body of `GET`. Handlers can keep a copy of the response and answer later. The timeout covers the whole request, handler included: if it expires the result is `504`, and the [cancellation scope](#cancellation) of the request is cancelled with `cancel_reason::timeout`; the handler goes on unless its route declared `.cancel_on({http::cancel_reason::timeout})`, which interrupts it (its pending awaits end with `operation_aborted`). A caller cancelling the coroutine awaiting `dispatch()` (a cancellation slot, or `||` with a timer) cancels the scope with `cancel_reason::client_gone`, which interrupts only a route declaring it, and `dispatch()` throws `operation_aborted`. WebSockets, SSE and `take_over()` answer `501`, as there is no connection. The request is served by the [virtual host](#virtual-hosts) of its URL (or `Host` header). `remote_ip` is the peer address: `get_request_ip()` returns it (or the forwarded client address, if it is a [trusted proxy](#client-ip-behind-proxies)), and it is empty unless set: internal calls never pass as a trusted local address by default. `context` holds the initial values of the [request context](#request-context) (empty by default): middlewares may replace them, and nothing is carried over from a request the caller is serving, so a gateway decides what to pass (or authenticates the call again). Copying `dispatch_options` copies its values; a value of a type that cannot be copied (e.g. `std::unique_ptr`) makes that copy throw `std::logic_error`, so move such options into `dispatch()`.
 
+Destroying the application (or the server, which is one) ends its dispatches in flight without waiting for them, and may be done from any thread or from one of their handlers:
+
+- A dispatch without a complete response, one streaming in parts included, ends at once instead of at its timeout: `co_await dispatch()` throws `boost::system::system_error` with `operation_aborted`, the same as a caller cancelling it and the transport error a client sees from Node's `closeAllConnections()` or Go's `Server.Close()`. The variant with a callback has no error to report, so its callback is called once with `503 Service Unavailable` (RFC 9110 section 15.6.4). A response already complete is delivered, even if the caller has not resumed yet. The caller gets its result when its executor runs, which the destructor does not need.
+- A dispatch not started yet (a callback queued on its executor, an awaitable still to be awaited) ends the same, without running any middleware or handler and without reaching [`on_response()`](#response-hook). Nor does a later step start: a request whose middleware was suspended never reaches its handler.
+- A handler running is interrupted with `cancel_reason::shutdown` as on [`stop()`](#server-lifecycle), whatever its route declared: its next cancellable await ends with `operation_aborted`. That includes a handler that went on after the `504` of the dispatch timeout: `req.cancelled()` keeps saying `timeout`, the first reason. Its current step, and the awaits it isolated from cancellation (see [Cancellation](#cancellation)), end on their own; what it sends afterwards, from a copy of the response too, is dropped; and `on_response()` is called once, when it ends.
+
+Once the destructor returned, the library touches nothing of the application: a dispatch and its handler share only what it serves with (routes, virtual hosts, middlewares, hooks and settings), which stays alive until they end. What the handler captured itself is the application's to keep alive, as on a server. Calling `dispatch()` on an application already destroyed is an error, like calling any other member.
+
 Everything about routes, hosts, middlewares and request settings (error format, trusted proxies, body limit and decoders, CORS), `dispatch()` included, comes from `http::http_application`, which the server extends with its listeners, TLS and connection settings. An `http::http_application` can also be used on its own, without a server, only to dispatch requests in memory.
 
 ### Virtual Hosts
@@ -953,7 +1047,7 @@ For HTTPS, the certificate is chosen per domain before any request is read, thro
 
 ### Error Format
 
-Errors sent with `res.error(status, message)`, and the ones the server generates itself (`400` for bodies that cannot be decoded, schema validation and invalid request framing or bodies, `401` of basic auth, `404`/`405`, `413`, `415` for body types not accepted, `500` from middlewares, handlers and invalid route schemas, `504` (or the status set) of [route timeouts](#limits-and-timeouts-per-route), and `501`/`504` of in-memory dispatch) go through an error formatter. By default the message is sent as `text/plain`, and errors with details (schema validation) as JSON `{"error": {"message": ..., "context": [...]}}`. A formatter changes it for all of them:
+Errors sent with `res.error(status, message)`, and the ones the server generates itself (`400` for bodies that cannot be decoded, schema validation and invalid request framing or bodies, `401` of basic auth, `404`/`405`, `413`, `415` for body types not accepted, `500` from middlewares, handlers and invalid route schemas, `504` (or the status set) of [route timeouts](#limits-and-timeouts-per-route), and `501`/`503`/`504` of in-memory dispatch) go through an error formatter. By default the message is sent as `text/plain`, and errors with details (schema validation) as JSON `{"error": {"message": ..., "context": [...]}}`. A formatter changes it for all of them:
 
 ```cpp
 server.set_error_formatter([](const http::http_error& error, http::http_response& response) {
@@ -1066,13 +1160,73 @@ The flow control comes from `res.start_stream(head, content_length)`, `co_await 
 
 ### CORS
 
-```cpp
-// Enable CORS for all origins
-server.enable_cors();
+CORS is off by default: no response has `Access-Control-*` headers and an `OPTIONS` is routed as any other method. `enable_cors()` turns it on for the whole application (every virtual host, on every listener, and `dispatch()`), with the defaults of `cors()` in Express:
 
-// Disable CORS
-server.enable_cors(false);
+```cpp
+server.enable_cors();    // any origin, without credentials
+server.disable_cors();   // back to no CORS headers
 ```
+
+With credentials (cookies or `Authorization` in a browser), list the origins allowed. Each is compared with the `Origin` of the request, and the one that matches is reflected:
+
+```cpp
+if (auto ec = server.enable_cors({
+        .origins = {"https://console.example.com", "https://admin.example.com"},
+        .allowed_headers = std::vector<std::string>{"Content-Type", "Authorization"},
+        .exposed_headers = {"X-Total-Count"},
+        .max_age = std::chrono::minutes(10),
+        .credentials = true,
+    })) {
+    // ec is invalid_argument: the options cannot be applied (the reason is logged)
+}
+```
+
+Or decide with a function, which replaces the list:
+
+```cpp
+server.enable_cors({
+    .origin_filter = [](std::string_view origin, const http::http_request&) {
+        return origin.ends_with(".example.com");
+    },
+    .credentials = true,
+});
+```
+
+| `http::cors_options` | Default | Meaning |
+|---|---|---|
+| `origins` | `{"*"}` | `{"*"}` alone is any origin. Otherwise the exact origins allowed, ASCII case-insensitive (empty for none, `"null"` for that origin) |
+| `origin_filter` | none | `bool(std::string_view origin, const http_request&)`: whether to allow an origin, instead of the list. Called once for each request with an `Origin`, before the middlewares and on the thread of the request, so it must not block. If it throws, the request is answered `500`, with no origin allowed |
+| `methods` | `GET, HEAD, PUT, PATCH, POST, DELETE` | `Access-Control-Allow-Methods` of a preflight (not sent if empty) |
+| `allowed_headers` | no value | `Access-Control-Allow-Headers` of a preflight. Without a value, what it asks for in `Access-Control-Request-Headers`; with a value, that list (not sent if empty). Being optional, it is written `std::vector<std::string>{...}` |
+| `exposed_headers` | empty | `Access-Control-Expose-Headers` |
+| `max_age` | no value | `Access-Control-Max-Age` of a preflight, in seconds: not sent without a value, sent when `0` |
+| `credentials` | `false` | `Access-Control-Allow-Credentials: true` |
+| `preflight_continue` | `false` | Let a preflight go on as any request (see below) |
+
+`enable_cors()` returns a `boost::system::error_code`, empty when applied. It is `invalid_argument`, with the reason in the log and the CORS in force unchanged, for `credentials` with any origin (`*`, which browsers reject: use a list or a filter), `*` listed with other origins, an origin with control characters, a method or header name that is not a token, or a negative `max_age`. As the [other settings](#server-lifecycle), set it before serving.
+
+**Responses.** The headers go on every response of the application, whoever answers it: a handler in any form (files, chunked and streams too), a middleware, or the library itself (`400`, `404`, `405`, `413`, `415`, `500`, a route timeout), so that a browser can read the errors too. A response to a request that is not a preflight has only these:
+
+- `Access-Control-Allow-Origin`: with any origin `*`, also to a request without `Origin`; with a list or a filter, the origin of the request as it came, if allowed. With a list or a filter every response also says `Vary: Origin`, allowed or not and with or without `Origin`, merged with the other fields of `Vary`, those of a head given to `start_stream()` or sent by the target of a `reverse_proxy` too.
+- `Access-Control-Allow-Credentials: true` with `credentials`, and `Access-Control-Expose-Headers` with `exposed_headers`.
+
+An origin not allowed gets none of them. CORS is not access control: its request still runs and only its browser cannot read the response, so authorize requests in a middleware. An `Access-Control-*` header set by a handler or a middleware stays instead of the one of CORS, never next to it. `Access-Control-Allow-Origin: *` never goes with `Access-Control-Allow-Credentials` from the library.
+
+**Preflight.** An `OPTIONS` with a non-empty `Access-Control-Request-Method` is a preflight (any other `OPTIONS` is routed as usual). The library answers it with `204` and no body, on any path and host, before route matching: no middleware or handler runs, because a browser sends a preflight without credentials and an authorization middleware would reject it. `on_response` is called for it as for any request. Besides the headers above, an origin allowed gets `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers` and `Access-Control-Max-Age` (when reflecting the requested headers, `Vary` lists `Access-Control-Request-Headers` too). An origin not allowed gets `204` with `Vary` only, and its browser blocks the request. The method and headers asked for are not checked against the lists: the browser does that with the lists it receives. CORS adds no route, so nothing of it appears in the [OpenAPI document](#openapi).
+
+To handle preflights in the application (to log them, limit them, or answer them with its own `OPTIONS` route and its metadata), set `preflight_continue`. They then follow the normal path, route matching and middlewares included, and end in that route or in `404`/`405`/the not-found handler, with the preflight headers already on the response:
+
+```cpp
+server.enable_cors({.preflight_continue = true});
+
+// A middleware sees this route as the matched one, with its metadata
+server.options("/api/devices", [](http::response& res) {
+    res.status(http::http_response::status::no_content);
+    res.send("");
+}).meta("permission", "Device:Preflight");
+```
+
+See `examples/http_server/server_cors_example.cpp`.
 
 ### HTTPS Server
 
@@ -1278,7 +1432,7 @@ server.wait();  // Wait for shutdown
 server.stop();
 ```
 
-`start()` listens on plain TCP and waits, returning `false` if it cannot listen. `stop()` stops the server right away: it stops listening on every listener, ends a [shutdown](#shutdown) in progress, and closes every connection still open, idle keep-alive ones, those handling a request and those taken over (WebSockets, event streams, tunnels) alike; on `http::server` its io_context stops too. The handlers still running are cancelled with `cancel_reason::shutdown`, whatever their route declared (their next cancellable await ends with `operation_aborted`), and are not waited for: each connection closes on its own thread, and what a handler sends afterwards is dropped. Destroying the server does the same. `stop_listening()` only stops listening: new connections are refused, and those open go on being served. For a graceful stop, see [Shutdown](#shutdown).
+`start()` listens on plain TCP and waits, returning `false` if it cannot listen. `stop()` stops the server right away: it stops listening on every listener, ends a [shutdown](#shutdown) in progress, and closes every connection still open, idle keep-alive ones, those handling a request and those taken over (WebSockets, event streams, tunnels) alike; on `http::server` its io_context stops too. The handlers still running whose response is not written yet are cancelled with `cancel_reason::shutdown`, whatever their route declared (their next cancellable await ends with `operation_aborted`; see [Cancellation](#cancellation)), and none is waited for: each connection closes on its own thread, and what a handler sends afterwards is dropped. Destroying the server does the same. `stop_listening()` only stops listening: new connections are refused, and those open go on being served. For a graceful stop, see [Shutdown](#shutdown).
 
 Once `stop()` or the destructor returned, the library touches nothing of the server: each connection, and each handler running on it, shares what the server serves with (routes, virtual hosts, middlewares, hooks and settings), so a handler still running may finish its current step against them, which stay alive until it ends. What the handler captured itself (the server, objects of the application) is the application's to keep alive, or not to touch once the server is stopped. Both may be called from one of the server's own handlers, on any worker thread, as they do not wait: that handler goes on, and must not touch a server it destroyed. The connections closed are never served again, even if the server listens again.
 
@@ -1297,6 +1451,7 @@ options.write_timeout = std::chrono::seconds(30);     // 60 s: a response the cl
 options.linger_max_bytes = 1024 * 1024;               // 8 MiB  } closing with the body unread,
 options.linger_timeout = std::chrono::seconds(2);     // 5 s    } see Limits and Timeouts per Route
 options.logging = {true, 512};                        // off: see What the Message Logs Show
+options.logging.redact.add("invite");                 // redacted_parameters::defaults()
 server.set_connection_options(options);
 server.listen("0.0.0.0", 8080);
 ```
@@ -1308,10 +1463,11 @@ server.listen("0.0.0.0", 8080);
 - `0` disables any of the three; with the three at 0, a connection is served as in 0.8, with `idle_timeout` as its only deadline.
 - `linger_max_bytes` and `linger_timeout`: the bounds of a lingering close (RFC 9112, section 9.6, see [Limits and Timeouts per Route](#limits-and-timeouts-per-route)); 0 for either closes at once. During a graceful shutdown a connection lingers 0.5 s at most.
 - `logging`: the header values and the start of the bodies of the requests and responses, for debugging (see [What the Message Logs Show](#what-the-message-logs-show)).
+- `logging.redact`: the query parameters whose values this server hides from the URIs it logs, whether the values above are logged or not (see [Query Parameters in the Logs](#query-parameters-in-the-logs)). Assigning `options.logging = {true, 512}` sets it back to the defaults, so set it afterwards, as above.
 
 ### Workers
 
-A `pool_server` and an `async_client` run on `asio::workers`: a pool of threads, each running an io_context of its own, that the application creates, starts, hands to them by reference and stops. Nothing starts or stops the workers by themselves. A `pool_server` accepts on a thread of its own and serves each connection on the next thread of the pool; several servers and clients may share one `workers`, and several `workers` may live in one process, sharing nothing. The workers must outlive what runs on them: stop the servers and the clients (or destroy them) before stopping the workers. A server stopped or destroyed this way has closed its connections, keep-alive ones included, and cancelled its handlers (see [Server Lifecycle](#server-lifecycle)), and a client has ended its requests in flight, so stopping the workers then drops none of them (see [Async Client](#async-client-async_client)). Handlers still running on the workers end there, without the server.
+A `pool_server` and an `async_client` run on `asio::workers`: a pool of threads, each running an io_context of its own, that the application creates, starts, hands to them by reference and stops. Nothing starts or stops the workers by themselves. A `pool_server` accepts on a thread of its own and serves each connection on the next thread of the pool; several servers and clients may share one `workers`, and several `workers` may live in one process, sharing nothing. The workers must outlive what runs on them: stop the servers and the clients (or destroy them) before stopping the workers. A server stopped or destroyed this way has closed its connections, keep-alive ones included, and cancelled its handlers (see [Server Lifecycle](#server-lifecycle)), and a client stopped or destroyed from a thread that is not one of the workers has ended its requests in flight, so stopping the workers then drops none of them (see [Async Client](#async-client-async_client)). Handlers still running on the workers end there, without the server.
 
 ```cpp
 thinger::asio::workers workers;
@@ -1339,7 +1495,7 @@ A server stops in three steps: `stop_listening()` (quiesce), `shutdown(by)` (dra
 - idle keep-alive connections are closed at once;
 - a connection handling a request finishes it: its response tells the client with `Connection: close` (unless the response already started: then the connection is closed after it), and the connection closes after it;
 - connections taken over are told (once, on their thread): a `websocket_connection` closes with 1001 (Going Away), an `sse_connection` closes, and others call what the application set with `on_shutdown()` (`websocket_connection`, `sse_connection`), or with `scope.on_shutdown(callback)` for the connection of `take_over()` (`upgraded_connection`) or `upgrade_websocket_stream()` (`upgraded_websocket`), see [Taking Over the Connection](#taking-over-the-connection). Their `on_close()` tells when they closed. Proxied WebSockets (reverse proxy tunnels) are not told: they end when either side closes, or at their [idle timeout](#reverse-proxy). The server calls `on_shutdown()` once when the shutdown starts, for anything else the application runs (what it throws is logged, and the shutdown goes on);
-- once every connection is gone it returns `true`, at once for a server with none open; at `by`, every handler still running is interrupted (its [cancellation scope](#cancellation) is cancelled with `cancel_reason::shutdown`, whatever its route declared: its next cancellable await ends with `operation_aborted`), whatever is left is closed and it returns `false`, without waiting for the handlers it interrupted. Then the server stops as with `stop()` (`wait()` returns), once the connections closed on their threads. It does not call `stop()` itself, which may end on a thread of the server while a subclass is being destroyed: a `stop()` overridden in a subclass of `pool_server` or `server` runs only when the application calls it.
+- once every connection is gone it returns `true`, at once for a server with none open; at `by`, every handler still running whose response is not written yet is interrupted (its [cancellation scope](#cancellation) is cancelled with `cancel_reason::shutdown`, whatever its route declared: its next cancellable await ends with `operation_aborted`), whatever is left is closed and it returns `false`, without waiting for the handlers it interrupted. Then the server stops as with `stop()` (`wait()` returns), once the connections closed on their threads. It does not call `stop()` itself, which may end on a thread of the server while a subclass is being destroyed: a `stop()` overridden in a subclass of `pool_server` or `server` runs only when the application calls it.
 
 Every listener drains at once, under the same `by`. `shutdown(by)` may be awaited from any executor, a thread of the server included (a handler, or a worker of a `pool_server`), which it does not block: the other connections of that thread go on being served. It may be called several times, concurrently too: every call shares the same end and result, and the first one sets `by`. A handler starting the shutdown does not await it, as the drain waits for its own request: it spawns it, as the [server shutdown example](examples/http_server/server_shutdown_example.cpp) does:
 
@@ -1374,7 +1530,7 @@ workers.stop();
 
 // a WebSocket that says goodbye its own way
 res.upgrade_websocket({}, [](std::shared_ptr<thinger::http::websocket_connection> ws) {
-    ws->on_shutdown([ws] { ws->send_text("{\"event\":\"restarting\"}"); ws->stop(); });
+    ws->on_shutdown([ws] { ws->send_text("{\"event\":\"restarting\"}"); ws->stop(1012, "restarting"); });
 });
 ```
 
@@ -1447,7 +1603,11 @@ client.verify_ssl(false);  // Disable SSL verification
 client.unix_socket("/path/to/socket");  // Unix domain socket
 client.max_content_size(8 * 1048576);  // Largest buffered body, also once decompressed (8 MB)
 client.auto_decompress(false);  // Bodies as received: no Accept-Encoding, gzip/deflate not decoded
+client.log_bodies(true, 512);  // Header values and start of the bodies in the logs, for debugging
+client.redact_parameters(names);  // Query parameters hidden from the logs, instead of the defaults
 ```
+
+See [What the Message Logs Show](#what-the-message-logs-show) for the last two.
 
 ### Connection Pool (Keep-Alive)
 
@@ -1656,7 +1816,28 @@ Responses are parsed as strictly as the server parses requests, so a response is
 
 The async client supports three usage patterns: callbacks, coroutines, and the request builder. It runs its requests and callbacks on the [workers](#workers) it is given, which the application starts and keeps alive longer than the client (the snippets below use these `workers`).
 
-`stop()` and the destructor end the requests in flight before returning. They cancel them: their callbacks are not called (one that completed meanwhile may still call its own), and the coroutines of `run()` see their requests fail with `operation_aborted`. Called from a thread that is not one of the workers, they return once none of those requests runs, nor any callback of the client: a callback running then is waited for, not interrupted. Called from one of the workers (e.g. in a callback of the client), they do not wait for the requests, and none of them resumes anymore (the destructor still waits for the callbacks running on other workers). Either way, once the destructor returns no callback or coroutine of the client runs, so whatever they captured may be destroyed, and a client may be destroyed from one of its own callbacks. Requests started while `stop()` runs are not run; those started after it returned run as before. `stop()` also releases `wait()` and `wait_for()` and closes the idle connections. WebSockets already handed out (`websocket()`) belong to the application and stay open.
+`stop()` and the destructor cancel the requests in flight, in any phase, and close their connections and the idle ones. The callback of a request cancelled is not called (one running, of a request that completed before, is not interrupted). A coroutine, of `run()` or a callback that is one, sees its requests fail with `operation_aborted`, and any further one fail at once, without connecting. Requests started while `stop()` or the destructor runs are not run, and their callbacks are never called; those started after `stop()` returned run as before. `stop()` also releases `wait()` and `wait_for()` and leaves `pending_requests()` at 0. WebSockets already handed out (`websocket()`) belong to the application and stay open, and so does what it spawned on the executor of a coroutine of `run()`, which is the plain executor of its worker (`co_await this_coro::executor`).
+
+What they wait for depends on the thread they are called from:
+
+- **From a thread that is not one of the workers**, with the workers running, they return once no callback of the client runs and the requests cancelled ended, so whatever their callbacks and coroutines captured may be destroyed. A callback running is waited for as long as it takes, not interrupted. A coroutine that ignores the cancellation is waited for up to 1 s and then left behind: it holds what it uses of the client, ends by itself, and may resume after the call returned.
+- **From one of the workers** (e.g. in a callback of the client, which may destroy it), they do not wait for the requests: `stop()` waits for nothing, and the destructor only for the callbacks running on other workers. No callback of a request cancelled is called once they returned, but coroutines are not waited for: those of other workers run at the same time, and the cancellation reaches them through the queue of their worker. A coroutine may resume after the call returned, and see `operation_aborted` or the correct response of a request that completed before the cancellation reached it. Its frame is destroyed on its worker.
+
+Each request keeps what it uses of the client alive (its settings, connections and TLS contexts), so one that outlives the client touches no freed memory. The `async_client` object is not among those, and neither is what a coroutine uses itself: they are the application's, as an object is in any other language. A coroutine must not use a client that may be destroyed while it runs: not after a request was aborted, but also not before its first request or after a correct response, as it may be running on another worker at that very moment. If a callback ends the client, have the coroutines hold it by `std::shared_ptr`, captured by value, and have the callback call `stop()` and release its reference, so the client goes with the last one holding it, on a worker:
+
+```cpp
+auto client = std::make_shared<thinger::http::async_client>(workers);
+auto done = std::make_shared<std::atomic<int>>(0);
+
+client->run([client, done]() -> thinger::awaitable<void> {
+    auto res = co_await client->get("https://api.example.com/data");
+    if (res.ok()) ++*done;   // a response that completed before the cancellation reached it
+});
+client->get(close_url, [client](auto&) { client->stop(); });
+client.reset();              // it goes with the last request holding it
+```
+
+The workers still have to outlive it, and destroying them with a coroutine still holding it is a memory error: before stopping them, keep a reference on that thread and call `stop()` there, which waits for those coroutines. The other way is to stop or destroy the client from a thread that is not one of the workers, also after a `stop()` from a callback, as that call waits for the coroutines.
 
 #### Callback-based
 
@@ -1743,7 +1924,7 @@ server.get("/weather", [](thinger::http::response& res) -> thinger::awaitable<vo
 thinger::http::executor_client client(io_context);
 ```
 
-`for_current_coroutine()` takes the io_context of the calling coroutine, an io_context executor or a strand of one (as server handlers have), or the worker of a coroutine of `async_client::run()`, and throws `std::logic_error` on any other executor (e.g. a `thread_pool`); `thinger::asio::io_context_of(executor)` (in `<thinger/asio/io_context_of.hpp>`) tells which io_context an executor runs on, or null. Use the client on the threads running its io_context (with several threads, from a strand of it), and destroy it there, before the io_context. Cancelling the coroutine awaiting a request (a cancellation slot, or `||` with a timer) cancels the request and closes its connection. WebSockets opened through it (`websocket()`) run on the executor of the caller, its strand included: their keepalive and closing handshake never run at the same time as the caller.
+`for_current_coroutine()` takes the io_context of the calling coroutine, an io_context executor (as a coroutine of `async_client::run()` has, its worker's) or a strand of one (as server handlers have), and throws `std::logic_error` on any other executor (e.g. a `thread_pool`); `thinger::asio::io_context_of(executor)` (in `<thinger/asio/io_context_of.hpp>`) tells which io_context an executor runs on, or null. Use the client on the threads running its io_context (with several threads, from a strand of it), and destroy it there, before the io_context. Cancelling the coroutine awaiting a request (a cancellation slot, or `||` with a timer) cancels the request and closes its connection. WebSockets opened through it (`websocket()`) run on the executor of the caller, its strand included: their keepalive and closing handshake never run at the same time as the caller.
 
 For many calls to the same host, as a gateway sending most requests to one backend, use a pooled client instead (`async_client`), whose connections are kept alive and shared by every request. `max_idle_connections_per_host()` enables keep-alive here too, but a client created per call does not keep its connections for the next one.
 
@@ -1798,7 +1979,7 @@ Without `protocols`, a client offering a subprotocol is answered with `400` by `
 
 ### WebSocket Close
 
-`on_close()` is called once the WebSocket closed, whatever closed it (the client, a lost connection, `stop()`, the server shutdown, the overflow policy...), once, after its last message: nothing can be sent anymore. It tells how, as Node's `ws` `'close'` event: the status code of the client's close frame and its reason (when the server closed first and the client answered, the code of the answer, normally its echo), or the code the server closed with, or `1006` when no close frame was exchanged (the connection was lost, or closed by the server at the deadline of a shutdown).
+`on_close()` is called once the WebSocket closed, whatever closed it (the client, a lost connection, `stop()`, the server shutdown, the overflow policy...), once, after its last message: nothing can be sent anymore. It tells how, as Node's `ws` `'close'` event: the status code of the client's close frame and its reason (when the server closed first and the client answered, the code of the answer, normally its echo), or the code the server closed with, or `1006` when no close frame was exchanged (the connection was lost, closed by the server at the deadline of a shutdown, or the close frame of `stop()` was not written whole by its deadline).
 
 ```cpp
 res.upgrade_websocket({}, [&](std::shared_ptr<http::websocket_connection> ws) {
@@ -1811,6 +1992,20 @@ res.upgrade_websocket({}, [&](std::shared_ptr<http::websocket_connection> ws) {
 ```
 
 It is always posted to the thread of the connection, never called from within the call that closed it, so a loop sending to every connection can remove the ones closing; what it throws is logged. Set it in the handler, or later on the thread of the connection: set once the WebSocket closed, it is posted at once. It is not called once the socket is released (`release_socket()`), nor when the io_context is stopped and destroyed with the connection open (e.g. by `stop()` of an `http::server`, which stops its io_context). A server WebSocket whose `on_message()` throws is closed with `1011`.
+
+`stop()` closes with `1000`. `stop(code, reason)` closes with a code and a reason of your own, from any thread, as `ws.close(code, reason)` in Node:
+
+```cpp
+// The credential the connection was opened with has expired
+ws->stop(1008, "token expired");
+```
+
+It takes the same path as any other close: the closing handshake, the keepalive stopped, the awaited sends told `false`, and `on_close()` called once, so `release_socket()` is not needed to choose the code. The close frame goes after the message being written, ahead of the messages still queued, which are not sent; what must arrive first is awaited with `send_text_async()` or `send_binary_async()`. Nothing else is sent after it.
+
+- **Arguments**: a `code` that a close frame may not carry (anything but 1000–1014 without 1004, 1005 and 1006, and 3000–4999), a `reason` above 123 bytes (bytes of UTF-8, not characters) or a `reason` that is not valid UTF-8 throw `std::invalid_argument` in the calling thread, whatever the state of the connection: nothing is sent and the connection stays as it was. An empty `reason` sends the code alone.
+- **One close**: once closing or closed, a call with valid arguments does nothing else: there is one close frame and the first code decides. Calling it in `on_shutdown()` replaces the `1001` of a [shutdown](#shutdown), as with `ws->stop(1012, "restarting")`.
+- **Deadline**: the connection is closed and `on_close()` called within `thinger::asio::websocket::CLOSE_TIMEOUT` (5 seconds) of the call, with or without arguments, whatever the client does: not answering, not reading with a large message being written, or reading a few bytes at a time. At the deadline the socket is closed without the handshake, as `Conn.Close()` of Go's `coder/websocket` (Node's `ws` waits 30 seconds). It does not wait for the [write timeout](#websocket-flow-control), and never ends in `1013`. A message still being written then is cut, even to a slow client that keeps reading.
+- **What `on_close()` gets**: the code and reason of the client's answer, normally its echo, with `remote` false; if the client did not answer (or ended the connection without answering), the code sent, with an empty reason; `1006` if the close frame was not written whole. If the close frame of the client came first, its code, with `remote` true.
 
 The WebSocket used as a socket (`upgrade_websocket_stream()`, `thinger::asio::websocket`, see [WebSocket as a Socket](#websocket-as-a-socket)) has the same `on_close()`, with an `asio::websocket_close` (`http::websocket_close` is the same type): called once, whatever closed it, with the same guarantees. It has no read loop of its own: the connection is noticed lost by the operations running on it (a protocol always has a read pending; the keepalive), with `1006` when no close frame was exchanged, and closing the socket under it (the end of a server's shutdown) counts too. The callback must not own the WebSocket, which nothing would release: capture a `std::weak_ptr`.
 
@@ -1855,7 +2050,8 @@ ws->on_message([ws, sink](std::string message, bool binary) {
 - **Limits** (`set_write_limits()`, a `http::write_limits`): `max_messages` (100 by default) and `max_bytes` (no limit by default) of the queue, the message being written included; an empty queue always takes a message. `queued_bytes()` and `queued_messages()` tell what is not written yet; they are atomic, so any thread may read them (as Node's `bufferedAmount`). `queue_full()` tells whether the overflow policy applies to the next message, which is not the watermark state.
 - **Watermarks**, as Netty's `WriteBufferWaterMark` and `isWritable()`: once the bytes queued reach `high_watermark` the connection is not writable, and `wait_writable()` waits, until they drain to `low_watermark`. `on_high_watermark()` and `on_low_watermark()` are told of each change asynchronously, posted to the thread of the connection as Node emits `'drain'`: never from within a send or a drop, so they may send themselves, and never once the connection is closing. Changing the limits re-evaluates the state: disabling the watermarks, or raising the low one above what is queued, makes it writable.
 - **Overflow policy** of a full queue, for the messages sent without waiting: `drop_newest` (the default), `drop_oldest` (the oldest messages queued, never the one being written nor an awaited one; when that is not enough, the new message is dropped, so the limits hold), or `close`, which closes the connection with `1013 Try Again Later` (the code the IANA registry has for a server shedding a client, which may reconnect later; `1008 Policy Violation` is about the messages a peer sends).
-- **Write timeout** (`write_timeout`, 60 s by default, `0` disables it): a write that makes no progress for that long closes the connection with `1013`, as a client that stopped reading; awaited sends and `wait_writable()` then complete with `false`, and the queue is released. It bounds a stall, not the time a message takes: a write progresses while the socket takes bytes of it (a message over 64 KiB is written in 64 KiB slices, each one progress), or the client takes bytes from the socket, which is checked only once the socket took nothing for the timeout, for a quarter of it more. So a slow client that keeps reading gets every message, however large, and is never cut, and one that stopped reading is closed within the timeout and a quarter (75 s by default). 60 s is nginx's `send_timeout` and `proxy_send_timeout` (the time between two successive writes), and the server's own [`write_timeout`](#connection-options). `set_write_limits()` replaces every limit, but limits that do not name `write_timeout` keep the 60 s (as the examples above do). Changed while a write is stalled, the new value applies at once: 0 cancels the deadline, and another one counts from the last progress (from the call, if the deadline was off), so a shorter one may close the connection right away. 0.8 had no deadline by default: a client that stopped reading kept its connection, and its newest messages were dropped, until it left.
+- **Dropped messages**: `dropped_messages()` counts what `drop_newest` and `drop_oldest` dropped since the connection was created, the new message or the older ones, as a 64-bit number that never decreases, e.g. for metrics or to tell the client it lost data. Any thread may read it. Awaited sends are not counted, as they are never dropped; nor is what is sent once the connection is closing, what was queued when it closed, or an overflow with the `close` policy. A send from another thread counts once the thread of the connection took it, so once all were taken (e.g. after `execute()`), written + queued + dropped is what was sent while open.
+- **Write timeout** (`write_timeout`, 60 s by default, `0` disables it): a write that makes no progress for that long closes the connection with `1013`, as a client that stopped reading; awaited sends and `wait_writable()` then complete with `false`, and the queue is released. It bounds a stall, not the time a message takes: a write progresses while the socket takes bytes of it (a message over 64 KiB is written in 64 KiB slices, each one progress), or the client takes bytes from the socket, which is checked only once the socket took nothing for the timeout, for a quarter of it more. So a slow client that keeps reading gets every message, however large, and is never cut, and one that stopped reading is closed within the timeout and a quarter (75 s by default). 60 s is nginx's `send_timeout` and `proxy_send_timeout` (the time between two successive writes), and the server's own [`write_timeout`](#connection-options). `set_write_limits()` replaces every limit, but limits that do not name `write_timeout` keep the 60 s (as the examples above do). Changed while a write is stalled, the new value applies at once: 0 cancels the deadline, and another one counts from the last progress (from the call, if the deadline was off), so a shorter one may close the connection right away. 0.8 had no deadline by default: a client that stopped reading kept its connection, and its newest messages were dropped, until it left. Once `stop()` was called, the deadline of the [close](#websocket-close) applies instead, 5 seconds.
 - **Pausing reads**: after `pause_reading()` nothing more is read from the socket: called from `on_message()`, the message being delivered is the last one; from another thread, one more may be delivered, so the TCP window of the client fills and its writes block, as `socket.pause()` in Node; `resume_reading()` goes on where it stopped. While paused, the pings and the close frame of the client are not seen (as in any WebSocket not being read: the client may time out), and the keepalive is suspended, as its pongs could not be read: a dead client is not noticed until reading resumes, or until what the server sends it stalls for the write timeout (60 s by default), which then closes it. A paused connection that sends nothing has no deadline, so bound the pause. `stop()` still closes it: the closing handshake reads up to the close frame of the client, discarding the messages before it.
 
 ### WebSocket as a Socket
@@ -1895,7 +2091,7 @@ As a stream:
 - Each write sends one whole message (unfragmented). Writes may be called while others are pending, from several coroutines: they are sent one after another, in call order, never interleaved. Writing 0 bytes sends nothing. A write interrupted in the middle of its frame (`cancel()`, or the cancellation of the operation) leaves the rest of the frame to be sent before anything else, so the framing is never broken.
 - Pings are answered (and unsolicited pongs ignored) while reading, so some read must be pending, as a protocol reading its socket has. The pong goes out as soon as no frame is being written, without holding the reads. The keepalive counts on reading too: what is not read is not received. It sends one ping at a time, and closes the connection if a ping cannot be sent.
 - A close frame from the client is answered, the connection closed, and reads end with `boost::asio::error::eof`, as on a TCP connection closed by its peer. Writes fail afterwards.
-- `close()` returns at once: pending operations end, the socket is closed for its user, and the closing handshake finishes on its own: the rest of a frame being written, a close frame (code 1000), and the connection closed when the client answers, or after 5 seconds. Called anywhere else than on the executor of the WebSocket (e.g. by the synchronous client between calls, while nothing runs its io_context), it closes the connection at once instead. `co_await ws->close_graceful()` does the handshake, waiting. A WebSocket destroyed open on its executor sends 1001 (going away), and so does the idle timeout; protocol errors (an unmasked frame, an unknown opcode...) are answered with 1002.
+- `close()` returns at once: pending operations end, the socket is closed for its user, and the closing handshake finishes on its own: the rest of a frame being written, a close frame (code 1000), and the connection closed when the client answers, or after 5 seconds. Called anywhere else than on the executor of the WebSocket (e.g. by the synchronous client between calls, while nothing runs its io_context), it closes the connection at once instead. `co_await ws->close_graceful(code, reason)` does the handshake, waiting, with `1000` and no reason by default, and within 5 seconds whatever the client does: at the deadline the socket is closed without it, and `on_close()` gets the code sent, or `1006` if its frame was not written whole. A WebSocket destroyed open on its executor sends 1001 (going away), and so does the idle timeout; protocol errors (an unmasked frame, an unknown opcode...) are answered with 1002.
 
 For message-oriented code `upgrade_websocket()` (above) remains; `ws->read_message_some()` with `is_message_complete()` and `is_binary()` gives the message boundaries over the same socket.
 
@@ -2176,7 +2372,7 @@ server.get("/events", [](auto& req, auto& res) {
 });
 ```
 
-The queue of an SSE connection has the same flow control as a WebSocket, counting fields (`send_event()`, `send_data()`, `send_retry()`): `set_write_limits()` (up to 101 fields by default, dropping the newest), `queued_bytes()`, the watermarks, the [write timeout](#websocket-flow-control) and `wait_writable()`. `drop_oldest` drops whole events, never the rest of an event being written (fields of an event without its data yet are not dropped: the newest field is, then); `close` and the write timeout close the connection, and `EventSource` reconnects.
+The queue of an SSE connection has the same flow control as a WebSocket, counting fields (`send_event()`, `send_data()`, `send_retry()`): `set_write_limits()` (up to 101 fields by default, dropping the newest), `queued_bytes()`, `queued_messages()`, `dropped_messages()` (in the same unit: each field dropped counts one, also when `drop_oldest` drops a whole event, and the keep-alive comments never count), the watermarks, the [write timeout](#websocket-flow-control) and `wait_writable()`. `drop_oldest` drops whole events, never the rest of an event being written (fields of an event without its data yet are not dropped: the newest field is, then); `close` and the write timeout close the connection, and `EventSource` reconnects.
 
 A client that stops reading is closed by the write timeout: `write_timeout`, 60 s by default, as nginx's `send_timeout` and the server's own [`write_timeout`](#connection-options). It bounds a stall, the time a field being written goes without the socket taking any byte of it nor the client taking any byte from the socket (checked once the socket took nothing for the timeout, for a quarter of it more: a stalled write closes within the timeout and a quarter), not the time an event or the stream takes: an event over 64 KiB is written in 64 KiB slices, each one progress, so a slow client that keeps reading gets every event, however large, and is never closed by it. When it passes, the connection closes, a warning is logged, `on_close()` is called, and the pending `send_async()` and `wait_writable()` complete with `false`, so a producer awaiting them ends. Limits given to `set_write_limits()` that do not name `write_timeout` (as in the example below) keep the 60 s; `write_timeout = 0` disables it, as in 0.8, where a client that stopped reading kept its connection, and its newest events were dropped, until the process ended.
 
@@ -2275,9 +2471,9 @@ server on http://0.0.0.0:8080, https://0.0.0.0:8443 stopped
 
 ### What the Message Logs Show
 
-The client and the server log each request and response: the request line or the status (`info`), the header names (`debug`) and the body size (`trace`). In the request line, the values of query parameters that carry credentials (`access_token`, `authorization`, `token`, `api_key`, `password`...) are shown as `[redacted]`. Header values, bodies and WebSocket messages are never logged by default, as they may hold credentials: tokens, cookies, passwords, private keys.
+The client and the server log each request and response: the request line or the status (`info`), the header names (`debug`) and the body size (`trace`). In every URI logged, the values of the query parameters that carry credentials are shown as `[redacted]` (see [Query Parameters in the Logs](#query-parameters-in-the-logs)). Header values, bodies and WebSocket messages are never logged by default, as they may hold credentials: tokens, cookies, passwords, private keys.
 
-For debugging, the `logging` of the server's [connection options](#connection-options) (`log_bodies()` on a client) also logs the header values (`debug`) and the start of the bodies (`trace`), up to a maximum length, with control characters escaped. The values of `Authorization`, `Proxy-Authorization`, `Cookie` and `Set-Cookie` are redacted even then, and WebSocket messages are still logged by their size alone.
+For debugging, the `logging` of the server's [connection options](#connection-options) (`log_bodies()` on a client) also logs the header values (`debug`) and the start of the bodies (`trace`), up to a maximum length, with control characters escaped. The values of `Authorization`, `Proxy-Authorization`, `Cookie` and `Set-Cookie` are redacted even then, the query of `Location`, `Content-Location` and `Referer` is redacted as in any other URI, before it is truncated, and WebSocket messages are still logged by their size alone.
 
 ```cpp
 http::server server;
@@ -2297,6 +2493,39 @@ Headers:
 Body: 1834 bytes
   {"user":"alice","note":"..."}... (1322 more bytes)
 ```
+
+#### Query Parameters in the Logs
+
+A URI logged by the client or the server keeps everything (the other parameters, their order, the separators, the fragment) except the values of some query parameters:
+
+```text
+[SERVER REQUEST] GET /cb?code=[redacted]&state=s
+```
+
+By default, those of `access_token`, `api_key`, `apikey`, `authorization`, `client_secret`, `code`, `id_token`, `key`, `password`, `refresh_token`, `secret`, `sig`, `signature`, `token`, `x-amz-security-token`, `x-amz-signature` and `x-goog-signature`: `http::util::url::redacted_parameters::defaults()`. A name is compared whole, so `codec` is not `code`, without case and percent-decoded; there are no wildcards. The password of the user info of a URL is always redacted, whatever the names.
+
+This applies to the request line of the server and the client, to the WebSocket a client connects to, the redirects it follows (`debug`) and its errors about a URL (an invalid WebSocket URL, a proxy it cannot use), and to the values of `Location`, `Content-Location` and `Referer` when header values are logged. The reverse proxy logs the path of a request, without its query. The names are those of query parameters alone: a secret in a path (`/reset/<token>`) or a body is not recognized, so keep it in a parameter, or out of the logs.
+
+Each server and each client has its own names. Whatever you set replaces the defaults, as the `redact` of pino does: start from them to add or remove a name.
+
+```cpp
+using http::util::url::redacted_parameters;
+
+// A server: in its connection options, before listen(). A later call only reaches new connections
+http::connection_options options;
+options.logging.redact.add("invite").remove("key");   // the defaults, with one more and one less
+server.set_connection_options(options);
+
+// A client, an async_client too: from its next request, on a pooled connection too
+auto names = redacted_parameters::defaults();         // a copy: defaults() itself is const
+names.add("invite");
+client.redact_parameters(names);
+
+options.logging.redact = {"invite"};                  // only this one: code=abc is logged
+options.logging.redact = {};                          // no parameter at all
+```
+
+For your own log lines, `http::util::url::loggable_uri(uri, names)` redacts as the library does, and `loggable_uri(uri)` does it with the defaults.
 
 ## Build Options
 
@@ -2329,8 +2558,8 @@ See the [examples](examples/) directory for complete working examples:
 - `http::async_client` - Thread-safe, runs on the `asio::workers` it is given
 - `asio::workers` - `next_executor()`, `isolated_executor()`, `in_worker_thread()`, `stop()` and `wait()` from any thread (`stop()` from one of its own threads too); never destroy them from one of their threads
 - `http::websocket_client` - Not synchronized, sends included. The coroutine API (`send_text_async()`, `receive_async()`, `close_async()`), `run()`, `stop()` and `set_keepalive()` on the executor of the WebSocket, where `run()` calls its callbacks: the `async_client` callback or coroutine that got it, the `executor_client` coroutine that opened it. The synchronous calls (`send_text()`, `send_binary()`, `receive()`, `close()`) from a thread that does not run its io_context; on one that does they throw `std::logic_error` (see [WebSocket Client (Sync)](#websocket-client-sync)). The synchronous calls of an `http::client` WebSocket are made by one thread at a time, as for `http::client` itself
-- `http::websocket_connection` - Server-side WebSocket, thread-safe send, callbacks on IO thread
-- `http::sse_connection` - Runs on its executor (`get_executor()`, a strand if given one), where its callbacks run: `start()`, the `send*()` methods, `stop()`, `execute()` and the flow control setters from any thread
+- `http::websocket_connection` - Server-side WebSocket, thread-safe send and `stop()`, `queued_bytes()`, `queued_messages()` and `dropped_messages()` from any thread, callbacks on IO thread
+- `http::sse_connection` - Runs on its executor (`get_executor()`, a strand if given one), where its callbacks run: `start()`, the `send*()` methods, `stop()`, `execute()`, the flow control setters, `queued_bytes()`, `queued_messages()` and `dropped_messages()` from any thread
 - `http::server_scope` - On the thread of the socket it came with
 - `http::http_application::on_response()` - The hook runs on the thread of the connection, once per request
 - `asio::socket` (TCP, TLS, Unix, `asio::websocket`, custom sockets) - Not thread-safe, like the asio objects they wrap: use a socket on a thread running its io_context (`get_io_context()`), dispatching there from other threads; an `asio::websocket` on its executor (`get_executor()`: the io_context of its socket, or the strand of the coroutine that opened it from a client), where it runs its keepalive and closing handshake too. `socket_pipe::cancel()` may be called from any thread

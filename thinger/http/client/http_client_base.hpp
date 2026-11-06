@@ -18,6 +18,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <utility>
 #include <vector>
 #include <boost/asio/ssl/context.hpp>
 
@@ -53,12 +54,6 @@ protected:
     // Each derived class provides its own io_context
     virtual boost::asio::io_context& get_io_context() = 0;
 
-    // The executor a WebSocket opened by a coroutine running on `executor` runs on: that one
-    // (e.g. its strand), unless the derived class runs its coroutines on one of its own
-    virtual boost::asio::any_io_executor websocket_executor(const boost::asio::any_io_executor& executor) {
-        return executor;
-    }
-
     // Whether the io_context is the client's own, run only within its synchronous calls: the
     // synchronous calls of its WebSockets then wait running it (see websocket_client)
     virtual bool owns_io_context() const { return false; }
@@ -87,7 +82,15 @@ public:
     // Log the header values and the start of the bodies (up to `max_length` bytes) of the
     // requests and responses: an opt-in for debugging, off by default (see body_logging)
     http_client_base& log_bodies(bool enabled = true, size_t max_length = body_logging::default_max_length) {
-        body_logging_ = {enabled, max_length};
+        body_logging_.enabled = enabled;
+        body_logging_.max_length = max_length;
+        return *this;
+    }
+    // The query parameters hidden from the URIs this client logs, instead of the defaults:
+    // start from util::url::redacted_parameters::defaults() to add or remove a name. Applies
+    // from the next request, on a pooled connection too
+    http_client_base& redact_parameters(util::url::redacted_parameters names) {
+        body_logging_.redact = std::move(names);
         return *this;
     }
     http_client_base& unix_socket(const std::string& path) { unix_socket_ = path; return *this; }

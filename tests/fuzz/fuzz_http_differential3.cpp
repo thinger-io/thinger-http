@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <llhttp.h>
@@ -161,6 +162,13 @@ namespace {
         if (!what.empty()) beast_disagreements.add(what, describe_all(input, ours, llhttp, beast));
     }
 
+    // A chunked request that llhttp took for an upgrade with no body: it stops at the end of the
+    // headers, before it would reject a Transfer-Encoding it does not read as chunked
+    bool upgrade_missing_chunked(const fuzz::server_result& ours, const llhttp_result& theirs) {
+        return theirs.result == outcome::accepted && theirs.upgrade && !theirs.chunked && ours.request &&
+               ours.request->is_chunked_transfer();
+    }
+
     /**
      * Discrepancies known to be acceptable, where we accept a request llhttp rejects or still
      * needs data for (see README.md). If it is one of them, `input` is rewritten so that
@@ -201,8 +209,9 @@ namespace {
 
         // HTAB after "chunked" (OWS, not part of the value: RFC 9110 section 5.5): llhttp only
         // takes SP after it, and reads "chunked\t" as another coding, which a request must not
-        // have. Made SP
-        if (theirs.error == HPE_INVALID_TRANSFER_ENCODING && req.is_chunked_transfer() &&
+        // have (or, in an upgrade, does not see the body). Made SP
+        if ((theirs.error == HPE_INVALID_TRANSFER_ENCODING || upgrade_missing_chunked(ours, theirs)) &&
+            req.is_chunked_transfer() &&
             fuzz::replace_in_header(input, 0, ours.header_end, "Transfer-Encoding", '\t', ' ')) {
             return "HTAB after chunked";
         }
@@ -247,27 +256,37 @@ namespace {
         if (trace) std::fprintf(stderr, "\n%s\n", describe_all(input, ours, theirs, beast).c_str());
         compare_beast(input, ours, theirs, beast);
 
+        // Compare `input` again with a known discrepancy rewritten, if it is one
+        const auto compare_normalized = [&]() -> std::optional<size_t> {
+            std::string normalized(input);
+            const char* known = normalizations < 4 ? normalize_known_discrepancy(ours, theirs, normalized) : nullptr;
+            if (!known) return std::nullopt;
+            known_discrepancies.add(known, describe_all(input, ours, theirs, beast));
+            if (trace) std::fprintf(stderr, "normalized (%s): %s\n", known, fuzz::escape(normalized, 2048).c_str());
+            size_t bytes = compare(reinterpret_cast<const uint8_t*>(normalized.data()), normalized.size(), normalizations + 1);
+            // The rewrite is in the request line or headers: the end moves by the size difference
+            return bytes ? bytes + size - normalized.size() : 0;
+        };
+        bool missing_chunked = upgrade_missing_chunked(ours, theirs);
+
         if (ours.result == outcome::rejected) return 0;  // stricter than llhttp, or both reject
         if (ours.result == outcome::incomplete) {
+            if (missing_chunked) {
+                if (auto bytes = compare_normalized()) return *bytes;
+            }
             // llhttp found the end of a request we would still read past
             if (theirs.result == outcome::accepted) disagree("we need more data for a request llhttp completed", input, ours, theirs, beast);
             return 0;
         }
 
         // We accept the request
-        if (theirs.result != outcome::accepted) {
-            std::string normalized(input);
-            const char* known = normalizations < 4 ? normalize_known_discrepancy(ours, theirs, normalized) : nullptr;
-            if (known) {
-                known_discrepancies.add(known, describe_all(input, ours, theirs, beast));
-                if (trace) std::fprintf(stderr, "normalized (%s): %s\n", known, fuzz::escape(normalized, 2048).c_str());
-                size_t bytes = compare(reinterpret_cast<const uint8_t*>(normalized.data()), normalized.size(), normalizations + 1);
-                // The rewrite is in the request line or headers: the end moves by the size difference
-                return bytes ? bytes + size - normalized.size() : 0;
+        if (theirs.result != outcome::accepted || missing_chunked) {
+            if (auto bytes = compare_normalized()) return *bytes;
+            if (!missing_chunked) {
+                disagree(theirs.result == outcome::rejected ? "we accept a request llhttp rejects"
+                                                            : "we complete a request llhttp needs more data for",
+                         input, ours, theirs, beast);
             }
-            disagree(theirs.result == outcome::rejected ? "we accept a request llhttp rejects"
-                                                        : "we complete a request llhttp needs more data for",
-                     input, ours, theirs, beast);
         }
 
         auto& req = *ours.request;

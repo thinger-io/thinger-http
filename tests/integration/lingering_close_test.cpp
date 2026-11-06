@@ -9,6 +9,7 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <string>
 #include <vector>
@@ -59,14 +60,17 @@ namespace {
         std::string response;
         boost::system::error_code read_error;       // how reading ended: eof if the server closed
         bool read_ended = false;
-        // Since the response arrived: when writing failed
+        // When a body write failed, since the client read the response: negative if the failure
+        // came first, as the two ends run in no fixed order. -1 ms too if either never happened:
+        // a check on it goes after the checks on write_error and on the response
         std::chrono::milliseconds write_failed_after{-1};
     };
 
     // Upload on `socket` (a stream of any transport), run on `ioc`
     template<typename Stream>
     void upload_on(boost::asio::io_context& ioc, Stream& socket, const upload_options& options, upload_result& result) {
-        std::chrono::steady_clock::time_point response_arrived{};
+        std::optional<std::chrono::steady_clock::time_point> response_arrived;
+        std::optional<std::chrono::steady_clock::time_point> write_failed;
 
         co_spawn(ioc, [&]() -> awaitable<void> {
             auto [ec, written] = co_await boost::asio::async_write(socket, boost::asio::buffer(options.head),
@@ -87,10 +91,7 @@ namespace {
                 auto [write_ec, bytes] = co_await boost::asio::async_write(socket, buffers, use_nothrow_awaitable);
                 if (write_ec) {
                     result.write_error = write_ec;
-                    if (response_arrived != std::chrono::steady_clock::time_point{}) {
-                        result.write_failed_after = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - response_arrived);
-                    }
+                    write_failed = std::chrono::steady_clock::now();
                     co_return;
                 }
                 result.sent += size;
@@ -122,6 +123,11 @@ namespace {
 
         ioc.restart();
         ioc.run_for(options.timeout);
+
+        if (response_arrived && write_failed) {
+            result.write_failed_after = std::chrono::duration_cast<std::chrono::milliseconds>(
+                *write_failed - *response_arrived);
+        }
     }
 
     // A client sending a request and its body as fast as the server takes it (or at the pace
@@ -396,9 +402,9 @@ TEST_CASE("A lingering close is bounded", "[server][linger][integration][matrix]
         REQUIRE(result.response.starts_with("HTTP/1.1 413"));
         REQUIRE(result.write_error);
         // Cut long before the whole body (what the server dropped, and what the socket
-        // buffers of both ends held, were sent), soon after the response
+        // buffers of both ends held, were sent), soon after the response. The client may notice
+        // the cut before it reads the response: that is soon too
         REQUIRE(result.sent < 1024 * MiB);
-        REQUIRE(result.write_failed_after >= 0ms);
         REQUIRE(result.write_failed_after < 5s);
     }
 

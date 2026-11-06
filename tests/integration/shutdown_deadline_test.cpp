@@ -11,6 +11,7 @@
 #include "../fixtures/listener_helpers.hpp"
 #include "../fixtures/running_workers.hpp"
 #include "../fixtures/server_listen.hpp"
+#include "../fixtures/time_scale.hpp"
 
 #include <atomic>
 #include <future>
@@ -30,6 +31,8 @@ using server_test::running_server;
 using server_test::transport;
 using server_test::transport_endpoint;
 using http::test::awaited_shutdown;
+using http::test::scaled;
+using http::test::stop_margin;
 using shutdown_test::can_connect;
 using shutdown_test::eventually;
 using shutdown_test::raw_client;
@@ -39,8 +42,20 @@ namespace {
 
     using shutdown_test::clock;   // here, as ::clock is the C function
 
-    // How far from `by` a shutdown may end
-    constexpr auto tolerance = 50ms;
+    // How far from `by` a shutdown may end, and how long one ending "at once" may take
+    constexpr auto tolerance = scaled(50ms);
+    constexpr auto at_once = scaled(100ms);
+
+    // The same for a check whose window includes stopping the listener, as every shutdown does
+    // from its start: on a Unix socket, with what unlinking its file may take (unix_unlink_margin)
+    constexpr std::chrono::milliseconds tolerance_on(transport kind) { return tolerance + stop_margin(kind); }
+    constexpr std::chrono::milliseconds at_once_on(transport kind) { return at_once + stop_margin(kind); }
+
+    // None reaches what its check has to tell apart: 300 ms from the 600 of two listeners drained
+    // one after the other, a call that waits for its deadline of 500 ms, one that ends 500 ms
+    // before it, and the deadline of 5 s of an idle server. A stricter one has its own below
+    static_assert(tolerance_on(transport::unix) < 300ms);
+    static_assert(at_once_on(transport::unix) < 5s);
 
     // How far `when` is from `by`, either way
     std::chrono::milliseconds off_by(clock::time_point when, clock::time_point by) {
@@ -101,7 +116,7 @@ TEST_CASE("Shutdown of an idle server ends at once, and the server stops accepti
     awaited_shutdown shutdown(server, grace);
     REQUIRE(shutdown.ended_within(1s));
     INFO("ended in " << since(begin).count() << " ms");
-    REQUIRE(clock::now() - begin < 100ms);
+    REQUIRE(clock::now() - begin < at_once_on(kind));
     REQUIRE(shutdown.get());
     REQUIRE_FALSE(server.is_listening());
     REQUIRE_FALSE(can_connect(running.endpoint()));
@@ -114,7 +129,7 @@ TEST_CASE("Shutdown of an idle server blocking a thread of the application ends 
 
     auto begin = clock::now();
     REQUIRE(server.shutdown(std::chrono::milliseconds(10h)));
-    REQUIRE(clock::now() - begin < 100ms);
+    REQUIRE(clock::now() - begin < at_once);
     REQUIRE_FALSE(can_connect(running.endpoint()));
 }
 
@@ -130,7 +145,7 @@ TEST_CASE("Shutdown with its deadline passed closes what is left at once",
         auto begin = clock::now();
         awaited_shutdown shutdown(server, clock::now() - 1s);
         REQUIRE(shutdown.ended_within(1s));
-        REQUIRE(clock::now() - begin < tolerance);
+        REQUIRE(clock::now() - begin < tolerance_on(kind));
         REQUIRE(shutdown.get());
         REQUIRE_FALSE(can_connect(running.endpoint()));
     }
@@ -143,7 +158,7 @@ TEST_CASE("Shutdown with its deadline passed closes what is left at once",
         auto begin = clock::now();
         awaited_shutdown shutdown(server, clock::now() - 1ms);
         REQUIRE(shutdown.ended_within(1s));
-        REQUIRE(clock::now() - begin < tolerance);
+        REQUIRE(clock::now() - begin < tolerance_on(kind));
         REQUIRE_FALSE(shutdown.get());
         auto rest = client.rest(2s);
         REQUIRE(rest.closed);
@@ -160,7 +175,7 @@ TEST_CASE("Shutdown of a server not running ends at once", "[server][shutdown][d
         auto begin = clock::now();
         awaited_shutdown shutdown(server, 5s);
         REQUIRE(shutdown.ended_within(1s));
-        REQUIRE(clock::now() - begin < 100ms);
+        REQUIRE(clock::now() - begin < at_once);
         REQUIRE(shutdown.get());
         REQUIRE_FALSE(server.is_listening());
         REQUIRE_FALSE(can_connect(port));
@@ -169,7 +184,7 @@ TEST_CASE("Shutdown of a server not running ends at once", "[server][shutdown][d
     SECTION("Never listening") {
         http::server server;
         awaited_shutdown shutdown(server, 5s);
-        REQUIRE(shutdown.ended_within(100ms));
+        REQUIRE(shutdown.ended_within(at_once));
         REQUIRE(shutdown.get());
     }
 }
@@ -182,7 +197,15 @@ TEST_CASE("Shutdown closes an idle connection at once and ends when the request 
     http::server server;
     server.get("/hello", [](http::response& res) { res.send("hi"); });
     std::promise<void> started;
-    slow_route(server, "/slow", 200ms, &started);
+    // The request grows with the bounds of this test, always outlasting the one of the idle close:
+    // an idle connection closed only when the request ends fails it in every build. Everything
+    // stays well below the deadline of 5 s
+    const auto request_takes = scaled(200ms) + stop_margin(kind);
+    const auto idle_closes_within = scaled(150ms) + stop_margin(kind);
+    const auto ends_within = scaled(500ms) + stop_margin(kind);
+    static_assert(scaled(150ms) < scaled(200ms) && scaled(200ms) < scaled(500ms));
+    static_assert(scaled(500ms) + http::test::unix_unlink_margin < 5s);
+    slow_route(server, "/slow", request_takes, &started);
     running_server running(server, kind);
 
     raw_client idle(running.endpoint());
@@ -201,13 +224,13 @@ TEST_CASE("Shutdown closes an idle connection at once and ends when the request 
     REQUIRE(idle_rest.closed);
     REQUIRE(idle_rest.data.empty());
     INFO("idle closed in " << since(begin).count() << " ms");
-    REQUIRE(clock::now() - begin < 150ms);
+    REQUIRE(clock::now() - begin < idle_closes_within);
 
     // The shutdown ends just after the request, long before its deadline
     REQUIRE(shutdown.ended_within(3s));
     INFO("ended " << since(request_began).count() << " ms after the request began");
-    REQUIRE(clock::now() - request_began >= 200ms);
-    REQUIRE(clock::now() - begin < 500ms);
+    REQUIRE(clock::now() - request_began >= request_takes);
+    REQUIRE(clock::now() - begin < ends_within);
     REQUIRE(shutdown.get());
 
     // and the request got its answer, telling the client the connection closes
@@ -237,7 +260,7 @@ TEST_CASE("Shutdown ends at its deadline with a handler still running, the clien
         auto ended = clock::now();
         INFO("ended " << std::chrono::duration_cast<std::chrono::milliseconds>(ended - shutdown.by()).count()
                       << " ms from its deadline");
-        REQUIRE(off_by(ended, shutdown.by()) <= tolerance);
+        REQUIRE(off_by(ended, shutdown.by()) <= tolerance_on(kind));
         REQUIRE_FALSE(shutdown.get());
 
         // The whole of it, with the sockets closed, within the deadline too
@@ -247,7 +270,7 @@ TEST_CASE("Shutdown ends at its deadline with a handler still running, the clien
                               << " ms from the deadline");
         REQUIRE(rest.closed);
         REQUIRE(rest.data.empty());
-        REQUIRE(closed - shutdown.by() <= tolerance);
+        REQUIRE(closed - shutdown.by() <= tolerance_on(kind));
     }
 }
 
@@ -265,6 +288,7 @@ TEST_CASE("Shutdown blocking a thread of the application ends as the awaited one
         REQUIRE(started.get_future().wait_for(3s) == std::future_status::ready);
 
         auto begin = clock::now();
+        // Against its deadline, which no tolerance may reach: not scaled
         REQUIRE(server.shutdown(500ms));
         REQUIRE(clock::now() - begin < 500ms);
         REQUIRE(client.rest().data.ends_with("done"));
@@ -280,7 +304,7 @@ TEST_CASE("Shutdown blocking a thread of the application ends as the awaited one
         auto by = clock::now() + 500ms;
         REQUIRE_FALSE(server.shutdown(500ms));
         INFO("ended " << since(by).count() << " ms after its deadline");
-        REQUIRE(off_by(clock::now(), by) <= tolerance);
+        REQUIRE(off_by(clock::now(), by) <= tolerance_on(kind));
         REQUIRE(client.rest(2s).closed);
     }
 }
@@ -293,6 +317,8 @@ TEST_CASE("Shutdown drains every listener at once, under the same deadline", "[s
         {transport::tcp, transport::unix},
     }));
     INFO("listening on " << first_kind << " and " << second_kind);
+    // Of the two, only the second may be Unix
+    const auto within = tolerance_on(second_kind);
     http::server server;
     std::promise<void> first_started;
     std::promise<void> second_started;
@@ -315,7 +341,7 @@ TEST_CASE("Shutdown drains every listener at once, under the same deadline", "[s
 
         REQUIRE(shutdown.ended_within(3s));
         INFO("ended in " << since(begin).count() << " ms");
-        REQUIRE(clock::now() - begin < 300ms + tolerance);
+        REQUIRE(clock::now() - begin < 300ms + within);
         REQUIRE(shutdown.get());
         for (auto* client : {&first, &second}) {
             auto response = client->rest();
@@ -342,7 +368,7 @@ TEST_CASE("Shutdown drains every listener at once, under the same deadline", "[s
 
         REQUIRE(shutdown.ended_within(2s));
         INFO("ended " << since(shutdown.by()).count() << " ms after its deadline");
-        REQUIRE(off_by(clock::now(), shutdown.by()) <= tolerance);
+        REQUIRE(off_by(clock::now(), shutdown.by()) <= within);
         REQUIRE_FALSE(shutdown.get());
         REQUIRE(first.rest(2s).closed);
         REQUIRE(second.rest(2s).closed);
@@ -469,7 +495,7 @@ TEST_CASE("Shutdown blocking a thread of the server does not wait there, and clo
     REQUIRE(future.wait_for(3s) == std::future_status::ready);
     auto result = future.get();
     REQUIRE_FALSE(result.clean);
-    REQUIRE(result.returned - result.began < tolerance);
+    REQUIRE(result.returned - result.began < tolerance_on(kind));
     REQUIRE(logs.count("error", "cannot block a thread of the server") == 1);
 
     // and the shutdown goes on as an awaited one: listening no more, the handler answered, and
@@ -481,7 +507,7 @@ TEST_CASE("Shutdown blocking a thread of the server does not wait there, and clo
     auto stopped = waited.returned.get();
     INFO("stopped " << std::chrono::duration_cast<std::chrono::milliseconds>(stopped - by).count()
                     << " ms from its deadline");
-    REQUIRE(off_by(stopped, by) <= tolerance);
+    REQUIRE(off_by(stopped, by) <= tolerance_on(kind));
     REQUIRE(stuck.rest(2s).closed);
 }
 
@@ -541,12 +567,13 @@ TEST_CASE("stop() during a shutdown ends it with false, and wait() returns", "[s
 
     awaited_shutdown shutdown(server, 30s);
     REQUIRE_FALSE(shutdown.ended_within(50ms));
+    // The listener stopped already: no unlink in this window
     auto stopped = clock::now();
     server.stop();
     REQUIRE(shutdown.ended_within(1s));
     REQUIRE_FALSE(shutdown.get());
     REQUIRE(waited.returned.wait_for(1s) == std::future_status::ready);
-    REQUIRE(waited.returned.get() - stopped < 100ms);
+    REQUIRE(waited.returned.get() - stopped < at_once);
 }
 
 TEST_CASE("Shutdowns called twice share the end of the first one", "[server][shutdown][deadline][integration][matrix]") {
@@ -564,7 +591,7 @@ TEST_CASE("Shutdowns called twice share the end of the first one", "[server][shu
         awaited_shutdown later(server, 30s);
         REQUIRE(later.ended_within(2s));
         INFO("ended " << since(first.by()).count() << " ms after the first deadline");
-        REQUIRE(off_by(clock::now(), first.by()) <= tolerance);
+        REQUIRE(off_by(clock::now(), first.by()) <= tolerance_on(kind));
         REQUIRE_FALSE(later.get());
         REQUIRE(first.ended_within(1s));
         REQUIRE_FALSE(first.get());
@@ -584,7 +611,7 @@ TEST_CASE("Shutdowns called twice share the end of the first one", "[server][shu
             INFO("ended " << std::chrono::duration_cast<std::chrono::milliseconds>(ended - by).count()
                           << " ms from the deadline");
             REQUIRE_FALSE(clean);
-            REQUIRE(off_by(ended, by) <= tolerance);
+            REQUIRE(off_by(ended, by) <= tolerance_on(kind));
         }
     }
     REQUIRE(client.rest(2s).closed);
@@ -661,7 +688,7 @@ TEST_CASE("Shutdown closes a connection taken over that does not close at its de
     awaited_shutdown shutdown(server, 500ms);
     REQUIRE(shutdown.ended_within(2s));
     INFO("ended " << since(shutdown.by()).count() << " ms after its deadline");
-    REQUIRE(off_by(clock::now(), shutdown.by()) <= tolerance);
+    REQUIRE(off_by(clock::now(), shutdown.by()) <= tolerance_on(kind));
     REQUIRE_FALSE(shutdown.get());
     REQUIRE(client.rest(2s).closed);
 }
