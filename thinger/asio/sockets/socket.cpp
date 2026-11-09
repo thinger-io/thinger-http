@@ -168,6 +168,12 @@ namespace thinger::asio {
         return std::nullopt;
     }
 
+    awaitable<io_result> socket::read_some_cancellable(uint8_t buffer[], size_t max_size,
+                                                       boost::asio::cancellation_slot slot) {
+        co_return co_await boost::asio::co_spawn(io_context_, read_some(buffer, max_size),
+                                                 boost::asio::bind_cancellation_slot(slot, boost::asio::use_awaitable));
+    }
+
     awaitable<io_result> socket::read(uint8_t buffer[], size_t size) {
         size_t total = 0;
         while (total < size) {

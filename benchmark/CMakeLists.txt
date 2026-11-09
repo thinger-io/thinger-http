@@ -29,6 +29,10 @@ target_link_libraries(benchmark_cpp_httplib PRIVATE Threads::Threads)
 add_executable(benchmark_routing routing/routing_benchmark.cpp)
 target_link_libraries(benchmark_routing PRIVATE thinger::http)
 
+# Cost of registering 500 routes in an application
+add_executable(benchmark_route_registration routing/route_registration_benchmark.cpp)
+target_link_libraries(benchmark_route_registration PRIVATE thinger::http)
+
 # Server with the same ~200 routes, for end-to-end load tests (wrk, bombardier)
 add_executable(benchmark_routes_server routing/routes_server.cpp)
 target_link_libraries(benchmark_routes_server PRIVATE thinger::http)

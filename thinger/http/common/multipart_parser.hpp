@@ -2,6 +2,7 @@
 #define THINGER_HTTP_COMMON_MULTIPART_PARSER_HPP
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -21,16 +22,16 @@ namespace thinger::http {
         // Parts with a filename (busboy and Go: unlimited)
         size_t max_files = std::numeric_limits<size_t>::max();
         // Header section of each part, line endings included (busboy: 16 KB)
-        size_t max_header_size = 16 * 1024;
+        std::uint64_t max_header_size = 16 * 1024;
         // Filename of a part, in bytes, as sent (decoded from filename* if present): no
         // longer than a file name can be in most file systems
-        size_t max_filename_size = 255;
+        std::uint64_t max_filename_size = 255;
         // Content of each part without filename (busboy: 1 MB)
-        size_t max_field_size = 1024 * 1024;
+        std::uint64_t max_field_size = 1024 * 1024;
         // Content of all the parts without filename, which are usually kept in memory
-        size_t max_fields_size = 8 * 1024 * 1024;
+        std::uint64_t max_fields_size = 8 * 1024 * 1024;
         // Content of each part with a filename (busboy and Go: unlimited)
-        size_t max_file_size = std::numeric_limits<size_t>::max();
+        std::uint64_t max_file_size = std::numeric_limits<std::uint64_t>::max();
     };
 
     // Why a multipart body failed
@@ -142,7 +143,7 @@ namespace thinger::http {
 
         /// Parts started, and bytes of content of the current part
         size_t parts() const { return parts_; }
-        size_t part_size() const { return part_size_; }
+        std::uint64_t part_size() const { return part_size_; }
 
     private:
         enum class state {
@@ -174,14 +175,14 @@ namespace thinger::http {
         // Header section of the next part: the line being read, its fields, and its size
         std::string line_;
         std::vector<std::pair<std::string, std::string>> headers_;
-        size_t header_size_ = 0;
+        std::uint64_t header_size_ = 0;
 
         multipart_part part_;
         std::string_view data_;
         size_t parts_ = 0;
         size_t files_ = 0;
-        size_t part_size_ = 0;
-        size_t fields_size_ = 0;
+        std::uint64_t part_size_ = 0;
+        std::uint64_t fields_size_ = 0;
 
         event fail(multipart_error error);
         void start_matching();

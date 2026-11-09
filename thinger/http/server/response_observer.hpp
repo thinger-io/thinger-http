@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 namespace thinger::http {
@@ -72,6 +73,10 @@ public:
     // The application is done with the request
     void handled();
 
+    // `callback` runs once the hook has returned (for an in-memory dispatch, which waits for
+    // it). Set before the response can end
+    void on_reported(std::function<void()> callback) { on_reported_ = std::move(callback); }
+
 private:
     // One side is done: the last one reports
     void done();
@@ -79,6 +84,7 @@ private:
 
     std::shared_ptr<request> request_;
     std::shared_ptr<const response_hook> hook_;
+    std::function<void()> on_reported_;
     std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
     response_info info_;
     bool ended_ = false;

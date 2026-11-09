@@ -6,10 +6,20 @@
 #include "../fixtures/compression_bomb.hpp"
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <string>
+#include <type_traits>
+#include <utility>
 
 using namespace thinger;
 using namespace std::chrono_literals;
 using namespace server_test;
+
+// The maximum body size holds more than 4 GiB on any platform
+static_assert(std::is_same_v<std::remove_cv_t<decltype(http::default_max_body_size)>, std::uint64_t>);
+static_assert(std::is_same_v<decltype(&http::request::set_max_body_size), void (http::request::*)(std::uint64_t)>);
+static_assert(std::is_same_v<decltype(std::declval<const http::request&>().get_max_body_size()), std::uint64_t>);
+static_assert(std::is_same_v<decltype(&http::http_application::set_max_body_size), void (http::http_application::*)(std::uint64_t)>);
 
 // Request bodies are bounded by the maximum body size everywhere: read_body() on deferred
 // routes, and compressed bodies once decompressed
@@ -50,6 +60,41 @@ TEST_CASE("read_body() is bounded on deferred routes", "[server][body][deferred]
         INFO("response: " << result.data);
         REQUIRE(result.data.starts_with("HTTP/1.1 200"));
         REQUIRE(result.data.find("size=1000") != std::string::npos);
+    }
+}
+
+// A head announcing 5 GiB: the check of the size happens at the first read, before the body
+// arrives, so a few bytes are enough
+TEST_CASE("Body limits over 4 GiB", "[server][body][deferred][413][integration]") {
+    constexpr std::uint64_t gib = 1024ULL * 1024 * 1024;
+    constexpr auto five_gib = 5 * gib;
+    auto handler = [](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        uint8_t buffer[4];
+        size_t bytes = co_await req.read_some(buffer, sizeof(buffer));
+        if (req.get_body_error() != http::body_error::none) co_return;   // answered by the server
+        res.send("read=" + std::to_string(bytes) + " limit=" + std::to_string(req.get_max_body_size()));
+    };
+    http::server server;
+    server.post("/six", handler).max_body_size(6 * gib);
+    server.post("/four", handler).max_body_size(4 * gib);
+    running_server running(server);
+
+    auto head = [&](const std::string& path) {
+        return "POST " + path + " HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + std::to_string(five_gib) + "\r\n\r\nabcd";
+    };
+
+    SECTION("5 GiB with a maximum of 6 GiB is not rejected") {
+        auto result = raw_exchange(running.port, head("/six"));
+        INFO("response: " << result.data);
+        REQUIRE(result.data.starts_with("HTTP/1.1 200"));
+        REQUIRE(result.data.find("read=4 limit=" + std::to_string(6 * gib)) != std::string::npos);
+    }
+
+    SECTION("5 GiB with a maximum of 4 GiB is rejected") {
+        auto result = raw_exchange(running.port, head("/four"));
+        INFO("response: " << result.data);
+        REQUIRE(result.data.starts_with("HTTP/1.1 413"));
+        REQUIRE(result.closed);
     }
 }
 

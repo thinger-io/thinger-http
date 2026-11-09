@@ -229,6 +229,19 @@ private:
     // The request deadline of the request of `stream`, set by its route (see
     // route::request_timeout), from the start of the request; zero for none
     void set_request_deadline(const http_stream& stream, std::chrono::milliseconds deadline);
+    // The deadline the handler set for reading the body of the request of `stream` (only compared:
+    // it may be gone), replacing its request deadline (see request::set_read_deadline()); the end
+    // of time removes it
+    void set_read_deadline(const http_stream* stream, clock::time_point deadline);
+    // Whether a read deadline is set and has passed: a read then fails at once
+    // (read_deadline_expired)
+    bool read_deadline_passed() const;
+    // A read of the body starts and ends, bound to read_cancel_, which the watchdog emits as its
+    // deadline passes, whenever it was set: nothing else on the socket is cancelled, and the
+    // same read goes on when the deadline only moves. `caller` is the cancellation of the
+    // coroutine reading (its `||`, the scope of the request), forwarded to the read while it waits
+    void body_read_started(boost::asio::cancellation_slot caller);
+    void body_read_ended(boost::asio::cancellation_slot caller, io_result& result);
     // The body of the request of `stream` was not read to its end at its deadline: its scope is
     // cancelled (cancel_reason::timeout), and it is answered 408 unless its response started,
     // or another one is being written; the connection is closed after it (or at once). What
@@ -283,6 +296,10 @@ private:
     // The request deadline of the request in progress while its body is read: the options',
     // or its route's (zero: none)
     std::chrono::milliseconds request_deadline_{0};
+    // The read deadline its handler set (see set_read_deadline()), and the signal ending the body
+    // read that waits (see body_read_started())
+    clock::time_point read_deadline_{};
+    boost::asio::cancellation_signal read_cancel_;
 
     uint8_t buffer_[MAX_BUFFER_SIZE];
     request_factory request_parser_;
@@ -316,6 +333,11 @@ private:
     bool write_waits_{false};
     // The read loop waits for the output (see wait_output())
     bool output_waited_{false};
+    // Whether the request in progress has a read deadline, a read of its body waits for the
+    // socket, and it was ended at that deadline
+    bool read_bounded_{false};
+    bool read_waits_{false};
+    bool read_expired_{false};
     stream_id request_id_{0};
 };
 

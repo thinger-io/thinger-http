@@ -144,9 +144,12 @@ TEST_CASE("Form MIME Type Detection", "[form][unit]") {
         REQUIRE(form::mime_type("file.xyz") == "application/octet-stream");
     }
 
-    SECTION("file without extension returns text/plain") {
-        // Files without extension get text/plain (library default)
-        REQUIRE(form::mime_type("noext") == "text/plain");
+    SECTION("file without extension defaults to octet-stream") {
+        REQUIRE(form::mime_type("noext") == "application/octet-stream");
+    }
+
+    SECTION("text files keep their type") {
+        REQUIRE(form::mime_type("notes.txt") == "text/plain");
     }
 
     SECTION("case insensitive") {

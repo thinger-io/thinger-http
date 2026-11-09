@@ -13,6 +13,7 @@
 
 #include "server_test_helpers.hpp"
 #include "../fixtures/stream_test_helpers.hpp"
+#include "../fixtures/time_scale.hpp"
 
 #include <future>
 
@@ -281,6 +282,66 @@ TEST_CASE("Custom socket: HTTP served over it answers late responses", "[socket]
     socket->push("GET /now HTTP/1.1\r\nHost: localhost\r\n\r\n");
     REQUIRE(received("right away"));
     REQUIRE(socket->is_open());
+
+    std::promise<void> closed;
+    boost::asio::post(ioc, [socket, &closed] {
+        socket->close();
+        closed.set_value();
+    });
+    closed.get_future().wait();
+    connection.reset();
+    work.reset();
+    ioc.stop();
+    io_thread.join();
+}
+
+// A read of the body goes through asio::socket::read_some_cancellable(), whose default is all a
+// socket defined by the application has: a read deadline set while that read waits still ends it
+TEST_CASE("Custom socket: a read deadline reaches a body read waiting on it", "[socket][custom][server][integration]") {
+    http::http_application app;
+    std::atomic<bool> done{false};
+    std::atomic<http::body_error> error{http::body_error::none};
+    std::atomic<long long> elapsed_ms{0};
+    app.post("/upload", [&](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        auto start = std::chrono::steady_clock::now();
+        auto read = [&]() -> thinger::awaitable<void> {
+            uint8_t buffer[64];
+            while (co_await req.read_some(buffer, sizeof(buffer))) {}
+        };
+        auto set = [&]() -> thinger::awaitable<void> {
+            boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 100ms);
+            co_await timer.async_wait(thinger::use_nothrow_awaitable);
+            req.set_read_deadline(std::chrono::steady_clock::now() + 200ms);
+            timer.expires_after(5s);
+            co_await timer.async_wait(thinger::use_nothrow_awaitable);
+        };
+        co_await (read() || set());
+        error = req.get_body_error();
+        elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+        done = true;
+        res.send("cut");
+    });
+
+    boost::asio::io_context ioc;
+    auto work = boost::asio::make_work_guard(ioc);
+    auto socket = std::make_shared<memory_socket>(ioc, [](std::string) {});
+    auto connection = std::make_shared<http::server_connection>(socket);
+    connection->set_handler([&app](std::shared_ptr<http::request> req) {
+        auto sink = std::make_shared<http::connection_sink>(*req);
+        return app.handle(std::move(req), std::move(sink));
+    });
+    boost::asio::post(ioc, [connection] { connection->start(); });
+    std::thread io_thread([&ioc] { ioc.run(); });
+
+    socket->push("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000\r\n\r\n");
+    auto deadline = std::chrono::steady_clock::now() + 3s;
+    while (!done && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(5ms);
+
+    REQUIRE(done.load());
+    CHECK(error.load() == http::body_error::timeout);
+    INFO("elapsed " << elapsed_ms.load() << " ms");
+    CHECK(elapsed_ms.load() >= 200);
+    CHECK(elapsed_ms.load() <= 300 + http::test::scaled(100ms).count() * 4);
 
     std::promise<void> closed;
     boost::asio::post(ioc, [socket, &closed] {

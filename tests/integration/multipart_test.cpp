@@ -62,6 +62,28 @@ namespace {
         return content;
     }
 
+    // Answers how every part of the body was read in pieces of `max_size` bytes at most
+    thinger::awaitable<void> read_in_pieces(http::request& req, http::response& res, const std::string& expected,
+                                            size_t buffer_size, size_t max_size) {
+        http::multipart_reader reader(req, {}, buffer_size);
+        std::string content;
+        size_t largest = 0;
+        size_t pieces = 0;
+        while (co_await reader.next()) {
+            for (auto data = co_await reader.read(max_size); !data.empty(); data = co_await reader.read(max_size)) {
+                largest = std::max(largest, data.size());
+                content.append(data);
+                ++pieces;
+            }
+        }
+        if (reader.failed()) {
+            res.error(reader.status(), reader.message());
+            co_return;
+        }
+        res.json({{"exact", content == expected}, {"size", content.size()}, {"largest", largest}, {"pieces", pieces},
+                  {"done", reader.done()}});
+    }
+
     // A directory of its own for the temporary files of a test, removed with it
     struct temp_directory {
         fs::path path;
@@ -202,6 +224,91 @@ TEST_CASE("Multipart files kept by the handler", "[multipart][integration]") {
     REQUIRE(read_file(destination.path / "kept.bin") == "kept");
     REQUIRE(eventually_empty(temp));
     REQUIRE(destination.files() == 2);
+}
+
+TEST_CASE("multipart_reader::read() with a maximum size", "[multipart][integration]") {
+    const size_t max_size = 100000;
+    const auto content = binary_content(1024 * 1024, 7);
+    const auto body = file("data", "data.bin", content) + close();
+
+    http::server server;
+    server.post("/stream", [&content, max_size](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        co_await read_in_pieces(req, res, content, 256 * 1024, max_size);   // a buffer larger than the maximum
+    });
+    server.post("/in-memory", [&content, max_size](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        co_await read_in_pieces(req, res, content, 64 * 1024, max_size);
+    }).deferred_body(false);
+    server.post("/mixed", [](http::request& req, http::response& res) -> thinger::awaitable<void> {
+        http::multipart_reader reader(req);
+        json answer;
+        co_await reader.next();
+        auto none = co_await reader.read(0);
+        answer["zero_empty"] = none.empty();
+        answer["zero_in_part"] = reader.part() != nullptr;
+        auto first = co_await reader.read(5);
+        answer["first"] = std::string(first);
+        auto zero_again = co_await reader.read(0);
+        answer["zero_keeps_rest"] = zero_again.empty();
+        auto rest = co_await reader.read();             // no maximum: what is left of the piece
+        answer["rest"] = std::string(rest);
+        answer["end"] = (co_await reader.read()).empty();
+
+        co_await reader.next();
+        answer["skipped"] = std::string(co_await reader.read(2));
+
+        auto part = co_await reader.next();             // skips what is left of the part
+        answer["next"] = part ? part->name : "";
+        std::string value;
+        answer["first_of_all"] = std::string(co_await reader.read(1));
+        answer["read_all"] = co_await reader.read_all(value);
+        answer["value"] = value;
+        answer["after"] = co_await reader.next() == nullptr;
+        answer["done"] = reader.done();
+        res.json(answer);
+    });
+    running_server running(server);
+
+    auto check = [&](const std::string& path, bool whole_pieces) {
+        auto result = raw_exchange(running.port, post(path, body), 10s);
+        INFO(result.data.substr(0, 400));
+        REQUIRE(result.data.starts_with("HTTP/1.1 200"));
+        auto answer = json::parse(response_body(result.data));
+        REQUIRE(answer["exact"] == true);
+        REQUIRE(answer["size"] == content.size());
+        REQUIRE(answer["largest"] <= max_size);
+        REQUIRE(answer["done"] == true);
+        // The body whole in memory: full pieces, but for the last one
+        if (whole_pieces) REQUIRE(answer["pieces"] == content.size() / max_size + 1);
+    };
+
+    SECTION("Read from the connection") {
+        check("/stream", false);
+    }
+
+    SECTION("Read from memory") {
+        check("/in-memory", true);
+    }
+
+    SECTION("read(0), a maximum then no maximum, next() and read_all() after a bounded read") {
+        auto result = raw_exchange(running.port, post("/mixed", field("a", "hello world") + field("b", "skip me") +
+                                                               field("c", "abcdef") + close()));
+        INFO(result.data.substr(0, 400));
+        REQUIRE(result.data.starts_with("HTTP/1.1 200"));
+        auto answer = json::parse(response_body(result.data));
+        REQUIRE(answer["zero_empty"] == true);
+        REQUIRE(answer["zero_in_part"] == true);
+        REQUIRE(answer["first"] == "hello");
+        REQUIRE(answer["zero_keeps_rest"] == true);
+        REQUIRE(answer["rest"] == " world");
+        REQUIRE(answer["end"] == true);
+        REQUIRE(answer["skipped"] == "sk");
+        REQUIRE(answer["next"] == "c");
+        REQUIRE(answer["first_of_all"] == "a");
+        REQUIRE(answer["read_all"] == true);
+        REQUIRE(answer["value"] == "bcdef");
+        REQUIRE(answer["after"] == true);
+        REQUIRE(answer["done"] == true);
+    }
 }
 
 TEST_CASE("Multipart bodies streamed with multipart_reader", "[multipart][integration]") {

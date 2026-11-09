@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <concepts>
+#include <cstdint>
 #include <type_traits>
 #include <map>
 #include <functional>
@@ -251,11 +252,11 @@ public:
     // Large, a Content-Length one before reading it, whether the server reads it (callbacks
     // taking the body decoded, or deferred_body(false)) or the callback does (read_body(),
     // read(), read_some(), a reverse proxy). Also once decompressed.
-    // std::numeric_limits<size_t>::max() for no limit.
-    route& max_body_size(size_t size);
+    // std::numeric_limits<std::uint64_t>::max() for no limit.
+    route& max_body_size(std::uint64_t size);
 
     // Maximum body size set for the route; nullopt if none (the host or application one applies)
-    const std::optional<size_t>& get_max_body_size() const { return max_body_size_; }
+    const std::optional<std::uint64_t>& get_max_body_size() const { return max_body_size_; }
 
     // Maximum time from the dispatch of a request (its headers received and the route
     // matched) until its response starts, middlewares and body reading included. On expiry
@@ -362,7 +363,8 @@ public:
     const nlohmann::json& get_meta(const std::string& key) const;  // null if missing
     const nlohmann::json& get_metadata() const { return metadata_; }
     
-    // Check if route matches the given path
+    // Check if route matches the given path. The regex of the whole pattern is compiled by
+    // the first call (routing does not use it); calls from several threads are safe
     bool matches(const std::string& path, std::smatch& matches) const;
     
     // Get route parameters from regex
@@ -376,15 +378,17 @@ public:
     const std::string& get_pattern() const { return pattern_; }
     
 private:
+    struct lazy_regex;
+
     std::string pattern_;
-    std::regex regex_;
+    std::shared_ptr<lazy_regex> regex_;  // shared by the copies of the route
     std::vector<std::string> parameters_;
     std::map<std::string, std::string> parameter_patterns_;
     nlohmann::json json_schema_;
     std::vector<std::string> accepted_types_;
 
     // Limits (unset: those of the virtual host, or the application)
-    std::optional<size_t> max_body_size_;
+    std::optional<std::uint64_t> max_body_size_;
     std::optional<std::chrono::milliseconds> timeout_;
     http_response::status timeout_status_ = http_response::status::gateway_timeout;
     std::optional<std::chrono::milliseconds> request_timeout_;

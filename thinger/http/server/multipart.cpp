@@ -127,6 +127,7 @@ namespace thinger::http {
     thinger::awaitable<const multipart_part*> multipart_reader::next() {
         using event = multipart_parser::event;
         if (!parser_ || error_ != multipart_error::none) co_return nullptr;
+        pending_ = {};
         for (;;) {
             switch (co_await advance()) {
                 case event::part:
@@ -147,13 +148,20 @@ namespace thinger::http {
         }
     }
 
-    thinger::awaitable<std::string_view> multipart_reader::read() {
+    thinger::awaitable<std::string_view> multipart_reader::read(size_t max_size) {
         using event = multipart_parser::event;
-        if (!in_part_ || error_ != multipart_error::none) co_return std::string_view{};
-        auto result = co_await advance();
-        if (result == event::data) co_return parser_->data();
-        if (result == event::part_end) in_part_ = false;
-        co_return std::string_view{};
+        if (max_size == 0 || !in_part_ || error_ != multipart_error::none) co_return std::string_view{};
+        if (pending_.empty()) {
+            auto result = co_await advance();
+            if (result != event::data) {
+                if (result == event::part_end) in_part_ = false;
+                co_return std::string_view{};
+            }
+            pending_ = parser_->data();
+        }
+        auto data = pending_.substr(0, max_size);
+        pending_.remove_prefix(data.size());
+        co_return data;
     }
 
     thinger::awaitable<bool> multipart_reader::read_all(std::string& value) {
@@ -167,7 +175,7 @@ namespace thinger::http {
 
     // --- multipart_file ---
 
-    multipart_file::multipart_file(multipart_part part, std::filesystem::path path, size_t size)
+    multipart_file::multipart_file(multipart_part part, std::filesystem::path path, std::uint64_t size)
         : part_(std::move(part)), path_(std::move(path)), size_(size) {}
 
     multipart_file::~multipart_file() {
@@ -297,6 +305,47 @@ namespace thinger::http {
             std::string path_;
         };
 
+        // Where uploads are written: the directory of the options, or the system's
+        std::filesystem::path upload_directory(const multipart_options& options) {
+            if (!options.temp_directory.empty()) return options.temp_directory;
+            std::error_code error;
+            auto directory = std::filesystem::temp_directory_path(error);
+            return error ? std::filesystem::path("/tmp") : directory;
+        }
+
+        // A part stored in a temporary file: file_failed if it could not be written, and no
+        // path if the body failed first (the file is deleted then)
+        struct stored_part {
+            multipart_error error = multipart_error::none;
+            std::string path;
+            std::uint64_t size = 0;
+        };
+
+        // (blocking writes, as Go's ParseMultipartForm: there is no portable asynchronous
+        // file I/O, and the parts arrive slower than a disk takes them)
+        thinger::awaitable<stored_part> store_part(multipart_reader& reader, const std::filesystem::path& directory) {
+            temporary_file file(directory);
+            if (!file.is_open()) {
+                LOG_ERROR("Cannot create a temporary file for an upload in {}: {}", directory.string(), std::strerror(errno));
+                co_return stored_part{multipart_error::file_failed};
+            }
+            std::uint64_t size = 0;
+            bool written = true;
+            for (auto data = co_await reader.read(); !data.empty(); data = co_await reader.read()) {
+                if (!file.write(data)) {
+                    written = false;
+                    break;
+                }
+                size += data.size();
+            }
+            if (!written || !file.close()) {
+                LOG_ERROR("Cannot write the temporary file of an upload: {}", std::strerror(errno));
+                co_return stored_part{multipart_error::file_failed};
+            }
+            if (reader.failed()) co_return stored_part{};
+            co_return stored_part{multipart_error::none, file.release(), size};
+        }
+
     }
 
     thinger::awaitable<multipart_form> read_multipart(request& req, multipart_options options) {
@@ -307,13 +356,7 @@ namespace thinger::http {
             co_return form;
         }
 
-        std::filesystem::path directory = options.temp_directory;
-        if (directory.empty()) {
-            std::error_code error;
-            directory = std::filesystem::temp_directory_path(error);
-            if (error) directory = "/tmp";
-        }
-
+        auto directory = upload_directory(options);
         multipart_error failure = multipart_error::none;
         while (const multipart_part* part = co_await reader.next()) {
             // Parts that are not form fields are skipped, as Go and busboy do
@@ -331,30 +374,14 @@ namespace thinger::http {
                 continue;
             }
 
-            // (blocking writes, as Go's ParseMultipartForm: there is no portable asynchronous
-            // file I/O, and the parts arrive slower than a disk takes them)
-            temporary_file file(directory);
-            if (!file.is_open()) {
-                LOG_ERROR("Cannot create a temporary file for an upload in {}: {}", directory.string(), std::strerror(errno));
-                failure = multipart_error::file_failed;
+            auto stored = co_await store_part(reader, directory);
+            if (stored.error != multipart_error::none) {
+                failure = stored.error;
                 break;
             }
-            size_t size = 0;
-            bool written = true;
-            for (auto data = co_await reader.read(); !data.empty(); data = co_await reader.read()) {
-                if (!file.write(data)) {
-                    written = false;
-                    break;
-                }
-                size += data.size();
-            }
-            if (!written || !file.close()) {
-                LOG_ERROR("Cannot write the temporary file of an upload: {}", std::strerror(errno));
-                failure = multipart_error::file_failed;
-                break;
-            }
-            if (reader.failed()) break;
-            form.files_.emplace_back(*part, file.release(), size);
+            // The body failed while the part was being written
+            if (stored.path.empty()) break;
+            form.files_.emplace_back(*part, std::move(stored.path), stored.size);
         }
 
         if (failure == multipart_error::none && !reader.done()) {

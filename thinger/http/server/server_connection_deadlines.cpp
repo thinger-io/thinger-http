@@ -1,6 +1,7 @@
 #include "server_connection.hpp"
 #include "server_base.hpp"
 #include "../../asio/sockets/socket.hpp"
+#include "body_reader.hpp"
 #include "../../util/logger.hpp"
 #include <algorithm>
 
@@ -20,6 +21,7 @@ server_connection::clock::time_point server_connection::next_deadline() const {
     auto deadline = idle_deadline();
     if (clock::time_point head; head_deadline(head)) deadline = std::min(deadline, head);
     if (clock::time_point body; body_deadline(body)) deadline = std::min(deadline, body);
+    if (read_waits_ && read_bounded_) deadline = std::min(deadline, read_deadline_);
     return deadline;
 }
 
@@ -70,6 +72,13 @@ void server_connection::deadline_expired() {
     auto now = clock::now();
     if (clock::time_point head; head_deadline(head) && now >= head) {
         head_timed_out();
+        return;
+    }
+    if (read_waits_ && read_bounded_ && now >= read_deadline_) [[unlikely]] {
+        read_waits_ = false;
+        read_expired_ = true;
+        read_cancel_.emit(boost::asio::cancellation_type::terminal);
+        arm_deadline();
         return;
     }
     if (clock::time_point body; body_deadline(body) && now >= body) {
@@ -127,6 +136,39 @@ void server_connection::set_request_deadline(const http_stream& stream, std::chr
     request_deadline_ = deadline;
     // An earlier deadline arms the watchdog again (at once if it passed already)
     arm_deadline();
+}
+
+void server_connection::set_read_deadline(const http_stream* stream, clock::time_point deadline) {
+    if (in_progress_ != stream) return;
+    // It replaces the request deadline for the rest of the body, as in Go: the read deadline
+    // itself applies only while a read waits for the socket (see body_read_started()), a
+    // read already waiting included
+    request_deadline_ = std::chrono::milliseconds{0};
+    read_deadline_ = deadline;
+    // (the end of time, as Go's zero time: none)
+    read_bounded_ = deadline.time_since_epoch() != clock::duration::max();
+    if (read_waits_) arm_deadline();
+}
+
+bool server_connection::read_deadline_passed() const {
+    return read_bounded_ && clock::now() >= read_deadline_;
+}
+
+void server_connection::body_read_started(boost::asio::cancellation_slot caller) {
+    if (caller.is_connected()) caller.assign([this](auto type) { read_cancel_.emit(type); });
+    read_waits_ = true;
+    if (read_bounded_) arm_deadline();
+}
+
+void server_connection::body_read_ended(boost::asio::cancellation_slot caller, io_result& result) {
+    // No longer forwarded: the slot may be emitted after the connection is gone
+    if (caller.is_connected()) caller.clear();
+    read_waits_ = false;
+    if (read_expired_) [[unlikely]] {
+        read_expired_ = false;
+        auto& ec = std::get<boost::system::error_code>(result);
+        if (ec == boost::asio::error::operation_aborted) ec = boost::system::errc::make_error_code(read_deadline_expired);
+    }
 }
 
 void server_connection::request_timed_out(http_stream& stream) {

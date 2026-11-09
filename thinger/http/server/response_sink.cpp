@@ -31,7 +31,7 @@ void connection_sink::send(std::shared_ptr<http_response> response) {
 
 bool connection_sink::begin(std::shared_ptr<http_response> headers) {
     headers->add_header("Transfer-Encoding", "chunked");
-    headers->add_header("X-Content-Type-Options", "nosniff");
+    headers->set_header("X-Content-Type-Options", "nosniff");
     headers->set_last_frame(false);   // the stream stays open for the chunks
     return write(std::move(headers));
 }

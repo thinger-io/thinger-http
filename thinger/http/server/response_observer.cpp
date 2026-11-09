@@ -52,6 +52,7 @@ void response_observer::report() noexcept {
     } catch (...) {
         LOG_ERROR("unknown error in the response hook");
     }
+    if (on_reported_) on_reported_();
 }
 
 } // namespace thinger::http

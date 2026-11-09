@@ -45,6 +45,12 @@ public:
     static awaitable<std::shared_ptr<http_response>> dispatch(std::shared_ptr<state> self,
                                                               std::shared_ptr<http_request> http_request,
                                                               dispatch_options options);
+    // What an in-memory dispatch collects once its timeout passed without a response: `res`,
+    // the response if created by then. Static, as dispatch()
+    static awaitable<std::shared_ptr<http_response>> answer_dispatch_timeout(std::shared_ptr<state> self,
+                                                                             std::shared_ptr<memory_response> memory,
+                                                                             std::shared_ptr<http_stream> stream,
+                                                                             std::optional<response> res);
     // Track an in-memory dispatch; false if the application is gone already
     bool track(tracked_source& source);
     // The application is being destroyed: from now on no request starts, and the dispatches in
@@ -89,7 +95,7 @@ public:
     std::shared_ptr<const detail::cors_policy> cors_;
 
     // Maximum allowed request body size
-    size_t max_body_size_{default_max_body_size};
+    std::uint64_t max_body_size_{default_max_body_size};
 
     // Virtual hosts by exact name, and by pattern (in registration order)
     std::map<std::string, std::unique_ptr<virtual_host>> exact_hosts_;
@@ -378,11 +384,11 @@ void http_application::disable_cors() {
     state_->cors_.reset();
 }
 
-void http_application::set_max_body_size(size_t size) {
+void http_application::set_max_body_size(std::uint64_t size) {
     state_->max_body_size_ = size;
 }
 
-size_t http_application::get_max_body_size() const {
+std::uint64_t http_application::get_max_body_size() const {
     return state_->max_body_size_;
 }
 
@@ -463,6 +469,8 @@ static void answer_failures(request& req, response& res, bool handler_failed) {
         if (!res.has_responded()) {
             if (error == body_error::too_large) {
                 res.error(http_response::status::payload_too_large, "Payload Too Large");
+            } else if (error == body_error::timeout) {
+                res.error(http_response::status::timed_out, "Request Timeout");
             } else {
                 res.error(http_response::status::bad_request, "Invalid request body");
             }
@@ -835,6 +843,10 @@ awaitable<std::shared_ptr<http_response>> http_application::state::dispatch(std:
     auto executor = co_await boost::asio::this_coro::executor;
     auto memory = std::make_shared<memory_response>(executor);
 
+    // With a response hook the dispatch also waits for its report, within the same timeout
+    std::optional<std::chrono::steady_clock::time_point> started;
+    if (self->response_hook_) [[unlikely]] started = std::chrono::steady_clock::now();
+
     // Run the request on its own coroutine (in a strand, where its stream, the cancellation
     // scope of the request, acts), and wait for the response from the start: the timeout
     // also covers a handler that never finishes. Handlers may also answer later, from a copy
@@ -875,30 +887,45 @@ awaitable<std::shared_ptr<http_response>> http_application::state::dispatch(std:
         throw boost::system::system_error(boost::asio::error::operation_aborted);
     }
     if (!result && !memory->abandoned()) {
-        // Answered with the timeout as a route timeout does (a later answer is dropped, and
-        // logged as late), without the headers the handler may still be setting on the strand;
-        // unless an answer started first. Before the response exists, the 504 is collected alone
         std::optional<response> res;
         {
             std::scoped_lock lock(created->mutex);
             res = created->res;
         }
-        if (res) {
-            res->answer_timeout(http_response::status::gateway_timeout, false);
-        } else {
-            memory->send(self->make_error_response(http_response::status::gateway_timeout, "No response within the timeout"));
-        }
-        // Then the scope of the request is cancelled, on the strand: its handler goes on unless
-        // its route declared the timeout (see route::cancel_on)
-        stream->cancel(cancel_reason::timeout);
-        result = co_await memory->wait(std::chrono::milliseconds(0));
-        // An answer that started first and is not complete
-        if (!result && !memory->abandoned()) {
-            result = self->make_error_response(http_response::status::gateway_timeout, "No response within the timeout");
-        }
+        result = co_await answer_dispatch_timeout(self, memory, stream, std::move(res));
     }
     // The application was destroyed without a complete response (see close())
     if (!result) throw boost::system::system_error(boost::asio::error::operation_aborted);
+    // The caller resumes after the hook, which may use what the caller owns
+    if (started) [[unlikely]] {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - *started);
+        if (!co_await memory->wait_reported(options.timeout - elapsed)) {
+            stream->cancel(cancel_reason::client_gone);
+            throw boost::system::system_error(boost::asio::error::operation_aborted);
+        }
+    }
+    co_return result;
+}
+
+awaitable<std::shared_ptr<http_response>> http_application::state::answer_dispatch_timeout(
+        std::shared_ptr<state> self, std::shared_ptr<memory_response> memory, std::shared_ptr<http_stream> stream,
+        std::optional<response> res) {
+    // Answered with the timeout as a route timeout does (a later answer is dropped, and
+    // logged as late), without the headers the handler may still be setting on the strand;
+    // unless an answer started first. Before the response exists, the 504 is collected alone
+    if (res) {
+        res->answer_timeout(http_response::status::gateway_timeout, false);
+    } else {
+        memory->send(self->make_error_response(http_response::status::gateway_timeout, "No response within the timeout"));
+    }
+    // Then the scope of the request is cancelled, on the strand: its handler goes on unless
+    // its route declared the timeout (see route::cancel_on)
+    stream->cancel(cancel_reason::timeout);
+    auto result = co_await memory->wait(std::chrono::milliseconds(0));
+    // An answer that started first and is not complete
+    if (!result && !memory->abandoned()) {
+        result = self->make_error_response(http_response::status::gateway_timeout, "No response within the timeout");
+    }
     co_return result;
 }
 

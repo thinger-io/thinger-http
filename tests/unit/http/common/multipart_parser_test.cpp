@@ -1,10 +1,21 @@
 #include <catch2/catch_test_macros.hpp>
 #include <thinger/http/common/multipart_parser.hpp>
 #include <algorithm>
+#include <cstdint>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 using namespace thinger::http;
+
+// Byte limits and the counters behind them hold more than 4 GiB on any platform
+static_assert(std::is_same_v<decltype(multipart_limits::max_header_size), std::uint64_t>);
+static_assert(std::is_same_v<decltype(multipart_limits::max_filename_size), std::uint64_t>);
+static_assert(std::is_same_v<decltype(multipart_limits::max_field_size), std::uint64_t>);
+static_assert(std::is_same_v<decltype(multipart_limits::max_fields_size), std::uint64_t>);
+static_assert(std::is_same_v<decltype(multipart_limits::max_file_size), std::uint64_t>);
+static_assert(std::is_same_v<decltype(std::declval<const multipart_parser&>().part_size()), std::uint64_t>);
 
 namespace {
 
@@ -570,6 +581,21 @@ TEST_CASE("Multipart limits", "[multipart][unit]") {
                 multipart_error::field_too_large);
         // Files are not fields
         REQUIRE(parse_every_split(file("f", std::string(15, 'y')) + close(), "boundary", limits).done);
+    }
+
+    SECTION("A file of 1000 bytes with a limit of 1000 passes, one of 1001 fails") {
+        multipart_limits limits;
+        limits.max_file_size = 1000;
+        REQUIRE(parse_every_split(file("f", std::string(1000, 'y')) + close(), "boundary", limits).done);
+        REQUIRE(parse_every_split(file("f", std::string(1001, 'y')) + close(), "boundary", limits).error ==
+                multipart_error::file_too_large);
+    }
+
+    SECTION("A byte limit over 4 GiB is kept whole") {
+        multipart_limits limits;
+        limits.max_file_size = std::uint64_t{5} * 1024 * 1024 * 1024;
+        REQUIRE(limits.max_file_size == 5368709120ULL);
+        REQUIRE(parse_every_split(file("f", std::string(100, 'y')) + close(), "boundary", limits).done);
     }
 
     SECTION("Fields in total") {

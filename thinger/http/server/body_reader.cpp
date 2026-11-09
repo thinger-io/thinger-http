@@ -21,7 +21,7 @@ namespace thinger::http {
 
     }
 
-    void body_reader::set_framing(bool chunked, size_t content_length) {
+    void body_reader::set_framing(bool chunked, std::uint64_t content_length) {
         chunked_ = chunked;
         remaining_ = chunked ? 0 : content_length;
         read_ = 0;
@@ -53,6 +53,12 @@ namespace thinger::http {
         return chunked_ ? !decoder_.done() : remaining_ > 0;
     }
 
+    size_t body_reader::received(const io_result& read) {
+        const auto& [ec, bytes] = read;
+        if (bytes == 0 && ec == read_deadline_expired) [[unlikely]] error_ = body_error::timeout;
+        return bytes;
+    }
+
     thinger::awaitable<size_t> body_reader::read_raw(uint8_t* buffer, size_t max_size) {
         if (size_t available = buffered()) {
             size_t bytes = std::min(available, max_size);
@@ -61,24 +67,23 @@ namespace thinger::http {
             co_return bytes;
         }
         if (!source_) co_return 0;
-        auto [ec, bytes] = co_await source_(buffer, max_size);
-        co_return bytes;
+        co_return received(co_await source_(buffer, max_size));
     }
 
     thinger::awaitable<bool> body_reader::fill_read_ahead() {
         read_ahead_.resize(framing_read_size);
         read_ahead_offset_ = 0;
-        size_t bytes = source_ ? std::get<1>(co_await source_(read_ahead_.data(), read_ahead_.size())) : 0;
+        size_t bytes = source_ ? received(co_await source_(read_ahead_.data(), read_ahead_.size())) : 0;
         read_ahead_.resize(bytes);
         co_return bytes > 0;
     }
 
     thinger::awaitable<size_t> body_reader::read_some_length(uint8_t* buffer, size_t max_size) {
-        size_t to_read = std::min(max_size, remaining_);
+        auto to_read = static_cast<size_t>(std::min<std::uint64_t>(max_size, remaining_));
         if (to_read == 0) co_return 0;
         size_t bytes = co_await read_raw(buffer, to_read);
         if (bytes == 0) {
-            if (!co_await cancelled()) error_ = body_error::incomplete;
+            if (error_ == body_error::none && !co_await cancelled()) error_ = body_error::incomplete;
             co_return 0;
         }
         remaining_ -= bytes;
@@ -90,9 +95,9 @@ namespace thinger::http {
             if (buffered() == 0) {
                 // Within chunk data: read it straight into the caller buffer
                 if (size_t pending = decoder_.data_pending()) {
-                    size_t bytes = source_ ? std::get<1>(co_await source_(buffer, std::min(pending, max_size))) : 0;
+                    size_t bytes = source_ ? received(co_await source_(buffer, std::min(pending, max_size))) : 0;
                     if (bytes == 0) {
-                        if (!co_await cancelled()) error_ = body_error::incomplete;
+                        if (error_ == body_error::none && !co_await cancelled()) error_ = body_error::incomplete;
                         co_return 0;
                     }
                     decoder_.data_consumed(bytes);
@@ -101,7 +106,7 @@ namespace thinger::http {
                 // Framing: decode it from the read-ahead, where anything read past the end
                 // of the body stays for the next request
                 if (!co_await fill_read_ahead()) {
-                    if (!co_await cancelled()) error_ = body_error::incomplete;
+                    if (error_ == body_error::none && !co_await cancelled()) error_ = body_error::incomplete;
                     co_return 0;
                 }
             }
@@ -158,7 +163,7 @@ namespace thinger::http {
             // large body takes no memory for bytes that never come (as Go's io.ReadAll). The
             // first piece holds a small body whole; each next one doubles what arrived
             size_t offset = body.size();
-            size_t end = offset + remaining_;
+            size_t end = offset + static_cast<size_t>(remaining_);
             while (body.size() < end) {
                 size_t size = body.size();
                 size_t piece = std::min(end - size, std::max(body_first_piece, size - offset));
@@ -183,13 +188,13 @@ namespace thinger::http {
         co_return error_ == body_error::none;
     }
 
-    thinger::awaitable<bool> body_reader::discard(size_t max_size) {
+    thinger::awaitable<bool> body_reader::discard(std::uint64_t max_size) {
         if (error_ != body_error::none) co_return false;
         if (!has_pending()) co_return true;
         if (!chunked_ && remaining_ > max_size) co_return false;
 
         uint8_t buffer[8192];
-        size_t discarded = 0;
+        std::uint64_t discarded = 0;
         while (has_pending()) {
             size_t bytes = co_await read_some(buffer, sizeof(buffer));
             if (bytes == 0) break;

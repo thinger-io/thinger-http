@@ -28,11 +28,18 @@ namespace {
     // they are sent as they are (or a precompressed sibling of them)
     constexpr uint64_t compression_cap = 4 * 1024 * 1024;
 
+    // The media type the file is sent with: the Content-Type a handler or a middleware set
+    // before, as Node's send respects it, else the one of the file
+    const std::string& sent_content_type(const http_response& message, const representation& file) {
+        const auto& content_type = message.get_content_type();
+        return content_type.empty() ? file.content_type : content_type;
+    }
+
     // Whether the file is compressed on the fly for the clients accepting it (see
     // compression::compressible), given the headers of `message`
     bool compressed_on_the_fly(const http_response& message, const representation& file) {
         return file.encoding.empty() && file.info.size <= compression_cap &&
-               compression::compressible(message, file.info.size, file.content_type);
+               compression::compressible(message, file.info.size, sent_content_type(message, file));
     }
 
     // Headers of the 200 and 304 answers alike: the validators, and how to cache them.
@@ -107,7 +114,7 @@ namespace {
 
     void add_content_headers(http_response& message, const representation& file) {
         message.set_status(http_response::status::ok);
-        message.set_content_type(file.content_type);
+        message.set_content_type(sent_content_type(message, file));
         if (!file.encoding.empty()) message.add_header("Content-Encoding", std::string(file.encoding));
         message.add_header("Accept-Ranges", "bytes");
         if (file.force_download) {

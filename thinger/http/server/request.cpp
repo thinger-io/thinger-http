@@ -1,5 +1,8 @@
 #include "../../util/logger.hpp"
 #include "../../util/compression.hpp"
+#include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <utility>
 
 #include "request.hpp"
@@ -249,6 +252,10 @@ namespace thinger::http{
         co_return bytes;
     }
 
+    void request::set_read_deadline(std::chrono::steady_clock::time_point deadline) {
+        if (source_) source_->set_read_deadline(deadline);
+    }
+
     // Decode the body in place according to its Content-Encoding (gzip, x-gzip, deflate, or
     // several of them; a body with any other coding is left to the handler, with its
     // Content-Encoding), up to `max_size` bytes once decoded
@@ -283,11 +290,13 @@ namespace thinger::http{
         // Nothing left to read (already read, or no body)
         if (!body_reader_.has_pending()) co_return body_reader_.error() == body_error::none;
 
-        bool read = co_await body_reader_.read_all(http_request_->get_body(), body_reader_.limit());
+        // Held in memory: at most what a size_t counts, whatever the limit (a 32-bit build)
+        auto limit = static_cast<size_t>(std::min<std::uint64_t>(body_reader_.limit(), std::numeric_limits<size_t>::max()));
+        bool read = co_await body_reader_.read_all(http_request_->get_body(), limit);
         note_body_read();
         if (!read) co_return false;
 
-        auto error = decode_content_encoding(*http_request_, body_reader_.limit());
+        auto error = decode_content_encoding(*http_request_, limit);
         if (error != body_error::none) {
             body_reader_.set_error(error);
             co_return false;
@@ -307,7 +316,7 @@ namespace thinger::http{
         co_return co_await http::read_multipart(*this, std::move(options));
     }
 
-    thinger::awaitable<bool> request::discard_body(size_t max_size) {
+    thinger::awaitable<bool> request::discard_body(std::uint64_t max_size) {
         bool discarded = co_await body_reader_.discard(max_size);
         note_body_read();
         co_return discarded;

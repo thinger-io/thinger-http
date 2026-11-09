@@ -17,8 +17,13 @@ namespace thinger::http {
         too_large,      // larger than the allowed size
         malformed,      // invalid chunked framing
         incomplete,     // the connection ended before the body did
-        bad_encoding    // the Content-Encoding (gzip, deflate) could not be decoded
+        bad_encoding,   // the Content-Encoding (gzip, deflate) could not be decoded
+        timeout         // the read deadline of the request passed (see request::set_read_deadline())
     };
+
+    // The error of a read its source ended at the read deadline of the request: ETIME, which no
+    // socket reports, not to take it for a TCP connection that timed out (ETIMEDOUT)
+    inline constexpr auto read_deadline_expired = boost::system::errc::stream_timeout;
 
     /**
      * Reads a request body framed by Content-Length or by the chunked transfer coding: first
@@ -29,7 +34,7 @@ namespace thinger::http {
     class body_reader {
     public:
         /// Reads up to `size` bytes from the connection: 0 on end of stream or error (see
-        /// detail::request_source::read_body_some())
+        /// detail::request_source::read_body_some()), read_deadline_expired at the read deadline
         using source = std::function<thinger::awaitable<io_result>(uint8_t* buffer, size_t size)>;
 
         /// Bytes read from the connection at once while decoding chunked framing (never more
@@ -39,7 +44,7 @@ namespace thinger::http {
         body_reader() = default;
 
         /// Body framing: chunked, or `content_length` bytes
-        void set_framing(bool chunked, size_t content_length);
+        void set_framing(bool chunked, std::uint64_t content_length);
 
         /// Connection to read from once the read-ahead is exhausted (none: the body is only
         /// what is in the read-ahead)
@@ -48,8 +53,8 @@ namespace thinger::http {
         /// Maximum body size (none by default): reading a larger body fails (too_large), a
         /// Content-Length one at its first read, before reading anything, and a chunked one
         /// once it exceeds the limit
-        void set_limit(size_t limit) { limit_ = limit; }
-        size_t limit() const { return limit_; }
+        void set_limit(std::uint64_t limit) { limit_ = limit; }
+        std::uint64_t limit() const { return limit_; }
 
         void set_read_ahead(const uint8_t* data, size_t size);
 
@@ -62,9 +67,9 @@ namespace thinger::http {
         /// Read exactly `size` body bytes, or less at the end of the body or on error
         thinger::awaitable<size_t> read(uint8_t* buffer, size_t size);
 
-        /// Read up to `max_size` body bytes; 0 at the end of the body or on error. A read
-        /// cancelled (through the cancellation slot of its coroutine) returns 0 too, leaving
-        /// the body pending, without an error
+        /// Read up to `max_size` body bytes; 0 at the end of the body or on error, a read past
+        /// the read deadline included (timeout). A read cancelled (through the cancellation
+        /// slot of its coroutine) returns 0 too, leaving the body pending, without an error
         thinger::awaitable<size_t> read_some(uint8_t* buffer, size_t max_size);
 
         /// Append the rest of the body to `body`, failing (too_large) if `body` would exceed
@@ -73,7 +78,7 @@ namespace thinger::http {
         thinger::awaitable<bool> read_all(std::string& body, size_t max_size);
 
         /// Read and drop the rest of the body; false if it exceeds `max_size` bytes or fails
-        thinger::awaitable<bool> discard(size_t max_size);
+        thinger::awaitable<bool> discard(std::uint64_t max_size);
 
         /// Whether part of the body is still unread (false once reading failed)
         bool has_pending() const;
@@ -86,9 +91,9 @@ namespace thinger::http {
     private:
         source source_;
         bool chunked_ = false;
-        size_t remaining_ = 0;      // unread bytes of a Content-Length body
-        size_t read_ = 0;           // body bytes read
-        size_t limit_ = std::numeric_limits<size_t>::max();
+        std::uint64_t remaining_ = 0;   // unread bytes of a Content-Length body
+        std::uint64_t read_ = 0;        // body bytes read
+        std::uint64_t limit_ = std::numeric_limits<std::uint64_t>::max();
         chunked_decoder decoder_;
         body_error error_ = body_error::none;
 
@@ -100,6 +105,9 @@ namespace thinger::http {
 
         /// Refill the (empty) read-ahead from the source; false on end of stream
         thinger::awaitable<bool> fill_read_ahead();
+
+        /// The bytes a read from the source got: none past the read deadline (timeout)
+        size_t received(const io_result& read);
 
         thinger::awaitable<size_t> read_some_length(uint8_t* buffer, size_t max_size);
         thinger::awaitable<size_t> read_some_chunked(uint8_t* buffer, size_t max_size);

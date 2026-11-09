@@ -324,9 +324,9 @@ multipart_parser::event multipart_parser::content(std::string_view data) {
     if (data.empty() || state_ != state::content) return event::need_more;    // (the preamble is dropped)
 
     // Over a limit: the one crossed first, as if the content came byte by byte
-    size_t limit = part_.has_filename ? limits_.max_file_size : limits_.max_field_size;
-    size_t allowed = limit - part_size_;
-    size_t fields_allowed = part_.has_filename ? allowed : limits_.max_fields_size - fields_size_;
+    std::uint64_t limit = part_.has_filename ? limits_.max_file_size : limits_.max_field_size;
+    std::uint64_t allowed = limit - part_size_;
+    std::uint64_t fields_allowed = part_.has_filename ? allowed : limits_.max_fields_size - fields_size_;
     if (data.size() > allowed || data.size() > fields_allowed) {
         if (allowed <= fields_allowed) {
             return fail(part_.has_filename ? multipart_error::file_too_large : multipart_error::field_too_large);

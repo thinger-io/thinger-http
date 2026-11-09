@@ -36,6 +36,8 @@ public:
 
     // read operations
     awaitable<io_result> read_some(uint8_t buffer[], size_t max_size) override;
+    awaitable<io_result> read_some_cancellable(uint8_t buffer[], size_t max_size,
+                                               boost::asio::cancellation_slot slot) override;
     awaitable<io_result> read(uint8_t buffer[], size_t size) override;
     awaitable<io_result> read(boost::asio::streambuf &buffer, size_t size) override;
     awaitable<io_result> read_until(boost::asio::streambuf &buffer, std::string_view delim) override;

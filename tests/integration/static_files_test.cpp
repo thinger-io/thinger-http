@@ -1220,3 +1220,137 @@ TEST_CASE("A rule by prefix needs only serve_static() and a not-found handler", 
     REQUIRE(elsewhere.body.empty());
     REQUIRE(send_request(site.port, "POST", "/console/devices", "Content-Length: 0\r\n").status == 404);
 }
+
+namespace {
+
+    size_t fields(const raw_response& response, std::string_view name) {
+        return static_cast<size_t>(std::count_if(response.headers.begin(), response.headers.end(), [&](const auto& header) {
+            return util::ascii::iequals(header.first, name);
+        }));
+    }
+
+    // A site whose files are also sent by send_file(), from /file/<name>
+    struct send_file_site : static_site {
+        send_file_site() {
+            server.get("/file/:name", [this](http::request& req, http::response& res) { res.send_file(root / req["name"]); });
+        }
+    };
+
+}
+
+TEST_CASE("Files of unknown type are application/octet-stream, the known ones keep theirs", "[server][static][integration]") {
+    send_file_site site;
+    for (const auto* name : {"datos", "x.zzz", "y.bin", "a.txt", "a.html", "a.json", "a.js", "a.css"}) {
+        write_file(site.root / name, "some content");
+    }
+    site.server.serve_static("/static", site.root.string());
+    site.start();
+
+    SECTION("Without extension, with an unknown one or a binary one") {
+        for (const auto* name : {"datos", "x.zzz", "y.bin"}) {
+            INFO(name);
+            for (const auto& prefix : {"/file/", "/static/"}) {
+                auto response = get(site.port, prefix + std::string(name));
+                REQUIRE(response.status == 200);
+                REQUIRE(response.header("Content-Type") == "application/octet-stream");
+                REQUIRE(fields(response, "Content-Type") == 1);
+            }
+        }
+    }
+
+    SECTION("The known extensions keep the type of 0.10") {
+        const std::pair<const char*, const char*> known[] = {{"a.txt", "text/plain"},
+                                                             {"a.html", "text/html"},
+                                                             {"a.json", "application/json"},
+                                                             {"a.js", "application/javascript"},
+                                                             {"a.css", "text/css"}};
+        for (const auto& [name, type] : known) {
+            INFO(name);
+            for (const auto& prefix : {"/file/", "/static/"}) {
+                REQUIRE(get(site.port, prefix + std::string(name)).header("Content-Type") == type);
+            }
+        }
+    }
+}
+
+TEST_CASE("Files of unknown type are not compressed on the fly, text ones still are", "[server][static][compression][integration]") {
+    send_file_site site;
+    write_file(site.root / "big.zzz", std::string(4096, 'a'));
+    write_file(site.root / "big.txt", std::string(4096, 'a'));
+    site.start();
+
+    auto unknown = get(site.port, "/file/big.zzz", "Accept-Encoding: gzip\r\n");
+    REQUIRE(unknown.header("Content-Type") == "application/octet-stream");
+    REQUIRE_FALSE(unknown.has_header("Content-Encoding"));
+    REQUIRE(unknown.body.size() == 4096);
+
+    REQUIRE(get(site.port, "/file/big.txt", "Accept-Encoding: gzip\r\n").header("Content-Encoding") == "gzip");
+}
+
+TEST_CASE("A Content-Type set before answering wins over the one of the file", "[server][static][integration]") {
+    send_file_site site;
+    write_file(site.root / "x.dat", "a,b\n1,2\n");
+    write_file(site.root / "big.dat", std::string(4096, 'a'));
+    write_file(site.root / "big.txt", std::string(4096, 'a'));
+    write_file(site.root / "streamed.dat", std::string(2 * 1024 * 1024, 'a'));
+    auto file_as = [&site](bool replace, const char* type, const char* name) {
+        return [&site, replace, type, name](http::response& res) {
+            if (replace) res.set_header("Content-Type", type);
+            else res.header("Content-Type", type);
+            res.send_file(site.root / name);
+        };
+    };
+
+    SECTION("set_header() and header() before send_file()") {
+        site.server.get("/set", file_as(true, "text/csv", "x.dat"));
+        site.server.get("/add", file_as(false, "text/csv", "x.dat"));
+        site.start();
+        for (const auto* target : {"/set", "/add"}) {
+            INFO(target);
+            auto response = get(site.port, target);
+            REQUIRE(response.status == 200);
+            REQUIRE(response.header("Content-Type") == "text/csv");
+            REQUIRE(fields(response, "Content-Type") == 1);
+        }
+        auto head = send_request(site.port, "HEAD", "/set");
+        REQUIRE(head.header("Content-Type") == "text/csv");
+        REQUIRE(fields(head, "Content-Type") == 1);
+    }
+
+    SECTION("A file streamed keeps it too") {
+        site.server.get("/streamed", file_as(true, "text/csv", "streamed.dat"));
+        site.start();
+        auto response = get(site.port, "/streamed");
+        REQUIRE(response.status == 200);
+        REQUIRE(response.header("Content-Type") == "text/csv");
+        REQUIRE(fields(response, "Content-Type") == 1);
+        REQUIRE(response.body.size() == 2 * 1024 * 1024);
+    }
+
+    SECTION("serve_static() when a middleware set it") {
+        site.server.use([](http::request& req, http::response& res, std::function<void()> next) {
+            if (req.get_http_request()->get_path().ends_with("x.dat")) res.set_header("Content-Type", "text/csv");
+            next();
+        });
+        site.server.serve_static("/static", site.root.string());
+        site.start();
+        auto response = get(site.port, "/static/x.dat");
+        REQUIRE(response.header("Content-Type") == "text/csv");
+        REQUIRE(fields(response, "Content-Type") == 1);
+        REQUIRE(get(site.port, "/static/big.dat").header("Content-Type") == "application/octet-stream");
+    }
+
+    SECTION("Compression follows the type sent, not the one of the file") {
+        site.server.get("/csv", file_as(true, "text/csv", "big.dat"));
+        site.server.get("/pdf", file_as(true, "application/pdf", "big.txt"));
+        site.start();
+        auto csv = get(site.port, "/csv", "Accept-Encoding: gzip\r\n");
+        REQUIRE(csv.header("Content-Encoding") == "gzip");
+        REQUIRE(csv.header("Vary") == "Accept-Encoding");
+
+        auto pdf = get(site.port, "/pdf", "Accept-Encoding: gzip\r\n");
+        REQUIRE_FALSE(pdf.has_header("Content-Encoding"));
+        REQUIRE_FALSE(pdf.has_header("Vary"));
+        REQUIRE(pdf.body.size() == 4096);
+    }
+}

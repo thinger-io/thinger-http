@@ -7,6 +7,7 @@
 #include "file_server/static_files.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -78,7 +79,7 @@ public:
     // set_body_limits; no timeout; the request deadline of the connection, see
     // connection_options::request_timeout). Precedence: route > group > host > application. On the
     // application itself, they are those of the default host only. Set before serving.
-    virtual_host& max_body_size(size_t size) {
+    virtual_host& max_body_size(std::uint64_t size) {
         settings_->max_body_size = size;
         return *this;
     }
@@ -101,7 +102,7 @@ public:
     }
 
     // Limits set on the host (nullopt if unset)
-    const std::optional<size_t>& get_max_body_size() const { return settings_->max_body_size; }
+    const std::optional<std::uint64_t>& get_max_body_size() const { return settings_->max_body_size; }
     const std::optional<std::chrono::milliseconds>& get_timeout() const { return settings_->timeout; }
     http_response::status get_timeout_status() const { return settings_->timeout_status; }
     const std::optional<std::chrono::milliseconds>& get_request_timeout() const { return settings_->request_timeout; }
@@ -147,7 +148,7 @@ private:
         std::vector<std::string> parameters;
 
         // Limits of the host (unset: the application ones)
-        std::optional<size_t> max_body_size;
+        std::optional<std::uint64_t> max_body_size;
         std::optional<std::chrono::milliseconds> timeout;
         http_response::status timeout_status = http_response::status::gateway_timeout;
         std::optional<std::chrono::milliseconds> request_timeout;
@@ -183,7 +184,7 @@ public:
 
     // Limits of the routes registered afterwards (see route::max_body_size, route::timeout,
     // route::request_timeout and route::decode_limits)
-    route_group& max_body_size(size_t size) {
+    route_group& max_body_size(std::uint64_t size) {
         max_body_size_ = size;
         return *this;
     }
@@ -232,7 +233,7 @@ private:
     std::string prefix_;
     std::vector<std::string> tags_;
     nlohmann::json metadata_ = nlohmann::json::object();
-    std::optional<size_t> max_body_size_;
+    std::optional<std::uint64_t> max_body_size_;
     std::optional<std::pair<std::chrono::milliseconds, http_response::status>> timeout_;
     std::optional<std::chrono::milliseconds> request_timeout_;
     std::optional<body_limits> decode_limits_;

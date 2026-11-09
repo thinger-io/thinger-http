@@ -287,6 +287,31 @@ void response::header(std::string key, std::string value) {
     draft().add_header(std::move(key), std::move(value));
 }
 
+void response::set_header(std::string key, std::string value) {
+    if (!ensure_not_responded()) return;
+    draft().replace_headers(std::move(key), std::move(value));
+}
+
+namespace {
+
+    // The headers set before a message built by hand: those of the message win over the ones
+    // of the same name, as the headers given to writeHead() in Node. Compared only with the
+    // fields it came with, so repeated ones (Set-Cookie) are all added. Its framing is its own
+    void add_draft_headers(http_response& draft, http_response& message) {
+        const auto own = static_cast<std::ptrdiff_t>(message.get_headers().size());
+        for (auto& field : draft.get_headers()) {
+            if (headers::is_header(field.first, header::content_length) ||
+                headers::is_header(field.first, header::transfer_encoding)) continue;
+            const auto& fields = message.get_headers();
+            bool replaced = std::any_of(fields.begin(), fields.begin() + own, [&field](const auto& other) {
+                return headers::is_header(other.first, field.first);
+            });
+            if (!replaced) message.add_header(std::move(field.first), std::move(field.second));
+        }
+    }
+
+}
+
 void response::send_response(const std::shared_ptr<http_response>& response) {
     if (!ensure_not_responded()) return;
     // A message built by hand may carry the framing of another one (e.g. copied from a
@@ -297,6 +322,8 @@ void response::send_response(const std::shared_ptr<http_response>& response) {
         response->remove_headers(header::content_length);
     }
     if (!mark_responded()) return;
+    // Before the CORS headers, which do not replace the ones set so far (see take_draft)
+    if (state_->draft) add_draft_headers(*state_->draft, *response);
     if (state_->cors) detail::apply_cors(*state_->cors, state_->cors_decision, *response);
     send_message(response);
 }

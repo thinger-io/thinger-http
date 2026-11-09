@@ -113,6 +113,10 @@ namespace thinger::http {
             // server_connection::set_request_deadline()); nothing without a connection
             virtual void set_request_deadline(std::chrono::milliseconds /*deadline*/) {}
 
+            // The read deadline of the body (see request::set_read_deadline()), from the
+            // thread reading it; nothing without a connection, as memory never waits
+            virtual void set_read_deadline(std::chrono::steady_clock::time_point /*deadline*/) {}
+
             // The server connection, for the sink writing the response (none in memory)
             virtual std::weak_ptr<server_connection> connection() const { return {}; }
 

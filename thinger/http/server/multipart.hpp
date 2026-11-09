@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -31,7 +32,9 @@ namespace thinger::http {
      *
      * The body is read with request::read_some(), within the maximum body size of the route
      * (body_too_large), or from req.body() if the server already read it (routes that are not
-     * deferred). A body with a Content-Encoding is not decoded: not_multipart (415).
+     * deferred). A body with a Content-Encoding is not decoded: not_multipart (415). A read that
+     * reaches the read deadline of the request (request::set_read_deadline()) fails with
+     * invalid_body (400): req.get_body_error() is body_error::timeout, to answer 408 instead.
      */
     class multipart_reader {
     public:
@@ -45,9 +48,12 @@ namespace thinger::http {
         /// body, on error (see failed()), or if the read was cancelled. Valid until the next call.
         thinger::awaitable<const multipart_part*> next();
 
-        /// The next piece of the content of the current part; empty at its end, on error or if
-        /// the read was cancelled. Valid until the next call.
-        thinger::awaitable<std::string_view> read();
+        /// The next piece of the content of the current part, of `max_size` bytes at most (what
+        /// is left of it stays for the next call, as Go's Part.Read): a view into the buffer of
+        /// the reader, no copy, valid until the next call. Empty at the end of the part, on
+        /// error or if the read was cancelled. read(0) returns empty at once without advancing
+        /// or reading: it does not mean the end of the part.
+        thinger::awaitable<std::string_view> read(size_t max_size = std::numeric_limits<size_t>::max());
 
         /// Append the rest of the content of the current part to `value` (bounded by the
         /// limits of the part); false on error or if the read was cancelled
@@ -75,6 +81,7 @@ namespace thinger::http {
         std::unique_ptr<uint8_t[]> buffer_;
         size_t buffer_size_;
         std::string_view input_;
+        std::string_view pending_;  // what read() left of the last piece of the parser
         multipart_error error_ = multipart_error::none;
         bool in_memory_ = false;    // the body was read by the server: parse req.body()
         bool finished_ = false;     // the whole body was read
@@ -98,7 +105,7 @@ namespace thinger::http {
      */
     class multipart_file {
     public:
-        multipart_file(multipart_part part, std::filesystem::path path, size_t size);
+        multipart_file(multipart_part part, std::filesystem::path path, std::uint64_t size);
         ~multipart_file();
 
         multipart_file(multipart_file&& other) noexcept;
@@ -118,7 +125,7 @@ namespace thinger::http {
         const multipart_part& part() const { return part_; }
 
         /// Bytes of content
-        size_t size() const { return size_; }
+        std::uint64_t size() const { return size_; }
 
         /// The file with the content: the temporary file (readable by its owner only), or
         /// wherever move_to() moved it
@@ -135,7 +142,7 @@ namespace thinger::http {
     private:
         multipart_part part_;
         std::filesystem::path path_;
-        size_t size_ = 0;
+        std::uint64_t size_ = 0;
         bool owned_ = true;     // the temporary file is deleted with this object
 
         void remove();

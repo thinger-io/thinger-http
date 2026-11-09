@@ -297,6 +297,78 @@ TEST_CASE("Destroying an application delivers a response already complete", "[di
     CHECK(hooked == 1);
 }
 
+// A route answering at once and then waiting for its interruption, with a response hook: its
+// dispatch waits for the hook until something ends the wait
+struct answered_application {
+    http::test::handler_probe probe;
+    std::atomic<int> hooked{0};
+    std::unique_ptr<http::http_application> application = std::make_unique<http::http_application>();
+
+    answered_application() {
+        application->get("/answered", [this](http::request& req, http::response& res) -> awaitable<void> {
+            res.send("complete");
+            probe.start();
+            bool interrupted = co_await http::test::interrupted_wait(10s);
+            probe.end(req, interrupted);
+        });
+        application->on_response([this](const http::request&, const http::response_info&) { ++hooked; });
+    }
+};
+
+TEST_CASE("Destroying an application delivers the response of a dispatch waiting for the response hook", "[dispatch][lifetime]") {
+    watchdog guard(30s);
+    answered_application app;
+    dispatch_outcome outcome;
+    caller_thread caller;
+    auto awaited = GENERATE(true, false);
+    INFO((awaited ? "awaited" : "with a callback"));
+
+    dispatch_either(awaited, caller.executor(), *app.application, outcome, "/answered");
+    REQUIRE(app.probe.wait_started());
+    // the dispatch waits for the hook of the handler still running
+    std::this_thread::sleep_for(20ms);
+    REQUIRE(outcome.results == 0);
+
+    app.application.reset();
+
+    REQUIRE(outcome.ended_within(1s));
+    REQUIRE(outcome.answered(http::http_response::status::ok));
+    CHECK(outcome.response->get_content() == "complete");
+    REQUIRE(app.probe.wait_ended(1s));
+    REQUIRE(eventually([&] { return app.hooked > 0; }, 1s));
+    CHECK(app.hooked == 1);
+}
+
+TEST_CASE("Cancelling a dispatch waiting for the response hook fails with operation_aborted", "[dispatch][lifetime]") {
+    watchdog guard(30s);
+    answered_application app;
+    dispatch_outcome outcome;
+    caller_thread caller;
+    boost::asio::cancellation_signal signal;
+
+    co_spawn(caller.executor(), app.application->dispatch(get_request("/answered"), within(10s)),
+             boost::asio::bind_cancellation_slot(signal.slot(),
+                 [&outcome](std::exception_ptr error, std::shared_ptr<http::http_response> response) {
+                     outcome.set(std::move(error), std::move(response));
+                 }));
+    REQUIRE(app.probe.wait_started());
+    std::this_thread::sleep_for(20ms);
+    REQUIRE(outcome.results == 0);
+    boost::asio::post(caller.executor(), [&signal] { signal.emit(boost::asio::cancellation_type::terminal); });
+
+    // At once, not when the hook runs
+    REQUIRE(outcome.ended_within(1s));
+    REQUIRE(outcome.aborted());
+    REQUIRE_FALSE(app.probe.ended);
+    CHECK(app.hooked == 0);
+
+    app.application.reset();
+    REQUIRE(app.probe.wait_ended(1s));
+    CHECK(app.probe.reason == http::cancel_reason::client_gone);
+    REQUIRE(eventually([&] { return app.hooked > 0; }, 1s));
+    CHECK(app.hooked == 1);
+}
+
 TEST_CASE("The response hook is told once about a dispatch interrupted by the destruction", "[dispatch][lifetime]") {
     watchdog guard(30s);
     http::test::handler_probe probe;

@@ -96,10 +96,19 @@ public:
     // without it
     void header(std::string key, std::string value);
 
+    // Set a header to this value only, whatever was set before with its name (compared without
+    // case), as setHeader() in Node and Header().Set() in Go; header() adds another field, as
+    // appendHeader() and Header().Add(), which is what Set-Cookie needs. Same rules as header():
+    // not thread-safe, and an invalid header is dropped, logged at debug level, leaving the
+    // ones set before as they were
+    void set_header(std::string key, std::string value);
+
     // Send raw http_response object (for advanced use cases). Its content is sent whole,
     // framed by a Content-Length of its size (any Content-Length or Transfer-Encoding it
     // carries is replaced, e.g. when copied from another response); 1xx, 204 and 304 are
-    // sent without body, and 1xx and 204 without Content-Length
+    // sent without body, and 1xx and 204 without Content-Length. The headers set before
+    // (header(), set_header()) are sent too, unless the message has its own of that name (as
+    // the headers given to writeHead() in Node), but never Content-Length or Transfer-Encoding
     void send_response(const std::shared_ptr<http_response>& response);
 
     // WebSocket upgrade, with a message interface. With options.protocols, the first one the
@@ -149,7 +158,9 @@ public:
     void take_over(takeover_handler handler);
     void take_over(takeover_coroutine handler);
 
-    // File response, with the media type of its extension. It carries a weak ETag and a
+    // File response, with the media type of its extension (application/octet-stream if it is
+    // unknown or missing: nothing is guessed from its content), unless a Content-Type was set
+    // before (header(), set_header()), as Node's send does. It carries a weak ETag and a
     // Last-Modified from the size and modification time of the file, and Cache-Control:
     // no-cache unless one was set before (header()): caches keep the file, but check it on
     // every use. GET and HEAD requests with If-None-Match (or else If-Modified-Since) are

@@ -12,6 +12,7 @@
 #include "../../util/types.hpp"
 #include <boost/system/error_code.hpp>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -172,6 +173,14 @@ public:
     // already (request::cancelled() keeps the first reason, cancel_reason::shutdown if none).
     // Its current step, and the awaits it isolated from cancellation, end on their own, and what
     // it sends afterwards is dropped. What it captured itself is the caller's to keep alive.
+    //
+    // With a response hook (see on_response()), the dispatch ends once the hook has run, so what
+    // the hook captures can be destroyed as soon as this returns. The wait is limited by what is
+    // left of dispatch_options::timeout: a handler still running then, even one that answered
+    // already, gets its response returned without waiting more, and the hook runs when the
+    // handler ends, as on a connection: what the hook captures must live as long as the handler.
+    // Neither a caller cancelling the dispatch, nor destroying the application, waits for the
+    // hook. Without a hook nothing is waited for.
     awaitable<std::shared_ptr<http_response>> dispatch(std::shared_ptr<http_request> request,
                                                        dispatch_options options = {});
 
@@ -228,8 +237,8 @@ public:
     // (route::max_body_size) and the requests matching no route: every read of a body is
     // bounded by it (413 if larger), and an unread body larger than this is not discarded
     // after the response: the connection is closed instead
-    void set_max_body_size(size_t size);
-    size_t get_max_body_size() const;
+    void set_max_body_size(std::uint64_t size);
+    std::uint64_t get_max_body_size() const;
 
     // Decoders of request bodies by media type, for the routes taking the body decoded:
     // JSON, MessagePack, CBOR, UBJSON, urlencoded forms, text and binary are built in (see
@@ -282,6 +291,9 @@ public:
     // written. Upgrades (WebSocket, SSE, take_over()) are reported once the response handing
     // the connection over is written, as taken_over: what happens on the connection afterwards
     // is not (see websocket_connection::on_close(), sse_connection::on_close()).
+    //
+    // A request dispatched in memory returns after the hook has run, unless the timeout of the
+    // dispatch ends first, or the dispatch is cancelled (see dispatch()).
     //
     // It runs on the thread of the connection (for in-memory dispatch, the one ending the
     // request or its response), so it must not block: hand anything slow to another thread.

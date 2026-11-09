@@ -208,16 +208,9 @@ std::string form::url_decode(const std::string& str) {
 // ============================================
 
 std::string form::mime_type(const std::filesystem::path& path) {
-    // Use the library's comprehensive MIME type lookup
-    const std::string& type = mime_types::extension_to_type(path.extension().string());
-
-    // mime_types returns text/plain for unknown, but for form uploads
-    // application/octet-stream is more appropriate
-    if (type == mime_types::text_plain && !path.extension().empty()) {
-        return mime_types::application_octect_stream;
-    }
-
-    return type;
+    // The library's MIME type lookup: application/octet-stream if the extension is unknown or
+    // missing, as curl and browsers send such a file
+    return mime_types::extension_to_type(path.extension().string());
 }
 
 } // namespace thinger::http

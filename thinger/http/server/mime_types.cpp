@@ -370,7 +370,7 @@ namespace thinger::http::mime_types{
         if(it != extension_map.end()){
             return it->second;
         }
-        return text_plain;
+        return application_octect_stream;
     }
 
 }

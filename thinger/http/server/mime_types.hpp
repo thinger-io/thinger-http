@@ -23,7 +23,8 @@ namespace thinger::http::mime_types {
     static const std::string application_octect_stream      = "application/octet-stream";
     static const std::string application_form_urlencoded    = "application/x-www-form-urlencoded";
 
-    /// Convert a file extension into a MIME type.
+    /// Convert a file extension into a MIME type: application/octet-stream if it is unknown or
+    /// missing, as Node's send does (nothing is guessed from the content of a file).
     const std::string& extension_to_type(const std::string& extension);
 
 

@@ -1,6 +1,7 @@
 #ifndef API_REQUEST_HPP
 #define API_REQUEST_HPP
 
+#include <cstdint>
 #include <string>
 #include <memory>
 #include <optional>
@@ -21,7 +22,7 @@
 namespace thinger::http{
 
     // Maximum request body size unless the application or the route set theirs
-    inline constexpr size_t default_max_body_size = 8 * 1024 * 1024;
+    inline constexpr std::uint64_t default_max_body_size = 8 * 1024 * 1024;
 
     // Why the scope of a request was cancelled (see request::cancelled()):
     // - client_gone: its client reset the connection, or a read or write on it failed, or it
@@ -208,6 +209,22 @@ namespace thinger::http{
         /// `read_some() || timer`) returns 0 too, without failing: the body is still pending.
         thinger::awaitable<size_t> read_some(uint8_t* buffer, size_t max_size);
 
+        /// Absolute deadline for the reads of the body, pending and later ones (read(),
+        /// read_some(), read_body(), those of a multipart_reader), as Go's
+        /// http.ResponseController.SetReadDeadline: the handler sets and moves it as it reads,
+        /// as often as it likes, on the thread rules of those reads ("60 s more for each 64 MiB
+        /// received"), which cuts a client that goes silent or trickles without cutting a long
+        /// upload. Bytes already received (the read-ahead) are still returned past it.
+        /// It replaces the request timeout (connection_options::request_timeout, or the one of
+        /// the route) for the rest of the body; time_point::max() removes it, leaving only the
+        /// idle timeout, which a deadline further away than it does not extend. It bounds no
+        /// write. As it passes, the pending read returns what it read, or 0, and
+        /// get_body_error() is body_error::timeout, for good. Nothing is answered for the
+        /// handler (408 if it answers nothing), and the connection closes after the response,
+        /// as with any body left unread. Without a connection (in memory) it does nothing: a
+        /// body in memory never waits.
+        void set_read_deadline(std::chrono::steady_clock::time_point deadline);
+
         /// Read full body into http_request content (for non-deferred dispatch), decoding
         /// its Content-Encoding (gzip, deflate, or a list of them; see util::decode_content).
         /// Fails if the body exceeds the maximum body size (see get_max_body_size()), a
@@ -225,13 +242,14 @@ namespace thinger::http{
 
         /// Read and drop an unread body so the connection can be reused.
         /// Returns false if the body exceeds `max_size` or the read fails.
-        thinger::awaitable<bool> discard_body(size_t max_size);
+        thinger::awaitable<bool> discard_body(std::uint64_t max_size);
 
         /// Whether part of the body is still unread by read(), read_some() or read_body().
         bool has_pending_body() const;
 
         /// Why reading the body failed (body_error::none if it did not): too large, invalid
-        /// chunked framing, connection closed before its end, or undecodable Content-Encoding
+        /// chunked framing, connection closed before its end, undecodable Content-Encoding, or
+        /// past its read deadline (see set_read_deadline())
         body_error get_body_error() const;
 
         /// Content-Length convenience (0 for chunked requests)
@@ -245,8 +263,8 @@ namespace thinger::http{
 
         /// Maximum body size of every read (read_body(), read(), read_some()), also once
         /// decompressed: the one of the matched route, or of the application (set by the server)
-        void set_max_body_size(size_t size) { body_reader_.set_limit(size); }
-        size_t get_max_body_size() const { return body_reader_.limit(); }
+        void set_max_body_size(std::uint64_t size) { body_reader_.set_limit(size); }
+        std::uint64_t get_max_body_size() const { return body_reader_.limit(); }
 
         /// How the matched route decodes the body (set by the server; the defaults if not)
         void set_body_settings(const body_settings* settings) { body_settings_ = settings; }

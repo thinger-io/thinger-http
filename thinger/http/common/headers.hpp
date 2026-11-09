@@ -78,6 +78,9 @@ public:
     void add_header(std::string key, std::string value);
     void set_header(std::string key, std::string value);
     void set(std::string key, std::string value) { set_header(std::move(key), std::move(value)); }
+    // Leave a single `key` header with this value, whatever how many there were: the first
+    // one keeps its place and the spelling of its name. set_header() changes only the first.
+    void replace_headers(std::string key, std::string value);
     void set_proxy(std::string key, std::string value);
     void add_proxy(std::string key, std::string value);
     // Whether a setter refused a header (see add_header)

@@ -106,6 +106,18 @@ namespace thinger::http{
         replace_header(std::move(key), std::move(value));
     }
 
+    void headers::replace_headers(std::string key, std::string value){
+        if(key.empty() || !accept_header(key, value)) return;
+        auto same_name = [&key](const http_header& header){ return is_header(header.first, key); };
+        auto first = std::find_if(headers_.begin(), headers_.end(), same_name);
+        if(first == headers_.end()){
+            store_header(std::move(key), std::move(value));
+            return;
+        }
+        first->second = std::move(value);
+        headers_.erase(std::remove_if(first + 1, headers_.end(), same_name), headers_.end());
+    }
+
     void headers::replace_header(std::string&& key, std::string&& value){
         for(auto & header : headers_)
         {

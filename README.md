@@ -118,7 +118,7 @@ include(FetchContent)
 FetchContent_Declare(
     thinger-http
     GIT_REPOSITORY https://github.com/thinger-io/thinger-http.git
-    GIT_TAG v0.10.0
+    GIT_TAG v0.11.0
 )
 FetchContent_MakeAvailable(thinger-http)
 
@@ -134,7 +134,7 @@ Releases are tagged `vMAJOR.MINOR.PATCH` and follow [Semantic Versioning](https:
 
 From 1.0.0 on, only a major version changes the API in an incompatible way.
 
-[MIGRATING.md](MIGRATING.md) walks through each minor version's breaking changes in migration order, with code before and after: see [from 0.9 to 0.10](MIGRATING.md#from-09-to-010) and [from 0.8 to 0.9](MIGRATING.md#from-08-to-09).
+[MIGRATING.md](MIGRATING.md) walks through each minor version's breaking changes in migration order, with code before and after: see [from 0.10 to 0.11](MIGRATING.md#from-010-to-011), [from 0.9 to 0.10](MIGRATING.md#from-09-to-010) and [from 0.8 to 0.9](MIGRATING.md#from-08-to-09).
 
 ### Build from Source
 
@@ -312,7 +312,8 @@ Reads never go past the end of the body, nor past the maximum body size of the r
 
 - A request gives no access to its socket: read the body with `read()`/`read_some()`, or take over the connection (below). `req.connection()` tells its peer and local addresses and whether it is TLS, and `req.tls()` its TLS session.
 - `co_await req.read_body()` loads the remaining body into `req.body()`, up to the maximum body size (it fails without reading a larger `Content-Length` body). Do not mix it with `read()`/`read_some()` on the same request: the stored body would miss the part already read (and fail to decompress if the request is compressed).
-- `read()`/`read_some()` return 0 at the end of the body, and also if reading it fails: `req.get_body_error()` tells why (`too_large`, `malformed` framing, `incomplete` if the connection ended first, or `bad_encoding`). A request whose body fails is answered with `400` (`413` if too large) unless the handler responded, and its connection is closed.
+- `read()`/`read_some()` return 0 at the end of the body, and also if reading it fails: `req.get_body_error()` tells why (`too_large`, `malformed` framing, `incomplete` if the connection ended first, `bad_encoding`, or `timeout` past the read deadline). A request whose body fails is answered with `400` (`413` if too large, `408` past the deadline) unless the handler responded, and its connection is closed.
+- `req.set_read_deadline(time_point)` sets an absolute deadline for the reads of the body, pending and later ones, as `http.ResponseController.SetReadDeadline` in Go: the handler moves it as it reads ("60 s more for each 64 MiB received"), which cuts a client that goes silent or trickles without cutting a long upload. As it passes, the read returns what it had, or 0, and `get_body_error()` is `timeout` for good; nothing is answered for the handler. It replaces the request timeout of the connection or route for the rest of the body, and `time_point::max()` removes it, leaving only the idle timeout. It does not bound the response. Without calling it nothing changes, nor does it cost anything; a body read from memory never waits, so it never passes.
 
 ### File Uploads (multipart/form-data)
 
@@ -363,6 +364,8 @@ server.post("/ingest", [](http::request& req, http::response& res) -> thinger::a
 ```
 
 `multipart_options::on_file` does the same within `read_multipart()`: called for each file with the part and the reader, instead of writing temporary files. The parser itself (`http::multipart_parser`, fed bytes and returning events) does not depend on sockets.
+
+To write in blocks of a fixed size, `reader.read(max_size)` returns at most `max_size` bytes, without copying, leaving the rest of the piece for the next call, as `Read(p)` in Go's `multipart.Part`; `read()` returns the piece as it came, `read(0)` returns empty at once without advancing, which is not the end of the part. A read past the deadline of `req.set_read_deadline()` fails the reader with `400` (`invalid_body`): check `req.get_body_error()` to answer `408` instead.
 
 - **Limits** (`http::multipart_limits`), checked as the body arrives: `max_parts` (1000), `max_files` (none), `max_header_size` of each part (16 KB), `max_filename_size` (255 bytes), `max_field_size` (1 MB, each part without filename), `max_fields_size` (8 MB, all of them, as they are kept in memory) and `max_file_size` (none). The whole body is bounded by the maximum body size of the route (`413` `Payload Too Large`), 8 MB by default: give upload routes the limit they need. Exceeding any limit fails with `413`. `max_parts` is Go's default, and the header and field sizes busboy's (Multer).
 - **Syntax** (RFC 7578, RFC 2046 5.1), as strict as Go's `mime/multipart`: the boundary from the `Content-Type` (quoted or not, 1 to 70 characters of the RFC 2046 set, exactly one), CRLF line endings, spaces and tabs after delimiters, preamble and epilogue ignored, a closing delimiter required (a truncated body is `400`, as one with no parts but its closing delimiter is an empty form). The boundary within the content is a delimiter only at the start of a line and followed by `--`, whitespace or CRLF. Part headers are case-insensitive, without folding, CR, LF or NUL in values; a repeated `Content-Disposition` or `Content-Type`, or a repeated parameter (`name`, `filename`) is ambiguous and malformed. `filename*` (RFC 5987, UTF-8, ISO-8859-1 or US-ASCII) wins over `filename`, as in busboy; quoted strings keep backslashes that escape nothing, so Windows paths sent by old browsers stay paths (as Go reads them). A part without filename is a field; with one, even empty (a file input without a file), a file. Parts without `Content-Disposition: form-data` or without a name are skipped by `read_multipart()` and the decoder, as Go and busboy do; the reader gives them too, and any `multipart/*` type.
@@ -430,7 +433,8 @@ res.send_file("/path/to/file.pdf");
 
 // Custom status and headers
 res.status(http::http_response::status::created);
-res.header("X-Custom", "value");
+res.header("X-Custom", "value");       // adds a field, even if it is already there (Set-Cookie)
+res.set_header("Cache-Control", "no-store");   // replaces every field of that name
 res.json({{"created", true}});
 
 // Redirect
@@ -507,7 +511,7 @@ It is on by default: unlike nginx (where `gzip_static` is off), a sibling only e
 server.serve_static("/", "/var/www/app", {.precompressed = false});
 ```
 
-`res.send_file()` does the same in a handler. Its `Cache-Control` is `no-cache` unless the handler set one before (`res.header("Cache-Control", ...)`):
+`res.send_file()` does the same in a handler. A file whose extension is unknown or missing goes as `application/octet-stream`, and a `Content-Type` set before by the handler or a middleware is kept, as in Express. Its `Cache-Control` is `no-cache` unless the handler set one before (`res.header("Cache-Control", ...)`):
 
 ```cpp
 server.get("/report", [](http::response& res) {
@@ -848,7 +852,7 @@ server.host("devices.example.com").max_body_size(64 * 1024 * 1024).timeout(60s).
 
 The limit of a request is the one of its route, else of the group it was registered in, else of its virtual host, else of the application (route > group > host > application). Group limits are copied to each route as it is registered, so set them on the group first; a route overrides them with its own (`.timeout(0ms)` removes the timeout of its group or host). Host limits apply when a request is served, to the routes of the host that do not set theirs and to its not-found handler (a proxy for the whole host, say), which has no route. On the server itself they are those of the default host only, while `set_max_body_size()` and `set_body_limits()` apply to every host.
 
-**Maximum body size** (`.max_body_size(bytes)`, `set_max_body_size()` if unset everywhere, `std::numeric_limits<size_t>::max()` for none) bounds every way the body is read, with `413 Payload Too Large` answered through the [error formatter](#error-format) and the connection closed:
+**Maximum body size** (`.max_body_size(bytes)`, `set_max_body_size()` if unset everywhere, `std::numeric_limits<std::uint64_t>::max()` for none) bounds every way the body is read, with `413 Payload Too Large` answered through the [error formatter](#error-format) and the connection closed:
 
 - Bodies the server reads (handlers taking the body decoded, synchronous handlers, `.deferred_body(false)`): a `Content-Length` over the limit is rejected before reading anything; a chunked body, as soon as it goes past it; a compressed body, also once decompressed.
 - Coroutines reading the body themselves (`read_body()`, `read()`, `read_some()`): reading a larger body fails (`req.get_body_error()` is `too_large`, a `Content-Length` one at the first read, without reading it), and the server answers `413` unless the handler did. **Behavior change**: these reads had no limit before; now they are bounded by `set_max_body_size()` (8 MB by default) unless the route (or its group or host) sets its own: give routes receiving files or other large uploads, and hosts forwarded whole, the limit they need.

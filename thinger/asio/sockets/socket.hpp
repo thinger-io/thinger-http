@@ -76,6 +76,13 @@ public:
     // read operations
     // Up to max_size bytes, at least one (see above)
     virtual awaitable<io_result> read_some(uint8_t buffer[], size_t max_size) = 0;
+    // As read_some(), for a caller that ends this read alone: a cancellation through `slot` ends
+    // it (operation_aborted), not whatever else waits on the socket, as cancel() would, and that
+    // of the caller does not reach it, which is for the caller to forward. The default runs
+    // read_some() on a coroutine of its own (which costs one per call); TCP, TLS and Unix bind
+    // the slot to the read itself
+    virtual awaitable<io_result> read_some_cancellable(uint8_t buffer[], size_t max_size,
+                                                       boost::asio::cancellation_slot slot);
     // Exactly `size` bytes (fewer only with an error)
     virtual awaitable<io_result> read(uint8_t buffer[], size_t size);
     // Exactly `size` bytes appended to `buffer` (fewer only with an error)
@@ -168,6 +175,40 @@ protected:
     boost::asio::io_context &io_context_;
     static std::atomic<unsigned long> connections;
 };
+
+namespace detail {
+
+    // async_read_some() that a cancellation through `slot` ends alone, completing as
+    // use_nothrow_awaitable does. A handler of its own, not bind_cancellation_slot(slot,
+    // use_nothrow_awaitable): an echo of 128 KiB takes 4% more cycles with the binder (the same
+    // instructions), even with a slot not connected; with this one, connected as it is, none.
+    // For TCP and Unix: over TLS the binder is not slower (see ssl_socket::read_some_cancellable())
+    template <typename Handler>
+    struct on_slot_handler {
+        Handler handler;
+        boost::asio::cancellation_slot slot;
+
+        using cancellation_slot_type = boost::asio::cancellation_slot;
+        cancellation_slot_type get_cancellation_slot() const noexcept { return slot; }
+
+        using executor_type = boost::asio::associated_executor_t<Handler>;
+        executor_type get_executor() const noexcept { return boost::asio::get_associated_executor(handler); }
+
+        void operator()(boost::system::error_code ec, size_t bytes) { std::move(handler)(io_result{ec, bytes}); }
+    };
+
+    template <typename Stream>
+    awaitable<io_result> read_some_on_slot(Stream& stream, uint8_t* buffer, size_t max_size,
+                                           boost::asio::cancellation_slot slot) {
+        return boost::asio::async_initiate<const boost::asio::use_awaitable_t<>, void(io_result)>(
+            [&stream, buffer, max_size, slot](auto handler) {
+                stream.async_read_some(boost::asio::buffer(buffer, max_size),
+                                       on_slot_handler<decltype(handler)>{std::move(handler), slot});
+            },
+            boost::asio::use_awaitable);
+    }
+
+}
 
 }
 

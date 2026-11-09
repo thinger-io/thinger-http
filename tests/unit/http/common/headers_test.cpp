@@ -556,6 +556,22 @@ TEST_CASE("Header setters refuse invalid names and values", "[http][headers][val
         REQUIRE(h.has_refused_header());
     }
 
+    SECTION("replace_headers leaves a single field, unless refused") {
+        http_response h;
+        h.add_header("X-A", "first");
+        h.add_header("X-B", "other");
+        h.add_header("x-a", "second");
+        h.replace_headers("X-A", "bad\nvalue");
+        REQUIRE(h.get_headers().size() == 3);
+        REQUIRE(h.get_headers_with_key("X-A") == std::vector<std::string>{"first", "second"});
+        h.replace_headers("x-A", "third");
+        REQUIRE(h.get_headers().size() == 2);
+        REQUIRE(h.get_headers_with_key("X-A") == std::vector<std::string>{"third"});
+        REQUIRE(h.get_headers()[0].first == "X-A");
+        h.replace_headers("X-C", "new");
+        REQUIRE(h.get_header("X-C") == "new");
+    }
+
     SECTION("Framing setters built on them are checked too") {
         http_response h;
         h.set_content_type("text/plain\r\nX-Injected: 1");

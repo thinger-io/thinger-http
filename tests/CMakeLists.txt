@@ -400,6 +400,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/server_deadlines_test.cpp)
     add_thinger_test(test_integration_server_deadlines integration/server_deadlines_test.cpp)
 endif()
 
+# Integration tests - Body read deadline: set_read_deadline() against silent and trickling clients
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/body_read_deadline_test.cpp)
+    add_thinger_test(test_integration_body_read_deadline integration/body_read_deadline_test.cpp)
+endif()
+
 # Integration tests - Listener: accepting TCP, TLS and Unix connections, stop() and the
 # deadline of TLS handshakes
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/listener_test.cpp)
@@ -546,6 +551,11 @@ endif()
 # Integration tests - Static files (validators, conditional requests, ranges)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/static_files_test.cpp)
     add_thinger_test(test_integration_static_files integration/static_files_test.cpp)
+endif()
+
+# Integration tests - Headers set on a response: replaced or added, on every kind of answer
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/integration/response_headers_test.cpp)
+    add_thinger_test(test_integration_response_headers integration/response_headers_test.cpp)
 endif()
 
 # Integration tests - Static files over 1 MiB, streamed (memory bound, ranges, compression cap)

@@ -2,6 +2,12 @@
 #include <thinger/http/server/routing/route.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
+#include <atomic>
+#include <regex>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
 
 using namespace thinger::http;
 
@@ -427,6 +433,81 @@ TEST_CASE("Route patterns with special characters and mixed parameters", "[route
         REQUIRE(m[1] == "alice");
         REQUIRE(m[2] == "xyz");
         REQUIRE(m[3] == "temp");
+    }
+}
+
+TEST_CASE("Route validates parameter regexes when it is built", "[route][regex][unit]") {
+    SECTION("An invalid parameter regex is rejected") {
+        REQUIRE_THROWS_AS(route("/users/:id([z-a])"), std::regex_error);
+        REQUIRE_THROWS_AS(route("/users/:id([0-9]+)/:name(a{2,1})"), std::regex_error);
+    }
+
+    SECTION("Unbalanced parentheses are rejected by the parser") {
+        REQUIRE_THROWS_AS(route("/users/:id([0-9)"), std::invalid_argument);
+        REQUIRE_THROWS_AS(route("/users/:id([0-9]+"), std::invalid_argument);
+    }
+
+    SECTION("Literal text with regex characters is valid") {
+        REQUIRE_NOTHROW(route("/a(b/c[d/:id([0-9]+)/e{f"));
+    }
+
+    SECTION("A back-reference may refer to the group of another parameter") {
+        route r("/:first([a-z]+)/:plain/:copy(\\1)");
+        std::smatch m;
+        std::string same = "/abc/x/abc", other = "/abc/x/abd";
+        REQUIRE(r.matches(same, m));
+        REQUIRE(m[3] == "abc");
+        REQUIRE_FALSE(r.matches(other, m));
+    }
+
+    SECTION("A back-reference to a later parameter is rejected") {
+        REQUIRE_THROWS_AS(route("/:first(\\2)/:second([a-z]+)"), std::regex_error);
+    }
+}
+
+TEST_CASE("Route matches() compiles its regex once", "[route][regex][unit]") {
+    SECTION("The first and the following calls give the same matches and captures") {
+        route r("/u/:user/d/:device([a-z]+)");
+        std::string path = "/u/alice/d/xyz", other = "/u/alice/d/123";
+        for (int i = 0; i < 3; ++i) {
+            std::smatch m;
+            REQUIRE(r.matches(path, m));
+            REQUIRE(m[1] == "alice");
+            REQUIRE(m[2] == "xyz");
+            REQUIRE_FALSE(r.matches(other, m));
+        }
+    }
+
+    SECTION("A copy matches as the original, before and after it compiled") {
+        route original("/items/:id([0-9]+)");
+        route before(original);
+        std::smatch m;
+        std::string path = "/items/42";
+        REQUIRE(before.matches(path, m));
+        REQUIRE(original.matches(path, m));
+        route after(original);
+        REQUIRE(after.matches(path, m));
+        REQUIRE(m[1] == "42");
+    }
+
+    SECTION("Eight threads on the same new route") {
+        for (int round = 0; round < 50; ++round) {
+            route r("/u/:user/d/:device([a-z]+)/f/:path(.+)");
+            std::atomic<bool> go{false};
+            std::atomic<int> matched{0};
+            std::vector<std::thread> threads;
+            for (int t = 0; t < 8; ++t) {
+                threads.emplace_back([&] {
+                    while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+                    std::string path = "/u/alice/d/xyz/f/a/b.txt";
+                    std::smatch m;
+                    if (r.matches(path, m) && m[1] == "alice" && m[2] == "xyz" && m[3] == "a/b.txt") ++matched;
+                });
+            }
+            go.store(true, std::memory_order_release);
+            for (auto& thread : threads) thread.join();
+            REQUIRE(matched == 8);
+        }
     }
 }
 

@@ -88,6 +88,11 @@ awaitable<io_result> unix_socket::read_some(uint8_t buffer[], size_t max_size) {
         use_nothrow_awaitable);
 }
 
+awaitable<io_result> unix_socket::read_some_cancellable(uint8_t buffer[], size_t max_size,
+                                                        boost::asio::cancellation_slot slot) {
+    co_return co_await detail::read_some_on_slot(socket_, buffer, max_size, slot);
+}
+
 awaitable<io_result> unix_socket::read(uint8_t buffer[], size_t size) {
     co_return co_await boost::asio::async_read(
         socket_,

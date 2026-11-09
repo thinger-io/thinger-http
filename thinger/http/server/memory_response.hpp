@@ -74,6 +74,10 @@ public:
     }
 
     void observe(std::shared_ptr<response_observer> observer) override {
+        // Weak: the observer is released with this object, and may report from its destructor
+        observer->on_reported([self = weak_from_this()] {
+            if (auto response = self.lock()) response->settle_report();
+        });
         std::lock_guard lock(mutex_);
         observer_ = std::move(observer);
     }
@@ -88,7 +92,12 @@ public:
     // not told: it reports the response as aborted when released, once the request ends too
     void abandon() {
         std::lock_guard lock(mutex_);
-        if (complete_) return;
+        // Nothing waits for the response hook any longer (see wait_reported())
+        report_settled_ = true;
+        if (complete_) {
+            done_.try_send(boost::system::error_code{});
+            return;
+        }
         response_.reset();
         finish_locked();
     }
@@ -114,7 +123,36 @@ public:
         co_return complete_ ? response_ : nullptr;
     }
 
+    // With a response hook, once the response is complete: wait until the hook has run, for at
+    // most `timeout`, or the application is gone (see abandon()). False if the wait was cancelled
+    awaitable<bool> wait_reported(std::chrono::milliseconds timeout) {
+        if (report_settled()) co_return true;
+        boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, timeout);
+        timer.async_wait([self = shared_from_this()](const boost::system::error_code& ec) {
+            if (!ec) self->done_.try_send(boost::system::error_code{});
+        });
+        auto cancellation = co_await boost::asio::this_coro::cancellation_state;
+        // A wake-up may be left from the response: each one is checked again
+        while (!report_settled() && timer.expiry() > boost::asio::steady_timer::clock_type::now()) {
+            if (cancellation.cancelled() != boost::asio::cancellation_type::none) co_return false;
+            auto [ec] = co_await done_.async_receive(use_nothrow_awaitable);
+            if (ec) co_return false;
+        }
+        co_return true;
+    }
+
 private:
+    void settle_report() {
+        std::lock_guard lock(mutex_);
+        report_settled_ = true;
+        done_.try_send(boost::system::error_code{});
+    }
+
+    bool report_settled() const {
+        std::lock_guard lock(mutex_);
+        return report_settled_;
+    }
+
     void finish_locked() {
         complete_ = true;
         done_.try_send(boost::system::error_code{});
@@ -134,6 +172,8 @@ private:
     bool complete_ = false;
     // Told about the response, while a response hook is set (see http_application::on_response)
     std::shared_ptr<response_observer> observer_;
+    // The response hook has run, or the application is gone and it is not waited for
+    bool report_settled_ = false;
     boost::asio::experimental::concurrent_channel<void(boost::system::error_code)> done_;
 };
 

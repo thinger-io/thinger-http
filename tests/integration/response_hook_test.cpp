@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <thinger/http/server/request.hpp>
 #include <thinger/http/server/response.hpp>
 #include <thinger/http/server/server_standalone.hpp>
@@ -8,10 +9,15 @@
 #include "server_test_helpers.hpp"
 #include "../fixtures/stream_test_helpers.hpp"
 
+#include <boost/asio/thread_pool.hpp>
+
 #include <atomic>
 #include <future>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 // http_application::on_response(): called once per request with its response, whoever
@@ -393,4 +399,135 @@ TEST_CASE("Response hook errors are logged", "[server][response_hook][integratio
     auto result = server_test::raw_exchange(running.port, requests);
     REQUIRE(server_test::count(result.data, "HTTP/1.1 200") == 2);
     REQUIRE(eventually([&] { return calls.load() == 2; }));
+}
+
+// --- In-memory dispatch: it returns after the hook ---
+
+namespace {
+
+    // Not an atomic, and in the frame of the caller: a hook running late is a use after free
+    // under ASan and a race under TSan
+    struct hook_seen {
+        int calls = 0;
+        http::response_info info;
+    };
+
+    // Runs the hook a little late, so an ordering bug shows on every run
+    void watch_hook(http::http_application& app, hook_seen& seen) {
+        app.on_response([&seen](const http::request&, const http::response_info& info) {
+            std::this_thread::sleep_for(1ms);
+            ++seen.calls;
+            seen.info = info;
+        });
+    }
+
+    struct dispatched {
+        http::http_response::status status{};
+        int calls = 0;
+        http::response_info info;
+    };
+
+    std::shared_ptr<http::http_request> memory_request(const std::string& path) {
+        return http::http_request::create_http_request(http::method::GET, "http://localhost" + path);
+    }
+
+    awaitable<dispatched> dispatch_with_local_hook(http::http_application& app, std::string path) {
+        hook_seen seen;
+        watch_hook(app, seen);
+        auto response = co_await app.dispatch(memory_request(path));
+        co_return dispatched{response->get_status(), seen.calls, seen.info};
+    }
+
+    dispatched run_with_local_hook(boost::asio::thread_pool& pool, http::http_application& app, const std::string& path) {
+        return co_spawn(pool, dispatch_with_local_hook(app, path), boost::asio::use_future).get();
+    }
+
+} // namespace
+
+TEST_CASE("A dispatch returns after the response hook has run", "[server][response_hook][dispatch][integration]") {
+    http::http_application app;
+    app.get("/now", [](http::response& res) { res.send("ok"); });
+    boost::asio::thread_pool pool(4);
+
+    SECTION("Awaited") {
+        for (int repetition = 0; repetition < 50; ++repetition) {
+            auto result = run_with_local_hook(pool, app, "/now");
+            REQUIRE(result.status == http::http_response::status::ok);
+            REQUIRE(result.calls == 1);
+            REQUIRE(result.info.outcome == http::response_outcome::completed);
+        }
+    }
+
+    SECTION("With a callback") {
+        for (int repetition = 0; repetition < 50; ++repetition) {
+            auto seen = std::make_shared<hook_seen>();
+            watch_hook(app, *seen);
+            std::promise<int> called;
+            app.dispatch(pool.get_executor(), memory_request("/now"),
+                         [&called, seen](std::shared_ptr<http::http_response>) mutable {
+                             called.set_value(seen->calls);
+                             seen.reset();
+                         });
+            REQUIRE(called.get_future().get() == 1);
+        }
+    }
+}
+
+TEST_CASE("A dispatch returns after the response hook, however the route ends", "[server][response_hook][dispatch][integration]") {
+    using status = http::http_response::status;
+    http::http_application app;
+    std::vector<std::thread> responders;
+    app.get("/other-thread", [&responders](http::response& res) {
+        responders.emplace_back([res]() mutable {
+            std::this_thread::sleep_for(5ms);
+            res.send("later");
+        });
+    });
+    app.get("/route-timeout", [](http::response& res) -> awaitable<void> {
+        boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 200ms);
+        co_await timer.async_wait(use_nothrow_awaitable);
+        res.send("late");
+    }).timeout(20ms);
+    app.get("/throws", [](http::response&) { throw std::runtime_error("failed"); });
+    boost::asio::thread_pool pool(4);
+
+    struct expectation {
+        std::string path;
+        status code;
+    };
+    auto expected = GENERATE(expectation{"/other-thread", status::ok}, expectation{"/route-timeout", status::gateway_timeout},
+                             expectation{"/throws", status::internal_server_error});
+    INFO(expected.path);
+    auto result = run_with_local_hook(pool, app, expected.path);
+    pool.join();
+    for (auto& responder : responders) responder.join();
+    REQUIRE(result.status == expected.code);
+    REQUIRE(result.calls == 1);
+    REQUIRE(result.info.status == expected.code);
+    REQUIRE(result.info.outcome == http::response_outcome::completed);
+}
+
+TEST_CASE("A dispatch does not wait past its timeout for a handler still running", "[server][response_hook][dispatch][integration]") {
+    http::http_application app;
+    std::atomic<int> hooks{0};
+    app.on_response([&hooks](const http::request&, const http::response_info&) { ++hooks; });
+    app.get("/keeps-working", [](http::response& res) -> awaitable<void> {
+        res.send("done");
+        boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor, 1s);
+        co_await timer.async_wait(use_nothrow_awaitable);
+    });
+    boost::asio::thread_pool pool(4);
+
+    auto start = std::chrono::steady_clock::now();
+    auto response = co_spawn(pool, app.dispatch(memory_request("/keeps-working"), {.timeout = 100ms}),
+                             boost::asio::use_future).get();
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    REQUIRE(response->get_status() == http::http_response::status::ok);
+    REQUIRE(response->get_content() == "done");
+    // it waited for the timeout, and no more: the hook runs when the handler ends
+    REQUIRE(elapsed >= 90ms);
+    REQUIRE(elapsed < 800ms);
+    REQUIRE(hooks == 0);
+    REQUIRE(eventually([&] { return hooks.load() == 1; }));
 }

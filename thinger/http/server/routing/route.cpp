@@ -4,19 +4,31 @@
 #include "../virtual_host.hpp"
 #include <regex>
 #include <algorithm>
+#include <mutex>
 #include "../../../util/ascii.hpp"
 #include "../../../util/logger.hpp"
 
 namespace thinger::http {
 
+// Regex of the whole pattern, compiled by the first matches()
+struct route::lazy_regex {
+    std::once_flag compiled;
+    std::regex regex;
+};
+
 route::route(const std::string& pattern)
     : pattern_(pattern)
+    , regex_(std::make_shared<lazy_regex>())
 {
     // Parameters in order of appearance (the first one of a repeated name), and their
     // custom regex if they have one
     auto tokens = detail::parse_route_pattern(pattern);
+    std::string parameter_regexes;
     for (const auto& token : tokens) {
         if (!token.parameter) continue;
+        parameter_regexes += '(';
+        parameter_regexes += token.regex;
+        parameter_regexes += ')';
         if (!token.regex.empty()) {
             parameter_patterns_[token.text] = token.regex;
         }
@@ -25,8 +37,12 @@ route::route(const std::string& pattern)
         }
     }
 
-    // Regex of the whole pattern, for matches(); also validates the parameter regexes
-    regex_ = std::regex(detail::pattern_regex(tokens));
+    // An invalid parameter regex throws std::regex_error here. They are compiled together,
+    // a group per parameter, as a back-reference may refer to the group of another one;
+    // the literal text, escaped in the regex of matches(), cannot make it invalid
+    if (!parameter_patterns_.empty()) {
+        [[maybe_unused]] const std::regex validated(parameter_regexes);
+    }
 }
 
 route& route::deferred_body(bool enabled) {
@@ -40,7 +56,7 @@ route& route::accepts(std::vector<std::string> types) {
     return *this;
 }
 
-route& route::max_body_size(size_t size) {
+route& route::max_body_size(std::uint64_t size) {
     max_body_size_ = size;
     return *this;
 }
@@ -151,7 +167,10 @@ const nlohmann::json& route::get_meta(const std::string& key) const {
 }
 
 bool route::matches(const std::string& path, std::smatch& matches) const {
-    return std::regex_match(path, matches, regex_);
+    std::call_once(regex_->compiled, [this] {
+        regex_->regex = std::regex(detail::pattern_regex(detail::parse_route_pattern(pattern_)));
+    });
+    return std::regex_match(path, matches, regex_->regex);
 }
 
 bool route::match_body_type(request& req, response& res) const {

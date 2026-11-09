@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <thinger/http/server/body_reader.hpp>
 #include <boost/asio.hpp>
 #include <boost/asio/use_future.hpp>
@@ -717,5 +718,35 @@ TEST_CASE("Cancelled body reads leave the body pending", "[body_reader][cancella
 
         REQUIRE(run(reader.read_some(buffer, sizeof(buffer))) == 0);
         REQUIRE(reader.error() == body_error::incomplete);
+    }
+}
+
+TEST_CASE("A read ended by the read deadline is a timeout, nothing else", "[http][body_reader][deadline]") {
+    uint8_t buffer[16];
+    body_reader reader;
+    reader.set_framing(GENERATE(false, true), 100);
+
+    SECTION("At the deadline: 0, the timeout error, and no other read") {
+        size_t reads = 0;
+        reader.set_source([&](uint8_t*, size_t) -> thinger::awaitable<io_result> {
+            ++reads;
+            co_return io_result{boost::system::errc::make_error_code(http::read_deadline_expired), 0};
+        });
+        REQUIRE(run(reader.read_some(buffer, sizeof(buffer))) == 0);
+        CHECK(reader.error() == body_error::timeout);
+        CHECK(reads == 1);
+        CHECK_FALSE(reader.has_pending());
+        REQUIRE(run(reader.read_some(buffer, sizeof(buffer))) == 0);
+        CHECK(reads == 1);
+        CHECK(reader.error() == body_error::timeout);
+    }
+
+    // A TCP connection that timed out is the client gone, not the deadline of the handler
+    SECTION("An ETIMEDOUT from the socket is still an incomplete body") {
+        reader.set_source([](uint8_t*, size_t) -> thinger::awaitable<io_result> {
+            co_return io_result{boost::asio::error::timed_out, 0};
+        });
+        REQUIRE(run(reader.read_some(buffer, sizeof(buffer))) == 0);
+        CHECK(reader.error() == body_error::incomplete);
     }
 }

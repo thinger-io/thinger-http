@@ -286,6 +286,7 @@ std::pair<std::shared_ptr<http_stream>, std::shared_ptr<request>> server_connect
     // Read within the request deadline, which its route may change (see request_timed_out()); none
     // for a request received with its head
     request_deadline_ = input_pending ? options_->request_timeout : std::chrono::milliseconds{0};
+    read_bounded_ = false;
     if (input_pending) arm_deadline();
 
     // The client may wait for 100 Continue before sending the body: sent once the body is

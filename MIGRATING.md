@@ -2,6 +2,138 @@
 
 How to move code from one minor version to the next while the version is 0.x (see [Versioning](README.md#versioning)). Each entry of the [changelog](CHANGELOG.md) under **Changed** and **Removed** says what changed and how to adapt; this guide puts the breaking ones in the order a migration meets them, with code before and after.
 
+## From 0.10 to 0.11
+
+0.11.0 adds what servers need to read large bodies (a read deadline the handler moves, blocks of a fixed size from a `multipart_reader`, 64-bit sizes) and changes what a file of an unknown type is sent as. Almost all code compiles as it is. What needs a closer look is what a server sends for files without a known extension, and the headers a handler sets before answering.
+
+A migration usually goes in this order:
+
+1. Fix what no longer compiles: a `switch` over `body_error` ([A new `body_error` value](#a-new-body_error-value)), and code that names `size_t` for a body or part size on macOS or a 32-bit build ([64-bit sizes](#64-bit-sizes)).
+2. Check what files are sent as: [files of an unknown type](#files-of-an-unknown-type) are `application/octet-stream`, from a server and from a client `form`.
+3. Check the [headers set before the response](#headers-set-before-the-response): a `Content-Type` set before `send_file()` now wins, and `send_response()` sends the headers set with `header()`.
+4. Replace the workarounds: a timer of your own around the reads of a body (`req.set_read_deadline()`), a copy to cut the pieces of a `multipart_reader` (`reader.read(max_size)`), and a header removed before setting it again (`res.set_header()`). Then review the [behaviour changes](#behaviour-changes-to-check-in-011).
+
+### Old → new
+
+| 0.10 | 0.11 | Notes |
+|---|---|---|
+| `switch (req.get_body_error())` with a case for each value | add `case body_error::timeout:` | only reached after `set_read_deadline()`; see [below](#a-new-body_error-value) |
+| `size_t` limits and sizes of bodies and parts | `std::uint64_t` | assigning a `size_t` still compiles; see [64-bit sizes](#64-bit-sizes) |
+| a file of an unknown type sent as `text/plain` | `application/octet-stream`, not compressed on the fly | `res.set_header("Content-Type", "text/plain")` before `send_file()`; see [below](#files-of-an-unknown-type) |
+| `form::file(name, path)` of a file without extension as `text/plain`, a `.txt` as `application/octet-stream` | the other way round | `form::file(name, path, content_type)` to choose |
+| a `Content-Type` set before `send_file()` replaced by the file's | kept | see [Headers set before the response](#headers-set-before-the-response) |
+| headers set with `header()` dropped by `send_response()` | sent, the message's own winning | |
+| `header(key, value)` to replace a header | `set_header(key, value)` | `header()` adds a field |
+| a timer of your own cancelling the reads of a body | `req.set_read_deadline(deadline)`, moved as it reads | `get_body_error()` is `timeout` past it |
+| copying the piece of `multipart_reader::read()` to cut it in blocks | `reader.read(max_size)` | a view, no copy |
+| `dispatch()` returning before the `on_response()` hook ran | returns once it ran, within the dispatch timeout | see [Behaviour changes](#behaviour-changes-to-check-in-011) |
+
+### A new `body_error` value
+
+`body_error::timeout` is what `get_body_error()` gives once a read passes the deadline of `req.set_read_deadline()`. A `switch` without a `default` warns for it, and with `-Werror` stops the build:
+
+```cpp
+// 0.10
+switch (req.get_body_error()) {
+    case http::body_error::none: break;
+    case http::body_error::too_large: /* ... */ break;
+    case http::body_error::malformed:
+    case http::body_error::incomplete:
+    case http::body_error::bad_encoding: /* ... */ break;
+}
+
+// 0.11: one more case, or a default
+switch (req.get_body_error()) {
+    case http::body_error::none: break;
+    case http::body_error::too_large: /* ... */ break;
+    case http::body_error::malformed:
+    case http::body_error::incomplete:
+    case http::body_error::bad_encoding: /* ... */ break;
+    case http::body_error::timeout: /* past the read deadline: 408 */ break;
+}
+```
+
+A read past the deadline only happens if the handler called `set_read_deadline()`, so code that never calls it never sees the new value.
+
+### 64-bit sizes
+
+The maximum body size (`default_max_body_size`, `set_max_body_size()`, `get_max_body_size()`, `max_body_size()` of routes, groups and hosts, `discard_body()`), the byte limits of `multipart_limits`, `multipart_parser::part_size()` and `multipart_file::size()` are `std::uint64_t`, so a 32-bit build holds a limit over 4 GiB. On Linux x86-64 `size_t` and `std::uint64_t` are the same type, and nothing changes. Where they are not (macOS, 32-bit builds), code that names the old type may not compile:
+
+```cpp
+// 0.10
+const std::optional<size_t>& limit = route.get_max_body_size();
+void (http::request::*set)(size_t) = &http::request::set_max_body_size;
+
+// 0.11
+const auto& limit = route.get_max_body_size();            // std::optional<std::uint64_t>
+void (http::request::*set)(std::uint64_t) = &http::request::set_max_body_size;
+```
+
+Assigning a `size_t` to these limits compiles as before. In a 32-bit build, reading one into a `size_t` narrows it: keep it as `std::uint64_t`. The count limits `max_parts` and `max_files` stay `size_t`.
+
+### Files of an unknown type
+
+`send_file()`, `serve_static()` and `file_server::serve()` send a file whose extension is unknown or missing as `application/octet-stream`, where 0.10 sent `text/plain`, as Node's `send` does. A browser now downloads such a file instead of showing it, and it is no longer compressed on the fly. To keep `text/plain` for a file, set the type before answering:
+
+```cpp
+// 0.10: a LICENSE file went as text/plain
+res.send_file(path);
+
+// 0.11: they go as application/octet-stream unless the handler says otherwise
+res.set_header("Content-Type", "text/plain");
+res.send_file(path);
+```
+
+For `serve_static()`, set it in a middleware for the paths that need it, or rename the files to an extension the library knows.
+
+A client `form` uses the same lookup: `form::file(name, path)` sends a file without extension as `application/octet-stream` (it was `text/plain`) and a `.txt`, `.log`, `.conf` or `.text` file as `text/plain` (it was `application/octet-stream`). To send the type a server expects, give it:
+
+```cpp
+// 0.10
+form.file("config", "/etc/app/settings");
+
+// 0.11: the type of your choice
+form.file("config", "/etc/app/settings", "text/plain");
+```
+
+### Headers set before the response
+
+Two headers a handler or a middleware set before answering now reach the client, where 0.10 replaced or dropped them.
+
+A `Content-Type` set before `send_file()` or `serve_static()` is kept, as Node's `send` keeps it, and whether the file is compressed on the fly follows that type. Code that set one and relied on the library replacing it should stop setting it:
+
+```cpp
+// 0.10: this header was replaced by the type of the file
+res.header("Content-Type", "application/json");
+res.send_file("/srv/report.csv");
+
+// 0.11: it is kept, so set none to get the type of the file
+res.send_file("/srv/report.csv");
+```
+
+`send_response()` sends the headers set before with `header()` or `set_header()`, as `header()` promised. The message's own headers win over those of the same name, and `Content-Length` and `Transfer-Encoding` set before are ignored. Remove a header set with `header()` that was not meant to go with that response:
+
+```cpp
+// 0.10: a header set before send_response() was dropped
+res.header("Cache-Control", "no-store");   // not sent
+res.send_response(message);
+
+// 0.11: it is sent, unless the message has one of the same name; drop the call if it was not meant for this response
+res.send_response(message);
+```
+
+To replace a header set before, `set_header()` replaces every field of that name, while `header()` still adds one, as `Set-Cookie` needs.
+
+### Behaviour changes to check in 0.11
+
+These change what a server or a client does without changing a signature (see the changelog for the details):
+
+- **Files of an unknown type**: `application/octet-stream`, not compressed on the fly, and streamed over 1 MiB. See [Files of an unknown type](#files-of-an-unknown-type).
+- **A client `form`**: a file without extension goes as `application/octet-stream`, and a `.txt`, `.log`, `.conf` or `.text` file as `text/plain`. See [Files of an unknown type](#files-of-an-unknown-type).
+- **`Content-Type` before `send_file()`**: kept instead of replaced. See [Headers set before the response](#headers-set-before-the-response).
+- **`send_response()`**: sends the headers set before with `header()` or `set_header()`. See [Headers set before the response](#headers-set-before-the-response).
+- **`dispatch()` with an `on_response()` hook**: the dispatch completes once the hook has run, within what is left of `dispatch_options::timeout`, where 0.10 resumed the caller first. A dispatch that waits for a slow hook now takes longer. When the timeout ends with the handler still running, the hook runs when the handler ends, so what it captures must live as long as the handler. Without a hook nothing changes.
+
 ## From 0.9 to 0.10
 
 0.10.0 replaces what servers and clients had to work around in 0.9: CORS takes options, a directory of static files can leave a path to the application, a server WebSocket closes with a code of its own and counts what it drops, and each server and client choose what their logs hide. Most code only has to compile again. What needs a closer look is what CORS sends to browsers, the logs, and the code that stops an `async_client` or destroys an application while they have work in flight.
